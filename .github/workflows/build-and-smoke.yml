@@ -117,6 +117,34 @@ jobs:
             'dirichlet_formulation=normal_jump_first_kind'
           printf '%s\n' "$formulation_compare_output" | grep -Fq \
             'dirichlet_formulation=value_jump_second_kind'
+          printf '%s\n' "$formulation_compare_output" | grep -Fq \
+            'dirichlet_formulation=normal_jump_second_kind'
+          normal_second_kind_output="$(
+            KFBIM_PYJET_DOF_MODE=uniform_midpoint \
+            KFBIM_PYJET_RESTRICT_MODE=biquadratic_quadratic_two_layer \
+            KFBIM_PYJET_DIRICHLET_FORMULATION=normal_jump_second_kind \
+              ./build/apps/dirichlet_harmonic_jet_python_compatible_2d lshape 24
+          )"
+          printf '%s\n' "$normal_second_kind_output"
+          printf '%s\n' "$normal_second_kind_output" | grep -Fq \
+            'dirichlet_formulation=normal_jump_second_kind'
+          printf '%s\n' "$normal_second_kind_output" | grep -Fq \
+            'converged=yes'
+          normal_second_exterior="$(
+            printf '%s\n' "$normal_second_kind_output" \
+              | sed -n 's/.* exterior_normal=\([^ ]*\).*/\1/p' | head -n 1
+          )"
+          normal_second_route="$(
+            printf '%s\n' "$normal_second_kind_output" \
+              | sed -n 's/.* normal_route_mismatch=\([^ ]*\).*/\1/p' | head -n 1
+          )"
+          normal_second_linf="$(
+            printf '%s\n' "$normal_second_kind_output" \
+              | sed -n 's/.* Linf=\([^ ]*\).*/\1/p' | head -n 1
+          )"
+          awk -v n="$normal_second_exterior" \
+              -v r="$normal_second_route" -v e="$normal_second_linf" \
+            'BEGIN { exit !(n != "" && r != "" && e != "" && n < 1e-7 && r < 1e-10 && e < 5e-2) }'
           if KFBIM_PYJET_DIRICHLET_FORMULATION=invalid \
               ./build/apps/dirichlet_harmonic_jet_python_compatible_2d circle 24; then
             echo "invalid Dirichlet formulation unexpectedly succeeded" >&2

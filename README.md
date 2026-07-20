@@ -158,7 +158,7 @@ python apps/visualize_transmission_center_perturb_2d.py output/transmission_cent
 进入插值模板的跨界网格值先使用相应界面自由度的局部 Cauchy 多项式统一调整到
 外侧值。每个 crossing 使用最近界面自由度对应的模板计算修正。
 
-PowerShell 直接比较两个 Dirichlet 格式：
+PowerShell 直接比较三个 Dirichlet 格式：
 
 ```powershell
 $env:KFBIM_PYJET_DIRICHLET_FORMULATION = "compare"

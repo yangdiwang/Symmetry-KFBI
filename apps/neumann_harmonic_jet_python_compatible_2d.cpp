@@ -3029,6 +3029,16 @@ int main(int argc, char** argv)
             "biquadratic_quadratic_two_layer");
         const std::vector<RestrictMode> restrict_modes =
             parse_restrict_modes(restrict_mode_selection);
+        if (bvp == BvpKind::Dirichlet
+            && formulations.size() == 1
+            && formulations.front()
+                == DirichletFormulation::NormalJumpSecondKind
+            && restrict_modes.size() == 1
+            && restrict_modes.front()
+                == RestrictMode::SixPointQuadraticExterior) {
+            throw std::invalid_argument(
+                "normal_jump_second_kind requires a joint normal restrict mode");
+        }
         const int quadratic_spread_neighbors = environment_int(
             "KFBIM_PYJET_QUADRATIC_SPREAD_NEIGHBORS", 3);
         const int quadratic_spread_derivative_neighbors = environment_int(
@@ -3103,6 +3113,16 @@ int main(int argc, char** argv)
                 for (InterfaceDofMode dof_mode : dof_modes) {
                     for (RestrictMode restrict_mode : restrict_modes) {
                         for (DirichletFormulation formulation : formulations) {
+                            if (formulation
+                                    == DirichletFormulation::NormalJumpSecondKind
+                                && restrict_mode
+                                    == RestrictMode::SixPointQuadraticExterior) {
+                                std::cout
+                                    << "[skip] normal_jump_second_kind / "
+                                       "six_point_quadratic_exterior: normal "
+                                       "trace is unavailable\n";
+                                continue;
+                            }
                             std::cout << "[run] geometry=" << name
                                       << " N=" << n
                                       << " dof_mode="
