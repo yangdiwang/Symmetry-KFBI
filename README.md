@@ -177,7 +177,7 @@ $env:KFBIM_PYJET_RESTRICT_MODE = "biquadratic_quadratic_two_layer"
 把第一行改为 `normal_jump_first_kind`、`value_jump_second_kind` 或
 `normal_jump_second_kind` 可单独运行对应格式。
 
-PowerShell 比较全部 restrict 格式的例子：
+PowerShell 比较原有四种 restrict 格式的例子：
 
 ```powershell
 $env:KFBIM_PYJET_DOF_MODE = "uniform_midpoint"
