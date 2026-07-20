@@ -80,17 +80,21 @@ python -m pip install -r requirements.txt
 每侧使用两个对称法向点。显式环境变量仍可覆盖这些预设。均匀界面段数默认取网格
 crossing 数量的 `0.75` 倍，以降低界面未知量规模。
 
-Dirichlet 入口并存两个迭代格式。稳定的默认格式 `normal_jump_first_kind` 固定
+Dirichlet 入口并存三个迭代格式。稳定的默认格式 `normal_jump_first_kind` 固定
 `[u]=g_D`，以 `q=[u_n]` 为未知量，求解
 `R^-P(0,q)=g_D-R^-P(g_D,0)`。新增的正确二类格式
 `value_jump_second_kind` 固定 `[u_n]=0`，以 `mu=[u]` 为未知量，直接求解
-`R^-P(mu,0)=g_D`；按本程序 jump 约定，该离散算子对应 `1/2 I+K_h`。两者每次
+`R^-P(mu,0)=g_D`；按本程序 jump 约定，该离散算子对应 `1/2 I+K_h`。新的
+`normal_jump_second_kind` 仍固定 `[u]=g_D`、以 `q=[u_n]` 为未知量，但求解
+`R_n^+P(0,q)=-R_n^+P(g_D,0)`，即令外侧法向迹为零；该算子对应
+`+/-1/2 I+K'_h`。三个格式每次
 算子应用都依次执行 spread、FFT bulk solve 和 restrict，并以实际内迹残差
 `u^- - g_D` 检查边界精度。该入口与 Neumann 入口共享全部自由度、4+3 spread、
 角点 5+4 三次调和 Cauchy 拟合以及双二次/法向二次两层 restrict 实现。命令中的
 `all` 依次运行椭圆、花形、圆和 L 形。
 
-一类格式的 `density_linf/density_l2` 用制造法向数据检验 `q`。二类密度 `mu`
+两个 normal-jump 格式的 `density_linf/density_l2` 用制造法向数据检验 `q`。
+value-jump 二类密度 `mu`
 没有直接可用的制造密度参考，因此这两列有意写为 `NaN`，不表示 GMRES 或势函数
 计算失败；二类结果仍报告密度均值、内迹残差和区域解误差。
 
@@ -115,8 +119,8 @@ python apps/visualize_transmission_center_perturb_2d.py output/transmission_cent
 
 - `KFBIM_PYJET_DOF_MODE=crossing|uniform_midpoint|compare`：交点自由度、沿曲线
   近似等弧长区间中点自由度，或两者都运行。区间中点避开参数段端点。
-- `KFBIM_PYJET_DIRICHLET_FORMULATION=normal_jump_first_kind|value_jump_second_kind|compare`：
-  仅供 Dirichlet 入口选择稳定一类格式、正确二类格式或两者都运行；默认值为
+- `KFBIM_PYJET_DIRICHLET_FORMULATION=normal_jump_first_kind|value_jump_second_kind|normal_jump_second_kind|compare`：
+  仅供 Dirichlet 入口选择一类格式、两个二类格式或三者都运行；默认值为
   `normal_jump_first_kind`。Neumann 入口忽略该变量。
 - `KFBIM_PYJET_UNIFORM_DOF_RATIO=<正数>`：设置 `uniform_midpoint` 段数相对于
   crossing 数量的比例；默认值为 `0.75`。
@@ -140,6 +144,9 @@ python apps/visualize_transmission_center_perturb_2d.py output/transmission_cent
   网格插值，法向二次联合拟合。
 - `KFBIM_PYJET_RESTRICT_MODE=biquadratic_quadratic_two_layer`：每侧两个对称法向
   点，双二次网格插值，法向二次联合拟合。
+- `normal_jump_second_kind` 从同一联合拟合的无量纲一次项提取外侧法向迹，并除以
+  网格间距 `h`。该格式支持上述三种联合法向 restrict，不支持仅恢复外侧函数值的
+  `six_point_quadratic_exterior`。
 - 法向 restrict 将内侧采样值换算到外侧分支时，主力方案使用
   `[u] + rho [u_n]` 的线性延拓。数值对比表明，在当前每侧两点的法向二次联合
   拟合中，直接使用三次 Cauchy jump 多项式没有带来一致的精度改善。
@@ -160,7 +167,8 @@ $env:KFBIM_PYJET_RESTRICT_MODE = "biquadratic_quadratic_two_layer"
 .\build\apps\Release\dirichlet_harmonic_jet_python_compatible_2d.exe all 32 64 128 256 512
 ```
 
-把第一行改为 `normal_jump_first_kind` 或 `value_jump_second_kind` 可单独运行对应格式。
+把第一行改为 `normal_jump_first_kind`、`value_jump_second_kind` 或
+`normal_jump_second_kind` 可单独运行对应格式。
 
 PowerShell 比较全部 restrict 格式的例子：
 

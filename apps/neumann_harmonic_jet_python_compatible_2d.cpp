@@ -53,13 +53,21 @@ enum class BvpKind {
 
 enum class DirichletFormulation {
     NormalJumpFirstKind,
-    ValueJumpSecondKind
+    ValueJumpSecondKind,
+    NormalJumpSecondKind
 };
 
 std::string dirichlet_formulation_name(DirichletFormulation formulation)
 {
-    return formulation == DirichletFormulation::ValueJumpSecondKind
-        ? "value_jump_second_kind" : "normal_jump_first_kind";
+    switch (formulation) {
+    case DirichletFormulation::NormalJumpFirstKind:
+        return "normal_jump_first_kind";
+    case DirichletFormulation::ValueJumpSecondKind:
+        return "value_jump_second_kind";
+    case DirichletFormulation::NormalJumpSecondKind:
+        return "normal_jump_second_kind";
+    }
+    throw std::invalid_argument("unknown Dirichlet formulation");
 }
 
 std::vector<DirichletFormulation> parse_dirichlet_formulations(
@@ -69,13 +77,17 @@ std::vector<DirichletFormulation> parse_dirichlet_formulations(
         return {DirichletFormulation::NormalJumpFirstKind};
     if (name == "value_jump_second_kind")
         return {DirichletFormulation::ValueJumpSecondKind};
+    if (name == "normal_jump_second_kind")
+        return {DirichletFormulation::NormalJumpSecondKind};
     if (name == "compare") {
         return {DirichletFormulation::NormalJumpFirstKind,
-                DirichletFormulation::ValueJumpSecondKind};
+                DirichletFormulation::ValueJumpSecondKind,
+                DirichletFormulation::NormalJumpSecondKind};
     }
     throw std::invalid_argument(
         "KFBIM_PYJET_DIRICHLET_FORMULATION must be "
-        "normal_jump_first_kind, value_jump_second_kind, or compare");
+        "normal_jump_first_kind, value_jump_second_kind, "
+        "normal_jump_second_kind, or compare");
 }
 
 std::string bvp_name(BvpKind kind)
@@ -1181,6 +1193,48 @@ public:
         return trace;
     }
 
+    Eigen::VectorXd exterior_normal_trace(
+        const Eigen::VectorXd& potential_values,
+        const Eigen::VectorXd& value_jump,
+        const Eigen::VectorXd& normal_jump,
+        bool diagnostics = false) const
+    {
+        if (restrict_mode_ == RestrictMode::SixPointQuadraticExterior) {
+            throw std::invalid_argument(
+                "six_point_quadratic_exterior does not recover a normal trace");
+        }
+
+        auto samples_pair = one_sided_samples(
+            potential_values, value_jump, normal_jump);
+        const Eigen::MatrixXd& inside = samples_pair.first;
+        const Eigen::MatrixXd& outside = samples_pair.second;
+        Eigen::VectorXd normal_trace(size());
+        double residual_sq = 0.0;
+        double samples_sq = 0.0;
+        const int layer_count = restrict_layer_count();
+        for (int i = 0; i < size(); ++i) {
+            Eigen::VectorXd samples(2 * layer_count);
+            for (int layer = 0; layer < layer_count; ++layer) {
+                const double rho_inside =
+                    -kNormalLayers[static_cast<std::size_t>(layer)] * h_;
+                samples[layer] = inside(i, layer)
+                    - value_jump[i] - rho_inside * normal_jump[i];
+                samples[layer_count + layer] = outside(i, layer);
+            }
+            normal_trace[i] = c1_weights_.dot(samples) / h_;
+            if (diagnostics) {
+                const Eigen::VectorXd fitted = trace_projection_ * samples;
+                residual_sq += (samples - fitted).squaredNorm();
+                samples_sq += samples.squaredNorm();
+            }
+        }
+        if (diagnostics) {
+            last_trace_fit_rel_l2_ = std::sqrt(residual_sq)
+                / std::max(std::sqrt(samples_sq), 1.0e-30);
+        }
+        return normal_trace;
+    }
+
     Eigen::VectorXd interior_trace(const Eigen::VectorXd& potential_values,
                                    const Eigen::VectorXd& value_jump,
                                    const Eigen::VectorXd& normal_jump,
@@ -1222,6 +1276,48 @@ public:
                 / std::max(std::sqrt(samples_sq), 1.0e-30);
         }
         return trace;
+    }
+
+    Eigen::VectorXd interior_normal_trace(
+        const Eigen::VectorXd& potential_values,
+        const Eigen::VectorXd& value_jump,
+        const Eigen::VectorXd& normal_jump,
+        bool diagnostics = false) const
+    {
+        if (restrict_mode_ == RestrictMode::SixPointQuadraticExterior) {
+            throw std::invalid_argument(
+                "six_point_quadratic_exterior does not recover a normal trace");
+        }
+
+        auto samples_pair = one_sided_samples(
+            potential_values, value_jump, normal_jump);
+        const Eigen::MatrixXd& inside = samples_pair.first;
+        const Eigen::MatrixXd& outside = samples_pair.second;
+        Eigen::VectorXd normal_trace(size());
+        double residual_sq = 0.0;
+        double samples_sq = 0.0;
+        const int layer_count = restrict_layer_count();
+        for (int i = 0; i < size(); ++i) {
+            Eigen::VectorXd samples(2 * layer_count);
+            for (int layer = 0; layer < layer_count; ++layer) {
+                const double rho_outside =
+                    kNormalLayers[static_cast<std::size_t>(layer)] * h_;
+                samples[layer] = inside(i, layer);
+                samples[layer_count + layer] = outside(i, layer)
+                    + value_jump[i] + rho_outside * normal_jump[i];
+            }
+            normal_trace[i] = c1_weights_.dot(samples) / h_;
+            if (diagnostics) {
+                const Eigen::VectorXd fitted = trace_projection_ * samples;
+                residual_sq += (samples - fitted).squaredNorm();
+                samples_sq += samples.squaredNorm();
+            }
+        }
+        if (diagnostics) {
+            last_trace_fit_rel_l2_ = std::sqrt(residual_sq)
+                / std::max(std::sqrt(samples_sq), 1.0e-30);
+        }
+        return normal_trace;
     }
 
     double last_trace_fit_rel_l2() const { return last_trace_fit_rel_l2_; }
@@ -2060,6 +2156,7 @@ private:
         }
         const Eigen::MatrixXd pinv = pseudo_inverse(design, 1.0e-13);
         c0_weights_ = pinv.row(0).transpose();
+        c1_weights_ = pinv.row(1).transpose();
         trace_projection_ = design * pinv;
     }
 
@@ -2092,6 +2189,7 @@ private:
     std::vector<TraceTemplate> trace_templates_;
     double boundary_length_ = 0.0;
     Eigen::VectorXd c0_weights_;
+    Eigen::VectorXd c1_weights_;
     Eigen::MatrixXd trace_projection_;
     mutable double last_trace_fit_rel_l2_ =
         std::numeric_limits<double>::quiet_NaN();
@@ -2143,6 +2241,32 @@ public:
             throw std::invalid_argument("Dirichlet trace input size mismatch");
         const Eigen::VectorXd potential = solver_.potential(zero_, x);
         y = solver_.interior_trace(potential, zero_, x);
+    }
+
+private:
+    const PythonCompatibleHarmonicJet2D& solver_;
+    Eigen::VectorXd zero_;
+};
+
+class ExteriorDirichletNormalJumpSecondKindOperator final
+    : public IKFBIOperator {
+public:
+    explicit ExteriorDirichletNormalJumpSecondKindOperator(
+        const PythonCompatibleHarmonicJet2D& solver)
+        : solver_(solver)
+        , zero_(Eigen::VectorXd::Zero(solver.size()))
+    {}
+
+    int problem_size() const override { return solver_.size(); }
+
+    void apply(const Eigen::VectorXd& x, Eigen::VectorXd& y) const override
+    {
+        if (x.size() != problem_size()) {
+            throw std::invalid_argument(
+                "Dirichlet normal-jump second-kind input size mismatch");
+        }
+        const Eigen::VectorXd potential = solver_.potential(zero_, x);
+        y = solver_.exterior_normal_trace(potential, zero_, x);
     }
 
 private:
@@ -2204,6 +2328,10 @@ struct StudyResult {
     double augmented_residual_linf = 0.0;
     double raw_exterior_trace_linf = 0.0;
     double raw_exterior_trace_l2 = 0.0;
+    double exterior_normal_linf = std::numeric_limits<double>::quiet_NaN();
+    double exterior_normal_l2 = std::numeric_limits<double>::quiet_NaN();
+    double normal_route_mismatch_linf =
+        std::numeric_limits<double>::quiet_NaN();
     double boundary_trace_res_linf = 0.0;
     double boundary_trace_res_l2 = 0.0;
     double density_mean = 0.0;
@@ -2283,6 +2411,9 @@ StudyResult run_one(BvpKind bvp,
     Eigen::VectorXd potential;
     Eigen::VectorXd boundary_residual;
     Eigen::VectorXd raw_exterior;
+    Eigen::VectorXd exterior_normal;
+    double normal_route_mismatch_linf =
+        std::numeric_limits<double>::quiet_NaN();
     double operator_residual_linf = 0.0;
     double lagrange = 0.0;
     int iterations = 0;
@@ -2325,6 +2456,32 @@ StudyResult run_one(BvpKind bvp,
             potential, dirichlet_data, density, true) - dirichlet_data;
         raw_exterior = solver.exterior_trace(
             potential, dirichlet_data, density);
+        Eigen::VectorXd applied;
+        op.apply(density, applied);
+        operator_residual_linf = inf_norm(applied - rhs);
+    } else if (formulation
+               == DirichletFormulation::NormalJumpSecondKind) {
+        ExteriorDirichletNormalJumpSecondKindOperator op(solver);
+        const Eigen::VectorXd fixed_potential =
+            solver.potential(dirichlet_data, zero);
+        const Eigen::VectorXd rhs = -solver.exterior_normal_trace(
+            fixed_potential, dirichlet_data, zero);
+        density = Eigen::VectorXd::Zero(ns);
+        GMRES gmres(max_iter, tolerance, std::min(restart, ns));
+        iterations = gmres.solve(op, rhs, density);
+        converged = gmres.converged();
+        potential = solver.potential(dirichlet_data, density);
+        boundary_residual = solver.interior_trace(
+            potential, dirichlet_data, density) - dirichlet_data;
+        raw_exterior = solver.exterior_trace(
+            potential, dirichlet_data, density);
+        exterior_normal = solver.exterior_normal_trace(
+            potential, dirichlet_data, density, true);
+        const Eigen::VectorXd exterior_normal_from_jump =
+            solver.interior_normal_trace(
+                potential, dirichlet_data, density) - density;
+        normal_route_mismatch_linf = inf_norm(
+            exterior_normal - exterior_normal_from_jump);
         Eigen::VectorXd applied;
         op.apply(density, applied);
         operator_residual_linf = inf_norm(applied - rhs);
@@ -2387,6 +2544,12 @@ StudyResult run_one(BvpKind bvp,
     result.raw_exterior_trace_linf = inf_norm(raw_exterior);
     result.raw_exterior_trace_l2 = std::sqrt(
         raw_exterior.squaredNorm() / static_cast<double>(ns));
+    if (exterior_normal.size() != 0) {
+        result.exterior_normal_linf = inf_norm(exterior_normal);
+        result.exterior_normal_l2 = std::sqrt(
+            exterior_normal.squaredNorm() / static_cast<double>(ns));
+        result.normal_route_mismatch_linf = normal_route_mismatch_linf;
+    }
     result.boundary_trace_res_linf = inf_norm(boundary_residual);
     result.boundary_trace_res_l2 = std::sqrt(
         boundary_residual.squaredNorm() / static_cast<double>(ns));
@@ -2395,7 +2558,7 @@ StudyResult run_one(BvpKind bvp,
         result.flux_mean = weights.dot(normal_data)
                          / solver.boundary_length();
     } else if (formulation
-               == DirichletFormulation::NormalJumpFirstKind) {
+               != DirichletFormulation::ValueJumpSecondKind) {
         result.flux_mean = weights.dot(density)
                          / solver.boundary_length();
     } else {
@@ -2492,7 +2655,7 @@ StudyResult run_one(BvpKind bvp,
         result.trace_l2 = std::sqrt(
             density_error.squaredNorm() / static_cast<double>(ns));
     } else if (formulation
-               == DirichletFormulation::NormalJumpFirstKind) {
+               != DirichletFormulation::ValueJumpSecondKind) {
         density_error = density - normal_data;
         result.trace_linf = result.boundary_trace_res_linf;
         result.trace_l2 = result.boundary_trace_res_l2;
@@ -2563,6 +2726,9 @@ void print_result(const StudyResult& result)
               << " converged=" << (result.converged ? "yes" : "no")
               << " aug_res=" << result.augmented_residual_linf
               << " boundary_res=" << result.boundary_trace_res_linf
+              << " exterior_normal=" << result.exterior_normal_linf
+              << " normal_route_mismatch="
+              << result.normal_route_mismatch_linf
               << " Linf=" << result.global_linf
               << " L2=" << result.global_l2
               << " trace=" << result.trace_linf
@@ -2579,7 +2745,8 @@ void print_summary(const std::vector<StudyResult>& results)
     for (const std::string formulation : {
              std::string("not_applicable"),
              std::string("normal_jump_first_kind"),
-             std::string("value_jump_second_kind")}) {
+             std::string("value_jump_second_kind"),
+             std::string("normal_jump_second_kind")}) {
         for (const std::string name : {std::string("ellipse"),
                                        std::string("flower"),
                                        std::string("circle"),
@@ -2746,6 +2913,8 @@ void write_csv(const std::filesystem::path& path,
            "cauchy_condition_mean,spread_condition_max,"
            "spread_condition_mean,augmented_boundary_res_linf,"
            "raw_exterior_trace_linf,raw_exterior_trace_l2,flux_weighted_mean,"
+           "exterior_normal_linf,exterior_normal_l2,"
+           "normal_route_mismatch_linf,"
            "lagrange,trace_mean,global_linf,global_l2,trace_linf,trace_l2,"
            "exterior_linf_far,exterior_l2_far,constant_shift,n_global,"
            "n_exterior_far,trace_fit_rel_l2,global_linf_order,global_l2_order,"
@@ -2771,6 +2940,9 @@ void write_csv(const std::filesystem::path& path,
             << result.augmented_residual_linf << ','
             << result.raw_exterior_trace_linf << ','
             << result.raw_exterior_trace_l2 << ',' << result.flux_mean << ','
+            << result.exterior_normal_linf << ','
+            << result.exterior_normal_l2 << ','
+            << result.normal_route_mismatch_linf << ','
             << result.lagrange << ',' << result.trace_mean << ','
             << result.global_linf << ',' << result.global_l2 << ','
             << result.trace_linf << ',' << result.trace_l2 << ','
@@ -2873,11 +3045,17 @@ int main(int argc, char** argv)
             "KFBIM_PYJET_CORNER_FIT_DERIVATIVE_NEIGHBORS", 4);
         const double uniform_dof_ratio = environment_double(
             "KFBIM_PYJET_UNIFORM_DOF_RATIO", 0.75);
+        const std::string trace_target = bvp != BvpKind::Dirichlet
+            ? "exterior_zero"
+            : formulation_selection == "normal_jump_second_kind"
+                ? "exterior_normal_zero"
+                : formulation_selection == "compare"
+                    ? "formulation_specific"
+                    : "interior_residual_zero";
 
         std::cout << "KFBI2D harmonic-jet " << bvp_name(bvp) << " solver\n"
                   << "bvp=" << bvp_name(bvp)
-                  << " trace_target=" << (bvp == BvpKind::Dirichlet
-                      ? "interior_residual_zero" : "exterior_zero") << '\n'
+                  << " trace_target=" << trace_target << '\n'
                   << "degree=" << degree
                   << " neighbors=" << neighbors
                   << " derivative_neighbors=" << derivative_neighbors
