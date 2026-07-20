@@ -118,6 +118,8 @@ enum class InterfaceDofMode {
 
 enum class RestrictMode {
     BicubicCubicNormal,
+    BicubicQuadraticNormal,
+    BiquadraticCubicNormal,
     BiquadraticQuadraticNormal,
     BiquadraticQuadraticTwoLayer,
     SixPointQuadraticExterior
@@ -127,6 +129,10 @@ std::string restrict_mode_name(RestrictMode mode)
 {
     if (mode == RestrictMode::BicubicCubicNormal)
         return "bicubic_cubic";
+    if (mode == RestrictMode::BicubicQuadraticNormal)
+        return "bicubic_quadratic";
+    if (mode == RestrictMode::BiquadraticCubicNormal)
+        return "biquadratic_cubic";
     if (mode == RestrictMode::BiquadraticQuadraticNormal)
         return "biquadratic_quadratic";
     if (mode == RestrictMode::BiquadraticQuadraticTwoLayer)
@@ -138,6 +144,10 @@ std::vector<RestrictMode> parse_restrict_modes(const std::string& name)
 {
     if (name == "bicubic_cubic")
         return {RestrictMode::BicubicCubicNormal};
+    if (name == "bicubic_quadratic")
+        return {RestrictMode::BicubicQuadraticNormal};
+    if (name == "biquadratic_cubic")
+        return {RestrictMode::BiquadraticCubicNormal};
     if (name == "biquadratic_quadratic")
         return {RestrictMode::BiquadraticQuadraticNormal};
     if (name == "biquadratic_quadratic_two_layer")
@@ -149,16 +159,25 @@ std::vector<RestrictMode> parse_restrict_modes(const std::string& name)
                 RestrictMode::BiquadraticQuadraticNormal,
                 RestrictMode::BiquadraticQuadraticTwoLayer};
     }
+    if (name == "degree_compare") {
+        return {RestrictMode::BiquadraticQuadraticNormal,
+                RestrictMode::BiquadraticCubicNormal,
+                RestrictMode::BicubicQuadraticNormal,
+                RestrictMode::BicubicCubicNormal};
+    }
     if (name == "compare") {
         return {RestrictMode::BicubicCubicNormal,
+                RestrictMode::BicubicQuadraticNormal,
+                RestrictMode::BiquadraticCubicNormal,
                 RestrictMode::BiquadraticQuadraticNormal,
                 RestrictMode::BiquadraticQuadraticTwoLayer,
                 RestrictMode::SixPointQuadraticExterior};
     }
     throw std::invalid_argument(
         "KFBIM_PYJET_RESTRICT_MODE must be bicubic_cubic, "
-        "biquadratic_quadratic, biquadratic_quadratic_two_layer, "
-        "six_point_quadratic_exterior, normal_compare, or compare");
+        "bicubic_quadratic, biquadratic_cubic, biquadratic_quadratic, "
+        "biquadratic_quadratic_two_layer, six_point_quadratic_exterior, "
+        "normal_compare, degree_compare, or compare");
 }
 
 std::string dof_mode_name(InterfaceDofMode mode)
@@ -807,8 +826,7 @@ public:
         build_cauchy_maps();
         if (spread_mode_
                 == SpreadCorrectionMode::QuadraticHarmonicAtOppositeNode
-            || restrict_mode_
-                != RestrictMode::BicubicCubicNormal) {
+            || !restrict_uses_cubic_grid()) {
             quadratic_spread_neighbor_count_ = std::min(
                 quadratic_spread_neighbor_count_, size());
             quadratic_spread_derivative_count_ = std::min(
@@ -877,7 +895,7 @@ public:
 
     double restrict_condition(const InterfaceDof& dof) const
     {
-        return restrict_mode_ == RestrictMode::BicubicCubicNormal
+        return restrict_uses_cubic_grid()
             ? dof.condition : dof.quadratic_condition;
     }
 
@@ -1107,8 +1125,7 @@ public:
         const Eigen::VectorXd& value_jump,
         const Eigen::VectorXd& normal_jump) const
     {
-        const Eigen::MatrixXd coefficients = restrict_mode_
-                == RestrictMode::BicubicCubicNormal
+        const Eigen::MatrixXd coefficients = restrict_uses_cubic_grid()
             ? correction_coefficients(value_jump, normal_jump)
             : quadratic_correction_coefficients(value_jump, normal_jump);
         const int layer_count = restrict_layer_count();
@@ -1336,20 +1353,32 @@ public:
     }
 
 private:
+    bool restrict_uses_cubic_grid() const
+    {
+        return restrict_mode_ == RestrictMode::BicubicCubicNormal
+            || restrict_mode_ == RestrictMode::BicubicQuadraticNormal;
+    }
+
+    bool restrict_uses_cubic_normal_fit() const
+    {
+        return restrict_mode_ == RestrictMode::BicubicCubicNormal
+            || restrict_mode_ == RestrictMode::BiquadraticCubicNormal;
+    }
+
     int restrict_layer_count() const
     {
-        if (restrict_mode_ == RestrictMode::BicubicCubicNormal)
-            return 4;
-        if (restrict_mode_ == RestrictMode::BiquadraticQuadraticNormal)
-            return 3;
+        if (restrict_mode_ == RestrictMode::SixPointQuadraticExterior)
+            return 0;
         if (restrict_mode_ == RestrictMode::BiquadraticQuadraticTwoLayer)
             return 2;
-        return 0;
+        if (restrict_uses_cubic_normal_fit())
+            return 4;
+        return 3;
     }
 
     int restrict_grid_side_count() const
     {
-        if (restrict_mode_ == RestrictMode::BicubicCubicNormal)
+        if (restrict_uses_cubic_grid())
             return 4;
         if (restrict_mode_ == RestrictMode::SixPointQuadraticExterior)
             return 0;
@@ -1358,12 +1387,12 @@ private:
 
     int restrict_normal_degree() const
     {
-        return restrict_mode_ == RestrictMode::BicubicCubicNormal ? 3 : 2;
+        return restrict_uses_cubic_normal_fit() ? 3 : 2;
     }
 
     int restrict_cauchy_degree() const
     {
-        return restrict_mode_ == RestrictMode::BicubicCubicNormal ? degree_ : 2;
+        return restrict_uses_cubic_grid() ? degree_ : 2;
     }
 
     void build_inside_mask()
@@ -2755,6 +2784,8 @@ void print_summary(const std::vector<StudyResult>& results)
                                            std::string("uniform_midpoint")}) {
                 for (const std::string restrict_mode : {
                          std::string("bicubic_cubic"),
+                         std::string("bicubic_quadratic"),
+                         std::string("biquadratic_cubic"),
                          std::string("biquadratic_quadratic"),
                          std::string("biquadratic_quadratic_two_layer"),
                          std::string("six_point_quadratic_exterior")}) {
@@ -2859,6 +2890,8 @@ void print_restrict_comparison(const std::vector<StudyResult>& results)
         if (baseline.restrict_mode != "bicubic_cubic")
             continue;
         for (const std::string target_mode : {
+                 std::string("bicubic_quadratic"),
+                 std::string("biquadratic_cubic"),
                  std::string("biquadratic_quadratic"),
                  std::string("biquadratic_quadratic_two_layer"),
                  std::string("six_point_quadratic_exterior")}) {

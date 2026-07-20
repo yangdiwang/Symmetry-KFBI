@@ -140,6 +140,10 @@ python apps/visualize_transmission_center_perturb_2d.py output/transmission_cent
   的三次调和 Cauchy 拟合；完整 harmonic-jet 路径仍保持原来的四次 20+12。
 - `KFBIM_PYJET_RESTRICT_MODE=bicubic_cubic`：每侧四个法向点，双三次网格插值，
   法向三次联合拟合。
+- `KFBIM_PYJET_RESTRICT_MODE=bicubic_quadratic`：每侧三个法向点，双三次网格
+  插值，法向二次联合拟合。
+- `KFBIM_PYJET_RESTRICT_MODE=biquadratic_cubic`：每侧四个法向点，双二次网格
+  插值，法向三次联合拟合。
 - `KFBIM_PYJET_RESTRICT_MODE=biquadratic_quadratic`：每侧三个法向点，双二次
   网格插值，法向二次联合拟合。
 - `KFBIM_PYJET_RESTRICT_MODE=biquadratic_quadratic_two_layer`：每侧两个对称法向
@@ -152,8 +156,10 @@ python apps/visualize_transmission_center_perturb_2d.py output/transmission_cent
   拟合中，直接使用三次 Cauchy jump 多项式没有带来一致的精度改善。
 - `KFBIM_PYJET_RESTRICT_MODE=six_point_quadratic_exterior`：最近网格点、上下左右
   四点和朝界面方向的最近斜点组成六点二次多项式模板。
-- `KFBIM_PYJET_RESTRICT_MODE=normal_compare|compare`：分别比较前三种法向格式，
-  或比较全部四种格式。
+- `KFBIM_PYJET_RESTRICT_MODE=normal_compare|compare`：分别比较原有三种法向格式，
+  或比较包括两个混合次数模式和六点外侧值模式在内的全部格式。
+- `KFBIM_PYJET_RESTRICT_MODE=degree_compare`：固定其他参数，仅比较双二次/双三次
+  网格插值与法向二次/三次拟合的四种组合。
 
 进入插值模板的跨界网格值先使用相应界面自由度的局部 Cauchy 多项式统一调整到
 外侧值。每个 crossing 使用最近界面自由度对应的模板计算修正。

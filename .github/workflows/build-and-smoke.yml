@@ -145,6 +145,18 @@ jobs:
           awk -v n="$normal_second_exterior" \
               -v r="$normal_second_route" -v e="$normal_second_linf" \
             'BEGIN { exit !(n != "" && r != "" && e != "" && n < 1e-7 && r < 1e-10 && e < 5e-2) }'
+          degree_compare_output="$(
+            KFBIM_PYJET_DOF_MODE=uniform_midpoint \
+            KFBIM_PYJET_RESTRICT_MODE=degree_compare \
+            KFBIM_PYJET_DIRICHLET_FORMULATION=normal_jump_second_kind \
+              ./build/apps/dirichlet_harmonic_jet_python_compatible_2d circle 24
+          )"
+          printf '%s\n' "$degree_compare_output" | grep -Fq \
+            'restrict_mode=bicubic_quadratic'
+          printf '%s\n' "$degree_compare_output" | grep -Fq \
+            'restrict_mode=biquadratic_cubic'
+          test "$(printf '%s\n' "$degree_compare_output" \
+            | grep -c 'converged=yes')" -eq 4
           if KFBIM_PYJET_DIRICHLET_FORMULATION=invalid \
               ./build/apps/dirichlet_harmonic_jet_python_compatible_2d circle 24; then
             echo "invalid Dirichlet formulation unexpectedly succeeded" >&2
