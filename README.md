@@ -154,9 +154,10 @@ python apps/visualize_transmission_center_perturb_2d.py output/transmission_cent
 - 法向 restrict 将内侧采样值换算到外侧分支时，主力方案使用
   `[u] + rho [u_n]` 的界面一阶关系；这一步属于最后的一维法向联合拟合，
   与网格插值模板中的局部 Cauchy 修正是两个不同环节。
-- 当 spread 为默认的 `cubic_harmonic` 时，插值模板跨界节点的 Cauchy 修正与 RHS
-  spread 共用同一个逐自由度三次多项式；双二次/双三次只改变网格插值权重，
-  法向二次/三次只改变最后的一维联合拟合。
+- 当 spread 为默认的 `cubic_harmonic` 且使用联合法向 restrict 时，插值模板跨界
+  节点的 Cauchy 修正与 RHS spread 共用同一个逐自由度三次多项式；双二次/双三次
+  只改变网格插值权重，法向二次/三次只改变最后的一维联合拟合。six-point 外侧值
+  restrict 保持其独立的二次 Cauchy 修正。
 - `KFBIM_PYJET_RESTRICT_MODE=six_point_quadratic_exterior`：最近网格点、上下左右
   四点和朝界面方向的最近斜点组成六点二次多项式模板。
 - `KFBIM_PYJET_RESTRICT_MODE=normal_compare|compare`：分别比较原有三种法向格式，

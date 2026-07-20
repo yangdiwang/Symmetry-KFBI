@@ -904,8 +904,7 @@ public:
 
     double restrict_condition(const InterfaceDof& dof) const
     {
-        if (spread_mode_
-            == SpreadCorrectionMode::CubicHarmonicAtOppositeNode) {
+        if (restrict_uses_shared_cubic_spread()) {
             return dof.cubic_use_full_fit
                 ? dof.corner_fit_condition : dof.cubic_condition;
         }
@@ -915,8 +914,9 @@ public:
 
     std::string restrict_cauchy_source() const
     {
-        return spread_mode_
-                == SpreadCorrectionMode::CubicHarmonicAtOppositeNode
+        if (restrict_mode_ == RestrictMode::SixPointQuadraticExterior)
+            return "six_point_quadratic";
+        return restrict_uses_shared_cubic_spread()
             ? "shared_cubic_spread" : "restrict_specific";
     }
 
@@ -1082,8 +1082,7 @@ public:
         const Eigen::VectorXd& value_jump,
         const Eigen::VectorXd& normal_jump) const
     {
-        if (spread_mode_
-            == SpreadCorrectionMode::CubicHarmonicAtOppositeNode) {
+        if (restrict_uses_shared_cubic_spread()) {
             return cubic_spread_correction_coefficients(
                 value_jump, normal_jump);
         }
@@ -1417,6 +1416,13 @@ public:
     }
 
 private:
+    bool restrict_uses_shared_cubic_spread() const
+    {
+        return spread_mode_
+                == SpreadCorrectionMode::CubicHarmonicAtOppositeNode
+            && restrict_mode_ != RestrictMode::SixPointQuadraticExterior;
+    }
+
     bool restrict_uses_cubic_grid() const
     {
         return restrict_mode_ == RestrictMode::BicubicCubicNormal
@@ -1456,8 +1462,7 @@ private:
 
     int restrict_cauchy_degree(const InterfaceDof& dof) const
     {
-        if (spread_mode_
-            == SpreadCorrectionMode::CubicHarmonicAtOppositeNode) {
+        if (restrict_uses_shared_cubic_spread()) {
             return dof.cubic_use_full_fit ? corner_fit_degree_ : 3;
         }
         return restrict_uses_cubic_grid() ? degree_ : 2;
@@ -3013,8 +3018,7 @@ void write_csv(const std::filesystem::path& path,
     std::ofstream out(path);
     if (!out)
         throw std::runtime_error("cannot open CSV: " + path.string());
-    out << "geometry,exact_solution,dof_mode,restrict_mode,"
-           "restrict_cauchy_source,spread_mode,N,h,dofs,crossings,"
+    out << "geometry,dof_mode,restrict_mode,spread_mode,N,h,dofs,crossings,"
            "dof_nearest_spacing_min,dof_nearest_spacing_mean,"
            "dof_nearest_spacing_max,"
            "gmres_iterations,converged,seconds,"
@@ -3029,13 +3033,11 @@ void write_csv(const std::filesystem::path& path,
            "n_exterior_far,trace_fit_rel_l2,global_linf_order,global_l2_order,"
            "bvp,setup_seconds,total_seconds,boundary_trace_res_linf,"
            "boundary_trace_res_l2,density_mean,density_linf,density_l2,"
-           "dirichlet_formulation\n";
+           "dirichlet_formulation,exact_solution,restrict_cauchy_source\n";
     out << std::setprecision(17);
     for (const StudyResult& result : results) {
-        out << result.geometry << ',' << result.exact_solution << ','
-            << result.dof_mode << ','
+        out << result.geometry << ',' << result.dof_mode << ','
             << result.restrict_mode << ','
-            << result.restrict_cauchy_source << ','
             << result.spread_mode << ','
             << result.n << ',' << result.h << ','
             << result.dofs << ',' << result.crossings << ','
@@ -3065,7 +3067,9 @@ void write_csv(const std::filesystem::path& path,
             << result.total_seconds << ',' << result.boundary_trace_res_linf << ','
             << result.boundary_trace_res_l2 << ',' << result.density_mean << ','
             << result.density_linf << ',' << result.density_l2 << ','
-            << result.dirichlet_formulation << '\n';
+            << result.dirichlet_formulation << ','
+            << result.exact_solution << ','
+            << result.restrict_cauchy_source << '\n';
     }
 }
 
