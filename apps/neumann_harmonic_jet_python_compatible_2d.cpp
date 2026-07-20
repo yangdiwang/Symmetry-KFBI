@@ -556,8 +556,8 @@ Eigen::Vector2d segment_intersection(GeometryKind kind,
 double exact_solution(GeometryKind kind, double x, double y)
 {
     if (kind == GeometryKind::LShape) {
-        return x * x * x + 3.0 * x * x * y
-             - 3.0 * x * y * y - y * y * y;
+        constexpr double a = 0.42;
+        return std::exp(a * x) * std::cos(a * y);
     }
     if (kind == GeometryKind::Circle) {
         const double X = x - kCircleCx;
@@ -576,9 +576,11 @@ double exact_solution(GeometryKind kind, double x, double y)
 Eigen::Vector2d exact_gradient(GeometryKind kind, double x, double y)
 {
     if (kind == GeometryKind::LShape) {
+        constexpr double a = 0.42;
+        const double exponential = std::exp(a * x);
         return Eigen::Vector2d(
-            3.0 * x * x + 6.0 * x * y - 3.0 * y * y,
-            3.0 * x * x - 6.0 * x * y - 3.0 * y * y);
+            a * exponential * std::cos(a * y),
+           -a * exponential * std::sin(a * y));
     }
     if (kind == GeometryKind::Circle) {
         const double X = x - kCircleCx;
@@ -594,6 +596,15 @@ Eigen::Vector2d exact_gradient(GeometryKind kind, double x, double y)
     return Eigen::Vector2d(
         a * exponential * std::cos(a * y) + 0.16 * x + 0.11,
        -a * exponential * std::sin(a * y) - 0.16 * y - 0.07);
+}
+
+std::string exact_solution_name(GeometryKind kind)
+{
+    if (kind == GeometryKind::LShape)
+        return "exp_cos_0p42";
+    if (kind == GeometryKind::Circle)
+        return "circle_quartic_gauge";
+    return "mixed_exp_cos_harmonic";
 }
 
 Eigen::Vector2d tangent_from_normal(const Eigen::Vector2d& normal)
@@ -893,8 +904,20 @@ public:
 
     double restrict_condition(const InterfaceDof& dof) const
     {
+        if (spread_mode_
+            == SpreadCorrectionMode::CubicHarmonicAtOppositeNode) {
+            return dof.cubic_use_full_fit
+                ? dof.corner_fit_condition : dof.cubic_condition;
+        }
         return restrict_uses_cubic_grid()
             ? dof.condition : dof.quadratic_condition;
+    }
+
+    std::string restrict_cauchy_source() const
+    {
+        return spread_mode_
+                == SpreadCorrectionMode::CubicHarmonicAtOppositeNode
+            ? "shared_cubic_spread" : "restrict_specific";
     }
 
     Eigen::VectorXd boundary_weights() const
@@ -1027,6 +1050,56 @@ public:
         return coefficients;
     }
 
+    std::vector<Eigen::VectorXd> cubic_spread_correction_coefficients(
+        const Eigen::VectorXd& value_jump,
+        const Eigen::VectorXd& normal_jump) const
+    {
+        const Eigen::MatrixXd cubic_coefficients =
+            cubic_correction_coefficients(value_jump, normal_jump);
+        const bool has_corner_fit = hybrid_full_fit_dofs() > 0;
+        Eigen::MatrixXd corner_coefficients;
+        if (has_corner_fit) {
+            corner_coefficients = corner_fit_correction_coefficients(
+                value_jump, normal_jump);
+        }
+
+        std::vector<Eigen::VectorXd> coefficients(
+            static_cast<std::size_t>(size()));
+        for (int i = 0; i < size(); ++i) {
+            const InterfaceDof& dof = dofs_[static_cast<std::size_t>(i)];
+            if (dof.cubic_use_full_fit) {
+                coefficients[static_cast<std::size_t>(i)] =
+                    corner_coefficients.row(i).transpose();
+            } else {
+                coefficients[static_cast<std::size_t>(i)] =
+                    cubic_coefficients.row(i).transpose();
+            }
+        }
+        return coefficients;
+    }
+
+    std::vector<Eigen::VectorXd> restrict_correction_coefficients(
+        const Eigen::VectorXd& value_jump,
+        const Eigen::VectorXd& normal_jump) const
+    {
+        if (spread_mode_
+            == SpreadCorrectionMode::CubicHarmonicAtOppositeNode) {
+            return cubic_spread_correction_coefficients(
+                value_jump, normal_jump);
+        }
+
+        const Eigen::MatrixXd matrix = restrict_uses_cubic_grid()
+            ? correction_coefficients(value_jump, normal_jump)
+            : quadratic_correction_coefficients(value_jump, normal_jump);
+        std::vector<Eigen::VectorXd> coefficients(
+            static_cast<std::size_t>(size()));
+        for (int i = 0; i < size(); ++i) {
+            coefficients[static_cast<std::size_t>(i)] =
+                matrix.row(i).transpose();
+        }
+        return coefficients;
+    }
+
     Eigen::VectorXd rhs_from_jumps(const Eigen::VectorXd& value_jump,
                                    const Eigen::VectorXd& normal_jump) const
     {
@@ -1063,27 +1136,20 @@ public:
 
         if (spread_mode_
             == SpreadCorrectionMode::CubicHarmonicAtOppositeNode) {
-            const Eigen::MatrixXd cubic_coefficients =
-                cubic_correction_coefficients(value_jump, normal_jump);
-            const bool has_full_fit = hybrid_full_fit_dofs() > 0;
-            Eigen::MatrixXd corner_fit_coefficients;
-            if (has_full_fit) {
-                corner_fit_coefficients = corner_fit_correction_coefficients(
+            const std::vector<Eigen::VectorXd> coefficients =
+                cubic_spread_correction_coefficients(
                     value_jump, normal_jump);
-            }
             for (const GridEdgeCrossing& crossing : crossings_) {
                 const InterfaceDof& dof = dofs_[static_cast<std::size_t>(
                     crossing.nearest_dof)];
+                const Eigen::VectorXd& coeff = coefficients[
+                    static_cast<std::size_t>(crossing.nearest_dof)];
                 if (dof.cubic_use_full_fit) {
-                    const Eigen::VectorXd coeff = corner_fit_coefficients.row(
-                        crossing.nearest_dof).transpose();
                     rhs[grid_.index(crossing.a[0], crossing.a[1])] +=
                         crossing.corner_fit_eval_a.dot(coeff) * inv_h2;
                     rhs[grid_.index(crossing.b[0], crossing.b[1])] +=
                         crossing.corner_fit_eval_b.dot(coeff) * inv_h2;
                 } else {
-                    const Eigen::VectorXd coeff = cubic_coefficients.row(
-                        crossing.nearest_dof).transpose();
                     rhs[grid_.index(crossing.a[0], crossing.a[1])] +=
                         crossing.cubic_eval_a.dot(coeff) * inv_h2;
                     rhs[grid_.index(crossing.b[0], crossing.b[1])] +=
@@ -1123,14 +1189,14 @@ public:
         const Eigen::VectorXd& value_jump,
         const Eigen::VectorXd& normal_jump) const
     {
-        const Eigen::MatrixXd coefficients = restrict_uses_cubic_grid()
-            ? correction_coefficients(value_jump, normal_jump)
-            : quadratic_correction_coefficients(value_jump, normal_jump);
+        const std::vector<Eigen::VectorXd> coefficients =
+            restrict_correction_coefficients(value_jump, normal_jump);
         const int layer_count = restrict_layer_count();
         Eigen::MatrixXd inside(size(), layer_count);
         Eigen::MatrixXd outside(size(), layer_count);
         for (int i = 0; i < size(); ++i) {
-            const Eigen::VectorXd coeff = coefficients.row(i).transpose();
+            const Eigen::VectorXd& coeff =
+                coefficients[static_cast<std::size_t>(i)];
             for (int side = 0; side < 2; ++side) {
                 for (int layer = 0; layer < layer_count; ++layer) {
                     const TraceTemplate& entry = trace_template(i, side, layer);
@@ -1388,8 +1454,12 @@ private:
         return restrict_uses_cubic_normal_fit() ? 3 : 2;
     }
 
-    int restrict_cauchy_degree() const
+    int restrict_cauchy_degree(const InterfaceDof& dof) const
     {
+        if (spread_mode_
+            == SpreadCorrectionMode::CubicHarmonicAtOppositeNode) {
+            return dof.cubic_use_full_fit ? corner_fit_degree_ : 3;
+        }
         return restrict_uses_cubic_grid() ? degree_ : 2;
     }
 
@@ -2063,12 +2133,12 @@ private:
         const int layer_count = restrict_layer_count();
         const int grid_side_count = restrict_grid_side_count();
         const int grid_node_count = grid_side_count * grid_side_count;
-        const int cauchy_degree = restrict_cauchy_degree();
-        const int cauchy_dim = 2 * cauchy_degree + 1;
         trace_templates_.resize(
             static_cast<std::size_t>(size() * 2 * layer_count));
         for (int i = 0; i < size(); ++i) {
             const InterfaceDof& dof = dofs_[static_cast<std::size_t>(i)];
+            const int cauchy_degree = restrict_cauchy_degree(dof);
+            const int cauchy_dim = 2 * cauchy_degree + 1;
             for (int side = 0; side < 2; ++side) {
                 const double sign = side == 0 ? -1.0 : 1.0;
                 const bool desired_inside = side == 0;
@@ -2330,8 +2400,10 @@ struct StudyResult {
     std::string bvp;
     std::string dirichlet_formulation;
     std::string geometry;
+    std::string exact_solution;
     std::string dof_mode;
     std::string restrict_mode;
+    std::string restrict_cauchy_source;
     std::string spread_mode;
     int n = 0;
     double h = 0.0;
@@ -2536,8 +2608,10 @@ StudyResult run_one(BvpKind bvp,
     result.dirichlet_formulation = bvp == BvpKind::Dirichlet
         ? dirichlet_formulation_name(formulation) : "not_applicable";
     result.geometry = geometry_name(geometry);
+    result.exact_solution = exact_solution_name(geometry);
     result.dof_mode = dof_mode_name(dof_mode);
     result.restrict_mode = restrict_mode_name(restrict_mode);
+    result.restrict_cauchy_source = solver.restrict_cauchy_source();
     result.spread_mode = spread_mode_name(spread_mode);
     result.n = n;
     result.h = solver.h();
@@ -2743,6 +2817,9 @@ void print_result(const StudyResult& result)
               << " dirichlet_formulation="
               << result.dirichlet_formulation
               << " restrict_mode=" << result.restrict_mode
+              << " restrict_cauchy_source="
+              << result.restrict_cauchy_source
+              << " exact_solution=" << result.exact_solution
               << " crossings=" << result.crossings
               << " dofs=" << result.dofs
               << " spacing[min/mean/max]="
@@ -2936,7 +3013,8 @@ void write_csv(const std::filesystem::path& path,
     std::ofstream out(path);
     if (!out)
         throw std::runtime_error("cannot open CSV: " + path.string());
-    out << "geometry,dof_mode,restrict_mode,spread_mode,N,h,dofs,crossings,"
+    out << "geometry,exact_solution,dof_mode,restrict_mode,"
+           "restrict_cauchy_source,spread_mode,N,h,dofs,crossings,"
            "dof_nearest_spacing_min,dof_nearest_spacing_mean,"
            "dof_nearest_spacing_max,"
            "gmres_iterations,converged,seconds,"
@@ -2954,8 +3032,10 @@ void write_csv(const std::filesystem::path& path,
            "dirichlet_formulation\n";
     out << std::setprecision(17);
     for (const StudyResult& result : results) {
-        out << result.geometry << ',' << result.dof_mode << ','
+        out << result.geometry << ',' << result.exact_solution << ','
+            << result.dof_mode << ','
             << result.restrict_mode << ','
+            << result.restrict_cauchy_source << ','
             << result.spread_mode << ','
             << result.n << ',' << result.h << ','
             << result.dofs << ',' << result.crossings << ','

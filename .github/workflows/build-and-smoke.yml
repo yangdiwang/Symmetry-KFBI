@@ -156,6 +156,10 @@ jobs:
           printf '%s\n' "$degree_compare_output" | grep -Fq \
             'restrict_mode=biquadratic_cubic'
           test "$(printf '%s\n' "$degree_compare_output" \
+            | grep -c 'restrict_cauchy_source=shared_cubic_spread')" -eq 4
+          printf '%s\n' "$degree_compare_output" | grep -Fq \
+            'exact_solution=exp_cos_0p42'
+          test "$(printf '%s\n' "$degree_compare_output" \
             | grep -c 'converged=yes')" -eq 4
           if KFBIM_PYJET_DIRICHLET_FORMULATION=invalid \
               ./build/apps/dirichlet_harmonic_jet_python_compatible_2d circle 24; then
