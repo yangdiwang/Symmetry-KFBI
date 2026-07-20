@@ -3141,7 +3141,7 @@ int main(int argc, char** argv)
             parse_dof_modes(dof_mode_selection);
         const std::string restrict_mode_selection = environment_string(
             "KFBIM_PYJET_RESTRICT_MODE",
-            "biquadratic_quadratic_two_layer");
+            "bicubic_cubic");
         const std::vector<RestrictMode> restrict_modes =
             parse_restrict_modes(restrict_mode_selection);
         if (bvp == BvpKind::Dirichlet

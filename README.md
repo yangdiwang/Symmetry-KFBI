@@ -76,8 +76,8 @@ python -m pip install -r requirements.txt
 `neumann_exterior_trace_circle_2d` 使用同一个圆：圆心 `(0.07, -0.04)`、半径
 `0.5`、计算盒 `[-1,1]^2`，并使用相同的四次调和制造解，因此可直接比较误差。
 未设置相关环境变量时，所有几何的主力方案均默认使用 `uniform_midpoint` 自由度、
-`cubic_harmonic` 4+3 spread 和 `biquadratic_quadratic_two_layer` restrict；后者在
-每侧使用两个对称法向点。显式环境变量仍可覆盖这些预设。均匀界面段数默认取网格
+`cubic_harmonic` 4+3 spread 和 `bicubic_cubic` restrict；后者使用双三次网格插值
+和法向三次联合拟合。显式环境变量仍可覆盖这些预设。均匀界面段数默认取网格
 crossing 数量的 `0.75` 倍，以降低界面未知量规模。
 
 Dirichlet 入口并存三个迭代格式。稳定的默认格式 `normal_jump_first_kind` 固定

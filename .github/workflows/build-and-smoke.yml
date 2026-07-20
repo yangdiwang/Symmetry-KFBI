@@ -55,7 +55,7 @@ jobs:
           )"
           printf '%s\n' "$main_preset_output"
           printf '%s\n' "$main_preset_output" | grep -Fq \
-            'spread_mode=cubic_harmonic dof_mode=uniform_midpoint restrict_mode=biquadratic_quadratic_two_layer'
+            'spread_mode=cubic_harmonic dof_mode=uniform_midpoint restrict_mode=bicubic_cubic'
           printf '%s\n' "$main_preset_output" | grep -Fq \
             'uniform_dof_ratio=7.500000e-01'
           printf '%s\n' "$main_preset_output" | grep -Fq \
