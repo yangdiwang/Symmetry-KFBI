@@ -31,6 +31,29 @@ target_include_directories(kfbim_core PUBLIC
 )
 
 target_link_libraries(kfbim_core PUBLIC Eigen3::Eigen zfft)
+
+if(KFBIM_BUILD_3D)
+    target_sources(kfbim_core PRIVATE
+        grid/cartesian_grid_3d.cpp
+        grid/mac_grid_3d.cpp
+        interface/interface_3d.cpp
+        geometry/grid_pair_3d.cpp
+        geometry/edge_patch_3d.cpp
+        geometry/p2_projection_3d.cpp
+        geometry/nurbs_patch_triangulator_3d.cpp
+        local_cauchy/edge_patch_laplacian_3d.cpp
+        local_cauchy/edge_singular_bspline_fit_3d.cpp
+        local_cauchy/edge_singular_fit_3d.cpp
+        transfer/laplace_spread_3d.cpp
+        transfer/laplace_restrict_3d.cpp
+        bulk_solvers/laplace_zfft_bulk_solver_3d.cpp
+        operators/laplace_bvp_3d.cpp
+        operators/laplace_transmission_3d.cpp
+    )
+    target_link_libraries(kfbim_core PRIVATE CGAL::CGAL)
+    target_compile_definitions(kfbim_core PUBLIC KFBIM_HAS_CGAL)
+endif()
+
 target_compile_features(kfbim_core PUBLIC cxx_std_17)
 
 if(MINGW)

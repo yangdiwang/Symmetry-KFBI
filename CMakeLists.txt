@@ -11,8 +11,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # mode unless this compatibility definition is present.  zFFT uses M_PI.
 add_compile_definitions(_USE_MATH_DEFINES)
 
-# Eigen is the only external dependency.  Prefer an installed package and
-# fetch the fixed 3.4.0 release when it is not available.
+# Eigen is required by all targets. Prefer an installed package and fetch the
+# fixed 3.4.0 release when it is not available.
 find_package(Eigen3 3.4 QUIET NO_MODULE)
 if(NOT Eigen3_FOUND)
     message(STATUS "Eigen3 3.4 was not found locally; fetching Eigen 3.4.0")
@@ -27,6 +27,14 @@ if(NOT Eigen3_FOUND)
     set(EIGEN_BUILD_PKGCONFIG OFF CACHE BOOL "" FORCE)
     set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(Eigen3)
+endif()
+
+# The 3D interface/crossing pipeline uses CGAL. Keep it enabled by default so
+# a normal build really produces every advertised app; 2D-only users may opt
+# out explicitly instead of silently losing the 3D executable.
+option(KFBIM_BUILD_3D "Build the CGAL-dependent 3D core and apps" ON)
+if(KFBIM_BUILD_3D)
+    find_package(CGAL 5.6 REQUIRED)
 endif()
 
 add_subdirectory(third_party/zfft)

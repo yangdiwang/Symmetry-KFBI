@@ -1,14 +1,34 @@
 # Symmetry-KFBI
 
-这是从原 KFBI 工作区中独立整理出的二维算例仓库。仓库包含 `apps` 下的全部
-七个 C++ 算例、两个 Python 可视化脚本，以及它们实际依赖的 KFBI 核心源码和
+这是从原 KFBI 工作区中独立整理出的二维与三维算例仓库。仓库包含 `apps` 下的全部
+八个 C++ 算例、两个 Python 可视化脚本，以及它们实际依赖的 KFBI 核心源码和
 zFFT。构建不依赖原代码库的相对路径。
 
 ## 依赖与构建
 
-需要 CMake 3.20 以上版本和支持 C++17 的编译器。Eigen 3.4 是唯一的外部 C++
-依赖：CMake 优先使用系统安装的 Eigen，找不到时会自动下载固定的 3.4.0 版本。
-zFFT 已放在 `third_party/zfft` 中。
+需要 CMake 3.20 以上版本和支持 C++17 的编译器。所有算例都使用 Eigen 3.4：
+CMake 优先使用系统安装的 Eigen，找不到时会自动下载固定的 3.4.0 版本。三维
+算例还需要 CGAL 5.6 或更新版本，以及 CGAL 所需的 Boost、GMP 和 MPFR；zFFT
+已经放在 `third_party/zfft` 中。
+
+Ubuntu 24.04 可安装完整构建依赖：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y cmake ninja-build g++ libeigen3-dev libcgal-dev libgmp-dev libmpfr-dev
+```
+
+Windows 可使用 vcpkg 安装 Eigen 和 CGAL，然后把 vcpkg toolchain 传给 CMake：
+
+```powershell
+vcpkg install eigen3:x64-windows cgal:x64-windows
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_TOOLCHAIN_FILE=C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
+cmake --build build --parallel 2
+```
+
+`KFBIM_BUILD_3D` 默认为 `ON`，因此默认配置会检查 CGAL 并确保三维目标确实生成。
+只需二维算例时，可以显式配置 `-DKFBIM_BUILD_3D=OFF`。
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -42,9 +62,15 @@ python -m pip install -r requirements.txt
 | `neumann_harmonic_jet_case_2d` | 原 P2 harmonic-jet 算例 | `build/apps/neumann_harmonic_jet_case_2d ellipse 24` |
 | `neumann_harmonic_jet_python_compatible_2d` | 新自由度与 restrict 格式比较，支持椭圆、花瓣和偏心圆 | `build/apps/neumann_harmonic_jet_python_compatible_2d circle 24` |
 | `dirichlet_harmonic_jet_python_compatible_2d` | 同一 spread/restrict 框架、并存一类/二类格式的 Dirichlet BVP | `build/apps/dirichlet_harmonic_jet_python_compatible_2d all 32 64 128 256 512` |
+| `neumann_exterior_zero_trace_3d` | 圆环、空心圆柱和 L 棱柱的三维外零迹 Neumann 几何与传递链就绪检查 | `build/apps/neumann_exterior_zero_trace_3d all 16` |
 
 在 Windows 上可执行文件名带 `.exe`。研究计算可省略末尾的 `24`，使用程序内置的
 多层网格；快速命令只用于检查完整运行链路。
+
+三维入口在参数面板中心建立曲面自由度，构造拓扑过滤的局部 Cauchy stencil，
+并检查固定 spread/restrict 路由和常数 jump 探针。当前 readiness 模式已经编译
+外迹为零的 GMRES 算法，但按阶段约定不执行最终数值迭代；运行输出写入
+`output/neumann_exterior_zero_trace_3d/`。
 
 `neumann_harmonic_jet_python_compatible_2d` 的 `circle` 几何与
 `neumann_exterior_trace_circle_2d` 使用同一个圆：圆心 `(0.07, -0.04)`、半径
@@ -154,9 +180,10 @@ KFBIM_PYJET_RESTRICT_MODE=compare \
 
 ## 本地验证结果
 
-本仓库整理时以 Release 模式完整构建，并在 `N=24` 上实际运行了七个 C++ 程序和
-两个 Python 绘图程序，所有命令退出码均为 0。新增的均匀中点自由度在椭圆测试中
-得到以下快速比较；这是低分辨率 smoke test，不应替代多层网格收敛结论。
+本仓库以 Release 模式完整构建，并在 `N=24` 上运行七个二维 C++ 程序、在 `N=16`
+上运行三维程序的全部三种几何，同时运行两个 Python 绘图程序，所有命令退出码均为
+0。新增的均匀中点自由度在椭圆测试中得到以下快速比较；这是低分辨率 smoke test，
+不应替代多层网格收敛结论。
 
 | restrict 格式 | GMRES | Linf | L2 |
 | --- | ---: | ---: | ---: |
@@ -165,7 +192,10 @@ KFBIM_PYJET_RESTRICT_MODE=compare \
 | 双二次 + 每侧两点二次法向拟合 | 10 | `3.503595e-4` | `1.313030e-4` |
 | 六网格点外侧二次拟合 | 12 | `3.618789e-4` | `1.520921e-4` |
 
-GitHub Actions 会在每次 push 和 pull request 时重新构建全部目标、运行七个快速
-C++ 算例，并执行两个可视化脚本。
+三维 `all 16` readiness 中，圆环、空心圆柱和 L 棱柱的网格标签不一致数均为 0；
+常数 jump 探针的最大无穷范数误差为 `1.77e-14`。
+
+GitHub Actions 会在每次 push 和 pull request 时安装 CGAL、重新构建全部目标、
+运行八个快速 C++ 算例，并执行两个可视化脚本。
 
 第三方依赖说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

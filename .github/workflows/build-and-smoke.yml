@@ -14,7 +14,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libeigen3-dev python3-pip
+          sudo apt-get install -y ninja-build libeigen3-dev libcgal-dev libgmp-dev libmpfr-dev python3-pip
           python3 -m pip install --break-system-packages -r requirements.txt
 
       - name: Configure and build all apps
@@ -43,6 +43,7 @@ jobs:
           ./build/apps/neumann_exterior_trace_lshape_2d 24
           ./build/apps/neumann_harmonic_jet_case_2d ellipse 24
           ./build/apps/neumann_harmonic_jet_python_compatible_2d ellipse 24
+          ./build/apps/neumann_exterior_zero_trace_3d all 16
           main_preset_output="$(
             env -u KFBIM_PYJET_DOF_MODE \
                 -u KFBIM_PYJET_SPREAD_MODE \
