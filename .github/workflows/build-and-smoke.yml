@@ -22,7 +22,7 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build --parallel 2
 
-      - name: Run six C++ smoke cases
+      - name: Run C++ smoke cases
         env:
           KFBIM_CIRCLE_EXT_TRACE_MAX_ITER: "30"
           KFBIM_CIRCLE_EXT_TRACE_RESTART: "30"
@@ -43,6 +43,131 @@ jobs:
           ./build/apps/neumann_exterior_trace_lshape_2d 24
           ./build/apps/neumann_harmonic_jet_case_2d ellipse 24
           ./build/apps/neumann_harmonic_jet_python_compatible_2d ellipse 24
+          main_preset_output="$(
+            env -u KFBIM_PYJET_DOF_MODE \
+                -u KFBIM_PYJET_SPREAD_MODE \
+                -u KFBIM_PYJET_RESTRICT_MODE \
+                -u KFBIM_PYJET_UNIFORM_DOF_RATIO \
+                -u KFBIM_PYJET_CUBIC_SPREAD_NEIGHBORS \
+                -u KFBIM_PYJET_CUBIC_SPREAD_DERIVATIVE_NEIGHBORS \
+                ./build/apps/neumann_harmonic_jet_python_compatible_2d ellipse 24
+          )"
+          printf '%s\n' "$main_preset_output"
+          printf '%s\n' "$main_preset_output" | grep -Fq \
+            'spread_mode=cubic_harmonic dof_mode=uniform_midpoint restrict_mode=biquadratic_quadratic_two_layer'
+          printf '%s\n' "$main_preset_output" | grep -Fq \
+            'uniform_dof_ratio=7.500000e-01'
+          printf '%s\n' "$main_preset_output" | grep -Fq \
+            'cubic_spread_neighbors=4 cubic_spread_derivative_neighbors=3'
+          printf '%s\n' "$main_preset_output" | grep -Fq \
+            'restrict_jump_extension=linear_taylor restrict_jump_degree=1'
+          printf '%s\n' "$main_preset_output" | grep -Fq \
+            'converged=yes'
+          dirichlet_output="$(
+            KFBIM_PYJET_DOF_MODE=uniform_midpoint \
+            KFBIM_PYJET_RESTRICT_MODE=biquadratic_quadratic_two_layer \
+              ./build/apps/dirichlet_harmonic_jet_python_compatible_2d circle 24
+          )"
+          printf '%s\n' "$dirichlet_output"
+          printf '%s\n' "$dirichlet_output" | grep -Fq \
+            'bvp=dirichlet trace_target=interior_residual_zero'
+          printf '%s\n' "$dirichlet_output" | grep -Fq \
+            'dirichlet_formulation=normal_jump_first_kind'
+          printf '%s\n' "$dirichlet_output" | grep -Fq \
+            'converged=yes'
+          dirichlet_boundary_res="$(
+            printf '%s\n' "$dirichlet_output" \
+              | sed -n 's/.* boundary_res=\([^ ]*\).*/\1/p' | head -n 1
+          )"
+          dirichlet_linf="$(
+            printf '%s\n' "$dirichlet_output" \
+              | sed -n 's/.* Linf=\([^ ]*\).*/\1/p' | head -n 1
+          )"
+          awk -v b="$dirichlet_boundary_res" -v e="$dirichlet_linf" \
+            'BEGIN { exit !(b != "" && e != "" && b < 1e-6 && e < 5e-2) }'
+          second_kind_output="$(
+            KFBIM_PYJET_DOF_MODE=uniform_midpoint \
+            KFBIM_PYJET_RESTRICT_MODE=biquadratic_quadratic_two_layer \
+            KFBIM_PYJET_DIRICHLET_FORMULATION=value_jump_second_kind \
+              ./build/apps/dirichlet_harmonic_jet_python_compatible_2d circle 24
+          )"
+          printf '%s\n' "$second_kind_output"
+          printf '%s\n' "$second_kind_output" | grep -Fq \
+            'dirichlet_formulation=value_jump_second_kind'
+          printf '%s\n' "$second_kind_output" | grep -Fq \
+            'converged=yes'
+          second_boundary_res="$(
+            printf '%s\n' "$second_kind_output" \
+              | sed -n 's/.* boundary_res=\([^ ]*\).*/\1/p' | head -n 1
+          )"
+          second_linf="$(
+            printf '%s\n' "$second_kind_output" \
+              | sed -n 's/.* Linf=\([^ ]*\).*/\1/p' | head -n 1
+          )"
+          awk -v b="$second_boundary_res" -v e="$second_linf" \
+            'BEGIN { exit !(b != "" && e != "" && b < 1e-6 && e < 1e-1) }'
+          formulation_compare_output="$(
+            KFBIM_PYJET_DOF_MODE=uniform_midpoint \
+            KFBIM_PYJET_RESTRICT_MODE=biquadratic_quadratic_two_layer \
+            KFBIM_PYJET_DIRICHLET_FORMULATION=compare \
+              ./build/apps/dirichlet_harmonic_jet_python_compatible_2d circle 24
+          )"
+          printf '%s\n' "$formulation_compare_output" | grep -Fq \
+            'dirichlet_formulation=normal_jump_first_kind'
+          printf '%s\n' "$formulation_compare_output" | grep -Fq \
+            'dirichlet_formulation=value_jump_second_kind'
+          if KFBIM_PYJET_DIRICHLET_FORMULATION=invalid \
+              ./build/apps/dirichlet_harmonic_jet_python_compatible_2d circle 24; then
+            echo "invalid Dirichlet formulation unexpectedly succeeded" >&2
+            exit 1
+          fi
+          KFBIM_PYJET_DIRICHLET_FORMULATION=invalid \
+            ./build/apps/neumann_harmonic_jet_python_compatible_2d circle 24
+          lshape_output="$(
+            env -u KFBIM_PYJET_DOF_MODE \
+                -u KFBIM_PYJET_SPREAD_MODE \
+                -u KFBIM_PYJET_RESTRICT_MODE \
+                -u KFBIM_PYJET_UNIFORM_DOF_RATIO \
+                KFBIM_PYJET_MAX_ITER=100 \
+                ./build/apps/neumann_harmonic_jet_python_compatible_2d lshape 24
+          )"
+          printf '%s\n' "$lshape_output"
+          printf '%s\n' "$lshape_output" | grep -Fq \
+            '[run] geometry=lshape N=24 dof_mode=uniform_midpoint restrict_mode=biquadratic_quadratic_two_layer'
+          printf '%s\n' "$lshape_output" | grep -Fq \
+            'spread_mode=cubic_harmonic'
+          printf '%s\n' "$lshape_output" | grep -Fq \
+            'lshape_neighbor_policy=hybrid_4plus3_corner_cauchy_fit'
+          printf '%s\n' "$lshape_output" | grep -Fq \
+            'lshape_corner_policy=edge_midpoints'
+          printf '%s\n' "$lshape_output" | grep -Fq \
+            'converged=yes'
+          printf '%s\n' "$lshape_output" | grep -Fq \
+            'hybrid_full_fit_dofs=24'
+          printf '%s\n' "$lshape_output" | grep -Fq \
+            'corner_fit_degree=3 corner_fit_neighbors=5 corner_fit_derivative_neighbors=4'
+          quadratic_all_three_output="$(
+            KFBIM_PYJET_SPREAD_MODE=quadratic_harmonic \
+            KFBIM_PYJET_RESTRICT_MODE=bicubic_cubic \
+            ./build/apps/neumann_harmonic_jet_python_compatible_2d circle 24
+          )"
+          printf '%s\n' "$quadratic_all_three_output"
+          printf '%s\n' "$quadratic_all_three_output" | grep -Fq \
+            'quadratic_spread_neighbors=3 quadratic_spread_derivative_neighbors=3'
+          printf '%s\n' "$quadratic_all_three_output" | grep -Fq \
+            'quadratic_normal_sampling=all_three'
+          printf '%s\n' "$quadratic_all_three_output" | grep -Fq \
+            'converged=yes'
+          quadratic_symmetric_output="$(
+            KFBIM_PYJET_SPREAD_MODE=quadratic_harmonic \
+            KFBIM_PYJET_RESTRICT_MODE=bicubic_cubic \
+            KFBIM_PYJET_QUADRATIC_SPREAD_DERIVATIVE_NEIGHBORS=2 \
+            ./build/apps/neumann_harmonic_jet_python_compatible_2d circle 24
+          )"
+          printf '%s\n' "$quadratic_symmetric_output" | grep -Fq \
+            'quadratic_normal_sampling=adjacent_symmetric'
+          printf '%s\n' "$quadratic_symmetric_output" | grep -Fq \
+            'converged=yes'
           ./build/apps/transmission_center_perturb_2d --samples 1 --levels 24 --jitter 0.01 --out output/smoke_transmission_center
           ./build/apps/shape_opt_transmission_2d --N 24 --iters 1 --save-every 1 --out output/smoke_shape_opt
 

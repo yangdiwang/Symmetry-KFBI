@@ -27,19 +27,76 @@ using namespace kfbim;
 namespace {
 
 constexpr double kPi = 3.141592653589793238462643383279502884;
-constexpr double kBoxMin = -2.5;
-constexpr double kBoxMax = 2.5;
+constexpr double kDefaultBoxMin = -2.5;
+constexpr double kDefaultBoxMax = 2.5;
+constexpr double kCircleBoxMin = -1.0;
+constexpr double kCircleBoxMax = 1.0;
+constexpr double kCircleCx = 0.07;
+constexpr double kCircleCy = -0.04;
+constexpr double kCircleRadius = 0.50;
+constexpr double kCircleGaugeConstant = 0.37;
+constexpr double kLShapeBoxMin = -1.5;
+constexpr double kLShapeBoxMax = 1.5;
 constexpr std::array<double, 4> kNormalLayers{{0.5, 1.5, 2.5, 3.5}};
 
 enum class GeometryKind {
     Ellipse,
-    Flower
+    Flower,
+    Circle,
+    LShape
 };
+
+enum class BvpKind {
+    Neumann,
+    Dirichlet
+};
+
+enum class DirichletFormulation {
+    NormalJumpFirstKind,
+    ValueJumpSecondKind
+};
+
+std::string dirichlet_formulation_name(DirichletFormulation formulation)
+{
+    return formulation == DirichletFormulation::ValueJumpSecondKind
+        ? "value_jump_second_kind" : "normal_jump_first_kind";
+}
+
+std::vector<DirichletFormulation> parse_dirichlet_formulations(
+    const std::string& name)
+{
+    if (name == "normal_jump_first_kind")
+        return {DirichletFormulation::NormalJumpFirstKind};
+    if (name == "value_jump_second_kind")
+        return {DirichletFormulation::ValueJumpSecondKind};
+    if (name == "compare") {
+        return {DirichletFormulation::NormalJumpFirstKind,
+                DirichletFormulation::ValueJumpSecondKind};
+    }
+    throw std::invalid_argument(
+        "KFBIM_PYJET_DIRICHLET_FORMULATION must be "
+        "normal_jump_first_kind, value_jump_second_kind, or compare");
+}
+
+std::string bvp_name(BvpKind kind)
+{
+    return kind == BvpKind::Dirichlet ? "dirichlet" : "neumann";
+}
+
+BvpKind default_bvp_kind()
+{
+#ifdef KFBIM_PYJET_DEFAULT_BVP_DIRICHLET
+    return BvpKind::Dirichlet;
+#else
+    return BvpKind::Neumann;
+#endif
+}
 
 enum class SpreadCorrectionMode {
     HarmonicJetAtOppositeNode,
     CrossingDensity,
-    QuadraticHarmonicAtOppositeNode
+    QuadraticHarmonicAtOppositeNode,
+    CubicHarmonicAtOppositeNode
 };
 
 enum class InterfaceDofMode {
@@ -118,6 +175,8 @@ std::string spread_mode_name(SpreadCorrectionMode mode)
         return "crossing_density";
     if (mode == SpreadCorrectionMode::QuadraticHarmonicAtOppositeNode)
         return "quadratic_harmonic";
+    if (mode == SpreadCorrectionMode::CubicHarmonicAtOppositeNode)
+        return "cubic_harmonic";
     return "harmonic_jet";
 }
 
@@ -129,9 +188,11 @@ SpreadCorrectionMode parse_spread_mode(const std::string& name)
         return SpreadCorrectionMode::CrossingDensity;
     if (name == "quadratic_harmonic")
         return SpreadCorrectionMode::QuadraticHarmonicAtOppositeNode;
+    if (name == "cubic_harmonic")
+        return SpreadCorrectionMode::CubicHarmonicAtOppositeNode;
     throw std::invalid_argument(
         "KFBIM_PYJET_SPREAD_MODE must be harmonic_jet, crossing_density, "
-        "or quadratic_harmonic");
+        "quadratic_harmonic, or cubic_harmonic");
 }
 
 Eigen::Matrix2d rotation(double angle_degrees)
@@ -145,29 +206,134 @@ Eigen::Matrix2d rotation(double angle_degrees)
     return result;
 }
 
+const std::array<Eigen::Vector2d, 6>& lshape_vertices()
+{
+    static const std::array<Eigen::Vector2d, 6> vertices{{
+        Eigen::Vector2d(-0.93, -1.04),
+        Eigen::Vector2d( 1.07, -1.04),
+        Eigen::Vector2d( 1.07, -0.04),
+        Eigen::Vector2d( 0.07, -0.04),
+        Eigen::Vector2d( 0.07,  0.96),
+        Eigen::Vector2d(-0.93,  0.96)
+    }};
+    return vertices;
+}
+
+double lshape_perimeter()
+{
+    return 8.0;
+}
+
+int lshape_boundary_segment(const Eigen::Vector2d& point)
+{
+    const auto& vertices = lshape_vertices();
+    int best_edge = -1;
+    double best_distance_sq = std::numeric_limits<double>::infinity();
+    for (int edge = 0; edge < static_cast<int>(vertices.size()); ++edge) {
+        const Eigen::Vector2d& start =
+            vertices[static_cast<std::size_t>(edge)];
+        const Eigen::Vector2d& end = vertices[static_cast<std::size_t>(
+            (edge + 1) % static_cast<int>(vertices.size()))];
+        const Eigen::Vector2d delta = end - start;
+        const double fraction = std::clamp(
+            (point - start).dot(delta) / delta.squaredNorm(), 0.0, 1.0);
+        const double distance_sq =
+            (point - (start + fraction * delta)).squaredNorm();
+        if (distance_sq < best_distance_sq) {
+            best_distance_sq = distance_sq;
+            best_edge = edge;
+        }
+    }
+    if (best_edge < 0)
+        throw std::runtime_error("L-shape point has no boundary segment");
+    return best_edge;
+}
+
 GeometryKind parse_geometry(const std::string& name)
 {
     if (name == "ellipse")
         return GeometryKind::Ellipse;
     if (name == "flower")
         return GeometryKind::Flower;
-    throw std::invalid_argument("geometry must be ellipse or flower");
+    if (name == "circle")
+        return GeometryKind::Circle;
+    if (name == "lshape")
+        return GeometryKind::LShape;
+    throw std::invalid_argument(
+        "geometry must be ellipse, flower, circle, or lshape");
 }
 
 std::string geometry_name(GeometryKind kind)
 {
-    return kind == GeometryKind::Ellipse ? "ellipse" : "flower";
+    switch (kind) {
+    case GeometryKind::Ellipse:
+        return "ellipse";
+    case GeometryKind::Flower:
+        return "flower";
+    case GeometryKind::Circle:
+        return "circle";
+    case GeometryKind::LShape:
+        return "lshape";
+    }
+    throw std::invalid_argument("unsupported geometry");
 }
 
 Eigen::Vector2d geometry_translation(GeometryKind kind)
 {
-    return kind == GeometryKind::Ellipse ? Eigen::Vector2d(0.13, -0.08)
-                                         : Eigen::Vector2d(0.09, -0.06);
+    switch (kind) {
+    case GeometryKind::Ellipse:
+        return Eigen::Vector2d(0.13, -0.08);
+    case GeometryKind::Flower:
+        return Eigen::Vector2d(0.09, -0.06);
+    case GeometryKind::Circle:
+        return Eigen::Vector2d(kCircleCx, kCircleCy);
+    case GeometryKind::LShape:
+        return Eigen::Vector2d(0.07, -0.04);
+    }
+    throw std::invalid_argument("unsupported geometry");
 }
 
 double geometry_angle(GeometryKind kind)
 {
-    return kind == GeometryKind::Ellipse ? 27.0 : 14.0;
+    switch (kind) {
+    case GeometryKind::Ellipse:
+        return 27.0;
+    case GeometryKind::Flower:
+        return 14.0;
+    case GeometryKind::Circle:
+        return 0.0;
+    case GeometryKind::LShape:
+        return 0.0;
+    }
+    throw std::invalid_argument("unsupported geometry");
+}
+
+double geometry_box_min(GeometryKind kind)
+{
+    if (kind == GeometryKind::Circle)
+        return kCircleBoxMin;
+    if (kind == GeometryKind::LShape)
+        return kLShapeBoxMin;
+    return kDefaultBoxMin;
+}
+
+double geometry_box_max(GeometryKind kind)
+{
+    if (kind == GeometryKind::Circle)
+        return kCircleBoxMax;
+    if (kind == GeometryKind::LShape)
+        return kLShapeBoxMax;
+    return kDefaultBoxMax;
+}
+
+Eigen::Vector2d geometry_semi_axes(GeometryKind kind)
+{
+    if (kind == GeometryKind::Circle)
+        return Eigen::Vector2d(kCircleRadius, kCircleRadius);
+    if (kind == GeometryKind::Ellipse)
+        return Eigen::Vector2d(1.10, 0.76);
+    throw std::invalid_argument(
+        "semi-axes are only defined for ellipse and circle");
 }
 
 Eigen::Vector2d to_local(GeometryKind kind, const Eigen::Vector2d& point)
@@ -188,13 +354,33 @@ double flower_radius_derivative(double theta)
 
 Eigen::Vector2d geometry_point(GeometryKind kind, double theta)
 {
+    if (kind == GeometryKind::LShape) {
+        double distance = std::fmod(
+            theta * lshape_perimeter() / (2.0 * kPi),
+            lshape_perimeter());
+        if (distance < 0.0)
+            distance += lshape_perimeter();
+        const auto& vertices = lshape_vertices();
+        for (int edge = 0; edge < static_cast<int>(vertices.size()); ++edge) {
+            const Eigen::Vector2d& start =
+                vertices[static_cast<std::size_t>(edge)];
+            const Eigen::Vector2d& end = vertices[static_cast<std::size_t>(
+                (edge + 1) % static_cast<int>(vertices.size()))];
+            const double length = (end - start).norm();
+            if (distance <= length || edge + 1 == static_cast<int>(vertices.size()))
+                return start + (distance / length) * (end - start);
+            distance -= length;
+        }
+        throw std::runtime_error("L-shape boundary parameterization failed");
+    }
     Eigen::Vector2d local;
-    if (kind == GeometryKind::Ellipse) {
-        local = Eigen::Vector2d(1.10 * std::cos(theta),
-                                0.76 * std::sin(theta));
-    } else {
+    if (kind == GeometryKind::Flower) {
         const double radius = flower_radius(theta);
         local = radius * Eigen::Vector2d(std::cos(theta), std::sin(theta));
+    } else {
+        const Eigen::Vector2d axes = geometry_semi_axes(kind);
+        local = Eigen::Vector2d(axes[0] * std::cos(theta),
+                                axes[1] * std::sin(theta));
     }
     return geometry_translation(kind)
          + rotation(geometry_angle(kind)) * local;
@@ -209,10 +395,22 @@ double flower_level_set(const Eigen::Vector2d& point)
 
 bool geometry_inside(GeometryKind kind, const Eigen::Vector2d& point)
 {
+    if (kind == GeometryKind::LShape) {
+        constexpr double ax = -0.93;
+        constexpr double bx = 0.07;
+        constexpr double cx = 1.07;
+        constexpr double ay = -1.04;
+        constexpr double by = -0.04;
+        constexpr double cy = 0.96;
+        return point[0] > ax && point[0] < cx
+            && point[1] > ay && point[1] < cy
+            && (point[0] < bx || point[1] < by);
+    }
     const Eigen::Vector2d q = to_local(kind, point);
-    if (kind == GeometryKind::Ellipse) {
-        const double x = q[0] / 1.10;
-        const double y = q[1] / 0.76;
+    if (kind != GeometryKind::Flower) {
+        const Eigen::Vector2d axes = geometry_semi_axes(kind);
+        const double x = q[0] / axes[0];
+        const double y = q[1] / axes[1];
         return x * x + y * y < 1.0;
     }
     return flower_level_set(point) < 0.0;
@@ -221,12 +419,17 @@ bool geometry_inside(GeometryKind kind, const Eigen::Vector2d& point)
 Eigen::Vector2d geometry_normal(GeometryKind kind,
                                 const Eigen::Vector2d& point)
 {
+    if (kind == GeometryKind::LShape) {
+        const auto& vertices = lshape_vertices();
+        const int edge = lshape_boundary_segment(point);
+        const Eigen::Vector2d tangent =
+            (vertices[static_cast<std::size_t>((edge + 1) % 6)]
+             - vertices[static_cast<std::size_t>(edge)]).normalized();
+        return Eigen::Vector2d(tangent[1], -tangent[0]);
+    }
     const Eigen::Vector2d q = to_local(kind, point);
     Eigen::Vector2d local;
-    if (kind == GeometryKind::Ellipse) {
-        local = Eigen::Vector2d(q[0] / (1.10 * 1.10),
-                                q[1] / (0.76 * 0.76));
-    } else {
+    if (kind == GeometryKind::Flower) {
         const double radius = std::max(q.norm(), 1.0e-14);
         const double theta = std::atan2(q[1], q[0]);
         const double rp = flower_radius_derivative(theta);
@@ -234,6 +437,10 @@ Eigen::Vector2d geometry_normal(GeometryKind kind,
         const double s = q[1] / radius;
         local = Eigen::Vector2d(c + rp * s / radius,
                                 s - rp * c / radius);
+    } else {
+        const Eigen::Vector2d axes = geometry_semi_axes(kind);
+        local = Eigen::Vector2d(q[0] / (axes[0] * axes[0]),
+                                q[1] / (axes[1] * axes[1]));
     }
     Eigen::Vector2d world = rotation(geometry_angle(kind)) * local;
     return world / world.norm();
@@ -244,19 +451,41 @@ Eigen::Vector2d segment_intersection(GeometryKind kind,
                                      const Eigen::Vector2d& q,
                                      double& phase)
 {
-    if (kind == GeometryKind::Ellipse) {
+    if (kind == GeometryKind::LShape) {
+        const bool p_inside = geometry_inside(kind, p);
+        if (p_inside == geometry_inside(kind, q))
+            throw std::runtime_error(
+                "L-shape segment does not bracket the interface");
+        double left = 0.0;
+        double right = 1.0;
+        for (int iteration = 0; iteration < 64; ++iteration) {
+            const double middle = 0.5 * (left + right);
+            const bool middle_inside =
+                geometry_inside(kind, p + middle * (q - p));
+            if (middle_inside == p_inside)
+                left = middle;
+            else
+                right = middle;
+        }
+        phase = 0.5 * (left + right);
+        return p + phase * (q - p);
+    }
+    if (kind != GeometryKind::Flower) {
         const Eigen::Vector2d a = to_local(kind, p);
         const Eigen::Vector2d b = to_local(kind, q);
         const Eigen::Vector2d d = b - a;
-        const double aa = d[0] * d[0] / (1.10 * 1.10)
-                        + d[1] * d[1] / (0.76 * 0.76);
-        const double bb = 2.0 * (a[0] * d[0] / (1.10 * 1.10)
-                               + a[1] * d[1] / (0.76 * 0.76));
-        const double cc = a[0] * a[0] / (1.10 * 1.10)
-                        + a[1] * a[1] / (0.76 * 0.76) - 1.0;
+        const Eigen::Vector2d axes = geometry_semi_axes(kind);
+        const double ax2 = axes[0] * axes[0];
+        const double ay2 = axes[1] * axes[1];
+        const double aa = d[0] * d[0] / ax2 + d[1] * d[1] / ay2;
+        const double bb = 2.0 * (a[0] * d[0] / ax2
+                               + a[1] * d[1] / ay2);
+        const double cc = a[0] * a[0] / ax2
+                        + a[1] * a[1] / ay2 - 1.0;
         const double discriminant = bb * bb - 4.0 * aa * cc;
         if (!(discriminant >= 0.0) || aa == 0.0)
-            throw std::runtime_error("ellipse segment does not cross interface");
+            throw std::runtime_error(
+                "quadratic geometry segment does not cross interface");
         const double root = std::sqrt(discriminant);
         const std::array<double, 2> roots{{(-bb - root) / (2.0 * aa),
                                            (-bb + root) / (2.0 * aa)}};
@@ -268,7 +497,8 @@ Eigen::Vector2d segment_intersection(GeometryKind kind,
             }
         }
         if (count != 1)
-            throw std::runtime_error("ellipse crossing root is ambiguous");
+            throw std::runtime_error(
+                "quadratic geometry crossing root is ambiguous");
         return p + phase * (q - p);
     }
 
@@ -294,15 +524,42 @@ Eigen::Vector2d segment_intersection(GeometryKind kind,
     return p + phase * (q - p);
 }
 
-double exact_solution(double x, double y)
+double exact_solution(GeometryKind kind, double x, double y)
 {
+    if (kind == GeometryKind::LShape) {
+        return x * x * x + 3.0 * x * x * y
+             - 3.0 * x * y * y - y * y * y;
+    }
+    if (kind == GeometryKind::Circle) {
+        const double X = x - kCircleCx;
+        const double Y = y - kCircleCy;
+        const double r4 = kCircleRadius * kCircleRadius
+                        * kCircleRadius * kCircleRadius;
+        return kCircleGaugeConstant
+             + (X * X * X * X - 6.0 * X * X * Y * Y
+                + Y * Y * Y * Y) / r4;
+    }
     constexpr double a = 0.42;
     return std::exp(a * x) * std::cos(a * y)
          + 0.08 * (x * x - y * y) + 0.11 * x - 0.07 * y;
 }
 
-Eigen::Vector2d exact_gradient(double x, double y)
+Eigen::Vector2d exact_gradient(GeometryKind kind, double x, double y)
 {
+    if (kind == GeometryKind::LShape) {
+        return Eigen::Vector2d(
+            3.0 * x * x + 6.0 * x * y - 3.0 * y * y,
+            3.0 * x * x - 6.0 * x * y - 3.0 * y * y);
+    }
+    if (kind == GeometryKind::Circle) {
+        const double X = x - kCircleCx;
+        const double Y = y - kCircleCy;
+        const double r4 = kCircleRadius * kCircleRadius
+                        * kCircleRadius * kCircleRadius;
+        return Eigen::Vector2d(
+            (4.0 * X * X * X - 12.0 * X * Y * Y) / r4,
+            (4.0 * Y * Y * Y - 12.0 * X * X * Y) / r4);
+    }
     constexpr double a = 0.42;
     const double exponential = std::exp(a * x);
     return Eigen::Vector2d(
@@ -407,18 +664,24 @@ struct GridEdgeCrossing {
     double phase = 0.0;
     Eigen::Vector2d normal = Eigen::Vector2d::Zero();
     Eigen::Vector2d tangent = Eigen::Vector2d::Zero();
+    int boundary_segment = -1;
     double weight = 0.0;
     int nearest_dof = -1;
     Eigen::VectorXd eval_a;
     Eigen::VectorXd eval_b;
     Eigen::VectorXd quadratic_eval_a;
     Eigen::VectorXd quadratic_eval_b;
+    Eigen::VectorXd cubic_eval_a;
+    Eigen::VectorXd cubic_eval_b;
+    Eigen::VectorXd corner_fit_eval_a;
+    Eigen::VectorXd corner_fit_eval_b;
 };
 
 struct InterfaceDof {
     Eigen::Vector2d point = Eigen::Vector2d::Zero();
     Eigen::Vector2d normal = Eigen::Vector2d::Zero();
     Eigen::Vector2d tangent = Eigen::Vector2d::Zero();
+    int boundary_segment = -1;
     double weight = 0.0;
     std::vector<int> neighbor_ids;
     Eigen::MatrixXd value_map;
@@ -428,6 +691,15 @@ struct InterfaceDof {
     Eigen::MatrixXd quadratic_value_map;
     Eigen::MatrixXd quadratic_normal_map;
     double quadratic_condition = 0.0;
+    std::vector<int> cubic_neighbor_ids;
+    Eigen::MatrixXd cubic_value_map;
+    Eigen::MatrixXd cubic_normal_map;
+    double cubic_condition = 0.0;
+    bool cubic_use_full_fit = false;
+    std::vector<int> corner_fit_neighbor_ids;
+    Eigen::MatrixXd corner_fit_value_map;
+    Eigen::MatrixXd corner_fit_normal_map;
+    double corner_fit_condition = 0.0;
 };
 
 struct TraceTemplate {
@@ -442,17 +714,25 @@ public:
                                   GeometryKind geometry,
                                   InterfaceDofMode dof_mode,
                                   RestrictMode restrict_mode,
+                                  double uniform_dof_ratio,
                                   int degree,
                                   int neighbor_count,
                                   int derivative_count,
                                   SpreadCorrectionMode spread_mode,
                                   int quadratic_spread_neighbor_count,
-                                  int quadratic_spread_derivative_count)
+                                  int quadratic_spread_derivative_count,
+                                  int cubic_spread_neighbor_count,
+                                  int cubic_spread_derivative_count,
+                                  int corner_fit_degree,
+                                  int corner_fit_neighbor_count,
+                                  int corner_fit_derivative_count)
         : n_(n_intervals)
-        , h_((kBoxMax - kBoxMin) / static_cast<double>(n_intervals))
+        , h_((geometry_box_max(geometry) - geometry_box_min(geometry))
+             / static_cast<double>(n_intervals))
         , geometry_(geometry)
         , dof_mode_(dof_mode)
         , restrict_mode_(restrict_mode)
+        , uniform_dof_ratio_(uniform_dof_ratio)
         , degree_(degree)
         , dim_(2 * degree + 1)
         , requested_neighbors_(neighbor_count)
@@ -460,13 +740,28 @@ public:
         , spread_mode_(spread_mode)
         , quadratic_spread_neighbor_count_(quadratic_spread_neighbor_count)
         , quadratic_spread_derivative_count_(quadratic_spread_derivative_count)
-        , grid_({kBoxMin, kBoxMin}, {h_, h_}, {n_, n_}, DofLayout2D::Node)
+        , cubic_spread_neighbor_count_(cubic_spread_neighbor_count)
+        , cubic_spread_derivative_count_(cubic_spread_derivative_count)
+        , corner_fit_degree_(corner_fit_degree)
+        , corner_fit_dim_(2 * corner_fit_degree + 1)
+        , corner_fit_neighbor_count_(corner_fit_neighbor_count)
+        , corner_fit_derivative_count_(corner_fit_derivative_count)
+        , grid_({geometry_box_min(geometry), geometry_box_min(geometry)},
+                {h_, h_}, {n_, n_}, DofLayout2D::Node)
         , bulk_solver_(grid_, ZfftBcType::Dirichlet, 0.0, 2)
     {
         if (n_ < 24)
             throw std::invalid_argument("N must be at least 24");
         if (degree_ < 2 || degree_ > 5)
             throw std::invalid_argument("harmonic jet degree must be in [2,5]");
+        if (corner_fit_degree_ < 2 || corner_fit_degree_ > 5)
+            throw std::invalid_argument(
+                "corner Cauchy fit degree must be in [2,5]");
+        if (!(uniform_dof_ratio_ > 0.0)
+            || !std::isfinite(uniform_dof_ratio_)) {
+            throw std::invalid_argument(
+                "uniform DOF ratio must be finite and positive");
+        }
         if (requested_neighbors_ <= 0 || requested_derivative_neighbors_ <= 0
             || requested_derivative_neighbors_ > requested_neighbors_) {
             throw std::invalid_argument("invalid harmonic-jet neighbor counts");
@@ -477,6 +772,19 @@ public:
                    > quadratic_spread_neighbor_count_) {
             throw std::invalid_argument(
                 "invalid quadratic-spread neighbor counts");
+        }
+        if (cubic_spread_neighbor_count_ <= 0
+            || cubic_spread_derivative_count_ <= 0
+            || cubic_spread_derivative_count_
+                   > cubic_spread_neighbor_count_) {
+            throw std::invalid_argument(
+                "invalid cubic-spread neighbor counts");
+        }
+        if (corner_fit_neighbor_count_ <= 0
+            || corner_fit_derivative_count_ <= 0
+            || corner_fit_derivative_count_ > corner_fit_neighbor_count_) {
+            throw std::invalid_argument(
+                "invalid corner-fit neighbor counts");
         }
         build_inside_mask();
         build_crossings();
@@ -496,6 +804,29 @@ public:
                 quadratic_spread_neighbor_count_);
             build_quadratic_spread_maps();
         }
+        if (spread_mode_
+            == SpreadCorrectionMode::CubicHarmonicAtOppositeNode) {
+            cubic_spread_neighbor_count_ = std::min(
+                cubic_spread_neighbor_count_, size());
+            cubic_spread_derivative_count_ = std::min(
+                cubic_spread_derivative_count_,
+                cubic_spread_neighbor_count_);
+            build_cubic_spread_maps();
+            if (geometry_ == GeometryKind::LShape
+                && hybrid_full_fit_dofs() > 0) {
+                corner_fit_neighbor_count_ = std::min(
+                    corner_fit_neighbor_count_, size());
+                corner_fit_derivative_count_ = std::min(
+                    corner_fit_derivative_count_,
+                    corner_fit_neighbor_count_);
+                if (corner_fit_neighbor_count_
+                        + corner_fit_derivative_count_ < corner_fit_dim_) {
+                    throw std::invalid_argument(
+                        "corner Cauchy fit has too few samples");
+                }
+                build_corner_cauchy_maps();
+            }
+        }
         build_crossing_rows();
         build_trace_templates();
         if (restrict_mode_ != RestrictMode::SixPointQuadraticExterior)
@@ -504,6 +835,13 @@ public:
 
     int size() const { return static_cast<int>(dofs_.size()); }
     int num_crossings() const { return static_cast<int>(crossings_.size()); }
+    int hybrid_full_fit_dofs() const
+    {
+        return static_cast<int>(std::count_if(
+            dofs_.begin(), dofs_.end(), [](const InterfaceDof& dof) {
+                return dof.cubic_use_full_fit;
+            }));
+    }
     int n_intervals() const { return n_; }
     double h() const { return h_; }
     double boundary_length() const { return boundary_length_; }
@@ -513,9 +851,16 @@ public:
 
     double spread_condition(const InterfaceDof& dof) const
     {
-        return spread_mode_
-                   == SpreadCorrectionMode::QuadraticHarmonicAtOppositeNode
-            ? dof.quadratic_condition : dof.condition;
+        if (spread_mode_
+            == SpreadCorrectionMode::QuadraticHarmonicAtOppositeNode) {
+            return dof.quadratic_condition;
+        }
+        if (spread_mode_
+            == SpreadCorrectionMode::CubicHarmonicAtOppositeNode) {
+            return dof.cubic_use_full_fit
+                ? dof.corner_fit_condition : dof.cubic_condition;
+        }
+        return dof.condition;
     }
 
     double restrict_condition(const InterfaceDof& dof) const
@@ -537,7 +882,7 @@ public:
         Eigen::VectorXd result(size());
         for (int i = 0; i < size(); ++i) {
             const Eigen::Vector2d& p = dofs_[static_cast<std::size_t>(i)].point;
-            result[i] = exact_solution(p[0], p[1]);
+            result[i] = exact_solution(geometry_, p[0], p[1]);
         }
         return result;
     }
@@ -547,7 +892,8 @@ public:
         Eigen::VectorXd result(size());
         for (int i = 0; i < size(); ++i) {
             const InterfaceDof& dof = dofs_[static_cast<std::size_t>(i)];
-            result[i] = exact_gradient(dof.point[0], dof.point[1])
+            result[i] = exact_gradient(
+                            geometry_, dof.point[0], dof.point[1])
                             .dot(dof.normal);
         }
         return result;
@@ -601,6 +947,58 @@ public:
         return coefficients;
     }
 
+    Eigen::MatrixXd cubic_correction_coefficients(
+        const Eigen::VectorXd& value_jump,
+        const Eigen::VectorXd& normal_jump) const
+    {
+        constexpr int cubic_dim = 7;
+        if (value_jump.size() != size() || normal_jump.size() != size())
+            throw std::invalid_argument("jump vector size mismatch");
+        Eigen::MatrixXd coefficients(size(), cubic_dim);
+        for (int i = 0; i < size(); ++i) {
+            const InterfaceDof& dof = dofs_[static_cast<std::size_t>(i)];
+            Eigen::VectorXd local_value(cubic_spread_neighbor_count_);
+            Eigen::VectorXd local_normal(cubic_spread_neighbor_count_);
+            for (int k = 0; k < cubic_spread_neighbor_count_; ++k) {
+                const int neighbor = dof.cubic_neighbor_ids[
+                    static_cast<std::size_t>(k)];
+                local_value[k] = value_jump[neighbor];
+                local_normal[k] = normal_jump[neighbor];
+            }
+            coefficients.row(i) =
+                (dof.cubic_value_map * local_value
+                 + dof.cubic_normal_map * local_normal).transpose();
+        }
+        return coefficients;
+    }
+
+    Eigen::MatrixXd corner_fit_correction_coefficients(
+        const Eigen::VectorXd& value_jump,
+        const Eigen::VectorXd& normal_jump) const
+    {
+        if (value_jump.size() != size() || normal_jump.size() != size())
+            throw std::invalid_argument("jump vector size mismatch");
+        Eigen::MatrixXd coefficients = Eigen::MatrixXd::Zero(
+            size(), corner_fit_dim_);
+        for (int i = 0; i < size(); ++i) {
+            const InterfaceDof& dof = dofs_[static_cast<std::size_t>(i)];
+            if (!dof.cubic_use_full_fit)
+                continue;
+            Eigen::VectorXd local_value(corner_fit_neighbor_count_);
+            Eigen::VectorXd local_normal(corner_fit_neighbor_count_);
+            for (int k = 0; k < corner_fit_neighbor_count_; ++k) {
+                const int neighbor = dof.corner_fit_neighbor_ids[
+                    static_cast<std::size_t>(k)];
+                local_value[k] = value_jump[neighbor];
+                local_normal[k] = normal_jump[neighbor];
+            }
+            coefficients.row(i) =
+                (dof.corner_fit_value_map * local_value
+                 + dof.corner_fit_normal_map * local_normal).transpose();
+        }
+        return coefficients;
+    }
+
     Eigen::VectorXd rhs_from_jumps(const Eigen::VectorXd& value_jump,
                                    const Eigen::VectorXd& normal_jump) const
     {
@@ -631,6 +1029,38 @@ public:
                     crossing.quadratic_eval_a.dot(coeff) * inv_h2;
                 rhs[grid_.index(crossing.b[0], crossing.b[1])] +=
                     crossing.quadratic_eval_b.dot(coeff) * inv_h2;
+            }
+            return rhs;
+        }
+
+        if (spread_mode_
+            == SpreadCorrectionMode::CubicHarmonicAtOppositeNode) {
+            const Eigen::MatrixXd cubic_coefficients =
+                cubic_correction_coefficients(value_jump, normal_jump);
+            const bool has_full_fit = hybrid_full_fit_dofs() > 0;
+            Eigen::MatrixXd corner_fit_coefficients;
+            if (has_full_fit) {
+                corner_fit_coefficients = corner_fit_correction_coefficients(
+                    value_jump, normal_jump);
+            }
+            for (const GridEdgeCrossing& crossing : crossings_) {
+                const InterfaceDof& dof = dofs_[static_cast<std::size_t>(
+                    crossing.nearest_dof)];
+                if (dof.cubic_use_full_fit) {
+                    const Eigen::VectorXd coeff = corner_fit_coefficients.row(
+                        crossing.nearest_dof).transpose();
+                    rhs[grid_.index(crossing.a[0], crossing.a[1])] +=
+                        crossing.corner_fit_eval_a.dot(coeff) * inv_h2;
+                    rhs[grid_.index(crossing.b[0], crossing.b[1])] +=
+                        crossing.corner_fit_eval_b.dot(coeff) * inv_h2;
+                } else {
+                    const Eigen::VectorXd coeff = cubic_coefficients.row(
+                        crossing.nearest_dof).transpose();
+                    rhs[grid_.index(crossing.a[0], crossing.a[1])] +=
+                        crossing.cubic_eval_a.dot(coeff) * inv_h2;
+                    rhs[grid_.index(crossing.b[0], crossing.b[1])] +=
+                        crossing.cubic_eval_b.dot(coeff) * inv_h2;
+                }
             }
             return rhs;
         }
@@ -751,6 +1181,49 @@ public:
         return trace;
     }
 
+    Eigen::VectorXd interior_trace(const Eigen::VectorXd& potential_values,
+                                   const Eigen::VectorXd& value_jump,
+                                   const Eigen::VectorXd& normal_jump,
+                                   bool diagnostics = false) const
+    {
+        if (restrict_mode_ == RestrictMode::SixPointQuadraticExterior) {
+            Eigen::VectorXd trace = exterior_trace(
+                potential_values, value_jump, normal_jump, diagnostics);
+            trace += value_jump;
+            return trace;
+        }
+
+        auto samples_pair = one_sided_samples(
+            potential_values, value_jump, normal_jump);
+        const Eigen::MatrixXd& inside = samples_pair.first;
+        const Eigen::MatrixXd& outside = samples_pair.second;
+        Eigen::VectorXd trace(size());
+        double residual_sq = 0.0;
+        double samples_sq = 0.0;
+        const int layer_count = restrict_layer_count();
+        for (int i = 0; i < size(); ++i) {
+            Eigen::VectorXd samples(2 * layer_count);
+            for (int layer = 0; layer < layer_count; ++layer) {
+                const double rho_outside =
+                    kNormalLayers[static_cast<std::size_t>(layer)] * h_;
+                samples[layer] = inside(i, layer);
+                samples[layer_count + layer] = outside(i, layer)
+                    + value_jump[i] + rho_outside * normal_jump[i];
+            }
+            trace[i] = c0_weights_.dot(samples);
+            if (diagnostics) {
+                const Eigen::VectorXd fitted = trace_projection_ * samples;
+                residual_sq += (samples - fitted).squaredNorm();
+                samples_sq += samples.squaredNorm();
+            }
+        }
+        if (diagnostics) {
+            last_trace_fit_rel_l2_ = std::sqrt(residual_sq)
+                / std::max(std::sqrt(samples_sq), 1.0e-30);
+        }
+        return trace;
+    }
+
     double last_trace_fit_rel_l2() const { return last_trace_fit_rel_l2_; }
 
     bool inside_node(int node) const
@@ -843,6 +1316,10 @@ private:
                         crossing.phase);
                     crossing.normal = geometry_normal(geometry_, crossing.gamma);
                     crossing.tangent = tangent_from_normal(crossing.normal);
+                    if (geometry_ == GeometryKind::LShape) {
+                        crossing.boundary_segment =
+                            lshape_boundary_segment(crossing.gamma);
+                    }
                     crossing.weight = h_ /
                         std::max(std::abs(crossing.normal[0])
                                + std::abs(crossing.normal[1]), 1.0e-14);
@@ -867,15 +1344,52 @@ private:
                 dof.point = crossing.gamma;
                 dof.normal = crossing.normal;
                 dof.tangent = crossing.tangent;
+                dof.boundary_segment = crossing.boundary_segment;
                 dof.weight = crossing.weight;
                 dofs_.push_back(std::move(dof));
             }
+        } else if (geometry_ == GeometryKind::LShape) {
+            const int requested_count = std::max(
+                24, static_cast<int>(std::lround(
+                    uniform_dof_ratio_
+                    * static_cast<double>(crossings_.size()))));
+            const auto& vertices = lshape_vertices();
+            boundary_length_ = lshape_perimeter();
+            for (int edge = 0; edge < static_cast<int>(vertices.size()); ++edge) {
+                const Eigen::Vector2d& start =
+                    vertices[static_cast<std::size_t>(edge)];
+                const Eigen::Vector2d& end = vertices[static_cast<std::size_t>(
+                    (edge + 1) % static_cast<int>(vertices.size()))];
+                const Eigen::Vector2d delta = end - start;
+                const double length = delta.norm();
+                const int edge_count = std::max(
+                    cubic_spread_neighbor_count_,
+                    static_cast<int>(std::lround(
+                        static_cast<double>(requested_count)
+                        * length / boundary_length_)));
+                const double edge_interval =
+                    length / static_cast<double>(edge_count);
+                const Eigen::Vector2d normal(
+                    delta[1] / length, -delta[0] / length);
+                for (int k = 0; k < edge_count; ++k) {
+                    InterfaceDof dof;
+                    dof.point = start
+                        + ((static_cast<double>(k) + 0.5)
+                           / static_cast<double>(edge_count)) * delta;
+                    dof.normal = normal;
+                    dof.tangent = tangent_from_normal(normal);
+                    dof.boundary_segment = edge;
+                    dof.weight = edge_interval;
+                    dofs_.push_back(std::move(dof));
+                }
+            }
         } else {
-            // Keep the same unknown count as the crossing scheme so the
-            // numerical comparison changes placement, not system dimension.
             // A dense parameter-space polyline supplies an inexpensive
-            // approximate arc-length coordinate for both supported curves.
-            const int count = static_cast<int>(crossings_.size());
+            // approximate arc-length coordinate for the supported curves.
+            const int count = std::max(
+                5, static_cast<int>(std::lround(
+                    uniform_dof_ratio_
+                    * static_cast<double>(crossings_.size()))));
             const int fine_count = std::max(4096, 64 * count);
             std::vector<double> cumulative(
                 static_cast<std::size_t>(fine_count + 1), 0.0);
@@ -912,6 +1426,10 @@ private:
                 dof.point = geometry_point(geometry_, theta);
                 dof.normal = geometry_normal(geometry_, dof.point);
                 dof.tangent = tangent_from_normal(dof.normal);
+                if (geometry_ == GeometryKind::LShape) {
+                    dof.boundary_segment =
+                        lshape_boundary_segment(dof.point);
+                }
                 dof.weight = interval_length;
                 dofs_.push_back(std::move(dof));
             }
@@ -922,6 +1440,11 @@ private:
         for (GridEdgeCrossing& crossing : crossings_) {
             double best_distance = std::numeric_limits<double>::infinity();
             for (int i = 0; i < size(); ++i) {
+                if (geometry_ == GeometryKind::LShape
+                    && dofs_[static_cast<std::size_t>(i)].boundary_segment
+                           != crossing.boundary_segment) {
+                    continue;
+                }
                 const double distance =
                     (crossing.gamma - dofs_[static_cast<std::size_t>(i)].point)
                         .squaredNorm();
@@ -1002,6 +1525,84 @@ private:
         }
     }
 
+    void build_corner_cauchy_maps()
+    {
+        for (int i = 0; i < size(); ++i) {
+            InterfaceDof& center = dofs_[static_cast<std::size_t>(i)];
+            if (!center.cubic_use_full_fit)
+                continue;
+            std::vector<int> order(static_cast<std::size_t>(size()));
+            std::iota(order.begin(), order.end(), 0);
+            std::stable_sort(order.begin(), order.end(), [&](int lhs, int rhs) {
+                const double dl = (dofs_[static_cast<std::size_t>(lhs)].point
+                                  - center.point).squaredNorm();
+                const double dr = (dofs_[static_cast<std::size_t>(rhs)].point
+                                  - center.point).squaredNorm();
+                if (dl != dr)
+                    return dl < dr;
+                return lhs < rhs;
+            });
+            if (static_cast<int>(order.size()) < corner_fit_neighbor_count_) {
+                throw std::runtime_error(
+                    "too few L-shape DOFs for corner Cauchy fit");
+            }
+            center.corner_fit_neighbor_ids.assign(
+                order.begin(), order.begin() + corner_fit_neighbor_count_);
+
+            const int rows = corner_fit_neighbor_count_
+                           + corner_fit_derivative_count_;
+            Eigen::MatrixXd design(rows, corner_fit_dim_);
+            Eigen::VectorXd sqrt_weights(rows);
+            for (int pos = 0; pos < corner_fit_neighbor_count_; ++pos) {
+                const int neighbor = center.corner_fit_neighbor_ids[
+                    static_cast<std::size_t>(pos)];
+                const Eigen::Vector2d d =
+                    (dofs_[static_cast<std::size_t>(neighbor)].point
+                     - center.point) / h_;
+                design.row(pos) = harmonic_basis(
+                    d.dot(center.tangent), d.dot(center.normal),
+                    corner_fit_degree_).transpose();
+                sqrt_weights[pos] = std::sqrt(
+                    1.0 / std::pow(0.35 + d.norm(), 2));
+            }
+            for (int pos = 0; pos < corner_fit_derivative_count_; ++pos) {
+                const int neighbor = center.corner_fit_neighbor_ids[
+                    static_cast<std::size_t>(pos)];
+                const InterfaceDof& sample =
+                    dofs_[static_cast<std::size_t>(neighbor)];
+                const Eigen::Vector2d d = (sample.point - center.point) / h_;
+                const Eigen::MatrixXd gradient = harmonic_gradient(
+                    d.dot(center.tangent), d.dot(center.normal),
+                    corner_fit_degree_);
+                const Eigen::Vector2d components(
+                    sample.normal.dot(center.tangent),
+                    sample.normal.dot(center.normal));
+                design.row(corner_fit_neighbor_count_ + pos) =
+                    components.transpose() * gradient;
+                sqrt_weights[corner_fit_neighbor_count_ + pos] =
+                    std::sqrt(0.85 / std::pow(0.35 + d.norm(), 2));
+            }
+
+            Eigen::MatrixXd weighted_design = design;
+            for (int row = 0; row < rows; ++row)
+                weighted_design.row(row) *= sqrt_weights[row];
+            const Eigen::MatrixXd pinv = pseudo_inverse(
+                weighted_design, 2.0e-12, &center.corner_fit_condition);
+            center.corner_fit_value_map = Eigen::MatrixXd::Zero(
+                corner_fit_dim_, corner_fit_neighbor_count_);
+            center.corner_fit_normal_map = Eigen::MatrixXd::Zero(
+                corner_fit_dim_, corner_fit_neighbor_count_);
+            for (int pos = 0; pos < corner_fit_neighbor_count_; ++pos) {
+                center.corner_fit_value_map.col(pos) =
+                    pinv.col(pos) * sqrt_weights[pos];
+            }
+            for (int pos = 0; pos < corner_fit_derivative_count_; ++pos) {
+                center.corner_fit_normal_map.col(pos) =
+                    pinv.col(corner_fit_neighbor_count_ + pos)
+                    * sqrt_weights[corner_fit_neighbor_count_ + pos] * h_;
+            }
+        }
+    }
     void build_quadratic_spread_maps()
     {
         constexpr int quadratic_degree = 2;
@@ -1019,12 +1620,28 @@ private:
                     return dl < dr;
                 return lhs < rhs;
             });
+            if (geometry_ == GeometryKind::LShape) {
+                order.erase(std::remove_if(
+                    order.begin(), order.end(), [&](int neighbor) {
+                        return dofs_[static_cast<std::size_t>(neighbor)]
+                                   .boundary_segment
+                            != center.boundary_segment;
+                    }), order.end());
+            }
+            if (static_cast<int>(order.size())
+                < quadratic_spread_neighbor_count_) {
+                throw std::runtime_error(
+                    "too few same-edge DOFs for quadratic L-shape stencil");
+            }
             center.quadratic_neighbor_ids.assign(
                 order.begin(),
                 order.begin() + quadratic_spread_neighbor_count_);
 
             const int rows = quadratic_spread_neighbor_count_
                            + quadratic_spread_derivative_count_;
+            const int derivative_neighbor_offset =
+                quadratic_spread_derivative_count_
+                    == quadratic_spread_neighbor_count_ ? 0 : 1;
             Eigen::MatrixXd design(rows, quadratic_dim);
             Eigen::VectorXd sqrt_weights(rows);
             for (int pos = 0; pos < quadratic_spread_neighbor_count_; ++pos) {
@@ -1041,7 +1658,8 @@ private:
             }
             for (int pos = 0; pos < quadratic_spread_derivative_count_; ++pos) {
                 const int neighbor = center.quadratic_neighbor_ids[
-                    static_cast<std::size_t>(pos)];
+                    static_cast<std::size_t>(
+                        pos + derivative_neighbor_offset)];
                 const InterfaceDof& sample =
                     dofs_[static_cast<std::size_t>(neighbor)];
                 const Eigen::Vector2d d = (sample.point - center.point) / h_;
@@ -1071,9 +1689,110 @@ private:
                     pinv.col(pos) * sqrt_weights[pos];
             }
             for (int pos = 0; pos < quadratic_spread_derivative_count_; ++pos) {
-                center.quadratic_normal_map.col(pos) =
+                center.quadratic_normal_map.col(
+                    pos + derivative_neighbor_offset) =
                     pinv.col(quadratic_spread_neighbor_count_ + pos)
                     * sqrt_weights[quadratic_spread_neighbor_count_ + pos] * h_;
+            }
+        }
+    }
+
+    void build_cubic_spread_maps()
+    {
+        constexpr int cubic_degree = 3;
+        constexpr int cubic_dim = 2 * cubic_degree + 1;
+        for (int i = 0; i < size(); ++i) {
+            InterfaceDof& center = dofs_[static_cast<std::size_t>(i)];
+            std::vector<int> order(static_cast<std::size_t>(size()));
+            std::iota(order.begin(), order.end(), 0);
+            std::stable_sort(order.begin(), order.end(), [&](int lhs, int rhs) {
+                const double dl = (dofs_[static_cast<std::size_t>(lhs)].point
+                                  - center.point).squaredNorm();
+                const double dr = (dofs_[static_cast<std::size_t>(rhs)].point
+                                  - center.point).squaredNorm();
+                if (dl != dr)
+                    return dl < dr;
+                return lhs < rhs;
+            });
+            if (geometry_ == GeometryKind::LShape) {
+                if (static_cast<int>(order.size())
+                    < cubic_spread_neighbor_count_) {
+                    throw std::runtime_error(
+                        "too few L-shape DOFs for cubic stencil");
+                }
+                center.cubic_use_full_fit = std::any_of(
+                    order.begin(),
+                    order.begin() + cubic_spread_neighbor_count_,
+                    [&](int neighbor) {
+                        return dofs_[static_cast<std::size_t>(neighbor)]
+                                   .boundary_segment
+                            != center.boundary_segment;
+                    });
+                order.erase(std::remove_if(
+                    order.begin(), order.end(), [&](int neighbor) {
+                        return dofs_[static_cast<std::size_t>(neighbor)]
+                                   .boundary_segment
+                            != center.boundary_segment;
+                    }), order.end());
+            }
+            if (static_cast<int>(order.size())
+                < cubic_spread_neighbor_count_) {
+                throw std::runtime_error(
+                    "too few same-edge DOFs for cubic L-shape stencil");
+            }
+            center.cubic_neighbor_ids.assign(
+                order.begin(), order.begin() + cubic_spread_neighbor_count_);
+
+            const int rows = cubic_spread_neighbor_count_
+                           + cubic_spread_derivative_count_;
+            Eigen::MatrixXd design(rows, cubic_dim);
+            Eigen::VectorXd sqrt_weights(rows);
+            for (int pos = 0; pos < cubic_spread_neighbor_count_; ++pos) {
+                const int neighbor = center.cubic_neighbor_ids[
+                    static_cast<std::size_t>(pos)];
+                const Eigen::Vector2d d =
+                    (dofs_[static_cast<std::size_t>(neighbor)].point
+                     - center.point) / h_;
+                design.row(pos) = harmonic_basis(
+                    d.dot(center.tangent), d.dot(center.normal),
+                    cubic_degree).transpose();
+                sqrt_weights[pos] = std::sqrt(
+                    1.0 / std::pow(0.35 + d.norm(), 2));
+            }
+            for (int pos = 0; pos < cubic_spread_derivative_count_; ++pos) {
+                const int neighbor = center.cubic_neighbor_ids[
+                    static_cast<std::size_t>(pos)];
+                const InterfaceDof& sample =
+                    dofs_[static_cast<std::size_t>(neighbor)];
+                const Eigen::Vector2d d = (sample.point - center.point) / h_;
+                const Eigen::MatrixXd gradient = harmonic_gradient(
+                    d.dot(center.tangent), d.dot(center.normal), cubic_degree);
+                const Eigen::Vector2d components(
+                    sample.normal.dot(center.tangent),
+                    sample.normal.dot(center.normal));
+                design.row(cubic_spread_neighbor_count_ + pos) =
+                    components.transpose() * gradient;
+                sqrt_weights[cubic_spread_neighbor_count_ + pos] =
+                    std::sqrt(0.85 / std::pow(0.35 + d.norm(), 2));
+            }
+
+            Eigen::MatrixXd weighted_design = design;
+            for (int row = 0; row < rows; ++row)
+                weighted_design.row(row) *= sqrt_weights[row];
+            const Eigen::MatrixXd pinv = pseudo_inverse(
+                weighted_design, 2.0e-12, &center.cubic_condition);
+            center.cubic_value_map = Eigen::MatrixXd::Zero(
+                cubic_dim, cubic_spread_neighbor_count_);
+            center.cubic_normal_map = Eigen::MatrixXd::Zero(
+                cubic_dim, cubic_spread_neighbor_count_);
+            for (int pos = 0; pos < cubic_spread_neighbor_count_; ++pos) {
+                center.cubic_value_map.col(pos) =
+                    pinv.col(pos) * sqrt_weights[pos];
+            }
+            for (int pos = 0; pos < cubic_spread_derivative_count_; ++pos) {
+                center.cubic_normal_map.col(pos) =
+                    pinv.col(cubic_spread_neighbor_count_ + pos)
+                    * sqrt_weights[cubic_spread_neighbor_count_ + pos] * h_;
             }
         }
     }
@@ -1098,6 +1817,20 @@ private:
             if (crossing.inside_a)
                 crossing.eval_b *= -1.0;
             if (spread_mode_
+                    == SpreadCorrectionMode::CubicHarmonicAtOppositeNode
+                && dof.cubic_use_full_fit) {
+                crossing.corner_fit_eval_a = harmonic_basis(
+                    da.dot(dof.tangent), da.dot(dof.normal),
+                    corner_fit_degree_);
+                crossing.corner_fit_eval_b = harmonic_basis(
+                    db.dot(dof.tangent), db.dot(dof.normal),
+                    corner_fit_degree_);
+                if (!crossing.inside_a)
+                    crossing.corner_fit_eval_a *= -1.0;
+                if (crossing.inside_a)
+                    crossing.corner_fit_eval_b *= -1.0;
+            }
+            if (spread_mode_
                 == SpreadCorrectionMode::QuadraticHarmonicAtOppositeNode) {
                 crossing.quadratic_eval_a = harmonic_basis(
                     da.dot(dof.tangent), da.dot(dof.normal), 2);
@@ -1107,6 +1840,17 @@ private:
                     crossing.quadratic_eval_a *= -1.0;
                 if (crossing.inside_a)
                     crossing.quadratic_eval_b *= -1.0;
+            }
+            if (spread_mode_
+                == SpreadCorrectionMode::CubicHarmonicAtOppositeNode) {
+                crossing.cubic_eval_a = harmonic_basis(
+                    da.dot(dof.tangent), da.dot(dof.normal), 3);
+                crossing.cubic_eval_b = harmonic_basis(
+                    db.dot(dof.tangent), db.dot(dof.normal), 3);
+                if (!crossing.inside_a)
+                    crossing.cubic_eval_a *= -1.0;
+                if (crossing.inside_a)
+                    crossing.cubic_eval_b *= -1.0;
             }
         }
     }
@@ -1133,7 +1877,9 @@ private:
         for (int i = 0; i < size(); ++i) {
             const InterfaceDof& dof = dofs_[static_cast<std::size_t>(i)];
             const Eigen::Vector2d rr =
-                (dof.point - Eigen::Vector2d(kBoxMin, kBoxMin)) / h_;
+                (dof.point
+                 - Eigen::Vector2d(geometry_box_min(geometry_),
+                                   geometry_box_min(geometry_))) / h_;
             const int center_i = static_cast<int>(std::floor(rr[0] + 0.5));
             const int center_j = static_cast<int>(std::floor(rr[1] + 0.5));
             const auto center_coord_array = grid_.coord(center_i, center_j);
@@ -1215,7 +1961,9 @@ private:
                         + sign * kNormalLayers[static_cast<std::size_t>(layer)]
                             * h_ * dof.normal;
                     const Eigen::Vector2d rr =
-                        (query - Eigen::Vector2d(kBoxMin, kBoxMin)) / h_;
+                        (query
+                         - Eigen::Vector2d(geometry_box_min(geometry_),
+                                           geometry_box_min(geometry_))) / h_;
                     std::vector<int> ix(static_cast<std::size_t>(grid_side_count));
                     std::vector<int> iy(static_cast<std::size_t>(grid_side_count));
                     std::vector<double> wx(
@@ -1320,6 +2068,7 @@ private:
     GeometryKind geometry_;
     InterfaceDofMode dof_mode_;
     RestrictMode restrict_mode_;
+    double uniform_dof_ratio_;
     int degree_;
     int dim_;
     int requested_neighbors_;
@@ -1327,6 +2076,12 @@ private:
     SpreadCorrectionMode spread_mode_;
     int quadratic_spread_neighbor_count_;
     int quadratic_spread_derivative_count_;
+    int cubic_spread_neighbor_count_;
+    int cubic_spread_derivative_count_;
+    int corner_fit_degree_;
+    int corner_fit_dim_;
+    int corner_fit_neighbor_count_;
+    int corner_fit_derivative_count_;
     int neighbor_count_ = 0;
     int derivative_count_ = 0;
     CartesianGrid2D grid_;
@@ -1372,7 +2127,57 @@ private:
     Eigen::VectorXd zero_;
 };
 
+class InteriorDirichletNormalJumpOperator final : public IKFBIOperator {
+public:
+    explicit InteriorDirichletNormalJumpOperator(
+        const PythonCompatibleHarmonicJet2D& solver)
+        : solver_(solver)
+        , zero_(Eigen::VectorXd::Zero(solver.size()))
+    {}
+
+    int problem_size() const override { return solver_.size(); }
+
+    void apply(const Eigen::VectorXd& x, Eigen::VectorXd& y) const override
+    {
+        if (x.size() != problem_size())
+            throw std::invalid_argument("Dirichlet trace input size mismatch");
+        const Eigen::VectorXd potential = solver_.potential(zero_, x);
+        y = solver_.interior_trace(potential, zero_, x);
+    }
+
+private:
+    const PythonCompatibleHarmonicJet2D& solver_;
+    Eigen::VectorXd zero_;
+};
+
+class InteriorDirichletValueJumpOperator final : public IKFBIOperator {
+public:
+    explicit InteriorDirichletValueJumpOperator(
+        const PythonCompatibleHarmonicJet2D& solver)
+        : solver_(solver)
+        , zero_(Eigen::VectorXd::Zero(solver.size()))
+    {}
+
+    int problem_size() const override { return solver_.size(); }
+
+    void apply(const Eigen::VectorXd& x, Eigen::VectorXd& y) const override
+    {
+        if (x.size() != problem_size()) {
+            throw std::invalid_argument(
+                "Dirichlet value-jump input size mismatch");
+        }
+        const Eigen::VectorXd potential = solver_.potential(x, zero_);
+        y = solver_.interior_trace(potential, x, zero_);
+    }
+
+private:
+    const PythonCompatibleHarmonicJet2D& solver_;
+    Eigen::VectorXd zero_;
+};
+
 struct StudyResult {
+    std::string bvp;
+    std::string dirichlet_formulation;
     std::string geometry;
     std::string dof_mode;
     std::string restrict_mode;
@@ -1386,7 +2191,9 @@ struct StudyResult {
     double dof_nearest_spacing_mean = 0.0;
     int iterations = 0;
     bool converged = false;
+    double setup_seconds = 0.0;
     double seconds = 0.0;
+    double total_seconds = 0.0;
     double phase_min = 0.0;
     double phase_max = 0.0;
     double phase_std = 0.0;
@@ -1397,6 +2204,11 @@ struct StudyResult {
     double augmented_residual_linf = 0.0;
     double raw_exterior_trace_linf = 0.0;
     double raw_exterior_trace_l2 = 0.0;
+    double boundary_trace_res_linf = 0.0;
+    double boundary_trace_res_l2 = 0.0;
+    double density_mean = 0.0;
+    double density_linf = 0.0;
+    double density_l2 = 0.0;
     double flux_mean = 0.0;
     double lagrange = 0.0;
     double trace_mean = 0.0;
@@ -1419,60 +2231,126 @@ double inf_norm(const Eigen::VectorXd& values)
     return values.size() == 0 ? 0.0 : values.cwiseAbs().maxCoeff();
 }
 
-StudyResult run_one(GeometryKind geometry,
+StudyResult run_one(BvpKind bvp,
+                    DirichletFormulation formulation,
+                    GeometryKind geometry,
                     int n,
                     InterfaceDofMode dof_mode,
                     RestrictMode restrict_mode,
+                    double uniform_dof_ratio,
                     int degree,
                     int neighbors,
                     int derivative_neighbors,
                     SpreadCorrectionMode spread_mode,
                     int quadratic_spread_neighbors,
                     int quadratic_spread_derivative_neighbors,
+                    int cubic_spread_neighbors,
+                    int cubic_spread_derivative_neighbors,
+                    int corner_fit_degree,
+                    int corner_fit_neighbors,
+                    int corner_fit_derivative_neighbors,
                     int max_iter,
                     double tolerance,
                     int restart)
 {
     const auto setup_start = std::chrono::steady_clock::now();
     PythonCompatibleHarmonicJet2D solver(
-        n, geometry, dof_mode, restrict_mode, degree, neighbors,
+        n, geometry, dof_mode, restrict_mode, uniform_dof_ratio,
+        degree, neighbors,
         derivative_neighbors, spread_mode,
         quadratic_spread_neighbors,
-        quadratic_spread_derivative_neighbors);
+        quadratic_spread_derivative_neighbors,
+        cubic_spread_neighbors,
+        cubic_spread_derivative_neighbors,
+        corner_fit_degree,
+        corner_fit_neighbors,
+        corner_fit_derivative_neighbors);
     const double setup_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - setup_start).count();
     std::cout << "  setup crossings=" << solver.num_crossings()
               << " dofs=" << solver.size()
+              << " hybrid_full_fit_dofs=" << solver.hybrid_full_fit_dofs()
               << " time=" << setup_seconds << "s\n";
 
     const int ns = solver.size();
     const Eigen::VectorXd zero = Eigen::VectorXd::Zero(ns);
     const Eigen::VectorXd normal_data = solver.neumann_data();
+    const Eigen::VectorXd dirichlet_data = solver.exact_trace();
     const Eigen::VectorXd weights = solver.boundary_weights();
 
     const auto solve_start = std::chrono::steady_clock::now();
-    const Eigen::VectorXd fixed_potential = solver.potential(zero, normal_data);
-    const Eigen::VectorXd fixed_exterior = solver.exterior_trace(
-        fixed_potential, zero, normal_data);
-
-    AugmentedExteriorTraceOperator op(solver);
-    Eigen::VectorXd rhs = Eigen::VectorXd::Zero(ns + 1);
-    rhs.head(ns) = -fixed_exterior;
-    Eigen::VectorXd augmented = Eigen::VectorXd::Zero(ns + 1);
-    GMRES gmres(max_iter, tolerance, std::min(restart, ns + 1));
-    const int iterations = gmres.solve(op, rhs, augmented);
-
-    const Eigen::VectorXd trace = augmented.head(ns);
-    const Eigen::VectorXd potential = solver.potential(trace, normal_data);
-    const Eigen::VectorXd raw_exterior = solver.exterior_trace(
-        potential, trace, normal_data, true);
-    Eigen::VectorXd applied;
-    op.apply(augmented, applied);
-    const Eigen::VectorXd augmented_residual = applied - rhs;
+    Eigen::VectorXd density;
+    Eigen::VectorXd potential;
+    Eigen::VectorXd boundary_residual;
+    Eigen::VectorXd raw_exterior;
+    double operator_residual_linf = 0.0;
+    double lagrange = 0.0;
+    int iterations = 0;
+    bool converged = false;
+    if (bvp == BvpKind::Neumann) {
+        const Eigen::VectorXd fixed_potential =
+            solver.potential(zero, normal_data);
+        const Eigen::VectorXd fixed_exterior = solver.exterior_trace(
+            fixed_potential, zero, normal_data);
+        AugmentedExteriorTraceOperator op(solver);
+        Eigen::VectorXd rhs = Eigen::VectorXd::Zero(ns + 1);
+        rhs.head(ns) = -fixed_exterior;
+        Eigen::VectorXd augmented = Eigen::VectorXd::Zero(ns + 1);
+        GMRES gmres(max_iter, tolerance, std::min(restart, ns + 1));
+        iterations = gmres.solve(op, rhs, augmented);
+        converged = gmres.converged();
+        density = augmented.head(ns);
+        lagrange = augmented[ns];
+        potential = solver.potential(density, normal_data);
+        boundary_residual = solver.exterior_trace(
+            potential, density, normal_data, true);
+        raw_exterior = boundary_residual;
+        Eigen::VectorXd applied;
+        op.apply(augmented, applied);
+        operator_residual_linf = inf_norm((applied - rhs).head(ns));
+    } else if (formulation
+               == DirichletFormulation::NormalJumpFirstKind) {
+        InteriorDirichletNormalJumpOperator op(solver);
+        const Eigen::VectorXd fixed_potential =
+            solver.potential(dirichlet_data, zero);
+        const Eigen::VectorXd fixed_interior = solver.interior_trace(
+            fixed_potential, dirichlet_data, zero);
+        const Eigen::VectorXd rhs = dirichlet_data - fixed_interior;
+        density = Eigen::VectorXd::Zero(ns);
+        GMRES gmres(max_iter, tolerance, std::min(restart, ns));
+        iterations = gmres.solve(op, rhs, density);
+        converged = gmres.converged();
+        potential = solver.potential(dirichlet_data, density);
+        boundary_residual = solver.interior_trace(
+            potential, dirichlet_data, density, true) - dirichlet_data;
+        raw_exterior = solver.exterior_trace(
+            potential, dirichlet_data, density);
+        Eigen::VectorXd applied;
+        op.apply(density, applied);
+        operator_residual_linf = inf_norm(applied - rhs);
+    } else {
+        InteriorDirichletValueJumpOperator op(solver);
+        const Eigen::VectorXd rhs = dirichlet_data;
+        density = Eigen::VectorXd::Zero(ns);
+        GMRES gmres(max_iter, tolerance, std::min(restart, ns));
+        iterations = gmres.solve(op, rhs, density);
+        converged = gmres.converged();
+        potential = solver.potential(density, zero);
+        boundary_residual = solver.interior_trace(
+            potential, density, zero, true) - dirichlet_data;
+        raw_exterior = solver.exterior_trace(
+            potential, density, zero);
+        Eigen::VectorXd applied;
+        op.apply(density, applied);
+        operator_residual_linf = inf_norm(applied - rhs);
+    }
     const double seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - solve_start).count();
 
     StudyResult result;
+    result.bvp = bvp_name(bvp);
+    result.dirichlet_formulation = bvp == BvpKind::Dirichlet
+        ? dirichlet_formulation_name(formulation) : "not_applicable";
     result.geometry = geometry_name(geometry);
     result.dof_mode = dof_mode_name(dof_mode);
     result.restrict_mode = restrict_mode_name(restrict_mode);
@@ -1500,15 +2378,32 @@ StudyResult run_one(GeometryKind geometry,
     }
     result.dof_nearest_spacing_mean /= static_cast<double>(ns);
     result.iterations = iterations;
-    result.converged = gmres.converged();
+    result.converged = converged;
+    result.setup_seconds = setup_seconds;
     result.seconds = seconds;
-    result.lagrange = augmented[ns];
-    result.augmented_residual_linf = inf_norm(augmented_residual.head(ns));
+    result.total_seconds = setup_seconds + seconds;
+    result.lagrange = lagrange;
+    result.augmented_residual_linf = operator_residual_linf;
     result.raw_exterior_trace_linf = inf_norm(raw_exterior);
     result.raw_exterior_trace_l2 = std::sqrt(
         raw_exterior.squaredNorm() / static_cast<double>(ns));
-    result.flux_mean = weights.dot(normal_data) / solver.boundary_length();
-    result.trace_mean = weights.dot(trace) / solver.boundary_length();
+    result.boundary_trace_res_linf = inf_norm(boundary_residual);
+    result.boundary_trace_res_l2 = std::sqrt(
+        boundary_residual.squaredNorm() / static_cast<double>(ns));
+    result.density_mean = weights.dot(density) / solver.boundary_length();
+    if (bvp == BvpKind::Neumann) {
+        result.flux_mean = weights.dot(normal_data)
+                         / solver.boundary_length();
+    } else if (formulation
+               == DirichletFormulation::NormalJumpFirstKind) {
+        result.flux_mean = weights.dot(density)
+                         / solver.boundary_length();
+    } else {
+        result.flux_mean = 0.0;
+    }
+    result.trace_mean = weights.dot(
+        bvp == BvpKind::Neumann ? density : dirichlet_data)
+        / solver.boundary_length();
     result.trace_fit_rel_l2 = solver.last_trace_fit_rel_l2();
 
     result.phase_min = std::numeric_limits<double>::infinity();
@@ -1549,12 +2444,16 @@ StudyResult run_one(GeometryKind geometry,
             const int node = solver.grid().index(i, j);
             if (!solver.inside_node(node))
                 continue;
-            const auto point = solver.grid().coord(i, j);
-            shift_sum += exact_solution(point[0], point[1]) - potential[node];
+            if (bvp == BvpKind::Neumann) {
+                const auto point = solver.grid().coord(i, j);
+                shift_sum += exact_solution(
+                    geometry, point[0], point[1]) - potential[node];
+            }
             ++result.n_global;
         }
     }
-    result.constant_shift = shift_sum / static_cast<double>(result.n_global);
+    result.constant_shift = bvp == BvpKind::Neumann
+        ? shift_sum / static_cast<double>(result.n_global) : 0.0;
     double error_sq = 0.0;
     double outside_sq = 0.0;
     for (int j = 1; j + 1 < dims[1]; ++j) {
@@ -1564,7 +2463,8 @@ StudyResult run_one(GeometryKind geometry,
             const Eigen::Vector2d point(point_array[0], point_array[1]);
             if (solver.inside_node(node)) {
                 const double error = potential[node] + result.constant_shift
-                                   - exact_solution(point[0], point[1]);
+                                   - exact_solution(
+                                       geometry, point[0], point[1]);
                 result.global_linf = std::max(result.global_linf,
                                               std::abs(error));
                 error_sq += error * error;
@@ -1582,12 +2482,30 @@ StudyResult run_one(GeometryKind geometry,
         ? std::sqrt(outside_sq / static_cast<double>(result.n_exterior_far))
         : std::numeric_limits<double>::quiet_NaN();
 
-    Eigen::VectorXd exact_trace = solver.exact_trace();
-    exact_trace.array() -= weights.dot(exact_trace) / solver.boundary_length();
-    const Eigen::VectorXd trace_error = trace - exact_trace;
-    result.trace_linf = inf_norm(trace_error);
-    result.trace_l2 = std::sqrt(
-        trace_error.squaredNorm() / static_cast<double>(ns));
+    Eigen::VectorXd density_error;
+    if (bvp == BvpKind::Neumann) {
+        Eigen::VectorXd exact_trace = solver.exact_trace();
+        exact_trace.array() -= weights.dot(exact_trace)
+                             / solver.boundary_length();
+        density_error = density - exact_trace;
+        result.trace_linf = inf_norm(density_error);
+        result.trace_l2 = std::sqrt(
+            density_error.squaredNorm() / static_cast<double>(ns));
+    } else if (formulation
+               == DirichletFormulation::NormalJumpFirstKind) {
+        density_error = density - normal_data;
+        result.trace_linf = result.boundary_trace_res_linf;
+        result.trace_l2 = result.boundary_trace_res_l2;
+    } else {
+        result.trace_linf = result.boundary_trace_res_linf;
+        result.trace_l2 = result.boundary_trace_res_l2;
+        result.density_linf = std::numeric_limits<double>::quiet_NaN();
+        result.density_l2 = std::numeric_limits<double>::quiet_NaN();
+        return result;
+    }
+    result.density_linf = inf_norm(density_error);
+    result.density_l2 = std::sqrt(
+        density_error.squaredNorm() / static_cast<double>(ns));
     return result;
 }
 
@@ -1602,32 +2520,29 @@ double observed_order(double coarse_error,
 
 void add_orders(std::vector<StudyResult>& results)
 {
-    for (const std::string name : {std::string("ellipse"),
-                                   std::string("flower")}) {
-        for (const std::string mode : {std::string("crossing"),
-                                       std::string("uniform_midpoint")}) {
-            for (const std::string restrict_mode : {
-                     std::string("bicubic_cubic"),
-                     std::string("biquadratic_quadratic"),
-                     std::string("biquadratic_quadratic_two_layer"),
-                     std::string("six_point_quadratic_exterior")}) {
-                StudyResult* previous = nullptr;
-                for (StudyResult& result : results) {
-                    if (result.geometry != name || result.dof_mode != mode
-                        || result.restrict_mode != restrict_mode) {
-                        continue;
-                    }
-                    if (previous != nullptr) {
-                        result.global_linf_order = observed_order(
-                            previous->global_linf, result.global_linf,
-                            previous->h, result.h);
-                        result.global_l2_order = observed_order(
-                            previous->global_l2, result.global_l2,
-                            previous->h, result.h);
-                    }
-                    previous = &result;
-                }
+    for (std::size_t i = 0; i < results.size(); ++i) {
+        StudyResult& result = results[i];
+        const StudyResult* previous = nullptr;
+        for (std::size_t j = 0; j < i; ++j) {
+            const StudyResult& candidate = results[j];
+            if (candidate.geometry != result.geometry
+                || candidate.dof_mode != result.dof_mode
+                || candidate.restrict_mode != result.restrict_mode
+                || candidate.dirichlet_formulation
+                    != result.dirichlet_formulation
+                || candidate.n >= result.n) {
+                continue;
             }
+            if (previous == nullptr || candidate.n > previous->n)
+                previous = &candidate;
+        }
+        if (previous != nullptr) {
+            result.global_linf_order = observed_order(
+                previous->global_linf, result.global_linf,
+                previous->h, result.h);
+            result.global_l2_order = observed_order(
+                previous->global_l2, result.global_l2,
+                previous->h, result.h);
         }
     }
 }
@@ -1635,6 +2550,8 @@ void add_orders(std::vector<StudyResult>& results)
 void print_result(const StudyResult& result)
 {
     std::cout << "  dof_mode=" << result.dof_mode
+              << " dirichlet_formulation="
+              << result.dirichlet_formulation
               << " restrict_mode=" << result.restrict_mode
               << " crossings=" << result.crossings
               << " dofs=" << result.dofs
@@ -1645,60 +2562,84 @@ void print_result(const StudyResult& result)
               << " gmres=" << result.iterations
               << " converged=" << (result.converged ? "yes" : "no")
               << " aug_res=" << result.augmented_residual_linf
-              << " raw_ext=" << result.raw_exterior_trace_linf
+              << " boundary_res=" << result.boundary_trace_res_linf
               << " Linf=" << result.global_linf
               << " L2=" << result.global_l2
               << " trace=" << result.trace_linf
+              << " density_err=" << result.density_linf
               << " cond_max=" << result.condition_max
               << " spread_cond_max=" << result.spread_condition_max
-              << " time=" << result.seconds << "s\n";
+              << " setup_time=" << result.setup_seconds << "s"
+              << " solve_time=" << result.seconds << "s"
+              << " total_time=" << result.total_seconds << "s\n";
 }
 
 void print_summary(const std::vector<StudyResult>& results)
 {
-    for (const std::string name : {std::string("ellipse"),
-                                   std::string("flower")}) {
-        for (const std::string mode : {std::string("crossing"),
-                                       std::string("uniform_midpoint")}) {
-            for (const std::string restrict_mode : {
-                     std::string("bicubic_cubic"),
-                     std::string("biquadratic_quadratic"),
-                     std::string("biquadratic_quadratic_two_layer"),
-                     std::string("six_point_quadratic_exterior")}) {
-                const bool present = std::any_of(
-                    results.begin(), results.end(), [&](const StudyResult& result) {
-                        return result.geometry == name && result.dof_mode == mode
-                            && result.restrict_mode == restrict_mode;
-                    });
-                if (!present)
-                    continue;
-                std::cout << "\nC++ harmonic-jet summary: " << name
-                          << " / " << mode << " / " << restrict_mode << '\n';
-                std::cout << "  " << std::setw(5) << "N"
-                          << std::setw(7) << "dofs"
-                          << std::setw(14) << "Linf"
-                          << std::setw(11) << "p_inf"
-                          << std::setw(14) << "L2"
-                          << std::setw(11) << "p_L2"
-                          << std::setw(9) << "GMRES" << '\n';
-                for (const StudyResult& result : results) {
-                    if (result.geometry != name || result.dof_mode != mode
-                        || result.restrict_mode != restrict_mode) {
+    for (const std::string formulation : {
+             std::string("not_applicable"),
+             std::string("normal_jump_first_kind"),
+             std::string("value_jump_second_kind")}) {
+        for (const std::string name : {std::string("ellipse"),
+                                       std::string("flower"),
+                                       std::string("circle"),
+                                       std::string("lshape")}) {
+            for (const std::string mode : {std::string("crossing"),
+                                           std::string("uniform_midpoint")}) {
+                for (const std::string restrict_mode : {
+                         std::string("bicubic_cubic"),
+                         std::string("biquadratic_quadratic"),
+                         std::string("biquadratic_quadratic_two_layer"),
+                         std::string("six_point_quadratic_exterior")}) {
+                    const bool present = std::any_of(
+                        results.begin(), results.end(),
+                        [&](const StudyResult& result) {
+                            return result.geometry == name
+                                && result.dof_mode == mode
+                                && result.restrict_mode == restrict_mode
+                                && result.dirichlet_formulation == formulation;
+                        });
+                    if (!present)
                         continue;
+                    std::cout << "\nC++ harmonic-jet summary: " << name
+                              << " / " << formulation
+                              << " / " << mode
+                              << " / " << restrict_mode << '\n';
+                    std::cout << "  " << std::setw(5) << "N"
+                              << std::setw(7) << "dofs"
+                              << std::setw(14) << "Linf"
+                              << std::setw(11) << "p_inf"
+                              << std::setw(14) << "L2"
+                              << std::setw(11) << "p_L2"
+                              << std::setw(9) << "GMRES"
+                              << std::setw(14) << "total(s)" << '\n';
+                    for (const StudyResult& result : results) {
+                        if (result.geometry != name
+                            || result.dof_mode != mode
+                            || result.restrict_mode != restrict_mode
+                            || result.dirichlet_formulation != formulation) {
+                            continue;
+                        }
+                        std::cout << "  " << std::setw(5) << result.n
+                                  << std::setw(7) << result.dofs
+                                  << std::setw(14) << result.global_linf;
+                        if (std::isfinite(result.global_linf_order)) {
+                            std::cout << std::setw(11)
+                                      << result.global_linf_order;
+                        } else {
+                            std::cout << std::setw(11) << "-";
+                        }
+                        std::cout << std::setw(14) << result.global_l2;
+                        if (std::isfinite(result.global_l2_order)) {
+                            std::cout << std::setw(11)
+                                      << result.global_l2_order;
+                        } else {
+                            std::cout << std::setw(11) << "-";
+                        }
+                        std::cout << std::setw(9) << result.iterations
+                                  << std::setw(14)
+                                  << result.total_seconds << '\n';
                     }
-                    std::cout << "  " << std::setw(5) << result.n
-                              << std::setw(7) << result.dofs
-                              << std::setw(14) << result.global_linf;
-                    if (std::isfinite(result.global_linf_order))
-                        std::cout << std::setw(11) << result.global_linf_order;
-                    else
-                        std::cout << std::setw(11) << "-";
-                    std::cout << std::setw(14) << result.global_l2;
-                    if (std::isfinite(result.global_l2_order))
-                        std::cout << std::setw(11) << result.global_l2_order;
-                    else
-                        std::cout << std::setw(11) << "-";
-                    std::cout << std::setw(9) << result.iterations << '\n';
                 }
             }
         }
@@ -1716,6 +2657,8 @@ void print_dof_comparison(const std::vector<StudyResult>& results)
                 return candidate.geometry == baseline.geometry
                     && candidate.n == baseline.n
                     && candidate.restrict_mode == baseline.restrict_mode
+                    && candidate.dirichlet_formulation
+                        == baseline.dirichlet_formulation
                     && candidate.dof_mode == "uniform_midpoint";
             });
         if (match == results.end())
@@ -1723,6 +2666,7 @@ void print_dof_comparison(const std::vector<StudyResult>& results)
         if (!printed_header) {
             std::cout << "\nUniform-midpoint / crossing-DOF error comparison\n"
                       << "  " << std::setw(9) << "geometry"
+                      << std::setw(28) << "formulation"
                       << std::setw(6) << "N"
                       << std::setw(27) << "restrict"
                       << std::setw(13) << "Linf ratio"
@@ -1731,6 +2675,7 @@ void print_dof_comparison(const std::vector<StudyResult>& results)
             printed_header = true;
         }
         std::cout << "  " << std::setw(9) << baseline.geometry
+                  << std::setw(28) << baseline.dirichlet_formulation
                   << std::setw(6) << baseline.n
                   << std::setw(27) << baseline.restrict_mode
                   << std::setw(13) << match->global_linf / baseline.global_linf
@@ -1755,6 +2700,8 @@ void print_restrict_comparison(const std::vector<StudyResult>& results)
                     return candidate.geometry == baseline.geometry
                         && candidate.n == baseline.n
                         && candidate.dof_mode == baseline.dof_mode
+                        && candidate.dirichlet_formulation
+                            == baseline.dirichlet_formulation
                         && candidate.restrict_mode == target_mode;
                 });
             if (match == results.end())
@@ -1762,6 +2709,7 @@ void print_restrict_comparison(const std::vector<StudyResult>& results)
             if (!printed_header) {
                 std::cout << "\nRestrict mode / bicubic-cubic error comparison\n"
                           << "  " << std::setw(9) << "geometry"
+                          << std::setw(28) << "formulation"
                           << std::setw(6) << "N"
                           << std::setw(19) << "dof mode"
                           << std::setw(31) << "restrict mode"
@@ -1771,6 +2719,7 @@ void print_restrict_comparison(const std::vector<StudyResult>& results)
                 printed_header = true;
             }
             std::cout << "  " << std::setw(9) << baseline.geometry
+                      << std::setw(28) << baseline.dirichlet_formulation
                       << std::setw(6) << baseline.n
                       << std::setw(19) << baseline.dof_mode
                       << std::setw(31) << target_mode
@@ -1799,7 +2748,10 @@ void write_csv(const std::filesystem::path& path,
            "raw_exterior_trace_linf,raw_exterior_trace_l2,flux_weighted_mean,"
            "lagrange,trace_mean,global_linf,global_l2,trace_linf,trace_l2,"
            "exterior_linf_far,exterior_l2_far,constant_shift,n_global,"
-           "n_exterior_far,trace_fit_rel_l2,global_linf_order,global_l2_order\n";
+           "n_exterior_far,trace_fit_rel_l2,global_linf_order,global_l2_order,"
+           "bvp,setup_seconds,total_seconds,boundary_trace_res_linf,"
+           "boundary_trace_res_l2,density_mean,density_linf,density_l2,"
+           "dirichlet_formulation\n";
     out << std::setprecision(17);
     for (const StudyResult& result : results) {
         out << result.geometry << ',' << result.dof_mode << ','
@@ -1825,7 +2777,12 @@ void write_csv(const std::filesystem::path& path,
             << result.exterior_linf_far << ',' << result.exterior_l2_far << ','
             << result.constant_shift << ',' << result.n_global << ','
             << result.n_exterior_far << ',' << result.trace_fit_rel_l2 << ','
-            << result.global_linf_order << ',' << result.global_l2_order << '\n';
+            << result.global_linf_order << ',' << result.global_l2_order << ','
+            << result.bvp << ',' << result.setup_seconds << ','
+            << result.total_seconds << ',' << result.boundary_trace_res_linf << ','
+            << result.boundary_trace_res_l2 << ',' << result.density_mean << ','
+            << result.density_linf << ',' << result.density_l2 << ','
+            << result.dirichlet_formulation << '\n';
     }
 }
 
@@ -1857,7 +2814,9 @@ int main(int argc, char** argv)
         std::vector<int> levels = {48, 72, 108, 162};
         if (argc >= 2) {
             const std::string selection = argv[1];
-            if (selection != "both")
+            if (selection == "all")
+                geometries = {"ellipse", "flower", "circle", "lshape"};
+            else if (selection != "both")
                 geometries = {selection};
         }
         if (argc >= 3) {
@@ -1865,6 +2824,18 @@ int main(int argc, char** argv)
             for (int i = 2; i < argc; ++i)
                 levels.push_back(std::stoi(argv[i]));
         }
+        const BvpKind bvp = default_bvp_kind();
+        const std::string formulation_selection =
+            bvp == BvpKind::Dirichlet
+            ? environment_string(
+                  "KFBIM_PYJET_DIRICHLET_FORMULATION",
+                  "normal_jump_first_kind")
+            : "not_applicable";
+        const std::vector<DirichletFormulation> formulations =
+            bvp == BvpKind::Dirichlet
+            ? parse_dirichlet_formulations(formulation_selection)
+            : std::vector<DirichletFormulation>{
+                  DirichletFormulation::NormalJumpFirstKind};
 
         const int degree = environment_int("KFBIM_PYJET_DEGREE", 4);
         const int neighbors = environment_int("KFBIM_PYJET_NEIGHBORS", 20);
@@ -1875,34 +2846,77 @@ int main(int argc, char** argv)
         const double tolerance = environment_double(
             "KFBIM_PYJET_TOL", 2.0e-10);
         const SpreadCorrectionMode spread_mode = parse_spread_mode(
-            environment_string("KFBIM_PYJET_SPREAD_MODE", "quadratic_harmonic"));
+            environment_string(
+                "KFBIM_PYJET_SPREAD_MODE", "cubic_harmonic"));
         const std::string dof_mode_selection = environment_string(
-            "KFBIM_PYJET_DOF_MODE", "compare");
+            "KFBIM_PYJET_DOF_MODE", "uniform_midpoint");
         const std::vector<InterfaceDofMode> dof_modes =
             parse_dof_modes(dof_mode_selection);
         const std::string restrict_mode_selection = environment_string(
-            "KFBIM_PYJET_RESTRICT_MODE", "bicubic_cubic");
+            "KFBIM_PYJET_RESTRICT_MODE",
+            "biquadratic_quadratic_two_layer");
         const std::vector<RestrictMode> restrict_modes =
             parse_restrict_modes(restrict_mode_selection);
         const int quadratic_spread_neighbors = environment_int(
             "KFBIM_PYJET_QUADRATIC_SPREAD_NEIGHBORS", 3);
         const int quadratic_spread_derivative_neighbors = environment_int(
-            "KFBIM_PYJET_QUADRATIC_SPREAD_DERIVATIVE_NEIGHBORS", 2);
+            "KFBIM_PYJET_QUADRATIC_SPREAD_DERIVATIVE_NEIGHBORS", 3);
+        const int cubic_spread_neighbors = environment_int(
+            "KFBIM_PYJET_CUBIC_SPREAD_NEIGHBORS", 4);
+        const int cubic_spread_derivative_neighbors = environment_int(
+            "KFBIM_PYJET_CUBIC_SPREAD_DERIVATIVE_NEIGHBORS", 3);
+        const int corner_fit_degree = environment_int(
+            "KFBIM_PYJET_CORNER_FIT_DEGREE", 3);
+        const int corner_fit_neighbors = environment_int(
+            "KFBIM_PYJET_CORNER_FIT_NEIGHBORS", 5);
+        const int corner_fit_derivative_neighbors = environment_int(
+            "KFBIM_PYJET_CORNER_FIT_DERIVATIVE_NEIGHBORS", 4);
+        const double uniform_dof_ratio = environment_double(
+            "KFBIM_PYJET_UNIFORM_DOF_RATIO", 0.75);
 
-        std::cout << "KFBI2D harmonic-jet Neumann solver\n"
+        std::cout << "KFBI2D harmonic-jet " << bvp_name(bvp) << " solver\n"
+                  << "bvp=" << bvp_name(bvp)
+                  << " trace_target=" << (bvp == BvpKind::Dirichlet
+                      ? "interior_residual_zero" : "exterior_zero") << '\n'
                   << "degree=" << degree
                   << " neighbors=" << neighbors
                   << " derivative_neighbors=" << derivative_neighbors
                   << " spread_mode=" << spread_mode_name(spread_mode)
                   << " dof_mode=" << dof_mode_selection
                   << " restrict_mode=" << restrict_mode_selection
+                  << " uniform_dof_ratio=" << uniform_dof_ratio
                   << " quadratic_spread_neighbors="
                   << quadratic_spread_neighbors
                   << " quadratic_spread_derivative_neighbors="
                   << quadratic_spread_derivative_neighbors
+                  << " quadratic_normal_sampling="
+                  << (quadratic_spread_neighbors == 3
+                          && quadratic_spread_derivative_neighbors == 3
+                      ? "all_three"
+                      : (quadratic_spread_neighbors == 3
+                             && quadratic_spread_derivative_neighbors == 2
+                         ? "adjacent_symmetric" : "nearest_noncenter"))
+                  << " cubic_spread_neighbors="
+                  << cubic_spread_neighbors
+                  << " cubic_spread_derivative_neighbors="
+                  << cubic_spread_derivative_neighbors
+                  << " corner_fit_degree="
+                  << corner_fit_degree
+                  << " corner_fit_neighbors="
+                  << corner_fit_neighbors
+                  << " corner_fit_derivative_neighbors="
+                  << corner_fit_derivative_neighbors
+                  << " restrict_jump_extension=linear_taylor"
+                  << " restrict_jump_degree=1"
+                  << " lshape_neighbor_policy=hybrid_4plus3_corner_cauchy_fit"
+                  << " lshape_corner_policy=edge_midpoints"
                   << " tol=" << tolerance
                   << " max_iter=" << max_iter
                   << " restart=" << restart << '\n';
+        if (bvp == BvpKind::Dirichlet) {
+            std::cout << "dirichlet_formulation="
+                      << formulation_selection << '\n';
+        }
 
         std::vector<StudyResult> results;
         for (const std::string& name : geometries) {
@@ -1910,18 +2924,35 @@ int main(int argc, char** argv)
             for (int n : levels) {
                 for (InterfaceDofMode dof_mode : dof_modes) {
                     for (RestrictMode restrict_mode : restrict_modes) {
-                        std::cout << "[run] geometry=" << name << " N=" << n
-                                  << " dof_mode=" << dof_mode_name(dof_mode)
-                                  << " restrict_mode="
-                                  << restrict_mode_name(restrict_mode) << '\n';
-                        StudyResult result = run_one(
-                            geometry, n, dof_mode, restrict_mode, degree,
-                            neighbors, derivative_neighbors, spread_mode,
-                            quadratic_spread_neighbors,
-                            quadratic_spread_derivative_neighbors,
-                            max_iter, tolerance, restart);
-                        print_result(result);
-                        results.push_back(std::move(result));
+                        for (DirichletFormulation formulation : formulations) {
+                            std::cout << "[run] geometry=" << name
+                                      << " N=" << n
+                                      << " dof_mode="
+                                      << dof_mode_name(dof_mode)
+                                      << " restrict_mode="
+                                      << restrict_mode_name(restrict_mode);
+                            if (bvp == BvpKind::Dirichlet) {
+                                std::cout << " dirichlet_formulation="
+                                          << dirichlet_formulation_name(
+                                                 formulation);
+                            }
+                            std::cout << '\n';
+                            StudyResult result = run_one(
+                                bvp, formulation, geometry, n,
+                                dof_mode, restrict_mode,
+                                uniform_dof_ratio, degree,
+                                neighbors, derivative_neighbors, spread_mode,
+                                quadratic_spread_neighbors,
+                                quadratic_spread_derivative_neighbors,
+                                cubic_spread_neighbors,
+                                cubic_spread_derivative_neighbors,
+                                corner_fit_degree,
+                                corner_fit_neighbors,
+                                corner_fit_derivative_neighbors,
+                                max_iter, tolerance, restart);
+                            print_result(result);
+                            results.push_back(std::move(result));
+                        }
                     }
                 }
             }
@@ -1945,6 +2976,12 @@ int main(int argc, char** argv)
                      + std::to_string(quadratic_spread_neighbors) + "_d"
                      + std::to_string(quadratic_spread_derivative_neighbors)
                      + ".csv";
+        } else if (spread_mode
+                   == SpreadCorrectionMode::CubicHarmonicAtOppositeNode) {
+            csv_name = "harmonic_jet_case_cpp_cubic_harmonic_spread_n"
+                     + std::to_string(cubic_spread_neighbors) + "_d"
+                     + std::to_string(cubic_spread_derivative_neighbors)
+                     + ".csv";
         }
         if (dof_mode_selection != "crossing") {
             const std::size_t extension = csv_name.rfind(".csv");
@@ -1954,6 +2991,12 @@ int main(int argc, char** argv)
             const std::size_t extension = csv_name.rfind(".csv");
             csv_name.insert(
                 extension, "_" + restrict_mode_selection + "_restrict");
+        }
+        if (bvp == BvpKind::Dirichlet) {
+            csv_name.insert(0, "dirichlet_");
+            const std::size_t extension = csv_name.rfind(".csv");
+            csv_name.insert(
+                extension, "_" + formulation_selection + "_formulation");
         }
         const std::filesystem::path csv_path = output_dir / csv_name;
         write_csv(csv_path, results);

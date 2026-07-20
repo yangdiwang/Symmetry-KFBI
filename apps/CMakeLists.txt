@@ -22,6 +22,10 @@ add_executable(neumann_harmonic_jet_python_compatible_2d
     neumann_harmonic_jet_python_compatible_2d.cpp
 )
 
+add_executable(dirichlet_harmonic_jet_python_compatible_2d
+    neumann_harmonic_jet_python_compatible_2d.cpp
+)
+
 target_link_libraries(shape_opt_transmission_2d PRIVATE
     kfbim_core
 )
@@ -43,6 +47,10 @@ target_link_libraries(neumann_harmonic_jet_case_2d PRIVATE
 )
 
 target_link_libraries(neumann_harmonic_jet_python_compatible_2d PRIVATE
+    kfbim_core
+)
+
+target_link_libraries(dirichlet_harmonic_jet_python_compatible_2d PRIVATE
     kfbim_core
 )
 
@@ -70,9 +78,15 @@ target_compile_definitions(neumann_harmonic_jet_python_compatible_2d PRIVATE
     KFBIM_APP_OUTPUT_DIR="${PROJECT_SOURCE_DIR}/output"
 )
 
+target_compile_definitions(dirichlet_harmonic_jet_python_compatible_2d PRIVATE
+    KFBIM_APP_OUTPUT_DIR="${PROJECT_SOURCE_DIR}/output"
+    KFBIM_PYJET_DEFAULT_BVP_DIRICHLET=1
+)
+
 target_compile_features(shape_opt_transmission_2d PRIVATE cxx_std_17)
 target_compile_features(transmission_center_perturb_2d PRIVATE cxx_std_17)
 target_compile_features(neumann_exterior_trace_lshape_2d PRIVATE cxx_std_17)
 target_compile_features(neumann_exterior_trace_circle_2d PRIVATE cxx_std_17)
 target_compile_features(neumann_harmonic_jet_case_2d PRIVATE cxx_std_17)
 target_compile_features(neumann_harmonic_jet_python_compatible_2d PRIVATE cxx_std_17)
+target_compile_features(dirichlet_harmonic_jet_python_compatible_2d PRIVATE cxx_std_17)
