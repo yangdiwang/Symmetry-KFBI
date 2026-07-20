@@ -1,0 +1,55 @@
+name: build-and-smoke
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libeigen3-dev python3-pip
+          python3 -m pip install --break-system-packages -r requirements.txt
+
+      - name: Configure and build all apps
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel 2
+
+      - name: Run six C++ smoke cases
+        env:
+          KFBIM_CIRCLE_EXT_TRACE_MAX_ITER: "30"
+          KFBIM_CIRCLE_EXT_TRACE_RESTART: "30"
+          KFBIM_CIRCLE_EXT_TRACE_TOL: "1e-7"
+          KFBIM_EXT_TRACE_MAX_ITER: "40"
+          KFBIM_EXT_TRACE_RESTART: "30"
+          KFBIM_EXT_TRACE_TOL: "1e-7"
+          KFBIM_HJET_MAX_ITER: "40"
+          KFBIM_HJET_RESTART: "30"
+          KFBIM_HJET_TOL: "1e-7"
+          KFBIM_PYJET_MAX_ITER: "40"
+          KFBIM_PYJET_RESTART: "30"
+          KFBIM_PYJET_TOL: "1e-7"
+          KFBIM_PYJET_DOF_MODE: uniform_midpoint
+          KFBIM_PYJET_RESTRICT_MODE: compare
+        run: |
+          ./build/apps/neumann_exterior_trace_circle_2d 24
+          ./build/apps/neumann_exterior_trace_lshape_2d 24
+          ./build/apps/neumann_harmonic_jet_case_2d ellipse 24
+          ./build/apps/neumann_harmonic_jet_python_compatible_2d ellipse 24
+          ./build/apps/transmission_center_perturb_2d --samples 1 --levels 24 --jitter 0.01 --out output/smoke_transmission_center
+          ./build/apps/shape_opt_transmission_2d --N 24 --iters 1 --save-every 1 --out output/smoke_shape_opt
+
+      - name: Run both visualization apps
+        env:
+          MPLBACKEND: Agg
+        run: |
+          python3 -m py_compile apps/visualize_shape_opt_2d.py apps/visualize_transmission_center_perturb_2d.py
+          python3 apps/visualize_shape_opt_2d.py output/smoke_shape_opt
+          python3 apps/visualize_transmission_center_perturb_2d.py output/smoke_transmission_center
