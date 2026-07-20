@@ -163,7 +163,7 @@ python apps/visualize_transmission_center_perturb_2d.py output/transmission_cent
   或保持原有行为、比较原有四种格式。
 - `KFBIM_PYJET_RESTRICT_MODE=degree_compare`：固定其他参数，仅比较双二次/双三次
   网格插值与法向二次/三次拟合的四种组合。L 形加密结果见
-  [次数组合比较](docs/superpowers/results/2026-07-21-lshape-normal-restrict-degree-comparison.md)。
+  [共享 Cauchy 非多项式比较](docs/superpowers/results/2026-07-21-lshape-shared-cauchy-nonpolynomial.md)。
 
 进入插值模板的跨界网格值先使用相应界面自由度的局部 Cauchy 多项式统一调整到
 外侧值。每个 crossing 使用最近界面自由度对应的模板计算修正。
