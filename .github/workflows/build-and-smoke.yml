@@ -149,7 +149,7 @@ jobs:
             KFBIM_PYJET_DOF_MODE=uniform_midpoint \
             KFBIM_PYJET_RESTRICT_MODE=degree_compare \
             KFBIM_PYJET_DIRICHLET_FORMULATION=normal_jump_second_kind \
-              ./build/apps/dirichlet_harmonic_jet_python_compatible_2d circle 24
+              ./build/apps/dirichlet_harmonic_jet_python_compatible_2d lshape 64
           )"
           printf '%s\n' "$degree_compare_output" | grep -Fq \
             'restrict_mode=bicubic_quadratic'

@@ -149,7 +149,7 @@ python apps/visualize_transmission_center_perturb_2d.py output/transmission_cent
 - `KFBIM_PYJET_RESTRICT_MODE=biquadratic_quadratic_two_layer`：每侧两个对称法向
   点，双二次网格插值，法向二次联合拟合。
 - `normal_jump_second_kind` 从同一联合拟合的无量纲一次项提取外侧法向迹，并除以
-  网格间距 `h`。该格式支持上述三种联合法向 restrict，不支持仅恢复外侧函数值的
+  网格间距 `h`。该格式支持上述五种联合法向 restrict，不支持仅恢复外侧函数值的
   `six_point_quadratic_exterior`。
 - 法向 restrict 将内侧采样值换算到外侧分支时，主力方案使用
   `[u] + rho [u_n]` 的线性延拓。数值对比表明，在当前每侧两点的法向二次联合
@@ -157,9 +157,10 @@ python apps/visualize_transmission_center_perturb_2d.py output/transmission_cent
 - `KFBIM_PYJET_RESTRICT_MODE=six_point_quadratic_exterior`：最近网格点、上下左右
   四点和朝界面方向的最近斜点组成六点二次多项式模板。
 - `KFBIM_PYJET_RESTRICT_MODE=normal_compare|compare`：分别比较原有三种法向格式，
-  或比较包括两个混合次数模式和六点外侧值模式在内的全部格式。
+  或保持原有行为、比较原有四种格式。
 - `KFBIM_PYJET_RESTRICT_MODE=degree_compare`：固定其他参数，仅比较双二次/双三次
-  网格插值与法向二次/三次拟合的四种组合。
+  网格插值与法向二次/三次拟合的四种组合。L 形加密结果见
+  [次数组合比较](docs/superpowers/results/2026-07-21-lshape-normal-restrict-degree-comparison.md)。
 
 进入插值模板的跨界网格值先使用相应界面自由度的局部 Cauchy 多项式统一调整到
 外侧值。每个 crossing 使用最近界面自由度对应的模板计算修正。

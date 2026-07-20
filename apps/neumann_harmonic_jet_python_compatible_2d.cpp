@@ -167,8 +167,6 @@ std::vector<RestrictMode> parse_restrict_modes(const std::string& name)
     }
     if (name == "compare") {
         return {RestrictMode::BicubicCubicNormal,
-                RestrictMode::BicubicQuadraticNormal,
-                RestrictMode::BiquadraticCubicNormal,
                 RestrictMode::BiquadraticQuadraticNormal,
                 RestrictMode::BiquadraticQuadraticTwoLayer,
                 RestrictMode::SixPointQuadraticExterior};
