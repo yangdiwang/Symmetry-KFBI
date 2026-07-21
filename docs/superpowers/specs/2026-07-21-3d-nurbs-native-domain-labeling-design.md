@@ -128,6 +128,13 @@ For each element, store:
 
 Build a BVH over the conservative element AABBs.
 
+For Cartesian-edge enumeration, recursively subdivide the rational Bézier
+elements in parameter space until each leaf AABB has maximum physical extent
+at most `2 * max(hx,hy,hz)`. These leaves are an acceleration structure only;
+their control hulls remain conservative and their subdivision does not change
+the NURBS surface. Without this step, one large curved patch AABB could cover a
+volume-sized set of grid edges.
+
 The AABB is the authoritative broad-phase test. A coarse triangle may:
 
 - prioritize candidates;
@@ -234,8 +241,9 @@ Initialize every flag to zero. Set a flag to one exactly when the native NURBS
 query returns one valid transverse crossing. Store the crossing record beside
 that barrier.
 
-The element AABBs are converted to clamped Cartesian index ranges so only
-nearby grid edges are queried. The work therefore scales primarily with the
+The `2h` leaf AABBs are converted to clamped Cartesian index ranges so only
+nearby grid edges are queried. Candidate edge keys are deduplicated before the
+native intersection solve. The work therefore scales primarily with the
 surface resolution rather than testing every volume edge against every patch.
 
 A barrier is only a topological “do not traverse” flag. It is distinct from
@@ -306,8 +314,8 @@ After construction, require:
 1. every barrier has exactly one native crossing record;
 2. every neighboring node pair with different binary inside/outside status is
    separated by a barrier;
-3. small samples on the two sides of every transverse crossing have opposite
-   NURBS parity;
+3. after graph components are classified, the two Cartesian endpoints of
+   every barrier have opposite binary inside/outside labels;
 4. every accepted root residual is below `tol_x`;
 5. every crossing patch parameter lies inside its declared domain;
 6. no production crossing uses a triangle-only fallback;
