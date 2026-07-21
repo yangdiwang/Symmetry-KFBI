@@ -1738,7 +1738,7 @@ private:
     LaplaceCorrectionSupport3D correction_support_;
     std::vector<HarmonicCrossingRow3D> crossing_rows_;
     std::vector<HarmonicTraceSample3D> trace_samples_;
-    const std::array<double, 4> normal_layers_{{0.5, 1.5, 2.5, 3.5}};
+    const std::array<double, 4> normal_layers_{{0.2, 0.6, 1.0, 1.4}};
     std::array<double, 8> c0_weights_{};
     std::array<double, 8> c1_weights_{};
 };
@@ -2607,6 +2607,117 @@ void write_summary(const std::filesystem::path& output_dir,
     }
 }
 
+double observed_order(double coarse_error,
+                      double fine_error,
+                      double coarse_h,
+                      double fine_h)
+{
+    if (!(coarse_error > 0.0) || !(fine_error > 0.0)
+        || !(coarse_h > fine_h)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    return std::log(coarse_error / fine_error)
+         / std::log(coarse_h / fine_h);
+}
+
+void write_solve_summaries(const std::filesystem::path& output_dir,
+                           const std::vector<ReadinessResult>& results)
+{
+    using MetricSelector =
+        std::function<const SolveMetrics3D&(const ReadinessResult&)>;
+    auto write_csv = [&](const std::filesystem::path& path,
+                         const MetricSelector& select_metric) {
+        std::vector<const ReadinessResult*> rows;
+        rows.reserve(results.size());
+        for (const ReadinessResult& result : results)
+            rows.push_back(&result);
+        std::sort(rows.begin(), rows.end(),
+                  [](const ReadinessResult* a, const ReadinessResult* b) {
+                      return std::tie(a->geometry, a->N)
+                           < std::tie(b->geometry, b->N);
+                  });
+
+        std::ofstream csv = open_output_file(path);
+        csv << std::setprecision(17);
+        csv << "geometry,N,h,dofs,formulation,iterations,converged,seconds,"
+               "gmres_relative_residual,operator_residual_linf,"
+               "exterior_condition_linf,boundary_residual_linf,"
+               "route_mismatch_linf,data_weighted_mean,density_weighted_mean,"
+               "density_linf,density_l2,density_order_linf,density_order_l2,"
+               "interior_linf,interior_l2,interior_order_linf,"
+               "interior_order_l2,exterior_bulk_linf,exterior_bulk_l2,"
+               "exterior_bulk_order_linf,exterior_bulk_order_l2,"
+               "constant_shift\n";
+        std::map<std::string, const ReadinessResult*> previous;
+        for (const ReadinessResult* row : rows) {
+            const SolveMetrics3D& metric = select_metric(*row);
+            double density_order_linf =
+                std::numeric_limits<double>::quiet_NaN();
+            double density_order_l2 =
+                std::numeric_limits<double>::quiet_NaN();
+            double interior_order_linf =
+                std::numeric_limits<double>::quiet_NaN();
+            double interior_order_l2 =
+                std::numeric_limits<double>::quiet_NaN();
+            double exterior_order_linf =
+                std::numeric_limits<double>::quiet_NaN();
+            double exterior_order_l2 =
+                std::numeric_limits<double>::quiet_NaN();
+            const auto found = previous.find(row->geometry);
+            if (found != previous.end()) {
+                const ReadinessResult& coarse = *found->second;
+                const SolveMetrics3D& coarse_metric = select_metric(coarse);
+                density_order_linf = observed_order(
+                    coarse_metric.density_linf, metric.density_linf,
+                    coarse.h, row->h);
+                density_order_l2 = observed_order(
+                    coarse_metric.density_l2, metric.density_l2,
+                    coarse.h, row->h);
+                interior_order_linf = observed_order(
+                    coarse_metric.interior_linf, metric.interior_linf,
+                    coarse.h, row->h);
+                interior_order_l2 = observed_order(
+                    coarse_metric.interior_l2, metric.interior_l2,
+                    coarse.h, row->h);
+                exterior_order_linf = observed_order(
+                    coarse_metric.exterior_bulk_linf,
+                    metric.exterior_bulk_linf, coarse.h, row->h);
+                exterior_order_l2 = observed_order(
+                    coarse_metric.exterior_bulk_l2,
+                    metric.exterior_bulk_l2, coarse.h, row->h);
+            }
+            csv << row->geometry << ',' << row->N << ',' << row->h << ','
+                << row->surface_dofs << ',' << metric.formulation << ','
+                << metric.iterations << ',' << metric.converged << ','
+                << metric.seconds << ',' << metric.gmres_relative_residual << ','
+                << metric.operator_residual_linf << ','
+                << metric.exterior_condition_linf << ','
+                << metric.boundary_residual_linf << ','
+                << metric.route_mismatch_linf << ','
+                << metric.data_weighted_mean << ','
+                << metric.density_weighted_mean << ','
+                << metric.density_linf << ',' << metric.density_l2 << ','
+                << density_order_linf << ',' << density_order_l2 << ','
+                << metric.interior_linf << ',' << metric.interior_l2 << ','
+                << interior_order_linf << ',' << interior_order_l2 << ','
+                << metric.exterior_bulk_linf << ','
+                << metric.exterior_bulk_l2 << ','
+                << exterior_order_linf << ',' << exterior_order_l2 << ','
+                << metric.constant_shift << '\n';
+            previous[row->geometry] = row;
+        }
+    };
+
+    write_csv(output_dir / "neumann_results.csv",
+              [](const ReadinessResult& row) -> const SolveMetrics3D& {
+                  return row.neumann;
+              });
+    write_csv(output_dir / "dirichlet_normal_results.csv",
+              [](const ReadinessResult& row) -> const SolveMetrics3D& {
+                  return row.dirichlet_normal;
+              });
+}
+
 void print_usage(const char* executable)
 {
     std::cout
@@ -2682,6 +2793,14 @@ int main(int argc, char** argv)
                 results.push_back(run_readiness_case(geometry, N, output_dir));
         }
         write_summary(output_dir, results);
+        write_solve_summaries(output_dir, results);
+        for (const ReadinessResult& result : results) {
+            if (!result.neumann.converged
+                || !result.dirichlet_normal.converged) {
+                throw std::runtime_error(
+                    "at least one requested 3D GMRES solve did not converge");
+            }
+        }
 
         std::cout << "Geometry checks and both GMRES formulations completed.\n"
                   << "Output: " << output_dir.string() << '\n';
