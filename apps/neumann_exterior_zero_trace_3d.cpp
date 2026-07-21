@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -104,6 +105,26 @@ struct CauchyStencilSet {
     int incident_patch_count_max = 0;
 };
 
+struct SolveMetrics3D {
+    std::string formulation;
+    int iterations = 0;
+    bool converged = false;
+    double seconds = 0.0;
+    double gmres_relative_residual = 0.0;
+    double operator_residual_linf = 0.0;
+    double exterior_condition_linf = 0.0;
+    double route_mismatch_linf = 0.0;
+    double density_linf = 0.0;
+    double density_l2 = 0.0;
+    double interior_linf = 0.0;
+    double interior_l2 = 0.0;
+    double exterior_bulk_linf = 0.0;
+    double exterior_bulk_l2 = 0.0;
+    double data_weighted_mean = 0.0;
+    double density_weighted_mean = 0.0;
+    double constant_shift = 0.0;
+};
+
 struct ReadinessResult {
     std::string geometry;
     int N = 0;
@@ -147,6 +168,7 @@ struct ReadinessResult {
     double cauchy_radius_mean_over_h = 0.0;
     int cauchy_incident_patches_min = 0;
     int cauchy_incident_patches_max = 0;
+    SolveMetrics3D neumann;
 };
 
 double triangle_area(const Eigen::Vector3d& a,
@@ -1775,6 +1797,7 @@ private:
 struct ExteriorZeroTraceSolution3D {
     Eigen::VectorXd value_jump;
     Eigen::VectorXd potential;
+    Eigen::MatrixXd coefficients;
     Eigen::VectorXd augmented_residual;
     std::vector<double> gmres_residuals;
     double lagrange_multiplier = 0.0;
@@ -1803,9 +1826,131 @@ ExteriorZeroTraceSolution3D solve_exterior_zero_trace_neumann_3d(
     const HarmonicJetField3D field =
         pipeline.evaluate(result.value_jump, prescribed_normal_jump);
     result.potential = field.potential;
+    result.coefficients = field.coefficients;
     Eigen::VectorXd applied;
     op.apply(augmented_unknown, applied);
     result.augmented_residual = applied - rhs;
+    return result;
+}
+
+double vector_linf(const Eigen::VectorXd& values)
+{
+    return values.size() == 0 ? 0.0 : values.lpNorm<Eigen::Infinity>();
+}
+
+double vector_rms(const Eigen::VectorXd& values)
+{
+    return values.size() == 0
+        ? 0.0
+        : std::sqrt(values.squaredNorm() / static_cast<double>(values.size()));
+}
+
+double surface_weighted_mean(const SurfaceDofCloud& surface,
+                             const Eigen::VectorXd& values)
+{
+    if (values.size() != static_cast<int>(surface.dofs.size()))
+        throw std::invalid_argument("surface weighted mean received wrong size");
+    double weighted_sum = 0.0;
+    double weight_sum = 0.0;
+    for (int q = 0; q < values.size(); ++q) {
+        const double weight = surface.dofs[static_cast<std::size_t>(q)].weight;
+        weighted_sum += weight * values[q];
+        weight_sum += weight;
+    }
+    return weighted_sum / weight_sum;
+}
+
+SolveMetrics3D run_neumann_case(
+    const CartesianGrid3D& grid,
+    const GridPair3D& grid_pair,
+    const PanelCenterHarmonicJetKFBI3D& pipeline)
+{
+    const int size = pipeline.surface_size();
+    Eigen::VectorXd exact_trace(size);
+    Eigen::VectorXd normal_data(size);
+    for (int q = 0; q < size; ++q) {
+        const SurfaceDof& dof =
+            pipeline.surface().dofs[static_cast<std::size_t>(q)];
+        exact_trace[q] = manufactured_u_3d(dof.point);
+        normal_data[q] = manufactured_gradient_3d(dof.point).dot(dof.normal);
+    }
+    // Enforce the discrete compatibility condition.  The exact flux has zero
+    // continuous mean; the tiny quadrature defect is otherwise amplified by
+    // the first-kind exterior-trace equation.
+    normal_data.array() -= surface_weighted_mean(
+        pipeline.surface(), normal_data);
+
+    const auto solve_start = std::chrono::steady_clock::now();
+    const ExteriorZeroTraceSolution3D solution =
+        solve_exterior_zero_trace_neumann_3d(
+            pipeline, normal_data, 2.0e-10, 80, 200);
+    const double seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - solve_start).count();
+
+    const HarmonicJetField3D field{
+        solution.potential, solution.coefficients};
+    const Eigen::VectorXd direct_exterior = pipeline.exterior_trace(
+        field, solution.value_jump, normal_data);
+    const Eigen::VectorXd exterior_from_jump = pipeline.interior_trace(
+        field, solution.value_jump, normal_data) - solution.value_jump;
+
+    SolveMetrics3D result;
+    result.formulation = "neumann_exterior_zero_value_trace";
+    result.iterations = solution.iterations;
+    result.converged = solution.converged;
+    result.seconds = seconds;
+    result.gmres_relative_residual = solution.gmres_residuals.empty()
+        ? std::numeric_limits<double>::quiet_NaN()
+        : solution.gmres_residuals.back();
+    result.operator_residual_linf = vector_linf(
+        solution.augmented_residual.head(size));
+    result.exterior_condition_linf = vector_linf(direct_exterior);
+    result.route_mismatch_linf = vector_linf(
+        direct_exterior - exterior_from_jump);
+    result.data_weighted_mean = surface_weighted_mean(
+        pipeline.surface(), normal_data);
+    result.density_weighted_mean = surface_weighted_mean(
+        pipeline.surface(), solution.value_jump);
+
+    exact_trace.array() -= surface_weighted_mean(
+        pipeline.surface(), exact_trace);
+    const Eigen::VectorXd density_error = solution.value_jump - exact_trace;
+    result.density_linf = vector_linf(density_error);
+    result.density_l2 = vector_rms(density_error);
+
+    double shift_sum = 0.0;
+    int interior_count = 0;
+    for (int node = 0; node < grid.num_dofs(); ++node) {
+        if (grid_pair.domain_label(node) <= 0)
+            continue;
+        shift_sum += manufactured_u_3d(grid_point(grid, node))
+                   - solution.potential[node];
+        ++interior_count;
+    }
+    result.constant_shift = shift_sum / static_cast<double>(interior_count);
+    double interior_error_sq = 0.0;
+    double exterior_error_sq = 0.0;
+    int exterior_count = 0;
+    for (int node = 0; node < grid.num_dofs(); ++node) {
+        if (grid_pair.domain_label(node) > 0) {
+            const double error = solution.potential[node]
+                               + result.constant_shift
+                               - manufactured_u_3d(grid_point(grid, node));
+            result.interior_linf = std::max(
+                result.interior_linf, std::abs(error));
+            interior_error_sq += error * error;
+        } else {
+            const double error = solution.potential[node];
+            result.exterior_bulk_linf = std::max(
+                result.exterior_bulk_linf, std::abs(error));
+            exterior_error_sq += error * error;
+            ++exterior_count;
+        }
+    }
+    result.interior_l2 = std::sqrt(
+        interior_error_sq / static_cast<double>(interior_count));
+    result.exterior_bulk_l2 = std::sqrt(
+        exterior_error_sq / static_cast<double>(exterior_count));
     return result;
 }
 
@@ -2133,6 +2278,7 @@ ReadinessResult run_readiness_case(GeometryKind kind,
         throw std::runtime_error(
             "harmonic-jet constant probe produced NaN/Inf");
     }
+    result.neumann = run_neumann_case(grid, grid_pair, harmonic_pipeline);
 
     std::cout << "[ready] " << geometry.name << " - " << geometry.description << '\n'
               << "  panel-center surface patches/dofs="
@@ -2178,7 +2324,22 @@ ReadinessResult run_readiness_case(GeometryKind kind,
               << " exterior/interior normal="
               << result.harmonic_constant_exterior_normal_linf << '/'
               << result.harmonic_constant_interior_normal_linf
-              << " bulk_err=" << result.harmonic_constant_bulk_linf << '\n';
+              << " bulk_err=" << result.harmonic_constant_bulk_linf << '\n'
+              << "  [neumann] converged/iterations="
+              << result.neumann.converged << '/' << result.neumann.iterations
+              << " gmres=" << result.neumann.gmres_relative_residual
+              << " operator=" << result.neumann.operator_residual_linf
+              << " exterior_trace=" << result.neumann.exterior_condition_linf
+              << " route_mismatch=" << result.neumann.route_mismatch_linf
+              << " density_linf/l2=" << result.neumann.density_linf << '/'
+              << result.neumann.density_l2
+              << " interior_linf/l2=" << result.neumann.interior_linf << '/'
+              << result.neumann.interior_l2
+              << " exterior_bulk_linf/l2="
+              << result.neumann.exterior_bulk_linf << '/'
+              << result.neumann.exterior_bulk_l2
+              << " flux_mean=" << result.neumann.data_weighted_mean
+              << " seconds=" << result.neumann.seconds << '\n';
     return result;
 }
 
