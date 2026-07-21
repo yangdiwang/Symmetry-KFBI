@@ -169,6 +169,27 @@ GeometryKind parse_geometry(const std::string& name)
         "geometry must be torus, cylinder, l_prism, or all");
 }
 
+double manufactured_u_3d(const Eigen::Vector3d& point)
+{
+    const double exponential = std::exp(0.35 * point.x());
+    return exponential * std::cos(0.21 * point.y())
+        * std::cos(0.28 * point.z());
+}
+
+Eigen::Vector3d manufactured_gradient_3d(const Eigen::Vector3d& point)
+{
+    const double exponential = std::exp(0.35 * point.x());
+    const double cos_y = std::cos(0.21 * point.y());
+    const double sin_y = std::sin(0.21 * point.y());
+    const double cos_z = std::cos(0.28 * point.z());
+    const double sin_z = std::sin(0.28 * point.z());
+    return {
+        0.35 * exponential * cos_y * cos_z,
+        -0.21 * exponential * sin_y * cos_z,
+        -0.28 * exponential * cos_y * sin_z
+    };
+}
+
 std::pair<Eigen::Vector3d, Eigen::Vector3d>
 frame_from_normal(const Eigen::Vector3d& input_normal)
 {
@@ -2054,7 +2075,8 @@ void write_summary(const std::filesystem::path& output_dir,
     std::filesystem::create_directories(output_dir);
     if (results.empty())
         return;
-    auto write_csv = [&](const std::filesystem::path& path) {
+    auto write_csv = [&](const std::filesystem::path& path,
+                         const std::vector<ReadinessResult>& rows) {
         std::ofstream csv = open_output_file(path);
         csv << std::setprecision(17);
         csv << "geometry,N,h,correction_panels,correction_dofs,crossing_panels,"
@@ -2069,7 +2091,7 @@ void write_summary(const std::filesystem::path& output_dir,
                "cauchy_derivative_neighbors,cauchy_radius_max_over_h,"
                "cauchy_radius_mean_over_h,cauchy_incident_patches_min,"
                "cauchy_incident_patches_max\n";
-        for (const ReadinessResult& row : results)
+        for (const ReadinessResult& row : rows)
             csv << row.geometry << ',' << row.N << ',' << row.h << ','
                 << row.correction_panels << ',' << row.correction_dofs << ','
                 << row.crossing_panels << ',' << row.feature_edges << ','
@@ -2095,16 +2117,28 @@ void write_summary(const std::filesystem::path& output_dir,
                 << row.cauchy_incident_patches_min << ','
                 << row.cauchy_incident_patches_max << '\n';
     };
-    write_csv(output_dir / "geometry_readiness.csv");
-    write_csv(output_dir / (
-        "geometry_readiness_N" + std::to_string(results.front().N) + ".csv"));
+    write_csv(output_dir / "geometry_readiness.csv", results);
+    std::set<int> levels;
+    for (const ReadinessResult& row : results)
+        levels.insert(row.N);
+    for (int level : levels) {
+        std::vector<ReadinessResult> level_rows;
+        for (const ReadinessResult& row : results) {
+            if (row.N == level)
+                level_rows.push_back(row);
+        }
+        write_csv(output_dir / (
+            "geometry_readiness_N" + std::to_string(level) + ".csv"),
+            level_rows);
+    }
 }
 
 void print_usage(const char* executable)
 {
     std::cout
-        << "usage: " << executable << " [torus|cylinder|l_prism|all] [N]\n"
-        << "  N must be a power of two and at least 16 (default: 16).\n"
+        << "usage: " << executable
+        << " [torus|cylinder|l_prism|all] [N ...]\n"
+        << "  Each N must be a power of two and at least 16 (default: 16).\n"
         << "  This stage builds independent parameter-panel-center surface\n"
         << "  unknowns, topology-filtered 48/28 Cauchy stencils, validates\n"
         << "  fixed transfer routes, and runs a constant value-jump probe.\n"
@@ -2119,19 +2153,24 @@ int main(int argc, char** argv)
     try {
         std::cout << std::scientific << std::setprecision(6) << std::unitbuf;
         std::string selection = "all";
-        int N = 16;
+        std::vector<int> levels = {16};
         if (argc >= 2)
             selection = argv[1];
         if (selection == "--help" || selection == "-h") {
             print_usage(argv[0]);
             return 0;
         }
-        if (argc >= 3)
-            N = std::stoi(argv[2]);
-        if (argc > 3)
-            throw std::invalid_argument("too many command-line arguments");
-        if (N < 16 || !is_power_of_two(N))
-            throw std::invalid_argument("N must be a power of two and at least 16");
+        if (argc >= 3) {
+            levels.clear();
+            for (int argument = 2; argument < argc; ++argument) {
+                const int N = std::stoi(argv[argument]);
+                if (N < 16 || !is_power_of_two(N)) {
+                    throw std::invalid_argument(
+                        "each N must be a power of two and at least 16");
+                }
+                levels.push_back(N);
+            }
+        }
 
         std::vector<GeometryKind> geometries;
         if (selection == "all") {
@@ -2156,12 +2195,19 @@ int main(int argc, char** argv)
                      "b=R_minus H_N(g)\n"
                   << "  current stage: parameter-panel-center surface DOFs + "
                      "topological Cauchy stencils + fixed routes\n"
-                  << "  N=" << N << " h="
-                  << kBoxSide / static_cast<double>(N) << '\n';
+                  << "  levels=";
+        for (std::size_t index = 0; index < levels.size(); ++index) {
+            if (index != 0)
+                std::cout << ',';
+            std::cout << levels[index];
+        }
+        std::cout << '\n';
 
         std::vector<ReadinessResult> results;
-        for (GeometryKind geometry : geometries)
-            results.push_back(run_readiness_case(geometry, N, output_dir));
+        for (int N : levels) {
+            for (GeometryKind geometry : geometries)
+                results.push_back(run_readiness_case(geometry, N, output_dir));
+        }
         write_summary(output_dir, results);
 
         std::cout << "Geometry and transfer-pipeline readiness passed.\n"
