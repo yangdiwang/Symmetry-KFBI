@@ -88,7 +88,7 @@ CauchyStencilPolicy3D selected_cauchy_policy()
 int positive_environment_integer(const char* name, int default_value)
 {
     const char* raw = std::getenv(name);
-    if (raw == nullptr || std::string(raw).empty())
+    if (raw == nullptr)
         return default_value;
 
     const std::string text(raw);
