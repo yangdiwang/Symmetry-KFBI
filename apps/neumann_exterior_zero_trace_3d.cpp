@@ -41,6 +41,9 @@ constexpr double kBoxSide = 3.0;
 constexpr double kTargetP2NodeSpacingOverH = 1.2;
 constexpr int kCauchyValueNeighborCount = 48;
 constexpr int kCauchyDerivativeNeighborCount = 28;
+constexpr int kCauchyPolynomialDegree = 3;
+constexpr int kRestrictGridDegree = 3;
+constexpr int kRestrictNormalDegree = 3;
 
 using GeometryKind = app3d::GeometryKind3D;
 using NativeNurbsSurface3D = app3d::NativeNurbsSurface3D;
@@ -80,6 +83,28 @@ CauchyStencilPolicy3D selected_cauchy_policy()
         return CauchyStencilPolicy3D::BalancedPatches;
     throw std::invalid_argument(
         "KFBIM_3D_CAUCHY_POLICY must be topological_nearest, same_patch, or balanced_patches");
+}
+
+int positive_environment_integer(const char* name, int default_value)
+{
+    const char* raw = std::getenv(name);
+    if (raw == nullptr || std::string(raw).empty())
+        return default_value;
+
+    const std::string text(raw);
+    std::size_t consumed = 0;
+    int value = 0;
+    try {
+        value = std::stoi(text, &consumed);
+    } catch (const std::exception&) {
+        throw std::invalid_argument(std::string(name)
+                                    + " must be a positive integer");
+    }
+    if (consumed != text.size() || value <= 0) {
+        throw std::invalid_argument(std::string(name)
+                                    + " must be a positive integer");
+    }
+    return value;
 }
 
 struct GeometryBundle {
@@ -809,7 +834,7 @@ public:
         , geometry_triangles_(geometry_triangles)
         , cloud_(cloud)
         , h_(grid.spacing()[0])
-        , fit_(cloud, stencils, h_, 3)
+        , fit_(cloud, stencils, h_, kCauchyPolynomialDegree)
         , bulk_(grid, ZfftBcType::Dirichlet, 0.0, 2)
         , correction_support_(build_laplace_correction_support_3d(
               grid_pair, "PanelCenterHarmonicJetKFBI3D"))
@@ -1177,7 +1202,8 @@ private:
     LaplaceCorrectionSupport3D correction_support_;
     std::vector<HarmonicCrossingRow3D> crossing_rows_;
     std::vector<HarmonicTraceSample3D> trace_samples_;
-    const std::array<double, 4> normal_layers_{{0.2, 0.6, 1.0, 1.4}};
+    const std::array<double, kRestrictNormalDegree + 1> normal_layers_{
+        {0.2, 0.6, 1.0, 1.4}};
     std::array<double, 8> c0_weights_{};
     std::array<double, 8> c1_weights_{};
 };
@@ -1734,7 +1760,9 @@ void write_panel_center_files(const std::filesystem::path& output_dir,
 ReadinessResult run_readiness_case(GeometryKind kind,
                                    int N,
                                    const std::filesystem::path& output_dir,
-                                   CauchyStencilPolicy3D cauchy_policy)
+                                   CauchyStencilPolicy3D cauchy_policy,
+                                   int cauchy_value_count,
+                                   int cauchy_normal_count)
 {
     const double h = kBoxSide / static_cast<double>(N);
     CartesianGrid3D grid({kBoxMin, kBoxMin, kBoxMin},
@@ -1750,8 +1778,8 @@ ReadinessResult run_readiness_case(GeometryKind kind,
         geometry.native_surface,
         surface_dofs,
         h,
-        kCauchyValueNeighborCount,
-        kCauchyDerivativeNeighborCount,
+        cauchy_value_count,
+        cauchy_normal_count,
         cauchy_policy);
     write_surface_files(output_dir, geometry, N);
     write_panel_center_files(
@@ -2266,7 +2294,10 @@ void print_usage(const char* executable)
         << "  fixed transfer routes, and executes the Neumann value-jump and\n"
         << "  Dirichlet normal-jump harmonic-jet GMRES formulations.\n"
         << "  KFBIM_3D_CAUCHY_POLICY selects topological_nearest (default),\n"
-        << "  same_patch, or balanced_patches.\n";
+        << "  same_patch, or balanced_patches.\n"
+        << "  KFBIM_3D_CAUCHY_VALUE_COUNT and\n"
+        << "  KFBIM_3D_CAUCHY_NORMAL_COUNT select positive stencil counts\n"
+        << "  (defaults: 48 and 28; normal count may not exceed value count).\n";
 }
 
 } // namespace
@@ -2295,6 +2326,15 @@ int main(int argc, char** argv)
             }
         }
         const CauchyStencilPolicy3D cauchy_policy = selected_cauchy_policy();
+        const int cauchy_value_count = positive_environment_integer(
+            "KFBIM_3D_CAUCHY_VALUE_COUNT", kCauchyValueNeighborCount);
+        const int cauchy_normal_count = positive_environment_integer(
+            "KFBIM_3D_CAUCHY_NORMAL_COUNT", kCauchyDerivativeNeighborCount);
+        if (cauchy_normal_count > cauchy_value_count) {
+            throw std::invalid_argument(
+                "KFBIM_3D_CAUCHY_NORMAL_COUNT may not exceed "
+                "KFBIM_3D_CAUCHY_VALUE_COUNT");
+        }
 
         std::vector<GeometryKind> geometries;
         if (selection == "all") {
@@ -2315,6 +2355,11 @@ int main(int argc, char** argv)
 #endif
         if (cauchy_policy != CauchyStencilPolicy3D::TopologicalNearest)
             output_dir /= cauchy_policy_name(cauchy_policy);
+        if (cauchy_value_count != kCauchyValueNeighborCount
+            || cauchy_normal_count != kCauchyDerivativeNeighborCount) {
+            output_dir /= "v" + std::to_string(cauchy_value_count) + "_n"
+                          + std::to_string(cauchy_normal_count);
+        }
 
         std::cout << "KFBI3D harmonic-jet convergence study\n"
                   << "  Neumann target: exterior value trace = 0\n"
@@ -2323,6 +2368,12 @@ int main(int argc, char** argv)
                      "topological Cauchy neighborhoods + G1 parameter-owned routes\n"
                   << "  cauchy_policy=" << cauchy_policy_name(cauchy_policy)
                   << '\n'
+                  << "  cauchy_degree=" << kCauchyPolynomialDegree
+                  << " restrict_grid_degree=" << kRestrictGridDegree
+                  << " restrict_normal_degree=" << kRestrictNormalDegree
+                  << '\n'
+                  << "  cauchy_counts=" << cauchy_value_count << '/'
+                  << cauchy_normal_count << '\n'
                   << "  levels=";
         for (std::size_t index = 0; index < levels.size(); ++index) {
             if (index != 0)
@@ -2335,7 +2386,12 @@ int main(int argc, char** argv)
         for (int N : levels) {
             for (GeometryKind geometry : geometries)
                 results.push_back(run_readiness_case(
-                    geometry, N, output_dir, cauchy_policy));
+                    geometry,
+                    N,
+                    output_dir,
+                    cauchy_policy,
+                    cauchy_value_count,
+                    cauchy_normal_count));
         }
         write_summary(output_dir, results);
         write_solve_summaries(output_dir, results);

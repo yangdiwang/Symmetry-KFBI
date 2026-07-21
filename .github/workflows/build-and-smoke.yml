@@ -47,6 +47,10 @@ jobs:
           printf '%s\n' "$three_d_output"
           printf '%s\n' "$three_d_output" | grep -Fq \
             'cauchy_policy=topological_nearest'
+          printf '%s\n' "$three_d_output" | grep -Fq \
+            'cauchy_degree=3 restrict_grid_degree=3 restrict_normal_degree=3'
+          printf '%s\n' "$three_d_output" | grep -Fq \
+            'cauchy_counts=48/28'
           main_preset_output="$(
             env -u KFBIM_PYJET_DOF_MODE \
                 -u KFBIM_PYJET_SPREAD_MODE \
