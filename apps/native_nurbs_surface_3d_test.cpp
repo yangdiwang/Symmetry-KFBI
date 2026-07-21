@@ -3,6 +3,7 @@
 #include "src/geometry/grid_pair_3d.hpp"
 #include "src/geometry/nurbs_bezier_extraction_3d.hpp"
 #include "src/geometry/nurbs_bezier_intersection_3d.hpp"
+#include "src/geometry/nurbs_cartesian_domain_3d.hpp"
 #include "src/geometry/rational_bezier_element_3d.hpp"
 #include "src/geometry/rational_bezier_subdivision_3d.hpp"
 #include "src/geometry/nurbs_surface_model_3d.hpp"
@@ -1224,6 +1225,233 @@ void test_native_nurbs_surface_intersector()
         "L-prism Cartesian edge rejects a surface overlap");
 }
 
+kfbim::geometry3d::NurbsSurfacePatch3D translated_patch(
+    const kfbim::geometry3d::NurbsSurfacePatch3D& patch,
+    const Eigen::Vector3d& offset)
+{
+    auto controls = patch.control_net();
+    for (auto& row : controls) {
+        for (Eigen::Vector3d& point : row)
+            point += offset;
+    }
+    return kfbim::geometry3d::NurbsSurfacePatch3D(
+        patch.basis_u(), patch.basis_v(), controls, patch.weights());
+}
+
+kfbim::geometry3d::NurbsSurfaceModel3D two_translated_components(
+    const kfbim::geometry3d::NurbsSurfaceModel3D& source,
+    const Eigen::Vector3d& offset)
+{
+    using kfbim::geometry3d::NurbsPatchEdgeConnection3D;
+    using kfbim::geometry3d::NurbsSurfacePatch3D;
+
+    std::vector<NurbsSurfacePatch3D> patches = source.patches();
+    std::vector<int> components(
+        static_cast<std::size_t>(source.num_patches()), 0);
+    std::vector<NurbsPatchEdgeConnection3D> connections =
+        source.connections();
+    const int patch_offset = source.num_patches();
+    for (int patch = 0; patch < source.num_patches(); ++patch) {
+        patches.push_back(translated_patch(source.patch(patch), offset));
+        components.push_back(1);
+    }
+    for (auto connection : source.connections()) {
+        connection.first.patch += patch_offset;
+        connection.second.patch += patch_offset;
+        connections.push_back(connection);
+    }
+    return kfbim::geometry3d::NurbsSurfaceModel3D(
+        std::move(patches), std::move(components),
+        std::move(connections));
+}
+
+void require_triangle_seed_independent_domain(
+    const kfbim::CartesianGrid3D& grid,
+    const kfbim::geometry3d::NurbsSurfaceModel3D& model,
+    int exterior_node,
+    int interior_node,
+    const std::string& name)
+{
+    using kfbim::geometry3d::NurbsCartesianDomain3D;
+    using kfbim::geometry3d::NurbsCartesianDomainOptions3D;
+
+    const NurbsCartesianDomain3D seeded(grid, model);
+    NurbsCartesianDomainOptions3D no_seed_options;
+    no_seed_options.use_triangle_seeds = false;
+    const NurbsCartesianDomain3D unseeded(
+        grid, model, no_seed_options);
+
+    require(seeded.label(exterior_node) == 0,
+            name + " central void is exterior");
+    require(seeded.label(interior_node) == 1,
+            name + " material point is inside");
+    require(seeded.labels() == unseeded.labels(),
+            name + " labels do not depend on triangle seeds");
+    require(seeded.diagnostics().barrier_edge_counts
+                == unseeded.diagnostics().barrier_edge_counts,
+            name + " barrier counts do not depend on triangle seeds");
+
+    const auto dims = grid.dof_dims();
+    const double crossing_tolerance = 8.0 * std::max(
+        seeded.geometry_tolerance(), unseeded.geometry_tolerance());
+    for (int k = 0; k < dims[2]; ++k) {
+        for (int j = 0; j < dims[1]; ++j) {
+            for (int i = 0; i < dims[0]; ++i) {
+                const int node = grid.index(i, j, k);
+                const std::array<int, 3> positive_neighbors{{
+                    i + 1 < dims[0] ? grid.index(i + 1, j, k) : -1,
+                    j + 1 < dims[1] ? grid.index(i, j + 1, k) : -1,
+                    k + 1 < dims[2] ? grid.index(i, j, k + 1) : -1}};
+                for (const int neighbor : positive_neighbors) {
+                    if (neighbor < 0)
+                        continue;
+                    const bool seeded_barrier =
+                        seeded.has_barrier_between(node, neighbor);
+                    require(seeded_barrier
+                                == unseeded.has_barrier_between(
+                                    node, neighbor),
+                            name + " barrier locations do not depend on triangle seeds");
+                    if (!seeded_barrier)
+                        continue;
+                    const auto& seeded_crossing =
+                        seeded.crossing_between(node, neighbor);
+                    const auto& unseeded_crossing =
+                        unseeded.crossing_between(node, neighbor);
+                    require((seeded_crossing.point
+                                - unseeded_crossing.point).norm()
+                                <= crossing_tolerance,
+                            name + " crossing points do not depend on triangle seeds");
+                }
+            }
+        }
+    }
+}
+
+void test_nurbs_cartesian_l_prism_labels()
+{
+    constexpr double h = 3.0 / 128.0;
+    const NativeNurbsSurface3D surface =
+        make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
+    const kfbim::CartesianGrid3D grid(
+        {-0.5625, -0.703125, -0.6328125},
+        {h, h, h}, {54, 54, 58}, kfbim::DofLayout3D::Node);
+
+    const kfbim::geometry3d::NurbsCartesianDomain3D domain(
+        grid, surface.geometry_model());
+    require(domain.label(grid.index(27, 27, 4)) == 1,
+            "L-prism reentrant lower-arm node is inside");
+    require(domain.label(grid.index(28, 28, 4)) == 0,
+            "L-prism missing quadrant is outside");
+
+    int mismatches = 0;
+    for (int node = 0; node < grid.num_dofs(); ++node) {
+        const auto x = grid.coord(node);
+        const Eigen::Vector3d point(x[0], x[1], x[2]);
+        const bool exact = surface.exact_inside(point);
+        mismatches += (domain.label(node) > 0) != exact ? 1 : 0;
+    }
+    require(mismatches == 0, "L-prism cropped-grid labels are exact");
+    require(domain.diagnostics().barrier_edge_counts[0]
+                + domain.diagnostics().barrier_edge_counts[1]
+                + domain.diagnostics().barrier_edge_counts[2] > 0,
+            "native crossings create Cartesian barriers");
+}
+
+void test_nurbs_cartesian_curved_targets_and_triangle_independence()
+{
+    const kfbim::CartesianGrid3D grid(
+        {-0.7767, -0.8329, -0.7093}, {0.05, 0.05, 0.05},
+        {34, 33, 31}, kfbim::DofLayout3D::Node);
+    const NativeNurbsSurface3D torus =
+        make_native_nurbs_surface_3d(GeometryKind3D::Torus);
+    const NativeNurbsSurface3D cylinder =
+        make_native_nurbs_surface_3d(GeometryKind3D::HollowCylinder);
+
+    require_triangle_seed_independent_domain(
+        grid, torus.geometry_model(),
+        grid.index(17, 16, 15), grid.index(28, 16, 15), "torus");
+    require_triangle_seed_independent_domain(
+        grid, cylinder.geometry_model(),
+        grid.index(17, 16, 15), grid.index(25, 16, 15),
+        "hollow cylinder");
+}
+
+void test_nurbs_cartesian_under_resolved_torus_fails_fast()
+{
+    const kfbim::CartesianGrid3D grid(
+        {-0.781, -0.841, -0.721}, {0.05, 0.05, 0.05},
+        {34, 33, 31}, kfbim::DofLayout3D::Node);
+    const NativeNurbsSurface3D torus =
+        make_native_nurbs_surface_3d(GeometryKind3D::Torus);
+    require_throws_contains_all(
+        [&] {
+            (void)kfbim::geometry3d::NurbsCartesianDomain3D(
+                grid, torus.geometry_model());
+        },
+        {"multiple crossings on Cartesian edge", "axis=0", "(6,13,19)"},
+        "under-resolved torus Cartesian grid fails instead of dropping a crossing");
+}
+
+void test_nurbs_cartesian_input_contracts()
+{
+    const NativeNurbsSurface3D torus =
+        make_native_nurbs_surface_3d(GeometryKind3D::Torus);
+    require_throws_contains(
+        [&] {
+            (void)kfbim::geometry3d::NurbsCartesianDomain3D(
+                kfbim::CartesianGrid3D(
+                    {-1.0, -1.0, -1.0}, {0.1, 0.1, 0.1},
+                    {20, 20, 20}, kfbim::DofLayout3D::CellCenter),
+                torus.geometry_model());
+        },
+        "node-layout Cartesian grid",
+        "NURBS Cartesian domain rejects non-node layouts");
+    require_throws_contains(
+        [&] {
+            (void)kfbim::geometry3d::NurbsCartesianDomain3D(
+                kfbim::CartesianGrid3D(
+                    {-1.0, -1.0, -1.0}, {0.0, 0.1, 0.1},
+                    {20, 20, 20}, kfbim::DofLayout3D::Node),
+                torus.geometry_model());
+        },
+        "positive finite Cartesian spacing",
+        "NURBS Cartesian domain rejects nonpositive spacing");
+
+    const auto model = torus.geometry_model();
+    const auto bounds = model.control_bounds();
+    require_throws_contains_all(
+        [&] {
+            (void)kfbim::geometry3d::NurbsCartesianDomain3D(
+                kfbim::CartesianGrid3D(
+                    {bounds.lower.x(), bounds.lower.y(), bounds.lower.z()},
+                    {0.1, 0.1, 0.1}, {20, 20, 20},
+                    kfbim::DofLayout3D::Node),
+                model);
+        },
+        {"NURBS surface must lie strictly inside Cartesian box",
+         "surface lower=(", "Cartesian box lower=("},
+        "NURBS Cartesian domain reports non-strict box bounds");
+}
+
+void test_nurbs_cartesian_multiple_components()
+{
+    const NativeNurbsSurface3D source =
+        make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
+    const kfbim::CartesianGrid3D grid(
+        {-0.7, -0.8, -0.7}, {0.05, 0.05, 0.05},
+        {64, 30, 30}, kfbim::DofLayout3D::Node);
+    const kfbim::geometry3d::NurbsCartesianDomain3D domain(
+        grid, two_translated_components(
+                  source.geometry_model(), Eigen::Vector3d(1.6, 0.0, 0.0)));
+
+    require(domain.label(grid.index(14, 10, 14)) == 1,
+            "first L-prism component has label one");
+    require(domain.label(grid.index(46, 10, 14)) == 2,
+            "translated L-prism component has label two");
+    require(domain.label(grid.index(30, 10, 14)) == 0,
+            "space between L-prism components is exterior");
+}
+
 void test_bezier_rejects_extreme_degree_control_count()
 {
     kfbim::geometry3d::RationalBezierElement3D element;
@@ -1679,6 +1907,11 @@ int main()
         test_single_patch_periodic_seam_canonicalization();
         test_tangent_witness_does_not_swallow_unresolved_candidate();
         test_native_nurbs_surface_intersector();
+        test_nurbs_cartesian_l_prism_labels();
+        test_nurbs_cartesian_under_resolved_torus_fails_fast();
+        test_nurbs_cartesian_input_contracts();
+        test_nurbs_cartesian_multiple_components();
+        test_nurbs_cartesian_curved_targets_and_triangle_independence();
         test_uniform_native_dofs();
         test_parameter_candidates();
         test_grid_edge_triangle_owners();
