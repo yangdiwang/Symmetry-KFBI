@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <iostream>
+#include <set>
 #include <stdexcept>
 #include <string>
 
@@ -9,9 +10,14 @@ namespace {
 
 using kfbim::app3d::GeometryKind3D;
 using kfbim::app3d::NativeNurbsSurface3D;
+using kfbim::app3d::PatchEdge3D;
+using kfbim::app3d::SmoothPatchNeighbor3D;
 using kfbim::app3d::SurfaceDofCloud3D;
+using kfbim::app3d::interpolate_triangle_parameter;
 using kfbim::app3d::make_native_nurbs_surface_3d;
 using kfbim::app3d::make_native_surface_dofs_3d;
+using kfbim::app3d::parameter_dof_candidates_2x2;
+using kfbim::app3d::smooth_patch_component;
 
 void require(bool condition, const std::string& message)
 {
@@ -162,6 +168,128 @@ void test_uniform_native_dofs()
     }
 }
 
+bool four_unique_valid_ids(const std::array<int, 4>& ids,
+                           const SurfaceDofCloud3D& cloud)
+{
+    std::set<int> unique;
+    for (int id : ids) {
+        if (id < 0 || id >= static_cast<int>(cloud.dofs.size()))
+            return false;
+        unique.insert(id);
+    }
+    return unique.size() == 4;
+}
+
+bool contains_patch(const std::array<int, 4>& ids,
+                    const SurfaceDofCloud3D& cloud,
+                    int patch_id)
+{
+    for (int id : ids) {
+        if (cloud.dofs[static_cast<std::size_t>(id)].patch_id == patch_id)
+            return true;
+    }
+    return false;
+}
+
+bool all_on_patch(const std::array<int, 4>& ids,
+                  const SurfaceDofCloud3D& cloud,
+                  int patch_id)
+{
+    for (int id : ids) {
+        if (cloud.dofs[static_cast<std::size_t>(id)].patch_id != patch_id)
+            return false;
+    }
+    return true;
+}
+
+void test_parameter_candidates()
+{
+    const NativeNurbsSurface3D torus =
+        make_native_nurbs_surface_3d(GeometryKind3D::Torus);
+    const SurfaceDofCloud3D torus_cloud =
+        make_native_surface_dofs_3d(torus, 3.0 / 32.0);
+    const auto interior = parameter_dof_candidates_2x2(
+        torus, torus_cloud, 0, 0.5, 0.5);
+    require(four_unique_valid_ids(interior, torus_cloud),
+            "interior query must have four valid DOFs");
+    require(all_on_patch(interior, torus_cloud, 0),
+            "interior query remains on its native patch");
+
+    const auto& torus_tensor = torus_cloud.patches[0];
+    const double torus_du = 1.0 / static_cast<double>(torus_tensor.nu);
+    const auto periodic = parameter_dof_candidates_2x2(
+        torus, torus_cloud, 0, 0.1 * torus_du, 0.5);
+    require(four_unique_valid_ids(periodic, torus_cloud),
+            "periodic query must have four valid DOFs");
+    require(contains_patch(periodic, torus_cloud, 12),
+            "torus closed seam reaches previous u quarter");
+
+    const NativeNurbsSurface3D lprism =
+        make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
+    const SurfaceDofCloud3D lcloud =
+        make_native_surface_dofs_3d(lprism, 3.0 / 32.0);
+    const auto& top_left = lcloud.patches[3];
+    const double ldu = 1.0 / static_cast<double>(top_left.nu);
+    const auto sharp = parameter_dof_candidates_2x2(
+        lprism, lcloud, 3, 0.1 * ldu, 0.5);
+    require(four_unique_valid_ids(sharp, lcloud),
+            "sharp-edge query must retain four candidates");
+    require(all_on_patch(sharp, lcloud, 3),
+            "non-G1 edge remains on the source patch");
+
+    const auto smooth = parameter_dof_candidates_2x2(
+        lprism, lcloud, 3, 1.0 - 0.1 * ldu, 0.5);
+    require(four_unique_valid_ids(smooth, lcloud),
+            "smooth L-cap seam must retain four candidates");
+    require(contains_patch(smooth, lcloud, 4),
+            "smooth L-cap seam reaches its neighboring patch");
+
+    NativeNurbsSurface3D reversed;
+    reversed.name = "reversed_test";
+    reversed.description = "two coplanar patches with reversed edge parameter";
+    reversed.patches.push_back(
+        kfbim::geometry3d::NurbsSurfacePatch3D::make_bilinear_plane(
+            {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0},
+            {0.0, 1.0, 0.0}, {1.0, 1.0, 0.0}));
+    reversed.patches.push_back(
+        kfbim::geometry3d::NurbsSurfacePatch3D::make_bilinear_plane(
+            {2.0, 1.0, 0.0}, {1.0, 1.0, 0.0},
+            {2.0, 0.0, 0.0}, {1.0, 0.0, 0.0}));
+    reversed.patch_names = {"left", "right_reversed"};
+    reversed.smooth_neighbors.resize(2);
+    reversed.smooth_neighbors[0][static_cast<int>(PatchEdge3D::UMax)] =
+        SmoothPatchNeighbor3D{1, PatchEdge3D::UMax, true};
+    reversed.smooth_neighbors[1][static_cast<int>(PatchEdge3D::UMax)] =
+        SmoothPatchNeighbor3D{0, PatchEdge3D::UMax, true};
+    reversed.expected_area = 2.0;
+    reversed.exact_inside = [](const Eigen::Vector3d&) { return false; };
+    const SurfaceDofCloud3D reversed_cloud =
+        make_native_surface_dofs_3d(reversed, 0.2);
+    const auto reversed_ids = parameter_dof_candidates_2x2(
+        reversed, reversed_cloud, 0, 0.99, 0.2);
+    require(contains_patch(reversed_ids, reversed_cloud, 1),
+            "reversed smooth seam reaches its neighbor");
+    bool found_high_v = false;
+    for (int id : reversed_ids) {
+        const auto& dof = reversed_cloud.dofs[static_cast<std::size_t>(id)];
+        if (dof.patch_id == 1 && dof.v > 0.5)
+            found_high_v = true;
+    }
+    require(found_high_v,
+            "reversed smooth seam reverses the along-edge parameter");
+
+    kfbim::geometry3d::NurbsParamTriangle3D triangle;
+    triangle.patch_index = 7;
+    triangle.uv = {{{0.0, 0.0}, {1.0, 0.0}, {0.0, 2.0}}};
+    const Eigen::Vector2d uv = interpolate_triangle_parameter(
+        triangle, Eigen::Vector3d(0.2, 0.3, 0.5));
+    require((uv - Eigen::Vector2d(0.3, 1.0)).norm() < 1.0e-14,
+            "triangle barycentric UV interpolation");
+
+    require(smooth_patch_component(torus, 0).size() == 16,
+            "torus smooth component contains every native patch");
+}
+
 } // namespace
 
 int main()
@@ -169,6 +297,7 @@ int main()
     try {
         test_native_models();
         test_uniform_native_dofs();
+        test_parameter_candidates();
         std::cout << "native NURBS model tests passed\n";
         return 0;
     } catch (const std::exception& error) {

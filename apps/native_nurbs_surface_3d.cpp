@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <queue>
+#include <set>
 #include <stdexcept>
 #include <utility>
 
@@ -496,6 +498,233 @@ SurfaceDofCloud3D make_native_surface_dofs_3d(
         cloud.patches.push_back(std::move(tensor_patch));
     }
     return cloud;
+}
+
+namespace {
+
+struct DofLatticeCoordinate3D {
+    int patch = -1;
+    int i = -1;
+    int j = -1;
+};
+
+bool lattice_coordinate_is_inside(const SurfaceDofCloud3D& cloud,
+                                  const DofLatticeCoordinate3D& coordinate)
+{
+    if (coordinate.patch < 0
+        || coordinate.patch >= static_cast<int>(cloud.patches.size())) {
+        return false;
+    }
+    const SurfaceDofPatch3D& patch =
+        cloud.patches[static_cast<std::size_t>(coordinate.patch)];
+    return coordinate.i >= 0 && coordinate.i < patch.nu
+        && coordinate.j >= 0 && coordinate.j < patch.nv;
+}
+
+PatchEdge3D first_crossed_edge(const SurfaceDofPatch3D& patch,
+                               const DofLatticeCoordinate3D& coordinate)
+{
+    if (coordinate.i < 0)
+        return PatchEdge3D::UMin;
+    if (coordinate.i >= patch.nu)
+        return PatchEdge3D::UMax;
+    if (coordinate.j < 0)
+        return PatchEdge3D::VMin;
+    return PatchEdge3D::VMax;
+}
+
+int along_index(PatchEdge3D edge,
+                const DofLatticeCoordinate3D& coordinate)
+{
+    return edge == PatchEdge3D::UMin || edge == PatchEdge3D::UMax
+        ? coordinate.j
+        : coordinate.i;
+}
+
+int along_count(PatchEdge3D edge, const SurfaceDofPatch3D& patch)
+{
+    return edge == PatchEdge3D::UMin || edge == PatchEdge3D::UMax
+        ? patch.nv
+        : patch.nu;
+}
+
+void reflect_across_feature_edge(PatchEdge3D edge,
+                                 const SurfaceDofPatch3D& patch,
+                                 DofLatticeCoordinate3D& coordinate)
+{
+    switch (edge) {
+    case PatchEdge3D::UMin:
+        coordinate.i = -coordinate.i;
+        break;
+    case PatchEdge3D::UMax:
+        coordinate.i = 2 * patch.nu - 2 - coordinate.i;
+        break;
+    case PatchEdge3D::VMin:
+        coordinate.j = -coordinate.j;
+        break;
+    case PatchEdge3D::VMax:
+        coordinate.j = 2 * patch.nv - 2 - coordinate.j;
+        break;
+    }
+}
+
+void cross_smooth_edge(const SurfaceDofCloud3D& cloud,
+                       PatchEdge3D source_edge,
+                       const SmoothPatchNeighbor3D& connection,
+                       DofLatticeCoordinate3D& coordinate)
+{
+    const SurfaceDofPatch3D& source =
+        cloud.patches[static_cast<std::size_t>(coordinate.patch)];
+    const int source_along_index = along_index(source_edge, coordinate);
+    const int source_along_count = along_count(source_edge, source);
+    double along = (static_cast<double>(source_along_index) + 0.5)
+                 / static_cast<double>(source_along_count);
+    if (connection.reversed)
+        along = 1.0 - along;
+
+    coordinate.patch = connection.patch;
+    const SurfaceDofPatch3D& destination =
+        cloud.patches[static_cast<std::size_t>(coordinate.patch)];
+    const int destination_along_count =
+        along_count(connection.edge, destination);
+    const int destination_along_index = static_cast<int>(
+        std::floor(along * static_cast<double>(destination_along_count)));
+    switch (connection.edge) {
+    case PatchEdge3D::UMin:
+        coordinate.i = 0;
+        coordinate.j = destination_along_index;
+        break;
+    case PatchEdge3D::UMax:
+        coordinate.i = destination.nu - 1;
+        coordinate.j = destination_along_index;
+        break;
+    case PatchEdge3D::VMin:
+        coordinate.i = destination_along_index;
+        coordinate.j = 0;
+        break;
+    case PatchEdge3D::VMax:
+        coordinate.i = destination_along_index;
+        coordinate.j = destination.nv - 1;
+        break;
+    }
+}
+
+int resolve_lattice_candidate(const NativeNurbsSurface3D& surface,
+                              const SurfaceDofCloud3D& cloud,
+                              DofLatticeCoordinate3D coordinate)
+{
+    for (int crossing = 0; crossing < 4; ++crossing) {
+        if (lattice_coordinate_is_inside(cloud, coordinate)) {
+            const SurfaceDofPatch3D& patch =
+                cloud.patches[static_cast<std::size_t>(coordinate.patch)];
+            return patch.dof_index(coordinate.i, coordinate.j);
+        }
+        if (coordinate.patch < 0
+            || coordinate.patch >= static_cast<int>(cloud.patches.size())) {
+            throw std::runtime_error("2x2 candidate has invalid patch");
+        }
+        const SurfaceDofPatch3D& patch =
+            cloud.patches[static_cast<std::size_t>(coordinate.patch)];
+        const PatchEdge3D edge = first_crossed_edge(patch, coordinate);
+        const auto& connection =
+            surface.smooth_neighbors[static_cast<std::size_t>(coordinate.patch)]
+                                    [static_cast<std::size_t>(edge_index(edge))];
+        if (connection)
+            cross_smooth_edge(cloud, edge, *connection, coordinate);
+        else
+            reflect_across_feature_edge(edge, patch, coordinate);
+    }
+    throw std::runtime_error("2x2 candidate crossed too many patch edges");
+}
+
+std::array<int, 2> bracketing_center_indices(double parameter,
+                                             double start,
+                                             double end,
+                                             int count)
+{
+    const double delta = (end - start) / static_cast<double>(count);
+    const int lower = static_cast<int>(
+        std::floor((parameter - start) / delta - 0.5));
+    return {{lower, lower + 1}};
+}
+
+} // namespace
+
+std::array<int, 4> parameter_dof_candidates_2x2(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud3D& cloud,
+    int patch_id,
+    double u,
+    double v)
+{
+    if (patch_id < 0
+        || patch_id >= static_cast<int>(surface.patches.size())
+        || surface.patches.size() != cloud.patches.size()
+        || surface.smooth_neighbors.size() != surface.patches.size()) {
+        throw std::invalid_argument("invalid native patch for 2x2 DOF lookup");
+    }
+    const geometry3d::NurbsSurfacePatch3D& patch =
+        surface.patches[static_cast<std::size_t>(patch_id)];
+    const SurfaceDofPatch3D& tensor =
+        cloud.patches[static_cast<std::size_t>(patch_id)];
+    const std::array<int, 2> indices_u = bracketing_center_indices(
+        u, patch.domain_start_u(), patch.domain_end_u(), tensor.nu);
+    const std::array<int, 2> indices_v = bracketing_center_indices(
+        v, patch.domain_start_v(), patch.domain_end_v(), tensor.nv);
+
+    std::array<int, 4> result{};
+    int candidate = 0;
+    for (int i : indices_u) {
+        for (int j : indices_v) {
+            result[static_cast<std::size_t>(candidate++)] =
+                resolve_lattice_candidate(
+                    surface, cloud, {patch_id, i, j});
+        }
+    }
+    const std::set<int> unique(result.begin(), result.end());
+    if (unique.size() != result.size())
+        throw std::runtime_error("2x2 parameter lookup did not produce four DOFs");
+    return result;
+}
+
+Eigen::Vector2d interpolate_triangle_parameter(
+    const geometry3d::NurbsParamTriangle3D& triangle,
+    const Eigen::Vector3d& barycentric)
+{
+    if (!barycentric.allFinite())
+        throw std::invalid_argument("triangle barycentric coordinates are not finite");
+    return barycentric.x() * triangle.uv[0]
+         + barycentric.y() * triangle.uv[1]
+         + barycentric.z() * triangle.uv[2];
+}
+
+std::vector<int> smooth_patch_component(const NativeNurbsSurface3D& surface,
+                                        int patch)
+{
+    if (patch < 0 || patch >= static_cast<int>(surface.patches.size())
+        || surface.smooth_neighbors.size() != surface.patches.size()) {
+        throw std::invalid_argument("invalid patch for smooth component query");
+    }
+    std::vector<int> result;
+    std::vector<bool> visited(surface.patches.size(), false);
+    std::queue<int> pending;
+    visited[static_cast<std::size_t>(patch)] = true;
+    pending.push(patch);
+    while (!pending.empty()) {
+        const int current = pending.front();
+        pending.pop();
+        result.push_back(current);
+        for (const auto& connection :
+             surface.smooth_neighbors[static_cast<std::size_t>(current)]) {
+            if (connection
+                && !visited[static_cast<std::size_t>(connection->patch)]) {
+                visited[static_cast<std::size_t>(connection->patch)] = true;
+                pending.push(connection->patch);
+            }
+        }
+    }
+    std::sort(result.begin(), result.end());
+    return result;
 }
 
 } // namespace kfbim::app3d

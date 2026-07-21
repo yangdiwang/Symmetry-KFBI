@@ -86,4 +86,19 @@ struct SurfaceDofCloud3D {
     const NativeNurbsSurface3D& surface,
     double h);
 
+[[nodiscard]] std::array<int, 4> parameter_dof_candidates_2x2(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud3D& cloud,
+    int patch,
+    double u,
+    double v);
+
+[[nodiscard]] Eigen::Vector2d interpolate_triangle_parameter(
+    const geometry3d::NurbsParamTriangle3D& triangle,
+    const Eigen::Vector3d& barycentric);
+
+[[nodiscard]] std::vector<int> smooth_patch_component(
+    const NativeNurbsSurface3D& surface,
+    int patch);
+
 } // namespace kfbim::app3d
