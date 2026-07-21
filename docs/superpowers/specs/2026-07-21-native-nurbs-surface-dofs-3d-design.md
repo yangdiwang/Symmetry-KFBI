@@ -15,10 +15,10 @@ Introduce one native surface model containing:
 - the ordered `NurbsSurfacePatch3D` collection;
 - a stable name for every patch;
 - the orientation implied by each patch parameterization;
-- smooth edge-to-edge connections, including the paired edges and whether the
-  neighboring edge parameter is reversed;
-- non-smooth geometric edges, which are deliberately absent from the smooth
-  adjacency graph.
+- complete topological edge-to-edge connections, including the paired edges
+  and whether the neighboring edge parameter is reversed;
+- the G1 subset of those connections, stored separately for parameter-based
+  crossing ownership.
 
 The model is the sole source for both NURBS triangulation and surface-DOF
 generation. The three geometries use these native decompositions:
@@ -64,19 +64,20 @@ indices `(i,j)`, point, normal, tangential frame, and midpoint quadrature
 weight. No DOF lies on a patch edge because all DOFs are parameter-cell
 centers.
 
-## Smooth Patch Connectivity
+## Patch Connectivity
 
-Patch edge matching records an explicit edge-to-edge parameter transformation.
-The connection is admitted only when the physical edge curves coincide and
-the surface normals agree to the configured smoothness tolerance. This handles
-closed torus and cylinder seams without interpolating raw global angles across
-`0` and `2*pi`; the query crosses a paired NURBS edge and applies its local
-parameter orientation.
+Patch edge matching records an explicit edge-to-edge parameter transformation
+for every pair of native patches that share a physical edge. A connection is
+also placed in the G1 subset only when the surface normals agree to the
+configured smoothness tolerance. This handles closed torus and cylinder seams
+without interpolating raw global angles across `0` and `2*pi`.
 
-Non-G1 edges never contribute neighboring candidates. In particular, an
-L-prism query near a sharp or re-entrant edge remains on its incident native
-patch. The same smooth adjacency graph constrains local Cauchy sampling so a
-single local polynomial never gathers data across a geometric corner.
+The two graphs have different purposes. Crossing-to-DOF association uses only
+the G1 graph, so an L-prism query near a sharp or re-entrant edge remains on
+its incident native patch. Cauchy stencil construction uses the complete
+topological graph, so its local polynomial may gather samples across a non-G1
+edge but cannot jump between geometrically close, topologically unrelated
+surface sheets such as the inner and outer cylinder walls.
 
 ## Crossing-to-DOF Association
 
@@ -106,10 +107,12 @@ evaluated from this geometric approximation.
 ## Cauchy Stencils
 
 The owner DOF remains the center of one degree-three local harmonic Cauchy
-polynomial. Stencil construction starts from its native tensor grid and may
-expand only through smooth edge connections. Candidate samples are finally
-ranked in physical space. Existing value/normal sample counts and polynomial
-order remain unchanged.
+polynomial. Stencil construction performs a breadth-first expansion from its
+native patch over the complete topological adjacency graph, including non-G1
+edges, until the accumulated patches contain enough samples for the requested
+48 value and 28 normal data. Candidate samples within that topological
+neighborhood are finally ranked by three-dimensional Euclidean distance. The
+center DOF is retained, and the existing polynomial order remains unchanged.
 
 ## Validation
 
@@ -124,7 +127,11 @@ Add deterministic checks covering:
 - L-prism coplanar seams admitted and all sharp edges rejected;
 - `2 x 2` owner candidates on patch interiors and smooth seams;
 - no candidates crossing non-G1 L-prism edges;
-- local Cauchy stencils confined to the smooth patch component;
+- crossing candidates remain confined to the G1 patch component;
+- L-prism Cauchy stencils near a sharp edge include samples from the
+  topologically adjacent patch across that non-G1 edge;
+- Cauchy stencils do not select samples from topologically unrelated patches
+  merely because their Euclidean distance is small;
 - successful builds and `16/32/64` runs for all three geometries;
 - comparison of Neumann first-kind and Dirichlet normal second-kind errors,
   convergence orders, iteration counts, and final residuals against the
@@ -134,6 +141,7 @@ Add deterministic checks covering:
 
 This change replaces the three geometry-specific analytic DOF builders with a
 shared native-NURBS builder and changes crossing ownership/stencil topology as
-described above. It does not replace the triangulated geometry used by
-`GridPair3D`, change the cubic Cauchy polynomial, change tricubic restriction,
-or change either Krylov equation.
+described above. Crossing ownership and Cauchy sampling deliberately use
+different adjacency graphs. It does not replace the triangulated geometry
+used by `GridPair3D`, change the cubic Cauchy polynomial, change tricubic
+restriction, or change either Krylov equation.
