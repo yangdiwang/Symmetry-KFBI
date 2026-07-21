@@ -1,6 +1,7 @@
 #include "native_nurbs_surface_3d.hpp"
 
 #include "src/geometry/grid_pair_3d.hpp"
+#include "src/geometry/rational_bezier_surface_3d.hpp"
 #include "src/geometry/nurbs_surface_model_3d.hpp"
 #include "src/grid/cartesian_grid_3d.hpp"
 #include "src/transfer/laplace_correction_support.hpp"
@@ -255,6 +256,96 @@ void test_interval_topology_rejects_tiny_overlap()
         [&] { (void)model.validate_closed(); },
         "multiply covered patch-edge interval",
         "tiny positive patch-edge overlap is rejected");
+}
+
+void check_bezier_element_samples(
+    const kfbim::geometry3d::RationalBezierElement3D& element,
+    const kfbim::geometry3d::NurbsSurfacePatch3D& patch,
+    const std::string& context)
+{
+    for (const Eigen::Vector4d& control : element.homogeneous_controls) {
+        require(control.w() > 0.0,
+                context + " positive homogeneous control weight");
+    }
+    for (int iu = 0; iu <= 4; ++iu) {
+        for (int iv = 0; iv <= 4; ++iv) {
+            const double u = element.u0()
+                + (element.u1() - element.u0()) * iu / 4.0;
+            const double v = element.v0()
+                + (element.v1() - element.v0()) * iv / 4.0;
+            const Eigen::Vector3d exact = patch.evaluate(u, v);
+            require((element.evaluate(u, v) - exact).norm() < 2.0e-12,
+                    context + " Bezier extraction preserves NURBS evaluation");
+            require(element.bounds().contains(exact, 2.0e-12),
+                    context + " Bezier control hull conservatively bounds surface");
+        }
+    }
+}
+
+void test_rational_bezier_extraction_and_subdivision()
+{
+    using kfbim::geometry::NurbsBasis1D;
+    using kfbim::geometry3d::NurbsSurfacePatch3D;
+    const NurbsSurfacePatch3D multispan_patch(
+        NurbsBasis1D(2, {0, 0, 0, 0.5, 1, 1, 1}),
+        NurbsBasis1D(1, {0, 0, 1, 1}),
+        {{{0.00, 0.0, 0.0}, {0.00, 1.0, 0.0}},
+         {{0.25, 0.0, 0.0}, {0.25, 1.0, 0.0}},
+         {{0.75, 0.0, 0.0}, {0.75, 1.0, 0.0}},
+         {{1.00, 0.0, 0.0}, {1.00, 1.0, 0.0}}},
+        {{1.0, 1.2}, {0.8, 1.1}, {1.3, 0.9}, {1.0, 1.4}});
+    const kfbim::geometry3d::NurbsSurfaceModel3D model(
+        {multispan_patch}, {0}, {});
+    const auto elements =
+        kfbim::geometry3d::extract_rational_bezier_elements_3d(model);
+    require(elements.size() == 2, "two U knot spans produce two elements");
+    require(elements[0].u0() == 0.0 && elements[0].u1() == 0.5
+                && elements[1].u0() == 0.5 && elements[1].u1() == 1.0,
+            "Bezier elements retain their native U knot spans");
+    for (const auto& element : elements) {
+        require(element.patch_index == 0 && element.component == 0,
+                "Bezier element retains patch and component IDs");
+        require(element.degree_u == 2 && element.degree_v == 1,
+                "Bezier element retains tensor-product degrees");
+        check_bezier_element_samples(element, model.patch(0), "original element");
+        for (const auto& u_child : element.split_u()) {
+            for (const auto& child : u_child.split_v()) {
+                check_bezier_element_samples(
+                    child, model.patch(0), "de Casteljau child");
+            }
+        }
+    }
+
+    const auto refined =
+        kfbim::geometry3d::subdivide_rational_bezier_elements_to_extent_3d(
+            elements, 0.2);
+    require(refined.size() > elements.size(),
+            "extent subdivision refines oversized Bezier elements");
+    for (const auto& element : refined) {
+        require(element.bounds().max_extent() <= 0.2,
+                "extent subdivision returns only bounded leaves");
+        check_bezier_element_samples(element, model.patch(0), "extent child");
+    }
+}
+
+void test_benchmark_rational_bezier_elements_are_conservative()
+{
+    for (GeometryKind3D kind : {GeometryKind3D::Torus,
+                                GeometryKind3D::HollowCylinder,
+                                GeometryKind3D::LPrism}) {
+        const NativeNurbsSurface3D surface = make_native_nurbs_surface_3d(kind);
+        const kfbim::geometry3d::NurbsSurfaceModel3D model =
+            surface.geometry_model();
+        const auto elements =
+            kfbim::geometry3d::extract_rational_bezier_elements_3d(model);
+        require(!elements.empty(), surface.name + " has Bezier elements");
+        for (const auto& element : elements) {
+            check_bezier_element_samples(
+                element,
+                model.patch(element.patch_index),
+                surface.name + " benchmark element");
+        }
+    }
 }
 
 double dof_area(const SurfaceDofCloud3D& cloud)
@@ -675,6 +766,8 @@ int main()
         test_interval_topology_rejects_out_of_domain_endpoint();
         test_interval_topology_rejects_tiny_gap();
         test_interval_topology_rejects_tiny_overlap();
+        test_rational_bezier_extraction_and_subdivision();
+        test_benchmark_rational_bezier_elements_are_conservative();
         test_uniform_native_dofs();
         test_parameter_candidates();
         test_grid_edge_triangle_owners();
