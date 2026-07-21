@@ -1,8 +1,10 @@
 #include "native_nurbs_surface_3d.hpp"
 
 #include "src/geometry/grid_pair_3d.hpp"
+#include "src/geometry/nurbs_bezier_extraction_3d.hpp"
 #include "src/geometry/nurbs_bezier_intersection_3d.hpp"
-#include "src/geometry/rational_bezier_surface_3d.hpp"
+#include "src/geometry/rational_bezier_element_3d.hpp"
+#include "src/geometry/rational_bezier_subdivision_3d.hpp"
 #include "src/geometry/nurbs_surface_model_3d.hpp"
 #include "src/grid/cartesian_grid_3d.hpp"
 #include "src/transfer/laplace_correction_support.hpp"

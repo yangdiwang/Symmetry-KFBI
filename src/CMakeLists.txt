@@ -42,7 +42,9 @@ if(KFBIM_BUILD_3D)
         geometry/p2_projection_3d.cpp
         geometry/nurbs_patch_triangulator_3d.cpp
         geometry/nurbs_bezier_intersection_3d.cpp
-        geometry/rational_bezier_surface_3d.cpp
+        geometry/nurbs_bezier_extraction_3d.cpp
+        geometry/rational_bezier_element_3d.cpp
+        geometry/rational_bezier_subdivision_3d.cpp
         geometry/nurbs_surface_model_3d.cpp
         local_cauchy/edge_patch_laplacian_3d.cpp
         local_cauchy/edge_singular_bspline_fit_3d.cpp

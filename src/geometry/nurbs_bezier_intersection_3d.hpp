@@ -1,6 +1,6 @@
 #pragma once
 
-#include "rational_bezier_surface_3d.hpp"
+#include "rational_bezier_element_3d.hpp"
 
 #include <Eigen/Dense>
 
