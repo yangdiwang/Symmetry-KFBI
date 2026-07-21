@@ -1017,6 +1017,16 @@ private:
     {
         int patch = owner.nurbs_patch_index;
         Eigen::Vector2d uv = owner.nurbs_parameter;
+        if (patch >= 0) {
+            if (patch >= static_cast<int>(native_surface_.patches.size())) {
+                throw std::runtime_error(
+                    "native crossing patch index is outside the readiness NURBS surface");
+            }
+            if (!uv.allFinite()) {
+                throw std::runtime_error(
+                    "native crossing parameters are not finite");
+            }
+        }
         if (patch < 0) {
             const geometry3d::NurbsParamTriangle3D* triangle = nullptr;
             Eigen::Vector3d barycentric = Eigen::Vector3d::Zero();

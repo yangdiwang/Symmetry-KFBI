@@ -43,6 +43,7 @@ public:
     const NurbsCartesianDomainDiagnostics3D& diagnostics() const;
     const NurbsAabb3D& surface_bounds() const;
     double geometry_tolerance() const;
+    bool is_compatible_grid(const CartesianGrid3D& grid) const noexcept;
 
 private:
     struct Impl;

@@ -212,6 +212,10 @@ std::string strict_box_error(const NurbsAabb3D& surface,
 } // namespace
 
 struct NurbsCartesianDomain3D::Impl {
+    DofLayout3D grid_layout = DofLayout3D::Node;
+    std::array<int, 3> grid_cells{{0, 0, 0}};
+    std::array<double, 3> grid_origin{{0.0, 0.0, 0.0}};
+    std::array<double, 3> grid_spacing{{0.0, 0.0, 0.0}};
     std::array<int, 3> dims{{0, 0, 0}};
     int plane_stride = 0;
     int node_count = 0;
@@ -226,6 +230,10 @@ struct NurbsCartesianDomain3D::Impl {
     Impl(const CartesianGrid3D& grid,
          NurbsSurfaceModel3D model,
          NurbsCartesianDomainOptions3D options)
+        : grid_layout(grid.layout())
+        , grid_cells(grid.num_cells())
+        , grid_origin(grid.origin())
+        , grid_spacing(grid.spacing())
     {
         if (grid.layout() != DofLayout3D::Node) {
             throw std::invalid_argument(
@@ -506,6 +514,14 @@ struct NurbsCartesianDomain3D::Impl {
 
         flood_and_label(grid, intersector);
         verify_barriers();
+    }
+
+    bool is_compatible_grid(const CartesianGrid3D& grid) const noexcept
+    {
+        return grid.layout() == grid_layout
+            && grid.num_cells() == grid_cells
+            && grid.origin() == grid_origin
+            && grid.spacing() == grid_spacing;
     }
 
     std::array<int, 3> node_coordinates(int node) const
@@ -810,6 +826,12 @@ const NurbsAabb3D& NurbsCartesianDomain3D::surface_bounds() const
 double NurbsCartesianDomain3D::geometry_tolerance() const
 {
     return impl_->tolerance;
+}
+
+bool NurbsCartesianDomain3D::is_compatible_grid(
+    const CartesianGrid3D& grid) const noexcept
+{
+    return impl_->is_compatible_grid(grid);
 }
 
 } // namespace kfbim::geometry3d

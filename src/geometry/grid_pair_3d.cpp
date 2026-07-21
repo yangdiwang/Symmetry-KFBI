@@ -676,6 +676,10 @@ GridPair3D::GridPair3D(
     , nurbs_domain_(std::move(nurbs_domain))
     , impl_(std::make_unique<Impl>())
 {
+    if (nurbs_domain_ && !nurbs_domain_->is_compatible_grid(grid_)) {
+        throw std::invalid_argument(
+            "GridPair3D native NURBS domain grid does not match the supplied Cartesian grid");
+    }
     const bool profile = profile_grid_pair_3d();
     const ProfileClock3D::time_point t_total_start = ProfileClock3D::now();
     const int Nq = iface.num_points();

@@ -51,6 +51,9 @@ public:
     GridPair3D(const CartesianGrid3D& grid,
                const Interface3D& correction_interface,
                const Interface3D& crossing_geometry);
+    // A non-null domain must have been built from this exact Cartesian grid.
+    // The correction/crossing interfaces and domain must also derive from the
+    // same native NURBS surface model.
     GridPair3D(
         const CartesianGrid3D& grid,
         const Interface3D& correction_interface,

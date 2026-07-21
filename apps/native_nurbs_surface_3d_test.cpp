@@ -1402,6 +1402,54 @@ void test_nurbs_cartesian_l_prism_labels()
     const auto triangulation =
         kfbim::geometry3d::triangulate_nurbs_surface_patches_3d(
             surface.patches, h);
+    require(domain->is_compatible_grid(grid),
+            "native domain recognizes its Cartesian grid");
+    auto require_grid_mismatch = [&](const kfbim::CartesianGrid3D& other,
+                                     const std::string& name) {
+        require(other.num_dofs() == grid.num_dofs(),
+                name + " preserves the grid DOF count");
+        require(!domain->is_compatible_grid(other),
+                name + " changes the native domain grid signature");
+        require_throws_contains(
+            [&] {
+                (void)kfbim::GridPair3D(
+                    other,
+                    triangulation.interface,
+                    triangulation.geometry_interface,
+                    domain);
+            },
+            "native NURBS domain grid does not match",
+            name + " is rejected before native labels are installed");
+    };
+
+    auto shifted_origin = grid.origin();
+    shifted_origin[0] += 0.125 * h;
+    require_grid_mismatch(
+        kfbim::CartesianGrid3D(
+            shifted_origin,
+            grid.spacing(),
+            grid.num_cells(),
+            kfbim::DofLayout3D::Node),
+        "same-size shifted grid");
+
+    auto reshaped_cells = grid.num_cells();
+    std::swap(reshaped_cells[1], reshaped_cells[2]);
+    require_grid_mismatch(
+        kfbim::CartesianGrid3D(
+            grid.origin(),
+            grid.spacing(),
+            reshaped_cells,
+            kfbim::DofLayout3D::Node),
+        "same-DOF reshaped grid");
+
+    require_grid_mismatch(
+        kfbim::CartesianGrid3D(
+            grid.origin(),
+            grid.spacing(),
+            grid.dof_dims(),
+            kfbim::DofLayout3D::CellCenter),
+        "same-DOF cell-center grid");
+
     kfbim::GridPair3D pair(grid,
                            triangulation.interface,
                            triangulation.geometry_interface,
