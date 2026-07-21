@@ -1,5 +1,9 @@
 #include "native_nurbs_surface_3d.hpp"
 
+#include "src/geometry/grid_pair_3d.hpp"
+#include "src/grid/cartesian_grid_3d.hpp"
+#include "src/transfer/laplace_correction_support.hpp"
+
 #include <cmath>
 #include <iostream>
 #include <set>
@@ -290,6 +294,57 @@ void test_parameter_candidates()
             "torus smooth component contains every native patch");
 }
 
+void test_grid_edge_triangle_owners()
+{
+    constexpr int N = 16;
+    constexpr double box_min = -1.5;
+    const double h = 3.0 / static_cast<double>(N);
+    const NativeNurbsSurface3D torus =
+        make_native_nurbs_surface_3d(GeometryKind3D::Torus);
+    kfbim::geometry3d::NurbsPatchTriangulatorOptions3D options;
+    options.H_factor = 2.0;
+    options.max_depth = 6;
+    const auto triangulation =
+        kfbim::geometry3d::triangulate_nurbs_surface_patches_3d(
+            torus.patches, h, options);
+    require(triangulation.geometry_triangles.size()
+                == static_cast<std::size_t>(
+                    triangulation.geometry_interface.num_panels()),
+            "geometry triangle metadata must align with panels");
+    kfbim::CartesianGrid3D grid(
+        {box_min, box_min, box_min}, {h, h, h}, {N, N, N},
+        kfbim::DofLayout3D::Node);
+    kfbim::GridPair3D pair(
+        grid, triangulation.interface, triangulation.geometry_interface);
+    const kfbim::LaplaceCorrectionSupport3D support =
+        kfbim::build_laplace_correction_support_3d(
+            pair, "native NURBS crossing-owner test");
+    std::set<std::pair<int, int>> crossing_edges;
+    for (const auto& operation : support.crossing_ops) {
+        crossing_edges.emplace(
+            std::min(operation.rhs_node, operation.correction_node),
+            std::max(operation.rhs_node, operation.correction_node));
+    }
+    require(!crossing_edges.empty(), "torus must cross Cartesian edges");
+    for (const auto& edge : crossing_edges) {
+        const kfbim::P2CrossingOwner3D owner =
+            pair.p2_crossing_owner_between(edge.first, edge.second);
+        require(owner.status
+                    != kfbim::P2CrossingOwnerStatus3D::EndpointNearestCenter,
+                "closed NURBS geometry must provide a triangle owner");
+        require(owner.geometry_panel_index >= 0
+                    && owner.geometry_panel_index
+                           < triangulation.geometry_interface.num_panels(),
+                "valid geometry panel index");
+        require(std::abs(owner.geometry_barycentric.sum() - 1.0) < 1.0e-12,
+                "triangle barycentric partition");
+        require(owner.geometry_barycentric.minCoeff() >= -1.0e-10,
+                "triangle barycentric lower bound");
+        require(owner.edge_parameter >= 0.0 && owner.edge_parameter <= 1.0,
+                "Cartesian-edge phase");
+    }
+}
+
 } // namespace
 
 int main()
@@ -298,6 +353,7 @@ int main()
         test_native_models();
         test_uniform_native_dofs();
         test_parameter_candidates();
+        test_grid_edge_triangle_owners();
         std::cout << "native NURBS model tests passed\n";
         return 0;
     } catch (const std::exception& error) {

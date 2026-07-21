@@ -3,6 +3,9 @@
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
 #include <CGAL/Surface_mesh.h>
 #include <CGAL/Side_of_triangle_mesh.h>
+#include <CGAL/AABB_tree.h>
+#include <CGAL/AABB_traits.h>
+#include <CGAL/AABB_face_graph_triangle_primitive.h>
 #include <CGAL/Search_traits_3.h>
 #include <CGAL/Search_traits_adapter.h>
 #include <CGAL/Orthogonal_k_neighbor_search.h>
@@ -18,6 +21,7 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
+#include <boost/variant/get.hpp>
 
 namespace kfbim {
 
@@ -33,6 +37,11 @@ using CSearchTraits3 =
                                 CSearchBaseTraits3>;
 using CNeighborSearch3 = CGAL::Orthogonal_k_neighbor_search<CSearchTraits3>;
 using CSearchTree3 = CNeighborSearch3::Tree;
+using CSegment3 = K3::Segment_3;
+using CFace3 = boost::graph_traits<CMesh3>::face_descriptor;
+using CAabbPrimitive3 = CGAL::AABB_face_graph_triangle_primitive<CMesh3>;
+using CAabbTraits3 = CGAL::AABB_traits<K3, CAabbPrimitive3>;
+using CAabbTree3 = CGAL::AABB_tree<CAabbTraits3>;
 
 // ============================================================================
 // Internal helpers
@@ -174,6 +183,39 @@ static std::vector<DistanceSample3D> p2_expansion_center_samples_3d(
         }
     }
     return samples;
+}
+
+static Eigen::Vector3d to_eigen(const CPoint3& point)
+{
+    return {CGAL::to_double(point.x()),
+            CGAL::to_double(point.y()),
+            CGAL::to_double(point.z())};
+}
+
+static Eigen::Vector3d triangle_barycentric(const Interface3D& iface,
+                                            int panel,
+                                            const Eigen::Vector3d& point)
+{
+    const Eigen::Vector3d a =
+        iface.vertices().row(iface.panels()(panel, 0)).transpose();
+    const Eigen::Vector3d b =
+        iface.vertices().row(iface.panels()(panel, 1)).transpose();
+    const Eigen::Vector3d c =
+        iface.vertices().row(iface.panels()(panel, 2)).transpose();
+    const Eigen::Vector3d e0 = b - a;
+    const Eigen::Vector3d e1 = c - a;
+    const Eigen::Vector3d displacement = point - a;
+    const double d00 = e0.dot(e0);
+    const double d01 = e0.dot(e1);
+    const double d11 = e1.dot(e1);
+    const double d20 = displacement.dot(e0);
+    const double d21 = displacement.dot(e1);
+    const double denominator = d00 * d11 - d01 * d01;
+    if (!std::isfinite(denominator) || std::abs(denominator) <= 1.0e-28)
+        throw std::runtime_error("crossing geometry contains a degenerate triangle");
+    const double lambda1 = (d11 * d20 - d01 * d21) / denominator;
+    const double lambda2 = (d00 * d21 - d01 * d20) / denominator;
+    return {1.0 - lambda1 - lambda2, lambda1, lambda2};
 }
 
 static bool is_better_nearest_candidate(double dist2,
@@ -541,6 +583,9 @@ struct GridPair3D::Impl {
     std::vector<int> nearest_p2_center_for_node;
     std::vector<int> owner_p2_center_for_point;
     double p2_center_cache_radius = -1.0;
+    std::unique_ptr<CMesh3> crossing_mesh;
+    std::unique_ptr<CAabbTree3> crossing_tree;
+    std::vector<int> geometry_panel_for_face;
 
     void ensure_p2_center_cache_radius(const CartesianGrid3D& grid,
                                        double radius)
@@ -619,6 +664,39 @@ GridPair3D::GridPair3D(const CartesianGrid3D& grid,
     std::vector<int> closest_sample_idx;
 
     if (active_p2) {
+        impl_->crossing_mesh = std::make_unique<CMesh3>();
+        std::vector<CMesh3::Vertex_index> mesh_vertices;
+        mesh_vertices.reserve(crossing_geometry.num_vertices());
+        for (int vertex = 0; vertex < crossing_geometry.num_vertices(); ++vertex) {
+            mesh_vertices.push_back(impl_->crossing_mesh->add_vertex(CPoint3(
+                crossing_geometry.vertices()(vertex, 0),
+                crossing_geometry.vertices()(vertex, 1),
+                crossing_geometry.vertices()(vertex, 2))));
+        }
+        for (int panel = 0; panel < crossing_geometry.num_panels(); ++panel) {
+            const CFace3 face = impl_->crossing_mesh->add_face(
+                mesh_vertices[static_cast<std::size_t>(
+                    crossing_geometry.panels()(panel, 0))],
+                mesh_vertices[static_cast<std::size_t>(
+                    crossing_geometry.panels()(panel, 1))],
+                mesh_vertices[static_cast<std::size_t>(
+                    crossing_geometry.panels()(panel, 2))]);
+            if (face == CMesh3::null_face()) {
+                throw std::runtime_error(
+                    "failed to build the P2 crossing-geometry triangle mesh");
+            }
+            if (face.idx() >= impl_->geometry_panel_for_face.size()) {
+                impl_->geometry_panel_for_face.resize(
+                    static_cast<std::size_t>(face.idx()) + 1, -1);
+            }
+            impl_->geometry_panel_for_face[face.idx()] = panel;
+        }
+        impl_->crossing_tree = std::make_unique<CAabbTree3>(
+            faces(*impl_->crossing_mesh).first,
+            faces(*impl_->crossing_mesh).second,
+            *impl_->crossing_mesh);
+        impl_->crossing_tree->accelerate_distance_queries();
+
         impl_->p2_center_samples = p2_expansion_center_samples_3d(iface);
         const std::vector<Eigen::Vector3d> p2_center_points =
             sample_points_for_hash(impl_->p2_center_samples);
@@ -864,6 +942,49 @@ P2CrossingOwner3D GridPair3D::p2_crossing_owner_between(int a, int b) const {
     owner.edge_parameter = 0.5;
     owner.barycentric = sample.barycentric;
     owner.status = P2CrossingOwnerStatus3D::EndpointNearestCenter;
+
+    if (impl_->crossing_tree && !impl_->crossing_tree->empty()) {
+        const CSegment3 segment(CPoint3(pa.x(), pa.y(), pa.z()),
+                                CPoint3(pb.x(), pb.y(), pb.z()));
+        Eigen::Vector3d hit = 0.5 * (pa + pb);
+        CFace3 face = CMesh3::null_face();
+        const auto intersection =
+            impl_->crossing_tree->any_intersection(segment);
+        if (intersection) {
+            if (const CPoint3* point =
+                    boost::get<CPoint3>(&(intersection->first))) {
+                hit = to_eigen(*point);
+            } else if (const CSegment3* overlap =
+                           boost::get<CSegment3>(&(intersection->first))) {
+                hit = 0.5 * (to_eigen(overlap->source())
+                           + to_eigen(overlap->target()));
+            }
+            face = intersection->second;
+            owner.status = P2CrossingOwnerStatus3D::ExactIntersection;
+        } else {
+            const auto closest = impl_->crossing_tree->closest_point_and_primitive(
+                CPoint3(hit.x(), hit.y(), hit.z()));
+            hit = to_eigen(closest.first);
+            face = closest.second;
+            owner.status = P2CrossingOwnerStatus3D::GapFallback;
+        }
+
+        if (face != CMesh3::null_face()
+            && face.idx() < impl_->geometry_panel_for_face.size()) {
+            owner.geometry_panel_index =
+                impl_->geometry_panel_for_face[face.idx()];
+        }
+        if (owner.geometry_panel_index >= 0) {
+            owner.geometry_barycentric = triangle_barycentric(
+                crossing_geometry_, owner.geometry_panel_index, hit);
+            const Eigen::Vector3d edge = pb - pa;
+            owner.edge_parameter = std::max(
+                0.0,
+                std::min(1.0, (hit - pa).dot(edge) / edge.squaredNorm()));
+        } else {
+            owner.status = P2CrossingOwnerStatus3D::EndpointNearestCenter;
+        }
+    }
     return owner;
 
 }

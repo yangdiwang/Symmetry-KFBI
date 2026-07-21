@@ -23,8 +23,8 @@ struct P2CrossingOwner3D {
     // Barycentric coordinate on panel_index when geometry and correction
     // surfaces coincide; otherwise this is the selected center coordinate.
     Eigen::Vector3d barycentric = Eigen::Vector3d::Zero();
-    // The endpoint-nearest-center rule does not construct a geometric hit;
-    // these fields remain unset for EndpointNearestCenter.
+    // Approximate hit on the complete flat corner-triangle geometry. These
+    // fields remain unset only for EndpointNearestCenter.
     int geometry_panel_index = -1;
     Eigen::Vector3d geometry_barycentric = Eigen::Vector3d::Zero();
     P2CrossingOwnerStatus3D status =
