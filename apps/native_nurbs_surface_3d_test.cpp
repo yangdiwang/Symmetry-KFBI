@@ -76,6 +76,34 @@ void require_throws_contains_all(
     throw std::runtime_error(message + ": no exception");
 }
 
+template <class Function>
+void require_throws_contains_all_with_count(
+    Function&& function,
+    std::initializer_list<const char*> needles,
+    const std::string& repeated,
+    std::size_t minimum_count,
+    const std::string& message)
+{
+    try {
+        function();
+    } catch (const std::exception& error) {
+        const std::string text = error.what();
+        for (const char* needle : needles) {
+            require(text.find(needle) != std::string::npos,
+                    message + ": " + text);
+        }
+        std::size_t count = 0;
+        for (std::size_t position = 0;
+             (position = text.find(repeated, position)) != std::string::npos;
+             position += repeated.size()) {
+            ++count;
+        }
+        require(count >= minimum_count, message + ": " + text);
+        return;
+    }
+    throw std::runtime_error(message + ": no exception");
+}
+
 void check_patch_regular(const NativeNurbsSurface3D& surface)
 {
     require(surface.patch_names.size() == surface.patches.size(),
@@ -544,7 +572,7 @@ void test_ruled_overlap_certificate_is_physical_and_fail_safe()
             "exact constant-weight cylinder ruling certifies overlap");
 
     constexpr double large_coordinate = 1.0e12;
-    constexpr double weight_perturbation = 5.0e-13;
+    constexpr double weight_perturbation = 1.0e-14;
     const std::vector<double> ruling_x{0.0, 0.5, 0.5, 0.5, 1.0};
     std::vector<std::vector<Eigen::Vector3d>> controls(
         3, std::vector<Eigen::Vector3d>(5));
@@ -572,6 +600,8 @@ void test_ruled_overlap_certificate_is_physical_and_fail_safe()
         kfbim::geometry3d::extract_rational_bezier_elements_3d(
             near_model).front();
 
+    auto near_options = options;
+    near_options.max_subdivision_depth = 0;
     bool failed_safely = false;
     try {
         const auto near_result =
@@ -581,7 +611,7 @@ void test_ruled_overlap_certificate_is_physical_and_fail_safe()
                       0.25 * large_coordinate},
                 {1.0, 0.5 * large_coordinate,
                       0.25 * large_coordinate},
-                options);
+                near_options);
         failed_safely = !near_result.overlap_detected;
     } catch (const std::exception& error) {
         failed_safely = std::string(error.what()).find(
@@ -590,6 +620,88 @@ void test_ruled_overlap_certificate_is_physical_and_fail_safe()
     }
     require(failed_safely,
             "near-separable large-coordinate control net cannot certify overlap");
+}
+
+void test_exact_predicate_triangle_seed_on_thin_element()
+{
+    using kfbim::geometry::NurbsBasis1D;
+    using kfbim::geometry3d::NurbsSurfacePatch3D;
+
+    constexpr double width = 1.0e-18;
+    const NurbsSurfacePatch3D thin_patch(
+        NurbsBasis1D(1, {0.0, 0.0, 1.0, 1.0}),
+        NurbsBasis1D(1, {0.0, 0.0, 1.0, 1.0}),
+        {{{0.0, 0.0, 0.0}, {0.0, 1.0, 0.0}},
+         {{1.0, 0.0, 0.0}, {1.0, width, 0.0}}},
+        {{1.0, 1.0}, {1.0, 1.0}});
+    const kfbim::geometry3d::NurbsSurfaceModel3D model(
+        {thin_patch}, {0}, {});
+    const auto element =
+        kfbim::geometry3d::extract_rational_bezier_elements_3d(model).front();
+    kfbim::geometry3d::NurbsElementIntersectionOptions3D options;
+    options.geometry_tolerance = 1.0e-16;
+    const auto result = [&] {
+        try {
+            return kfbim::geometry3d::intersect_nurbs_bezier_element_3d(
+                element, model.patch(0),
+                {0.25, 0.1 * width, -1.0},
+                {0.25, 0.1 * width, 1.0}, options);
+        } catch (const std::exception& error) {
+            throw std::runtime_error(
+                std::string("thin exact-predicate seed: ") + error.what());
+        }
+    }();
+    require(result.roots.size() == 1
+                && result.diagnostics.triangle_seed_hits >= 1,
+            "exact-predicate triangle seed survives a thin element");
+}
+
+void test_reweighted_ruled_overlap_certificate()
+{
+    using kfbim::geometry3d::NurbsSurfacePatch3D;
+
+    const NurbsSurfacePatch3D base =
+        NurbsSurfacePatch3D::make_quarter_cylinder_patch(1.0, 0.0, 1.0);
+    auto weights = base.weights();
+    for (auto& row : weights) {
+        require(row.size() == 2,
+                "quarter-cylinder ruling has two axial controls");
+        row[1] *= 2.0;
+    }
+    const NurbsSurfacePatch3D reweighted(
+        base.basis_u(), base.basis_v(), base.control_net(),
+        std::move(weights));
+    const kfbim::geometry3d::NurbsSurfaceModel3D model(
+        {reweighted}, {0}, {});
+    const auto element =
+        kfbim::geometry3d::extract_rational_bezier_elements_3d(model).front();
+    kfbim::geometry3d::NurbsElementIntersectionOptions3D options;
+    options.geometry_tolerance = 1.0e-12;
+    const double coordinate = std::sqrt(0.5);
+
+    const auto interior =
+        kfbim::geometry3d::intersect_nurbs_bezier_element_3d(
+            element, model.patch(0),
+            {coordinate, coordinate, 0.2},
+            {coordinate, coordinate, 0.8}, options);
+    require(interior.overlap_detected && interior.roots.empty(),
+            "separable positive weights preserve a ruled overlap");
+
+    const auto narrow =
+        kfbim::geometry3d::intersect_nurbs_bezier_element_3d(
+            element, model.patch(0),
+            {coordinate, coordinate, 0.999},
+            {coordinate, coordinate, 100.0}, options);
+    require(narrow.overlap_detected && narrow.roots.empty(),
+            "transverse-curve solve finds a narrow ruling overlap");
+    auto boundary_options = options;
+    boundary_options.max_subdivision_depth = 8;
+    const auto boundary_ruling =
+        kfbim::geometry3d::intersect_nurbs_bezier_element_3d(
+            element, model.patch(0),
+            {1.0, 0.0, 0.2}, {1.0, 0.0, 0.8}, boundary_options);
+    require(boundary_ruling.overlap_detected,
+            "positive-length boundary ruling is classified as overlap");
 }
 
 void test_nonclamped_rational_bezier_extraction()
@@ -727,6 +839,167 @@ void require_intersector_bounds_dense_samples(
     }
 }
 
+kfbim::geometry3d::NurbsSurfaceModel3D make_single_patch_periodic_torus()
+{
+    using kfbim::geometry::NurbsBasis1D;
+    using kfbim::geometry3d::NurbsPatchEdge3D;
+    using kfbim::geometry3d::NurbsPatchEdgeConnection3D;
+    using kfbim::geometry3d::NurbsSurfacePatch3D;
+
+    constexpr double inverse_sqrt_two =
+        0.707106781186547524400844362104849039;
+    const std::vector<double> knots{
+        0.0, 0.0, 0.0,
+        0.25, 0.25,
+        0.5, 0.5,
+        0.75, 0.75,
+        1.0, 1.0, 1.0};
+    const std::array<Eigen::Vector2d, 9> circle_controls{{
+        {1.0, 0.0}, {1.0, 1.0}, {0.0, 1.0},
+        {-1.0, 1.0}, {-1.0, 0.0}, {-1.0, -1.0},
+        {0.0, -1.0}, {1.0, -1.0}, {1.0, 0.0}}};
+    const std::array<double, 9> circle_weights{{
+        1.0, inverse_sqrt_two, 1.0,
+        inverse_sqrt_two, 1.0, inverse_sqrt_two,
+        1.0, inverse_sqrt_two, 1.0}};
+
+    constexpr double major_radius = 1.0;
+    constexpr double minor_radius = 0.2;
+    std::vector<std::vector<Eigen::Vector3d>> controls(
+        9, std::vector<Eigen::Vector3d>(9));
+    std::vector<std::vector<double>> weights(
+        9, std::vector<double>(9));
+    for (int i = 0; i < 9; ++i) {
+        for (int j = 0; j < 9; ++j) {
+            const double radius = major_radius
+                + minor_radius
+                    * circle_controls[static_cast<std::size_t>(j)].x();
+            controls[static_cast<std::size_t>(i)]
+                    [static_cast<std::size_t>(j)] = {
+                radius * circle_controls[static_cast<std::size_t>(i)].x(),
+                radius * circle_controls[static_cast<std::size_t>(i)].y(),
+                minor_radius
+                    * circle_controls[static_cast<std::size_t>(j)].y()};
+            weights[static_cast<std::size_t>(i)]
+                   [static_cast<std::size_t>(j)] =
+                circle_weights[static_cast<std::size_t>(i)]
+                * circle_weights[static_cast<std::size_t>(j)];
+        }
+    }
+
+    NurbsSurfacePatch3D patch(
+        NurbsBasis1D(2, knots), NurbsBasis1D(2, knots),
+        std::move(controls), std::move(weights));
+    std::vector<NurbsPatchEdgeConnection3D> connections{
+        {{0, NurbsPatchEdge3D::UMin, 0.0, 1.0},
+         {0, NurbsPatchEdge3D::UMax, 0.0, 1.0}, false, true},
+        // Store the first half in the opposite endpoint order and split both
+        // periodic sides, exercising orientation by interval membership.
+        {{0, NurbsPatchEdge3D::VMax, 0.0, 0.5},
+         {0, NurbsPatchEdge3D::VMin, 0.0, 0.5}, false, true},
+        {{0, NurbsPatchEdge3D::VMin, 0.5, 1.0},
+         {0, NurbsPatchEdge3D::VMax, 0.5, 1.0}, false, true}};
+    return kfbim::geometry3d::NurbsSurfaceModel3D(
+        {std::move(patch)}, {0}, std::move(connections));
+}
+
+void test_single_patch_periodic_seam_canonicalization()
+{
+    using kfbim::geometry3d::NurbsSurfaceIntersector3D;
+    const NurbsSurfaceIntersector3D intersector(
+        make_single_patch_periodic_torus());
+    const auto hit = intersector.intersect_segment(
+        {1.19, 0.0, 0.0}, {1.21, 0.0, 0.0});
+    require(hit.crossings.size() == 1
+                && hit.diagnostics.seam_deduplications >= 1,
+            "single-patch periodic seam root is canonicalized once");
+    require(intersector.containing_components({1.0, 0.0, 0.0})
+                == std::vector<int>{0},
+            "single-patch periodic seam preserves component parity");
+}
+
+kfbim::geometry3d::NurbsSurfaceModel3D
+make_mixed_tangent_unresolved_model()
+{
+    using kfbim::geometry::NurbsBasis1D;
+    using kfbim::geometry3d::NurbsPatchEdge3D;
+    using kfbim::geometry3d::NurbsPatchEdgeConnection3D;
+    using kfbim::geometry3d::NurbsSurfacePatch3D;
+
+    // Bernstein coefficients of
+    // (u - 0.5)^2 (u - 0.7)^2.  Both contacts are singular candidates;
+    // finding a witness for either one cannot certify the other away.
+    constexpr std::array<double, 5> graph_coefficients{{
+        0.1225, -0.0875, 0.05916666666666667, -0.0375, 0.0225}};
+    auto make_controls = [&](bool reverse_u) {
+        std::vector<std::vector<Eigen::Vector3d>> controls(
+            5, std::vector<Eigen::Vector3d>(2));
+        for (int i = 0; i < 5; ++i) {
+            const int source = reverse_u ? 4 - i : i;
+            for (int j = 0; j < 2; ++j) {
+                controls[static_cast<std::size_t>(i)]
+                        [static_cast<std::size_t>(j)] = {
+                    static_cast<double>(source) / 4.0,
+                    static_cast<double>(j),
+                    graph_coefficients[static_cast<std::size_t>(source)]};
+            }
+        }
+        return controls;
+    };
+    const std::vector<std::vector<double>> weights(
+        5, std::vector<double>(2, 1.0));
+    constexpr double narrow_v_begin = 1.0;
+    constexpr double narrow_v_end = 1.0 + 1.0e-10;
+    const NurbsBasis1D quartic(
+        4, {0.0, 0.0, 0.0, 0.0, 0.0,
+            1.0, 1.0, 1.0, 1.0, 1.0});
+    const NurbsBasis1D linear(
+        1, {narrow_v_begin, narrow_v_begin,
+            narrow_v_end, narrow_v_end});
+    NurbsSurfacePatch3D forward(
+        quartic, linear, make_controls(false), weights);
+    NurbsSurfacePatch3D reverse(
+        quartic, linear, make_controls(true), weights);
+    std::vector<NurbsPatchEdgeConnection3D> connections{
+        {{0, NurbsPatchEdge3D::UMin, narrow_v_begin, narrow_v_end},
+         {1, NurbsPatchEdge3D::UMax, narrow_v_begin, narrow_v_end},
+         false, false},
+        {{0, NurbsPatchEdge3D::UMax, narrow_v_begin, narrow_v_end},
+         {1, NurbsPatchEdge3D::UMin, narrow_v_begin, narrow_v_end},
+         false, false},
+        {{0, NurbsPatchEdge3D::VMin, 0.0, 1.0},
+         {1, NurbsPatchEdge3D::VMin, 0.0, 1.0}, true, false},
+        {{0, NurbsPatchEdge3D::VMax, 0.0, 1.0},
+         {1, NurbsPatchEdge3D::VMax, 0.0, 1.0}, true, false}};
+    return kfbim::geometry3d::NurbsSurfaceModel3D(
+        {std::move(forward), std::move(reverse)}, {0, 0},
+        std::move(connections));
+}
+
+void test_tangent_witness_does_not_swallow_unresolved_candidate()
+{
+    const kfbim::geometry3d::NurbsSurfaceIntersector3D intersector(
+        make_mixed_tangent_unresolved_model());
+    require_throws_contains(
+        [&] {
+            (void)intersector.intersect_segment(
+                {0.0, 0.5, 0.0}, {1.0, 0.5, 0.0});
+        },
+        "unresolved conservative NURBS intersection candidate",
+        "tangent witness preserves a coexisting unresolved candidate");
+    require_throws_contains_all_with_count(
+        [&] {
+            (void)intersector.intersect_cartesian_edge(
+                kfbim::geometry3d::NurbsCartesianEdgeQuery3D{
+                    0, 60, 61, 62,
+                    {0.0, 0.5, 0.0}, {1.0, 0.5, 0.0}});
+        },
+        {"unresolved conservative NURBS intersection candidate",
+         "axis=0", "(60,61,62)"},
+        "root=(patch=", 1,
+        "Cartesian unresolved query retains grid and root context");
+}
+
 void test_native_nurbs_surface_intersector()
 {
     using kfbim::geometry3d::NurbsCartesianEdgeQuery3D;
@@ -758,19 +1031,87 @@ void test_native_nurbs_surface_intersector()
     require(seam_hit.crossings.size() == 1
                 && seam_hit.diagnostics.seam_deduplications >= 1,
             "periodic torus seam root is canonicalized once");
+    const NurbsCartesianEdgeQuery3D seam_edge{
+        0, 1, 2, 3,
+        {0.80, -0.04, 0.03}, {0.84, -0.04, 0.03}};
+    kfbim::geometry3d::NurbsSurfaceIntersectionDiagnostics3D
+        seam_edge_diagnostics;
+    const auto seam_crossing = torus_intersector.intersect_cartesian_edge(
+        seam_edge, &seam_edge_diagnostics);
+    require(seam_crossing
+                && seam_crossing->component == 0
+                && seam_crossing->residual
+                       <= torus_intersector.geometry_tolerance()
+                && std::abs(seam_crossing->normal.norm() - 1.0) < 1.0e-12
+                && seam_edge_diagnostics.seam_deduplications >= 1,
+            "single Cartesian crossing returns canonical root data");
+    require(!torus_intersector.intersect_cartesian_edge(
+                 NurbsCartesianEdgeQuery3D{
+                     0, 4, 5, 6, {2.0, 2.0, 2.0}, {2.1, 2.0, 2.0}}),
+            "Cartesian edge with zero roots returns nullopt");
+
+    kfbim::geometry3d::NurbsSurfaceIntersectorOptions3D no_seed_options;
+    no_seed_options.use_triangle_seeds = false;
+    const NurbsSurfaceIntersector3D torus_without_seeds(
+        torus.geometry_model(), no_seed_options);
+    const auto no_seed_hit = torus_without_seeds.intersect_segment(
+        seam_edge.start, seam_edge.end);
+    require(no_seed_hit.crossings.size() == 1
+                && no_seed_hit.diagnostics.triangle_seed_hits == 0
+                && (no_seed_hit.crossings.front().point
+                    - seam_hit.crossings.front().point).norm()
+                       <= 8.0 * torus_intersector.geometry_tolerance()
+                && torus_without_seeds.containing_components(
+                       {0.62, -0.04, 0.03}) == std::vector<int>{0},
+            "triangle seeds do not change canonical roots or parity");
+
+    const auto torus_model = torus.geometry_model();
+    const int patch_offset = torus_model.num_patches();
+    const int component_offset = torus_model.num_components();
+    auto duplicate_patches = torus_model.patches();
+    duplicate_patches.insert(
+        duplicate_patches.end(),
+        torus_model.patches().begin(), torus_model.patches().end());
+    std::vector<int> duplicate_components;
+    duplicate_components.reserve(
+        static_cast<std::size_t>(2 * patch_offset));
+    for (int patch = 0; patch < patch_offset; ++patch)
+        duplicate_components.push_back(torus_model.patch_component(patch));
+    for (int patch = 0; patch < patch_offset; ++patch) {
+        duplicate_components.push_back(
+            torus_model.patch_component(patch) + component_offset);
+    }
+    auto duplicate_connections = torus_model.connections();
+    for (auto connection : torus_model.connections()) {
+        connection.first.patch += patch_offset;
+        connection.second.patch += patch_offset;
+        duplicate_connections.push_back(connection);
+    }
+    const NurbsSurfaceIntersector3D coincident_tori(
+        kfbim::geometry3d::NurbsSurfaceModel3D(
+            std::move(duplicate_patches),
+            std::move(duplicate_components),
+            std::move(duplicate_connections)));
+    require_throws_contains_all_with_count(
+        [&] { (void)coincident_tori.intersect_cartesian_edge(seam_edge); },
+        {"coincident roots on unrelated NURBS patches", "axis=0",
+         "(1,2,3)"},
+        "root=(patch=", 2,
+        "unrelated coincident patches report full Cartesian context");
     require(torus_intersector.containing_components(
                 {0.62, -0.04, 0.03}) == std::vector<int>{0}
                 && torus_intersector.containing_components(
                     {0.07, -0.04, 0.03}).empty(),
             "torus component parity distinguishes tube from central void");
-    require_throws_contains(
+    require_throws_contains_all_with_count(
         [&] {
             (void)torus_intersector.intersect_cartesian_edge(
                 NurbsCartesianEdgeQuery3D{
                     0, 10, 11, 12,
                     {-1.0, -0.04, 0.03}, {1.0, -0.04, 0.03}});
         },
-        "multiple crossings on Cartesian edge",
+        {"multiple crossings on Cartesian edge", "axis=0", "(10,11,12)"},
+        "root=(patch=", 2,
         "torus Cartesian edge rejects multiple crossings");
 
     const NativeNurbsSurface3D cylinder =
@@ -788,15 +1129,54 @@ void test_native_nurbs_surface_intersector()
                 && cylinder_intersector.containing_components(
                     {0.06, -0.05, 0.0}).empty(),
             "hollow-cylinder parity distinguishes shell from bore");
+    const Eigen::Vector3d reference_ray_direction =
+        Eigen::Vector3d(1.0, 0.3713906763541037,
+                        0.6947465906068658).normalized();
+    Eigen::Vector2d planar_direction(
+        reference_ray_direction.x(), reference_ray_direction.y());
+    planar_direction.normalize();
+    const Eigen::Vector3d tangent_radius(
+        -0.55 * planar_direction.y(),
+         0.55 * planar_direction.x(), 0.0);
+    const Eigen::Vector3d tangent_point =
+        Eigen::Vector3d(0.06, -0.05, 0.0) + tangent_radius;
+    const Eigen::Vector3d tangent_ray_start =
+        tangent_point - 0.2 * reference_ray_direction;
     require_throws_contains(
+        [&] {
+            (void)cylinder_intersector.intersect_segment(
+                tangent_ray_start,
+                tangent_ray_start + reference_ray_direction);
+        },
+        "unresolved conservative NURBS intersection candidate",
+        "non-Cartesian tangential segment preserves unresolved status");
+    require(cylinder_intersector.containing_components(tangent_ray_start)
+                .empty(),
+            "parity classification retries after a tangential unresolved ray");
+    require_throws_contains_all_with_count(
         [&] {
             (void)cylinder_intersector.intersect_cartesian_edge(
                 NurbsCartesianEdgeQuery3D{
                     1, 20, 21, 22,
                     {0.61, -0.10, 0.0}, {0.61, 0.0, 0.0}});
         },
-        "tangential Cartesian edge contact",
+        {"tangential Cartesian edge contact", "axis=1", "(20,21,22)"},
+        "root=(patch=", 1,
         "cylinder Cartesian edge rejects tangential contact");
+    const double outer_endpoint_y =
+        -0.05 - std::sqrt(0.55 * 0.55 - 0.25 * 0.25);
+    require_throws_contains_all_with_count(
+        [&] {
+            (void)cylinder_intersector.intersect_cartesian_edge(
+                NurbsCartesianEdgeQuery3D{
+                    1, 23, 24, 25,
+                    {0.31, outer_endpoint_y, 0.0},
+                    {0.31, 0.10, 0.0}});
+        },
+        {"surface intersects Cartesian node", "axis=1", "(23,24,25)"},
+        "root=(patch=", 2,
+        "endpoint root takes priority over an interior fallback tangent");
+
     require_throws_contains_all(
         [&] {
             (void)cylinder_intersector.intersect_cartesian_edge(
@@ -804,9 +1184,19 @@ void test_native_nurbs_surface_intersector()
                     0, 30, 31, 32,
                     {0.59, -0.05, 0.67}, {0.63, -0.05, 0.67}});
         },
-        {"non-G1 feature-edge alignment", "axis=0", "(30,31,32)",
+        {"surface overlaps Cartesian edge", "axis=0", "(30,31,32)",
          "root=(patch="},
-        "cylinder Cartesian edge rejects outer top-rim alignment");
+        "cylinder top-rim query gives overlap priority over feature contact");
+    require_throws_contains_all(
+        [&] {
+            (void)cylinder_intersector.intersect_cartesian_edge(
+                NurbsCartesianEdgeQuery3D{
+                    1, 33, 34, 35,
+                    {0.61, -0.07, 0.67}, {0.61, -0.03, 0.67}});
+        },
+        {"non-G1 feature-edge alignment", "axis=1", "(33,34,35)",
+         "root=(patch="},
+        "cylinder top rim reports a feature-only Cartesian contact");
 
     const NativeNurbsSurface3D lprism =
         make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
@@ -816,23 +1206,24 @@ void test_native_nurbs_surface_intersector()
     require(lprism_intersector.containing_components(
                 {0.0, -0.3, 0.0}) == std::vector<int>{0},
             "L-prism component parity classifies its reentrant solid");
-    require_throws_contains(
+    require_throws_contains_all(
         [&] {
             (void)lprism_intersector.intersect_cartesian_edge(
                 NurbsCartesianEdgeQuery3D{
                     2, 40, 41, 42,
                     {0.0, -0.3, 0.67}, {0.0, -0.3, 0.8}});
         },
-        "surface intersects Cartesian node",
+        {"surface intersects Cartesian node", "axis=2", "(40,41,42)",
+         "root=(patch="},
         "L-prism Cartesian edge rejects a node intersection");
-    require_throws_contains(
+    require_throws_contains_all(
         [&] {
             (void)lprism_intersector.intersect_cartesian_edge(
                 NurbsCartesianEdgeQuery3D{
                     0, 50, 51, 52,
                     {-0.2, -0.3, 0.67}, {-0.1, -0.3, 0.67}});
         },
-        "surface overlaps Cartesian edge",
+        {"surface overlaps Cartesian edge", "axis=0", "(50,51,52)"},
         "L-prism Cartesian edge rejects a surface overlap");
 }
 
@@ -1282,10 +1673,14 @@ int main()
         test_rational_bezier_element_intersection();
         test_bezier_element_intersection_isolates_all_roots_and_fails_safe();
         test_ruled_overlap_certificate_is_physical_and_fail_safe();
+        test_exact_predicate_triangle_seed_on_thin_element();
+        test_reweighted_ruled_overlap_certificate();
         test_nonclamped_rational_bezier_extraction();
         test_bezier_subdivision_rejects_collapsed_midpoint();
         test_bezier_split_preserves_large_finite_controls();
         test_bezier_rejects_extreme_degree_control_count();
+        test_single_patch_periodic_seam_canonicalization();
+        test_tangent_witness_does_not_swallow_unresolved_candidate();
         test_native_nurbs_surface_intersector();
         test_uniform_native_dofs();
         test_parameter_candidates();

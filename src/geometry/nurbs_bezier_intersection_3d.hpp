@@ -3,6 +3,7 @@
 #include "rational_bezier_element_3d.hpp"
 
 #include <Eigen/Dense>
+#include <stdexcept>
 
 #include <vector>
 
@@ -34,6 +35,17 @@ struct NurbsElementIntersectionResult3D {
     std::vector<NurbsElementRoot3D> roots;
     NurbsElementIntersectionDiagnostics3D diagnostics;
     bool overlap_detected = false;
+};
+
+class UnresolvedNurbsIntersectionCandidate3D : public std::runtime_error {
+public:
+    explicit UnresolvedNurbsIntersectionCandidate3D(
+        NurbsElementIntersectionResult3D partial_result);
+
+    const NurbsElementIntersectionResult3D& partial_result() const noexcept;
+
+private:
+    NurbsElementIntersectionResult3D partial_result_;
 };
 
 struct NurbsElementIntersectionOptions3D {

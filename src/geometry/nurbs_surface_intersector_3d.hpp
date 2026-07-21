@@ -89,6 +89,11 @@ private:
         int node,
         const NurbsAabb3D& segment_bounds,
         std::vector<int>& candidates) const;
+    NurbsSurfaceIntersectionResult3D intersect_segment_impl(
+        const Eigen::Vector3d& start,
+        const Eigen::Vector3d& end,
+        const NurbsCartesianEdgeQuery3D* cartesian_edge,
+        bool parity_ray) const;
 
     NurbsSurfaceModel3D model_;
     NurbsSurfaceIntersectorOptions3D options_;

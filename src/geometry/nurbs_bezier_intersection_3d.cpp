@@ -1,5 +1,8 @@
 #include "nurbs_bezier_intersection_3d.hpp"
 
+#include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
+#include <CGAL/intersections.h>
+
 #include <Eigen/LU>
 
 #include <algorithm>
@@ -14,6 +17,8 @@
 namespace kfbim::geometry3d {
 
 namespace {
+
+using ExactPredicateKernel = CGAL::Exact_predicates_inexact_constructions_kernel;
 
 struct SegmentFrame {
     Eigen::Vector3d start = Eigen::Vector3d::Zero();
@@ -537,15 +542,32 @@ std::optional<TriangleSeed> intersect_triangle(
     const SegmentFrame& frame,
     double parameter_tolerance)
 {
-    Eigen::Matrix3d matrix;
-    matrix.col(0) = p1 - p0;
-    matrix.col(1) = p2 - p0;
-    matrix.col(2) = -frame.delta;
-    Eigen::FullPivLU<Eigen::Matrix3d> factorization(matrix);
-    if (factorization.rank() < 3)
+    const auto point = [](const Eigen::Vector3d& value) {
+        return ExactPredicateKernel::Point_3(
+            value.x(), value.y(), value.z());
+    };
+    const ExactPredicateKernel::Triangle_3 triangle(
+        point(p0), point(p1), point(p2));
+    if (triangle.is_degenerate()
+        || !CGAL::do_intersect(
+            triangle,
+            ExactPredicateKernel::Segment_3(
+                point(frame.start), point(frame.start + frame.delta)))) {
         return std::nullopt;
-    const Eigen::Vector3d solution =
-        factorization.solve(frame.start - p0);
+    }
+
+    const Eigen::Vector3d first_column = p1 - p0;
+    const Eigen::Vector3d second_column = p2 - p0;
+    const Eigen::Vector3d third_column = -frame.delta;
+    const Eigen::Vector3d right_hand_side = frame.start - p0;
+    const double determinant =
+        first_column.dot(second_column.cross(third_column));
+    if (!std::isfinite(determinant) || determinant == 0.0)
+        return std::nullopt;
+    const Eigen::Vector3d solution(
+        right_hand_side.dot(second_column.cross(third_column)) / determinant,
+        first_column.dot(right_hand_side.cross(third_column)) / determinant,
+        first_column.dot(second_column.cross(right_hand_side)) / determinant);
     if (!solution.allFinite())
         return std::nullopt;
     const double first = solution.x();
@@ -727,8 +749,11 @@ bool append_root(std::vector<NurbsElementRoot3D>& roots,
     for (NurbsElementRoot3D& existing : roots) {
         if (!roots_agree(existing, root, options))
             continue;
+        const double minimum_transversality =
+            std::min(existing.transversality, root.transversality);
         if (root.residual < existing.residual)
             existing = std::move(root);
+        existing.transversality = minimum_transversality;
         return false;
     }
     roots.push_back(std::move(root));
@@ -843,64 +868,215 @@ bool certifies_planar_overlap(
     return false;
 }
 
-bool controls_form_parallel_rulings(
+std::array<std::vector<Eigen::Vector3d>, 2> split_transverse_curve(
+    std::vector<Eigen::Vector3d> controls)
+{
+    const std::size_t count = controls.size();
+    std::array<std::vector<Eigen::Vector3d>, 2> children{
+        std::vector<Eigen::Vector3d>(count),
+        std::vector<Eigen::Vector3d>(count)};
+    children[0][0] = controls.front();
+    children[1][count - 1] = controls.back();
+    for (std::size_t level = 1; level < count; ++level) {
+        for (std::size_t i = 0; i + level < count; ++i)
+            controls[i] = 0.5 * controls[i] + 0.5 * controls[i + 1];
+        children[0][level] = controls[0];
+        children[1][count - level - 1] =
+            controls[count - level - 1];
+    }
+    return children;
+}
+
+Eigen::Vector3d evaluate_transverse_homogeneous_curve(
+    std::vector<Eigen::Vector3d> controls,
+    double parameter)
+{
+    for (std::size_t remaining = controls.size(); remaining > 1; --remaining) {
+        for (std::size_t i = 0; i + 1 < remaining; ++i) {
+            controls[i] = (1.0 - parameter) * controls[i]
+                        + parameter * controls[i + 1];
+        }
+    }
+    return controls.front();
+}
+
+Eigen::Vector4d evaluate_homogeneous_curve(
+    std::vector<Eigen::Vector4d> controls,
+    double parameter)
+{
+    for (std::size_t remaining = controls.size(); remaining > 1; --remaining) {
+        for (std::size_t i = 0; i + 1 < remaining; ++i) {
+            controls[i] = (1.0 - parameter) * controls[i]
+                        + parameter * controls[i + 1];
+        }
+    }
+    return controls.front();
+}
+bool transverse_curve_can_reach_line(
+    const std::vector<Eigen::Vector3d>& controls,
+    double tolerance)
+{
+    double first_min = std::numeric_limits<double>::infinity();
+    double first_max = -std::numeric_limits<double>::infinity();
+    double second_min = std::numeric_limits<double>::infinity();
+    double second_max = -std::numeric_limits<double>::infinity();
+    for (const Eigen::Vector3d& control : controls) {
+        if (!control.allFinite() || control.z() <= 0.0)
+            return false;
+        const double first = control.x() / control.z();
+        const double second = control.y() / control.z();
+        first_min = std::min(first_min, first);
+        first_max = std::max(first_max, first);
+        second_min = std::min(second_min, second);
+        second_max = std::max(second_max, second);
+    }
+    return first_min <= tolerance && first_max >= -tolerance
+        && second_min <= tolerance && second_max >= -tolerance;
+}
+
+std::optional<double> refine_transverse_curve_root(
+    const std::vector<Eigen::Vector3d>& controls,
+    double parameter_begin,
+    double parameter_end,
+    const NurbsElementIntersectionOptions3D& options)
+{
+    const int degree = static_cast<int>(controls.size()) - 1;
+    if (degree <= 0)
+        return std::nullopt;
+    std::vector<Eigen::Vector3d> derivative_controls;
+    derivative_controls.reserve(static_cast<std::size_t>(degree));
+    for (int i = 0; i < degree; ++i) {
+        derivative_controls.push_back(
+            static_cast<double>(degree)
+            * (controls[static_cast<std::size_t>(i + 1)]
+               - controls[static_cast<std::size_t>(i)]));
+    }
+
+    double parameter = midpoint(parameter_begin, parameter_end);
+    for (int iteration = 0;
+         iteration < options.max_newton_iterations; ++iteration) {
+        const Eigen::Vector3d homogeneous =
+            evaluate_transverse_homogeneous_curve(controls, parameter);
+        const Eigen::Vector3d homogeneous_derivative =
+            evaluate_transverse_homogeneous_curve(
+                derivative_controls, parameter);
+        if (!homogeneous.allFinite() || !homogeneous_derivative.allFinite()
+            || homogeneous.z() <= 0.0) {
+            return std::nullopt;
+        }
+        const Eigen::Vector2d value =
+            homogeneous.head<2>() / homogeneous.z();
+        const Eigen::Vector2d derivative =
+            (homogeneous_derivative.head<2>() * homogeneous.z()
+             - homogeneous.head<2>() * homogeneous_derivative.z())
+            / (homogeneous.z() * homogeneous.z());
+        const double residual = value.norm();
+        if (residual <= options.geometry_tolerance
+            && derivative.norm() > options.geometry_tolerance) {
+            return parameter;
+        }
+        const double derivative_squared = derivative.squaredNorm();
+        if (!std::isfinite(residual) || !std::isfinite(derivative_squared)
+            || derivative_squared
+                   <= options.geometry_tolerance * options.geometry_tolerance) {
+            return std::nullopt;
+        }
+
+        const double step = -value.dot(derivative) / derivative_squared;
+        bool accepted = false;
+        double step_scale = 1.0;
+        for (int line_search = 0; line_search < 16; ++line_search) {
+            const double candidate = std::clamp(
+                parameter + step_scale * step,
+                parameter_begin, parameter_end);
+            if (candidate == parameter) {
+                step_scale *= 0.5;
+                continue;
+            }
+            const Eigen::Vector3d candidate_homogeneous =
+                evaluate_transverse_homogeneous_curve(controls, candidate);
+            if (candidate_homogeneous.allFinite()
+                && candidate_homogeneous.z() > 0.0
+                && (candidate_homogeneous.head<2>()
+                    / candidate_homogeneous.z()).norm() < residual) {
+                parameter = candidate;
+                accepted = true;
+                break;
+            }
+            step_scale *= 0.5;
+        }
+        if (!accepted)
+            return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+std::optional<double> find_transverse_ruling_parameter(
     const RationalBezierElement3D& element,
     bool ruling_along_u,
     const SegmentFrame& frame,
-    double tolerance)
+    const NurbsElementIntersectionOptions3D& options)
 {
-    const int ruling_degree =
-        ruling_along_u ? element.degree_u : element.degree_v;
     const int transverse_degree =
         ruling_along_u ? element.degree_v : element.degree_u;
-    if (ruling_degree < 1)
-        return false;
-    // This supported-geometry certificate deliberately requires exact
-    // constant weights along each ruling.  Combined with the physical
-    // transverse bounds below, that makes every fixed transverse blend a
-    // rational straight line parallel to the segment without weight products.
-    for (int transverse = 0; transverse <= transverse_degree; ++transverse) {
-        const double ruling_weight = ruling_along_u
-            ? element.control(0, transverse).w()
-            : element.control(transverse, 0).w();
-        for (int ruling = 0; ruling <= ruling_degree; ++ruling) {
-            const double weight = ruling_along_u
-                ? element.control(ruling, transverse).w()
-                : element.control(transverse, ruling).w();
-            if (!std::isfinite(weight) || weight != ruling_weight)
-                return false;
-        }
+    if (transverse_degree < 1)
+        return std::nullopt;
+
+    std::vector<Eigen::Vector3d> controls;
+    controls.reserve(static_cast<std::size_t>(transverse_degree + 1));
+    for (int transverse = 0;
+         transverse <= transverse_degree; ++transverse) {
+        const Eigen::Vector4d& homogeneous = ruling_along_u
+            ? element.control(0, transverse)
+            : element.control(transverse, 0);
+        const Eigen::Vector3d relative =
+            projected_control(homogeneous) - frame.start;
+        controls.emplace_back(
+            homogeneous.w() * relative.dot(frame.transverse_first),
+            homogeneous.w() * relative.dot(frame.transverse_second),
+            homogeneous.w());
     }
 
-    bool has_nonzero_ruling = false;
-    for (int transverse = 0; transverse <= transverse_degree; ++transverse) {
-        const Eigen::Vector3d origin = projected_control(
-            ruling_along_u ? element.control(0, transverse)
-                           : element.control(transverse, 0));
-        for (int ruling = 1; ruling <= ruling_degree; ++ruling) {
-            const Eigen::Vector3d point = projected_control(
-                ruling_along_u ? element.control(ruling, transverse)
-                               : element.control(transverse, ruling));
-            const Eigen::Vector3d difference = point - origin;
-            if (!difference.allFinite())
-                return false;
-            const double transverse_first =
-                difference.dot(frame.transverse_first);
-            const double transverse_second =
-                difference.dot(frame.transverse_second);
-            const double longitudinal = difference.dot(frame.direction);
-            if (!std::isfinite(transverse_first)
-                || !std::isfinite(transverse_second)
-                || !std::isfinite(longitudinal)
-                || std::abs(transverse_first) > tolerance
-                || std::abs(transverse_second) > tolerance) {
-                return false;
-            }
-            has_nonzero_ruling = has_nonzero_ruling
-                || std::abs(longitudinal) > tolerance;
+    struct CurveBox {
+        std::vector<Eigen::Vector3d> controls;
+        double begin = 0.0;
+        double end = 1.0;
+        int depth = 0;
+    };
+    std::vector<CurveBox> pending{{controls, 0.0, 1.0, 0}};
+    while (!pending.empty()) {
+        CurveBox box = std::move(pending.back());
+        pending.pop_back();
+        if (!transverse_curve_can_reach_line(
+                box.controls, options.geometry_tolerance)) {
+            continue;
         }
+        if (const auto root = refine_transverse_curve_root(
+                controls, box.begin, box.end, options)) {
+            const double native_begin = ruling_along_u
+                ? element.v0() : element.u0();
+            const double native_end = ruling_along_u
+                ? element.v1() : element.u1();
+            const double native =
+                (1.0 - *root) * native_begin + *root * native_end;
+            if (native >= native_begin - options.parameter_tolerance
+                && native <= native_end + options.parameter_tolerance) {
+                return std::clamp(native, native_begin, native_end);
+            }
+        }
+        if (box.depth >= options.max_subdivision_depth
+            || box.end - box.begin <= options.parameter_tolerance
+            || !has_representable_midpoint(box.begin, box.end)) {
+            continue;
+        }
+        auto children = split_transverse_curve(std::move(box.controls));
+        const double middle = midpoint(box.begin, box.end);
+        pending.push_back(
+            {std::move(children[1]), middle, box.end, box.depth + 1});
+        pending.push_back(
+            {std::move(children[0]), box.begin, middle, box.depth + 1});
     }
-    return has_nonzero_ruling;
+    return std::nullopt;
 }
 
 bool lies_on_segment_line(const Eigen::Vector3d& point,
@@ -914,10 +1090,63 @@ bool lies_on_segment_line(const Eigen::Vector3d& point,
     const double transverse_second = difference.dot(frame.transverse_second);
     return std::isfinite(transverse_first)
         && std::isfinite(transverse_second)
-        && std::abs(transverse_first) <= tolerance
-        && std::abs(transverse_second) <= tolerance;
+        && std::hypot(transverse_first, transverse_second) <= tolerance;
 }
 
+std::optional<std::vector<Eigen::Vector3d>>
+restricted_ruling_control_polygon(
+    const RationalBezierElement3D& element,
+    bool ruling_along_u,
+    double fixed_parameter,
+    const SegmentFrame& frame,
+    double tolerance)
+{
+    const double transverse_begin =
+        ruling_along_u ? element.v0() : element.u0();
+    const double transverse_end =
+        ruling_along_u ? element.v1() : element.u1();
+    const double local_parameter =
+        (fixed_parameter - transverse_begin)
+        / (transverse_end - transverse_begin);
+    if (!std::isfinite(local_parameter)
+        || local_parameter < 0.0 || local_parameter > 1.0) {
+        return std::nullopt;
+    }
+
+    const int ruling_degree =
+        ruling_along_u ? element.degree_u : element.degree_v;
+    const int transverse_degree =
+        ruling_along_u ? element.degree_v : element.degree_u;
+    if (ruling_degree < 1)
+        return std::nullopt;
+
+    std::vector<Eigen::Vector3d> restricted;
+    restricted.reserve(static_cast<std::size_t>(ruling_degree + 1));
+    for (int ruling = 0; ruling <= ruling_degree; ++ruling) {
+        std::vector<Eigen::Vector4d> transverse_controls;
+        transverse_controls.reserve(
+            static_cast<std::size_t>(transverse_degree + 1));
+        for (int transverse = 0;
+             transverse <= transverse_degree; ++transverse) {
+            transverse_controls.push_back(
+                ruling_along_u
+                ? element.control(ruling, transverse)
+                : element.control(transverse, ruling));
+        }
+        const Eigen::Vector4d homogeneous = evaluate_homogeneous_curve(
+            std::move(transverse_controls), local_parameter);
+        if (!homogeneous.allFinite() || homogeneous.w() <= 0.0)
+            return std::nullopt;
+        const Eigen::Vector3d point =
+            homogeneous.head<3>() / homogeneous.w();
+        if (!point.allFinite()
+            || !lies_on_segment_line(point, frame, tolerance)) {
+            return std::nullopt;
+        }
+        restricted.push_back(point);
+    }
+    return restricted;
+}
 bool certifies_ruled_overlap(
     const RationalBezierElement3D& element,
     const NurbsSurfacePatch3D& patch,
@@ -925,62 +1154,41 @@ bool certifies_ruled_overlap(
     const NurbsElementIntersectionOptions3D& options,
     bool ruling_along_u)
 {
-    if (!controls_form_parallel_rulings(
-            element, ruling_along_u, frame, options.geometry_tolerance)) {
+    const auto fixed_parameter = find_transverse_ruling_parameter(
+        element, ruling_along_u, frame, options);
+    if (!fixed_parameter)
         return false;
-    }
+    try {
+        const auto restricted = restricted_ruling_control_polygon(
+            element, ruling_along_u, *fixed_parameter, frame,
+            options.geometry_tolerance);
+        if (!restricted)
+            return false;
+        const Eigen::Vector3d& ruling_start = restricted->front();
+        const Eigen::Vector3d& ruling_end = restricted->back();
 
-    for (const double t : overlap_candidate_parameters(element, frame)) {
-        if (!is_strict_interior(t, 0.0, 1.0, options.parameter_tolerance))
-            continue;
-        try {
-            const auto projection = patch.project(frame.start + t * frame.delta);
-            if (projection.distance > options.geometry_tolerance)
-                continue;
-            const double fixed_parameter =
-                ruling_along_u ? projection.v : projection.u;
-            const double fixed_begin =
-                ruling_along_u ? element.v0() : element.u0();
-            const double fixed_end =
-                ruling_along_u ? element.v1() : element.u1();
-            if (!is_strict_interior(
-                    fixed_parameter, fixed_begin, fixed_end,
-                    options.parameter_tolerance)) {
-                continue;
-            }
+        const double first_longitudinal =
+            (ruling_start - frame.start).dot(frame.direction);
+        const double second_longitudinal =
+            (ruling_end - frame.start).dot(frame.direction);
+        const double overlap_begin = std::max(
+            0.0, std::min(first_longitudinal, second_longitudinal));
+        const double overlap_end = std::min(
+            frame.length, std::max(first_longitudinal, second_longitudinal));
+        if (overlap_end - overlap_begin <= options.geometry_tolerance)
+            return false;
 
-            const Eigen::Vector3d ruling_start = ruling_along_u
-                ? element.evaluate(element.u0(), fixed_parameter)
-                : element.evaluate(fixed_parameter, element.v0());
-            const Eigen::Vector3d ruling_end = ruling_along_u
-                ? element.evaluate(element.u1(), fixed_parameter)
-                : element.evaluate(fixed_parameter, element.v1());
-            if (!lies_on_segment_line(
-                    ruling_start, frame, options.geometry_tolerance)
-                || !lies_on_segment_line(
-                    ruling_end, frame, options.geometry_tolerance)) {
-                continue;
-            }
-
-            const double first_longitudinal =
-                (ruling_start - frame.start).dot(frame.direction);
-            const double second_longitudinal =
-                (ruling_end - frame.start).dot(frame.direction);
-            const double overlap_begin = std::max(
-                0.0, std::min(first_longitudinal, second_longitudinal));
-            const double overlap_end = std::min(
-                frame.length,
-                std::max(first_longitudinal, second_longitudinal));
-            if (overlap_end - overlap_begin > options.geometry_tolerance) {
-                const NurbsSurfaceDerivatives3D derivatives =
-                    patch.evaluate_with_derivatives(projection.u, projection.v);
-                if (derivatives.du.cross(derivatives.dv).norm()
-                    > options.geometry_tolerance) {
-                    return true;
-                }
-            }
-        } catch (const std::exception&) {
-        }
+        const double ruling_middle = ruling_along_u
+            ? midpoint(element.u0(), element.u1())
+            : midpoint(element.v0(), element.v1());
+        const NurbsSurfaceDerivatives3D derivatives = ruling_along_u
+            ? patch.evaluate_with_derivatives(
+                ruling_middle, *fixed_parameter)
+            : patch.evaluate_with_derivatives(
+                *fixed_parameter, ruling_middle);
+        return derivatives.du.cross(derivatives.dv).norm()
+            > options.geometry_tolerance;
+    } catch (const std::exception&) {
     }
     return false;
 }
@@ -1011,6 +1219,20 @@ TriangleSeed midpoint_seed(const RationalBezierElement3D& box,
 }
 
 } // namespace
+UnresolvedNurbsIntersectionCandidate3D::
+UnresolvedNurbsIntersectionCandidate3D(
+    NurbsElementIntersectionResult3D partial_result)
+    : std::runtime_error(
+        "unresolved conservative NURBS intersection candidate")
+    , partial_result_(std::move(partial_result))
+{
+}
+
+const NurbsElementIntersectionResult3D&
+UnresolvedNurbsIntersectionCandidate3D::partial_result() const noexcept
+{
+    return partial_result_;
+}
 
 NurbsElementIntersectionResult3D intersect_nurbs_bezier_element_3d(
     const RationalBezierElement3D& element,
@@ -1120,10 +1342,6 @@ NurbsElementIntersectionResult3D intersect_nurbs_bezier_element_3d(
         pending.push_back({children[0], current.depth + 1});
     }
 
-    if (result.diagnostics.unresolved_boxes > 0) {
-        throw std::runtime_error(
-            "unresolved conservative NURBS intersection candidate");
-    }
     std::sort(
         result.roots.begin(), result.roots.end(),
         [](const NurbsElementRoot3D& first,
@@ -1134,6 +1352,10 @@ NurbsElementIntersectionResult3D intersect_nurbs_bezier_element_3d(
                 return first.u < second.u;
             return first.v < second.v;
         });
+    if (result.diagnostics.unresolved_boxes > 0) {
+        throw UnresolvedNurbsIntersectionCandidate3D(
+            std::move(result));
+    }
     return result;
 }
 
