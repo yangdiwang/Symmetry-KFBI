@@ -187,6 +187,76 @@ void test_native_surface_interval_topology()
         "open NURBS patch is rejected by closed-topology validation");
 }
 
+std::vector<kfbim::geometry3d::NurbsPatchEdgeConnection3D>
+unit_square_pair_connections()
+{
+    using Edge = kfbim::geometry3d::NurbsPatchEdge3D;
+    std::vector<kfbim::geometry3d::NurbsPatchEdgeConnection3D> connections;
+    for (const Edge edge : {Edge::UMin, Edge::UMax, Edge::VMin, Edge::VMax}) {
+        connections.push_back(
+            kfbim::geometry3d::NurbsPatchEdgeConnection3D{
+                {0, edge, 0.0, 1.0}, {1, edge, 0.0, 1.0}, false, false});
+    }
+    return connections;
+}
+
+void test_interval_topology_rejects_out_of_domain_endpoint()
+{
+    using Edge = kfbim::geometry3d::NurbsPatchEdge3D;
+    const auto patch = kfbim::geometry3d::NurbsSurfacePatch3D::make_unit_square_xy();
+    require_throws_contains(
+        [&] {
+            (void)kfbim::geometry3d::NurbsSurfaceModel3D(
+                {patch}, {0},
+                {{{0, Edge::UMin, 0.0, std::nextafter(1.0, 2.0)},
+                  {0, Edge::UMax, 0.0, 1.0}, false, false}});
+        },
+        "outside its patch-edge parameter domain",
+        "interval endpoint just outside the domain is rejected");
+}
+
+void test_interval_topology_rejects_tiny_gap()
+{
+    using Edge = kfbim::geometry3d::NurbsPatchEdge3D;
+    const auto patch = kfbim::geometry3d::NurbsSurfacePatch3D::make_unit_square_xy();
+    auto connections = unit_square_pair_connections();
+    connections[0] = kfbim::geometry3d::NurbsPatchEdgeConnection3D{
+        {0, Edge::UMin, 0.0, 0.5}, {1, Edge::UMin, 0.0, 0.5}, false, false};
+    connections.insert(connections.begin() + 1,
+                       kfbim::geometry3d::NurbsPatchEdgeConnection3D{
+                           {0, Edge::UMin, std::nextafter(0.5, 1.0), 1.0},
+                           {1, Edge::UMin, std::nextafter(0.5, 1.0), 1.0},
+                           false,
+                           false});
+    const kfbim::geometry3d::NurbsSurfaceModel3D model(
+        {patch, patch}, {0, 0}, std::move(connections));
+    require_throws_contains(
+        [&] { (void)model.validate_closed(); },
+        "uncovered patch-edge interval",
+        "tiny positive patch-edge gap is rejected");
+}
+
+void test_interval_topology_rejects_tiny_overlap()
+{
+    using Edge = kfbim::geometry3d::NurbsPatchEdge3D;
+    const auto patch = kfbim::geometry3d::NurbsSurfacePatch3D::make_unit_square_xy();
+    auto connections = unit_square_pair_connections();
+    connections[0] = kfbim::geometry3d::NurbsPatchEdgeConnection3D{
+        {0, Edge::UMin, 0.0, 0.5}, {1, Edge::UMin, 0.0, 0.5}, false, false};
+    connections.insert(connections.begin() + 1,
+                       kfbim::geometry3d::NurbsPatchEdgeConnection3D{
+                           {0, Edge::UMin, std::nextafter(0.5, 0.0), 1.0},
+                           {1, Edge::UMin, std::nextafter(0.5, 0.0), 1.0},
+                           false,
+                           false});
+    const kfbim::geometry3d::NurbsSurfaceModel3D model(
+        {patch, patch}, {0, 0}, std::move(connections));
+    require_throws_contains(
+        [&] { (void)model.validate_closed(); },
+        "multiply covered patch-edge interval",
+        "tiny positive patch-edge overlap is rejected");
+}
+
 double dof_area(const SurfaceDofCloud3D& cloud)
 {
     double result = 0.0;
@@ -602,6 +672,9 @@ int main()
     try {
         test_native_models();
         test_native_surface_interval_topology();
+        test_interval_topology_rejects_out_of_domain_endpoint();
+        test_interval_topology_rejects_tiny_gap();
+        test_interval_topology_rejects_tiny_overlap();
         test_uniform_native_dofs();
         test_parameter_candidates();
         test_grid_edge_triangle_owners();

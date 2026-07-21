@@ -124,10 +124,7 @@ void validate_interval(const NurbsPatchEdgeInterval3D& interval,
     }
     const auto domain = edge_parameter_domain(
         patches[static_cast<std::size_t>(interval.patch)], interval.edge);
-    const double scale = std::max({1.0, std::abs(domain.first), std::abs(domain.second)});
-    const double tolerance = 64.0 * std::numeric_limits<double>::epsilon() * scale;
-    if (interval.begin < domain.first - tolerance
-        || interval.end > domain.second + tolerance) {
+    if (interval.begin < domain.first || interval.end > domain.second) {
         throw std::out_of_range(std::string(context)
                                 + " lies outside its patch-edge parameter domain");
     }
@@ -266,22 +263,14 @@ NurbsSurfaceTopologyDiagnostics3D NurbsSurfaceModel3D::validate_closed(
                 }
             }
             std::sort(endpoints.begin(), endpoints.end());
-            const double parameter_tolerance = 64.0 * std::numeric_limits<double>::epsilon()
-                * std::max({1.0, std::abs(domain.first), std::abs(domain.second)});
-            endpoints.erase(std::unique(endpoints.begin(), endpoints.end(),
-                                        [parameter_tolerance](double a, double b) {
-                                            return std::abs(a - b) <= parameter_tolerance;
-                                        }), endpoints.end());
+            endpoints.erase(std::unique(endpoints.begin(), endpoints.end()),
+                            endpoints.end());
             for (std::size_t i = 1; i < endpoints.size(); ++i) {
                 const double begin = endpoints[i - 1];
                 const double end = endpoints[i];
-                if (end <= begin + parameter_tolerance)
-                    continue;
-                const double midpoint = 0.5 * (begin + end);
                 int coverage = 0;
                 for (const auto* interval : incidents) {
-                    if (interval->begin <= midpoint + parameter_tolerance
-                        && interval->end >= midpoint - parameter_tolerance) {
+                    if (interval->begin <= begin && interval->end >= end) {
                         ++coverage;
                     }
                 }
