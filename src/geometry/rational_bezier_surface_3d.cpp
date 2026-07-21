@@ -216,13 +216,6 @@ void refine_active_knots_u(HomogeneousNet& net,
     for (const double knot : active_knots) {
         const int multiplicity =
             static_cast<int>(std::count(knots.begin(), knots.end(), knot));
-        if (knot > domain_start && knot < domain_end
-            && multiplicity > degree) {
-            throw std::invalid_argument(
-                "Bezier extraction interior knot multiplicity exceeds degree "
-                + std::to_string(degree) + " at knot "
-                + std::to_string(knot));
-        }
         const int target_multiplicity =
             (knot == domain_start || knot == domain_end) ? degree + 1 : degree;
         for (int insertion = multiplicity; insertion < target_multiplicity;
