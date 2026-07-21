@@ -12,6 +12,22 @@ namespace {
 
 using HomogeneousNet = std::vector<std::vector<Eigen::Vector4d>>;
 
+double midpoint_if_representable(double begin, double end)
+{
+    const double midpoint = 0.5 * begin + 0.5 * end;
+    if (!std::isfinite(midpoint) || midpoint <= begin || midpoint >= end) {
+        throw std::invalid_argument(
+            "Bezier parameter interval has no representable midpoint");
+    }
+    return midpoint;
+}
+
+bool has_representable_midpoint(double begin, double end)
+{
+    const double midpoint = 0.5 * begin + 0.5 * end;
+    return std::isfinite(midpoint) && midpoint > begin && midpoint < end;
+}
+
 std::size_t expected_control_count(const RationalBezierElement3D& element)
 {
     if (element.degree_u < 0 || element.degree_v < 0)
@@ -104,7 +120,7 @@ void insert_knot_u_once(HomogeneousNet& net,
     const int multiplicity = static_cast<int>(std::count(knots.begin(), knots.end(), knot));
     if (multiplicity >= degree)
         return;
-    if (span < degree || span > old_last_control) {
+    if (span < degree || span > old_last_control + 1) {
         throw std::invalid_argument("Bezier extraction knot lies outside its domain");
     }
 
@@ -155,26 +171,24 @@ HomogeneousNet transpose(const HomogeneousNet& net)
     return result;
 }
 
-void refine_interior_knots_u(HomogeneousNet& net,
-                             std::vector<double>& knots,
-                             int degree,
-                             double domain_start,
-                             double domain_end)
+void refine_active_knots_u(HomogeneousNet& net,
+                           std::vector<double>& knots,
+                           int degree,
+                           double domain_start,
+                           double domain_end)
 {
-    std::vector<double> interior;
+    if (degree == 0)
+        return;
+    std::vector<double> active_knots;
     for (const double knot : knots) {
-        if (knot > domain_start && knot < domain_end
-            && (interior.empty() || knot != interior.back())) {
-            interior.push_back(knot);
+        if (knot >= domain_start && knot <= domain_end
+            && (active_knots.empty() || knot != active_knots.back())) {
+            active_knots.push_back(knot);
         }
     }
-    for (const double knot : interior) {
+    for (const double knot : active_knots) {
         const int multiplicity =
             static_cast<int>(std::count(knots.begin(), knots.end(), knot));
-        if (multiplicity > degree) {
-            throw std::invalid_argument(
-                "Bezier extraction interior knot multiplicity exceeds degree");
-        }
         for (int insertion = multiplicity; insertion < degree; ++insertion)
             insert_knot_u_once(net, knots, degree, knot);
     }
@@ -287,7 +301,8 @@ RationalBezierElement3D::split_u() const
 {
     validate_element(*this);
     std::array<RationalBezierElement3D, 2> children{*this, *this};
-    const double midpoint = 0.5 * (parameter_u0 + parameter_u1);
+    const double midpoint = midpoint_if_representable(
+        parameter_u0, parameter_u1);
     children[0].parameter_u1 = midpoint;
     children[1].parameter_u0 = midpoint;
     for (int j = 0; j <= degree_v; ++j) {
@@ -313,7 +328,8 @@ RationalBezierElement3D::split_v() const
 {
     validate_element(*this);
     std::array<RationalBezierElement3D, 2> children{*this, *this};
-    const double midpoint = 0.5 * (parameter_v0 + parameter_v1);
+    const double midpoint = midpoint_if_representable(
+        parameter_v0, parameter_v1);
     children[0].parameter_v1 = midpoint;
     children[1].parameter_v0 = midpoint;
     for (int i = 0; i <= degree_u; ++i) {
@@ -366,11 +382,11 @@ extract_rational_bezier_elements_3d(const NurbsSurfaceModel3D& model)
 
         std::vector<double> knots_u = patch.basis_u().knots();
         std::vector<double> knots_v = patch.basis_v().knots();
-        refine_interior_knots_u(
+        refine_active_knots_u(
             net, knots_u, degree_u,
             patch.domain_start_u(), patch.domain_end_u());
         HomogeneousNet transposed = transpose(net);
-        refine_interior_knots_u(
+        refine_active_knots_u(
             transposed, knots_v, degree_v,
             patch.domain_start_v(), patch.domain_end_v());
         net = transpose(transposed);
@@ -446,9 +462,17 @@ subdivide_rational_bezier_elements_to_extent_3d(
         const bool split_along_u =
             projected_control_variation(current.element, true)
             >= projected_control_variation(current.element, false);
-        const auto children = split_along_u
-            ? current.element.split_u()
-            : current.element.split_v();
+        if ((split_along_u
+                && !has_representable_midpoint(
+                    current.element.u0(), current.element.u1()))
+            || (!split_along_u
+                && !has_representable_midpoint(
+                    current.element.v0(), current.element.v1()))) {
+            throw std::runtime_error(
+                "Bezier acceleration subdivision exceeded depth 48");
+        }
+        const auto children = split_along_u ? current.element.split_u()
+                                            : current.element.split_v();
         pending.push_back({children[1], current.depth + 1});
         pending.push_back({children[0], current.depth + 1});
     }

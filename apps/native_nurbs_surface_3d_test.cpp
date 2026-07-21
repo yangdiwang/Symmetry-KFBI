@@ -326,6 +326,27 @@ void test_rational_bezier_extraction_and_subdivision()
                 "extent subdivision returns only bounded leaves");
         check_bezier_element_samples(element, model.patch(0), "extent child");
     }
+
+    kfbim::geometry3d::RationalBezierElement3D deep_element;
+    deep_element.patch_index = 0;
+    deep_element.component = 0;
+    deep_element.degree_u = 1;
+    deep_element.degree_v = 0;
+    deep_element.parameter_u0 = 0.0;
+    deep_element.parameter_u1 = 1.0;
+    deep_element.parameter_v0 = 0.0;
+    deep_element.parameter_v1 = 1.0;
+    deep_element.homogeneous_controls = {
+        Eigen::Vector4d(0.0, 0.0, 0.0, 1.0),
+        Eigen::Vector4d(1.0, 0.0, 0.0, 1.0)};
+    require_throws_contains(
+        [&deep_element] {
+            (void)kfbim::geometry3d::
+                subdivide_rational_bezier_elements_to_extent_3d(
+                    {deep_element}, std::ldexp(1.0, -49));
+        },
+        "Bezier acceleration subdivision exceeded depth 48",
+        "extent subdivision reports its depth-48 failure");
 }
 
 void test_benchmark_rational_bezier_elements_are_conservative()
@@ -346,6 +367,52 @@ void test_benchmark_rational_bezier_elements_are_conservative()
                 surface.name + " benchmark element");
         }
     }
+}
+
+void test_nonclamped_rational_bezier_extraction()
+{
+    using kfbim::geometry::NurbsBasis1D;
+    using kfbim::geometry3d::NurbsSurfacePatch3D;
+    const NurbsSurfacePatch3D patch(
+        NurbsBasis1D(2, {0, 1, 2, 3, 4, 5}),
+        NurbsBasis1D(1, {0, 0, 1, 1}),
+        {{{0.0, 0.0, 0.0}, {0.0, 1.0, 0.0}},
+         {{2.0, 0.0, 0.0}, {2.0, 1.0, 0.0}},
+         {{4.0, 0.0, 0.0}, {4.0, 1.0, 0.0}}},
+        {{1.0, 1.0}, {1.0, 1.0}, {1.0, 1.0}});
+    const kfbim::geometry3d::NurbsSurfaceModel3D model({patch}, {0}, {});
+    const auto elements =
+        kfbim::geometry3d::extract_rational_bezier_elements_3d(model);
+    require(elements.size() == 1,
+            "non-clamped active domain produces one Bezier element");
+    check_bezier_element_samples(
+        elements.front(), patch, "non-clamped element");
+}
+
+void test_bezier_subdivision_rejects_collapsed_midpoint()
+{
+    kfbim::geometry3d::RationalBezierElement3D element;
+    element.degree_u = 1;
+    element.degree_v = 0;
+    element.parameter_u0 = 1.0;
+    element.parameter_u1 = std::nextafter(1.0, 2.0);
+    element.parameter_v0 = 0.0;
+    element.parameter_v1 = 1.0;
+    element.homogeneous_controls = {
+        {0.0, 0.0, 0.0, 1.0},
+        {1.0, 0.0, 0.0, 1.0}};
+    require_throws_contains(
+        [&] { (void)element.split_u(); },
+        "representable midpoint",
+        "Bezier split rejects a collapsed floating-point midpoint");
+    require_throws_contains(
+        [&] {
+            (void)kfbim::geometry3d::
+                subdivide_rational_bezier_elements_to_extent_3d(
+                    {element}, 0.5);
+        },
+        "Bezier acceleration subdivision exceeded depth 48",
+        "oversized unsplittable Bezier element uses the depth-limit failure");
 }
 
 double dof_area(const SurfaceDofCloud3D& cloud)
@@ -768,6 +835,8 @@ int main()
         test_interval_topology_rejects_tiny_overlap();
         test_rational_bezier_extraction_and_subdivision();
         test_benchmark_rational_bezier_elements_are_conservative();
+        test_nonclamped_rational_bezier_extraction();
+        test_bezier_subdivision_rejects_collapsed_midpoint();
         test_uniform_native_dofs();
         test_parameter_candidates();
         test_grid_edge_triangle_owners();
