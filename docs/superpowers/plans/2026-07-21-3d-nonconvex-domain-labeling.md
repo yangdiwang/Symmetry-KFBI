@@ -1,5 +1,8 @@
 # 3D Nonconvex Domain Labeling Implementation Plan
 
+> Superseded by the approved NURBS-native geometry design. Do not execute the
+> closed-triangle-mesh tasks in this plan.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace nearest-face-normal labels with closed-surface Cartesian-edge barriers and component flood fill so the L-prism is labeled correctly through `N=128`.

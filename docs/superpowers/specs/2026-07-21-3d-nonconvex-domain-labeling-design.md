@@ -1,5 +1,9 @@
 # 3D Nonconvex Domain-Labeling Design
 
+> Superseded by
+> `2026-07-21-3d-nurbs-native-domain-labeling-design.md`. Do not implement
+> this closed-triangle-mesh design.
+
 ## Goal
 
 Replace the active-P2 nearest-center-normal domain label with a topology-aware
