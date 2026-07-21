@@ -113,6 +113,7 @@ struct SolveMetrics3D {
     double gmres_relative_residual = 0.0;
     double operator_residual_linf = 0.0;
     double exterior_condition_linf = 0.0;
+    double boundary_residual_linf = 0.0;
     double route_mismatch_linf = 0.0;
     double density_linf = 0.0;
     double density_l2 = 0.0;
@@ -169,6 +170,7 @@ struct ReadinessResult {
     int cauchy_incident_patches_min = 0;
     int cauchy_incident_patches_max = 0;
     SolveMetrics3D neumann;
+    SolveMetrics3D dirichlet_normal;
 };
 
 double triangle_area(const Eigen::Vector3d& a,
@@ -1833,6 +1835,88 @@ ExteriorZeroTraceSolution3D solve_exterior_zero_trace_neumann_3d(
     return result;
 }
 
+class ExteriorNormalTraceOperator3D final : public IKFBIOperator {
+public:
+    explicit ExteriorNormalTraceOperator3D(
+        const PanelCenterHarmonicJetKFBI3D& pipeline)
+        : pipeline_(pipeline)
+    {}
+
+    int problem_size() const override
+    {
+        return pipeline_.surface_size();
+    }
+
+    void apply(const Eigen::VectorXd& normal_jump,
+               Eigen::VectorXd& result) const override
+    {
+        if (normal_jump.size() != problem_size()) {
+            throw std::invalid_argument(
+                "exterior-normal operator input has wrong size");
+        }
+        const Eigen::VectorXd zero_value =
+            Eigen::VectorXd::Zero(problem_size());
+        const HarmonicJetField3D field =
+            pipeline_.evaluate(zero_value, normal_jump);
+        result = pipeline_.exterior_normal_trace(
+            field, zero_value, normal_jump);
+    }
+
+    Eigen::VectorXd right_hand_side(
+        const Eigen::VectorXd& prescribed_value_jump) const
+    {
+        if (prescribed_value_jump.size() != problem_size()) {
+            throw std::invalid_argument(
+                "prescribed Dirichlet data has wrong size");
+        }
+        const Eigen::VectorXd zero_normal =
+            Eigen::VectorXd::Zero(problem_size());
+        const HarmonicJetField3D field =
+            pipeline_.evaluate(prescribed_value_jump, zero_normal);
+        return -pipeline_.exterior_normal_trace(
+            field, prescribed_value_jump, zero_normal);
+    }
+
+private:
+    const PanelCenterHarmonicJetKFBI3D& pipeline_;
+};
+
+struct ExteriorNormalTraceSolution3D {
+    Eigen::VectorXd normal_jump;
+    Eigen::VectorXd potential;
+    Eigen::MatrixXd coefficients;
+    Eigen::VectorXd operator_residual;
+    std::vector<double> gmres_residuals;
+    int iterations = 0;
+    bool converged = false;
+};
+
+ExteriorNormalTraceSolution3D solve_exterior_zero_normal_dirichlet_3d(
+    const PanelCenterHarmonicJetKFBI3D& pipeline,
+    const Eigen::VectorXd& prescribed_value_jump,
+    double tolerance,
+    int restart,
+    int max_iterations)
+{
+    ExteriorNormalTraceOperator3D op(pipeline);
+    const Eigen::VectorXd rhs = op.right_hand_side(prescribed_value_jump);
+    Eigen::VectorXd normal_jump = Eigen::VectorXd::Zero(op.problem_size());
+    GMRES gmres(max_iterations, tolerance, restart);
+    ExteriorNormalTraceSolution3D result;
+    result.iterations = gmres.solve(op, rhs, normal_jump);
+    result.converged = gmres.converged();
+    result.gmres_residuals = gmres.residuals();
+    result.normal_jump = normal_jump;
+    const HarmonicJetField3D field =
+        pipeline.evaluate(prescribed_value_jump, normal_jump);
+    result.potential = field.potential;
+    result.coefficients = field.coefficients;
+    Eigen::VectorXd applied;
+    op.apply(normal_jump, applied);
+    result.operator_residual = applied - rhs;
+    return result;
+}
+
 double vector_linf(const Eigen::VectorXd& values)
 {
     return values.size() == 0 ? 0.0 : values.lpNorm<Eigen::Infinity>();
@@ -1939,6 +2023,88 @@ SolveMetrics3D run_neumann_case(
             result.interior_linf = std::max(
                 result.interior_linf, std::abs(error));
             interior_error_sq += error * error;
+        } else {
+            const double error = solution.potential[node];
+            result.exterior_bulk_linf = std::max(
+                result.exterior_bulk_linf, std::abs(error));
+            exterior_error_sq += error * error;
+            ++exterior_count;
+        }
+    }
+    result.interior_l2 = std::sqrt(
+        interior_error_sq / static_cast<double>(interior_count));
+    result.exterior_bulk_l2 = std::sqrt(
+        exterior_error_sq / static_cast<double>(exterior_count));
+    return result;
+}
+
+SolveMetrics3D run_dirichlet_normal_case(
+    const CartesianGrid3D& grid,
+    const GridPair3D& grid_pair,
+    const PanelCenterHarmonicJetKFBI3D& pipeline)
+{
+    const int size = pipeline.surface_size();
+    Eigen::VectorXd value_data(size);
+    Eigen::VectorXd exact_normal(size);
+    for (int q = 0; q < size; ++q) {
+        const SurfaceDof& dof =
+            pipeline.surface().dofs[static_cast<std::size_t>(q)];
+        value_data[q] = manufactured_u_3d(dof.point);
+        exact_normal[q] = manufactured_gradient_3d(dof.point).dot(dof.normal);
+    }
+
+    const auto solve_start = std::chrono::steady_clock::now();
+    const ExteriorNormalTraceSolution3D solution =
+        solve_exterior_zero_normal_dirichlet_3d(
+            pipeline, value_data, 2.0e-10, 0, 400);
+    const double seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - solve_start).count();
+
+    const HarmonicJetField3D field{
+        solution.potential, solution.coefficients};
+    const Eigen::VectorXd direct_exterior_normal =
+        pipeline.exterior_normal_trace(
+            field, value_data, solution.normal_jump);
+    const Eigen::VectorXd exterior_normal_from_jump =
+        pipeline.interior_normal_trace(
+            field, value_data, solution.normal_jump) - solution.normal_jump;
+    const Eigen::VectorXd boundary_residual = pipeline.interior_trace(
+        field, value_data, solution.normal_jump) - value_data;
+
+    SolveMetrics3D result;
+    result.formulation = "dirichlet_exterior_zero_normal_trace";
+    result.iterations = solution.iterations;
+    result.converged = solution.converged;
+    result.seconds = seconds;
+    result.gmres_relative_residual = solution.gmres_residuals.empty()
+        ? std::numeric_limits<double>::quiet_NaN()
+        : solution.gmres_residuals.back();
+    result.operator_residual_linf = vector_linf(solution.operator_residual);
+    result.exterior_condition_linf = vector_linf(direct_exterior_normal);
+    result.boundary_residual_linf = vector_linf(boundary_residual);
+    result.route_mismatch_linf = vector_linf(
+        direct_exterior_normal - exterior_normal_from_jump);
+    result.data_weighted_mean = surface_weighted_mean(
+        pipeline.surface(), value_data);
+    result.density_weighted_mean = surface_weighted_mean(
+        pipeline.surface(), solution.normal_jump);
+
+    const Eigen::VectorXd density_error = solution.normal_jump - exact_normal;
+    result.density_linf = vector_linf(density_error);
+    result.density_l2 = vector_rms(density_error);
+
+    double interior_error_sq = 0.0;
+    double exterior_error_sq = 0.0;
+    int interior_count = 0;
+    int exterior_count = 0;
+    for (int node = 0; node < grid.num_dofs(); ++node) {
+        if (grid_pair.domain_label(node) > 0) {
+            const double error = solution.potential[node]
+                               - manufactured_u_3d(grid_point(grid, node));
+            result.interior_linf = std::max(
+                result.interior_linf, std::abs(error));
+            interior_error_sq += error * error;
+            ++interior_count;
         } else {
             const double error = solution.potential[node];
             result.exterior_bulk_linf = std::max(
@@ -2279,6 +2445,8 @@ ReadinessResult run_readiness_case(GeometryKind kind,
             "harmonic-jet constant probe produced NaN/Inf");
     }
     result.neumann = run_neumann_case(grid, grid_pair, harmonic_pipeline);
+    result.dirichlet_normal = run_dirichlet_normal_case(
+        grid, grid_pair, harmonic_pipeline);
 
     std::cout << "[ready] " << geometry.name << " - " << geometry.description << '\n'
               << "  panel-center surface patches/dofs="
@@ -2339,7 +2507,30 @@ ReadinessResult run_readiness_case(GeometryKind kind,
               << result.neumann.exterior_bulk_linf << '/'
               << result.neumann.exterior_bulk_l2
               << " flux_mean=" << result.neumann.data_weighted_mean
-              << " seconds=" << result.neumann.seconds << '\n';
+              << " seconds=" << result.neumann.seconds << '\n'
+              << "  [dirichlet-normal] converged/iterations="
+              << result.dirichlet_normal.converged << '/'
+              << result.dirichlet_normal.iterations
+              << " gmres="
+              << result.dirichlet_normal.gmres_relative_residual
+              << " operator="
+              << result.dirichlet_normal.operator_residual_linf
+              << " exterior_normal="
+              << result.dirichlet_normal.exterior_condition_linf
+              << " interior_value_res="
+              << result.dirichlet_normal.boundary_residual_linf
+              << " route_mismatch="
+              << result.dirichlet_normal.route_mismatch_linf
+              << " density_linf/l2="
+              << result.dirichlet_normal.density_linf << '/'
+              << result.dirichlet_normal.density_l2
+              << " interior_linf/l2="
+              << result.dirichlet_normal.interior_linf << '/'
+              << result.dirichlet_normal.interior_l2
+              << " exterior_bulk_linf/l2="
+              << result.dirichlet_normal.exterior_bulk_linf << '/'
+              << result.dirichlet_normal.exterior_bulk_l2
+              << " seconds=" << result.dirichlet_normal.seconds << '\n';
     return result;
 }
 
@@ -2424,9 +2615,8 @@ void print_usage(const char* executable)
         << "  Each N must be a power of two and at least 16 (default: 16).\n"
         << "  This stage builds independent parameter-panel-center surface\n"
         << "  unknowns, topology-filtered 48/28 Cauchy stencils, validates\n"
-        << "  fixed transfer routes, and runs a constant value-jump probe.\n"
-        << "  The exterior-zero-trace harmonic-jet GMRES path is compiled,\n"
-        << "  but this readiness command does not execute a numerical solve.\n";
+        << "  fixed transfer routes, and executes the Neumann value-jump and\n"
+        << "  Dirichlet normal-jump harmonic-jet GMRES formulations.\n";
 }
 
 } // namespace
@@ -2473,9 +2663,9 @@ int main(int argc, char** argv)
             "output/neumann_exterior_zero_trace_3d";
 #endif
 
-        std::cout << "KFBI3D exterior-zero-trace Neumann readiness stage\n"
-                  << "  implemented equation: A(f)=f-R_minus H_D(f), "
-                     "b=R_minus H_N(g)\n"
+        std::cout << "KFBI3D harmonic-jet convergence study\n"
+                  << "  Neumann target: exterior value trace = 0\n"
+                  << "  Dirichlet target: exterior normal trace = 0\n"
                   << "  current stage: parameter-panel-center surface DOFs + "
                      "topological Cauchy stencils + fixed routes\n"
                   << "  levels=";
@@ -2493,9 +2683,7 @@ int main(int argc, char** argv)
         }
         write_summary(output_dir, results);
 
-        std::cout << "Geometry and transfer-pipeline readiness passed.\n"
-                  << "The compiled exterior-zero-trace GMRES algorithm was "
-                     "not executed in readiness mode.\n"
+        std::cout << "Geometry checks and both GMRES formulations completed.\n"
                   << "Output: " << output_dir.string() << '\n';
         return 0;
     } catch (const std::exception& error) {
