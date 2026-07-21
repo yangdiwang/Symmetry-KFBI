@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -32,8 +33,27 @@ std::size_t expected_control_count(const RationalBezierElement3D& element)
 {
     if (element.degree_u < 0 || element.degree_v < 0)
         throw std::invalid_argument("Bezier element degree must be nonnegative");
-    return static_cast<std::size_t>(element.degree_u + 1)
-         * static_cast<std::size_t>(element.degree_v + 1);
+    const std::size_t maximum = std::numeric_limits<std::size_t>::max();
+    const auto checked_extent = [maximum](int degree) {
+        if (static_cast<std::uintmax_t>(degree)
+            >= static_cast<std::uintmax_t>(maximum)) {
+            throw std::invalid_argument(
+                "Bezier element control count is too large");
+        }
+        return static_cast<std::size_t>(degree) + std::size_t{1};
+    };
+    const std::size_t count_u = checked_extent(element.degree_u);
+    const std::size_t count_v = checked_extent(element.degree_v);
+    if (count_u > maximum / count_v) {
+        throw std::invalid_argument(
+            "Bezier element control count is too large");
+    }
+    const std::size_t count = count_u * count_v;
+    if (count > maximum / sizeof(Eigen::Vector4d)) {
+        throw std::invalid_argument(
+            "Bezier element control count is too large");
+    }
+    return count;
 }
 
 void validate_element(const RationalBezierElement3D& element)
@@ -81,7 +101,7 @@ std::array<std::vector<Eigen::Vector4d>, 2> split_curve(
     children[1][count - 1] = controls.back();
     for (std::size_t level = 1; level < count; ++level) {
         for (std::size_t i = 0; i + level < count; ++i)
-            controls[i] = 0.5 * (controls[i] + controls[i + 1]);
+            controls[i] = 0.5 * controls[i] + 0.5 * controls[i + 1];
         children[0][level] = controls[0];
         children[1][count - level - 1] = controls[count - level - 1];
     }
@@ -338,6 +358,8 @@ RationalBezierElement3D::split_u() const
                 split[1][static_cast<std::size_t>(i)];
         }
     }
+    validate_element(children[0]);
+    validate_element(children[1]);
     return children;
 }
 
@@ -365,6 +387,8 @@ RationalBezierElement3D::split_v() const
                 split[1][static_cast<std::size_t>(j)];
         }
     }
+    validate_element(children[0]);
+    validate_element(children[1]);
     return children;
 }
 

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -488,6 +489,61 @@ void test_bezier_subdivision_rejects_collapsed_midpoint()
         "oversized unsplittable Bezier element uses the depth-limit failure");
 }
 
+void test_bezier_split_preserves_large_finite_controls()
+{
+    const double maximum = std::numeric_limits<double>::max();
+    const double weight = 0.25 * maximum;
+    kfbim::geometry3d::RationalBezierElement3D element;
+    element.degree_u = 1;
+    element.degree_v = 0;
+    element.parameter_u0 = 0.0;
+    element.parameter_u1 = 1.0;
+    element.parameter_v0 = 0.0;
+    element.parameter_v1 = 1.0;
+    element.homogeneous_controls = {
+        {maximum, 0.0, 0.0, weight},
+        {0.75 * maximum, 0.0, 0.0, weight}};
+
+    const auto children = element.split_u();
+    for (const auto& child : children) {
+        for (const Eigen::Vector4d& control : child.homogeneous_controls) {
+            require(control.allFinite(),
+                    "large finite Bezier split retains finite controls");
+        }
+        require(child.bounds().max_extent() <= 0.5,
+                "large finite Bezier child has the exact half extent");
+    }
+    require(std::abs(children[0].evaluate(0.5, 0.5).x() - 3.5) < 1.0e-14
+                && std::abs(children[1].evaluate(0.5, 0.5).x() - 3.5)
+                       < 1.0e-14,
+            "large finite Bezier children meet at their exact midpoint");
+
+    const auto refined =
+        kfbim::geometry3d::subdivide_rational_bezier_elements_to_extent_3d(
+            {element}, 0.75);
+    require(refined.size() == 2,
+            "large finite Bezier extent subdivision produces two leaves");
+    for (const auto& child : refined) {
+        require(child.bounds().max_extent() <= 0.75,
+                "large finite Bezier extent leaf satisfies the limit");
+    }
+}
+
+void test_bezier_rejects_extreme_degree_control_count()
+{
+    kfbim::geometry3d::RationalBezierElement3D element;
+    element.degree_u = std::numeric_limits<int>::max();
+    element.degree_v = std::numeric_limits<int>::max();
+    element.parameter_u0 = 0.0;
+    element.parameter_u1 = 1.0;
+    element.parameter_v0 = 0.0;
+    element.parameter_v1 = 1.0;
+    require_throws_contains(
+        [&] { (void)element.bounds(); },
+        "Bezier element control count is too large",
+        "extreme Bezier degrees are rejected before count overflow");
+}
+
 double dof_area(const SurfaceDofCloud3D& cloud)
 {
     double result = 0.0;
@@ -912,6 +968,8 @@ int main()
         test_degree_zero_multispan_bezier_extraction();
         test_discontinuous_multispan_bezier_extraction_is_rejected();
         test_bezier_subdivision_rejects_collapsed_midpoint();
+        test_bezier_split_preserves_large_finite_controls();
+        test_bezier_rejects_extreme_degree_control_count();
         test_uniform_native_dofs();
         test_parameter_candidates();
         test_grid_edge_triangle_owners();
