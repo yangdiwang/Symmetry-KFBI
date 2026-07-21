@@ -42,6 +42,7 @@ if(KFBIM_BUILD_3D)
         geometry/p2_projection_3d.cpp
         geometry/nurbs_patch_triangulator_3d.cpp
         geometry/nurbs_bezier_intersection_3d.cpp
+        geometry/nurbs_surface_intersector_3d.cpp
         geometry/nurbs_bezier_extraction_3d.cpp
         geometry/rational_bezier_element_3d.cpp
         geometry/rational_bezier_subdivision_3d.cpp

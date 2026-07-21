@@ -6,11 +6,13 @@
 #include "src/geometry/rational_bezier_element_3d.hpp"
 #include "src/geometry/rational_bezier_subdivision_3d.hpp"
 #include "src/geometry/nurbs_surface_model_3d.hpp"
+#include "src/geometry/nurbs_surface_intersector_3d.hpp"
 #include "src/grid/cartesian_grid_3d.hpp"
 #include "src/transfer/laplace_correction_support.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -50,6 +52,25 @@ void require_throws_contains(Function&& function,
     } catch (const std::exception& error) {
         require(std::string(error.what()).find(needle) != std::string::npos,
                 message + ": " + error.what());
+        return;
+    }
+    throw std::runtime_error(message + ": no exception");
+}
+
+template <class Function>
+void require_throws_contains_all(
+    Function&& function,
+    std::initializer_list<const char*> needles,
+    const std::string& message)
+{
+    try {
+        function();
+    } catch (const std::exception& error) {
+        const std::string text = error.what();
+        for (const char* needle : needles) {
+            require(text.find(needle) != std::string::npos,
+                    message + ": " + text);
+        }
         return;
     }
     throw std::runtime_error(message + ": no exception");
@@ -684,6 +705,137 @@ void test_bezier_split_preserves_large_finite_controls()
     }
 }
 
+void require_intersector_bounds_dense_samples(
+    const NativeNurbsSurface3D& surface,
+    const kfbim::geometry3d::NurbsSurfaceIntersector3D& intersector)
+{
+    for (const auto& patch : surface.patches) {
+        for (int iu = 0; iu <= 16; ++iu) {
+            const double u = patch.domain_start_u()
+                + (patch.domain_end_u() - patch.domain_start_u())
+                    * static_cast<double>(iu) / 16.0;
+            for (int iv = 0; iv <= 16; ++iv) {
+                const double v = patch.domain_start_v()
+                    + (patch.domain_end_v() - patch.domain_start_v())
+                        * static_cast<double>(iv) / 16.0;
+                require(intersector.bounds().contains(
+                            patch.evaluate(u, v),
+                            intersector.geometry_tolerance()),
+                        surface.name + " intersector bounds contain dense samples");
+            }
+        }
+    }
+}
+
+void test_native_nurbs_surface_intersector()
+{
+    using kfbim::geometry3d::NurbsCartesianEdgeQuery3D;
+    using kfbim::geometry3d::NurbsSurfaceIntersector3D;
+
+    require_throws_contains(
+        [] {
+            (void)NurbsSurfaceIntersector3D(
+                kfbim::geometry3d::NurbsSurfaceModel3D(
+                    {kfbim::geometry3d::NurbsSurfacePatch3D::
+                         make_unit_square_xy()},
+                    {0}, {}));
+        },
+        "uncovered patch-edge interval",
+        "surface intersector rejects an open model");
+
+    const NativeNurbsSurface3D torus =
+        make_native_nurbs_surface_3d(GeometryKind3D::Torus);
+    const NurbsSurfaceIntersector3D torus_intersector(torus.geometry_model());
+    require_intersector_bounds_dense_samples(torus, torus_intersector);
+    const auto leaves = torus_intersector.acceleration_leaves(0.05);
+    require(std::all_of(leaves.begin(), leaves.end(), [](const auto& leaf) {
+                return leaf.bounds().max_extent() <= 0.05 + 1e-13;
+            }),
+            "all acceleration leaves satisfy requested extent");
+
+    const auto seam_hit = torus_intersector.intersect_segment(
+        {0.80, -0.04, 0.03}, {0.84, -0.04, 0.03});
+    require(seam_hit.crossings.size() == 1
+                && seam_hit.diagnostics.seam_deduplications >= 1,
+            "periodic torus seam root is canonicalized once");
+    require(torus_intersector.containing_components(
+                {0.62, -0.04, 0.03}) == std::vector<int>{0}
+                && torus_intersector.containing_components(
+                    {0.07, -0.04, 0.03}).empty(),
+            "torus component parity distinguishes tube from central void");
+    require_throws_contains(
+        [&] {
+            (void)torus_intersector.intersect_cartesian_edge(
+                NurbsCartesianEdgeQuery3D{
+                    0, 10, 11, 12,
+                    {-1.0, -0.04, 0.03}, {1.0, -0.04, 0.03}});
+        },
+        "multiple crossings on Cartesian edge",
+        "torus Cartesian edge rejects multiple crossings");
+
+    const NativeNurbsSurface3D cylinder =
+        make_native_nurbs_surface_3d(GeometryKind3D::HollowCylinder);
+    const NurbsSurfaceIntersector3D cylinder_intersector(
+        cylinder.geometry_model());
+    require_intersector_bounds_dense_samples(cylinder, cylinder_intersector);
+    const auto smooth_hit = cylinder_intersector.intersect_segment(
+        {0.06, 0.48, 0.0}, {0.06, 0.52, 0.0});
+    require(smooth_hit.crossings.size() == 1
+                && smooth_hit.diagnostics.seam_deduplications >= 1,
+            "smooth cylinder-quarter seam root is canonicalized once");
+    require(cylinder_intersector.containing_components(
+                {0.46, -0.05, 0.0}) == std::vector<int>{0}
+                && cylinder_intersector.containing_components(
+                    {0.06, -0.05, 0.0}).empty(),
+            "hollow-cylinder parity distinguishes shell from bore");
+    require_throws_contains(
+        [&] {
+            (void)cylinder_intersector.intersect_cartesian_edge(
+                NurbsCartesianEdgeQuery3D{
+                    1, 20, 21, 22,
+                    {0.61, -0.10, 0.0}, {0.61, 0.0, 0.0}});
+        },
+        "tangential Cartesian edge contact",
+        "cylinder Cartesian edge rejects tangential contact");
+    require_throws_contains_all(
+        [&] {
+            (void)cylinder_intersector.intersect_cartesian_edge(
+                NurbsCartesianEdgeQuery3D{
+                    0, 30, 31, 32,
+                    {0.59, -0.05, 0.67}, {0.63, -0.05, 0.67}});
+        },
+        {"non-G1 feature-edge alignment", "axis=0", "(30,31,32)",
+         "root=(patch="},
+        "cylinder Cartesian edge rejects outer top-rim alignment");
+
+    const NativeNurbsSurface3D lprism =
+        make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
+    const NurbsSurfaceIntersector3D lprism_intersector(
+        lprism.geometry_model());
+    require_intersector_bounds_dense_samples(lprism, lprism_intersector);
+    require(lprism_intersector.containing_components(
+                {0.0, -0.3, 0.0}) == std::vector<int>{0},
+            "L-prism component parity classifies its reentrant solid");
+    require_throws_contains(
+        [&] {
+            (void)lprism_intersector.intersect_cartesian_edge(
+                NurbsCartesianEdgeQuery3D{
+                    2, 40, 41, 42,
+                    {0.0, -0.3, 0.67}, {0.0, -0.3, 0.8}});
+        },
+        "surface intersects Cartesian node",
+        "L-prism Cartesian edge rejects a node intersection");
+    require_throws_contains(
+        [&] {
+            (void)lprism_intersector.intersect_cartesian_edge(
+                NurbsCartesianEdgeQuery3D{
+                    0, 50, 51, 52,
+                    {-0.2, -0.3, 0.67}, {-0.1, -0.3, 0.67}});
+        },
+        "surface overlaps Cartesian edge",
+        "L-prism Cartesian edge rejects a surface overlap");
+}
+
 void test_bezier_rejects_extreme_degree_control_count()
 {
     kfbim::geometry3d::RationalBezierElement3D element;
@@ -1134,6 +1286,7 @@ int main()
         test_bezier_subdivision_rejects_collapsed_midpoint();
         test_bezier_split_preserves_large_finite_controls();
         test_bezier_rejects_extreme_degree_control_count();
+        test_native_nurbs_surface_intersector();
         test_uniform_native_dofs();
         test_parameter_candidates();
         test_grid_edge_triangle_owners();
