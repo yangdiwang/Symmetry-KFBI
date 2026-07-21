@@ -5,9 +5,11 @@
 The 3D app constructs the torus, hollow cylinder, and L prism from native
 NURBS patches. Interface DOFs are uniform native-parameter cell midpoints;
 grid crossings use triangle-interpolated `(u,v)` and exactly `2x2` candidate
-DOFs. Periodic/G1 seams are mapped, while both DOF selection and the 48/28
-local Cauchy stencil stop at non-G1 patch edges. Detailed `N=16,32,64`
-convergence results are recorded in
+DOFs. Crossing ownership may traverse only periodic/G1 edge maps. The 48/28
+local Cauchy stencil instead starts from a complete topological patch ring,
+including non-G1 neighbors, and ranks that local pool by physical distance;
+it therefore cannot jump between spatially close but topologically unrelated
+surface sheets. Detailed `N=16,32,64` convergence results are recorded in
 [`docs/superpowers/results/2026-07-21-3d-harmonic-jet-results.md`](docs/superpowers/results/2026-07-21-3d-harmonic-jet-results.md).
 
 这是从原 KFBI 工作区中独立整理出的二维与三维算例仓库。仓库包含 `apps` 下的全部

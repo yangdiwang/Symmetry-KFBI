@@ -15,10 +15,10 @@ Introduce one native surface model containing:
 - the ordered `NurbsSurfacePatch3D` collection;
 - a stable name for every patch;
 - the orientation implied by each patch parameterization;
-- complete topological edge-to-edge connections, including the paired edges
-  and whether the neighboring edge parameter is reversed;
-- the G1 subset of those connections, stored separately for parameter-based
-  crossing ownership.
+- complete patch adjacency for every shared geometric edge, including
+  one-to-many adjacency where native patch edge partitions do not match;
+- explicit G1 edge-to-edge parameter maps, stored separately for
+  parameter-based crossing ownership.
 
 The model is the sole source for both NURBS triangulation and surface-DOF
 generation. The three geometries use these native decompositions:
@@ -66,11 +66,13 @@ centers.
 
 ## Patch Connectivity
 
-Patch edge matching records an explicit edge-to-edge parameter transformation
-for every pair of native patches that share a physical edge. A connection is
-also placed in the G1 subset only when the surface normals agree to the
-configured smoothness tolerance. This handles closed torus and cylinder seams
-without interpolating raw global angles across `0` and `2*pi`.
+Complete patch adjacency records every native patch pair that shares a
+physical edge. It is a patch graph rather than a single edge-pair array,
+because one long L-prism side edge can touch two shorter cap-patch edges.
+Separately, G1 connections record an explicit edge-to-edge parameter map when
+the edge partitions match and the surface normals agree. This handles closed
+torus and cylinder seams without interpolating raw global angles across `0`
+and `2*pi`.
 
 The two graphs have different purposes. Crossing-to-DOF association uses only
 the G1 graph, so an L-prism query near a sharp or re-entrant edge remains on
@@ -107,12 +109,15 @@ evaluated from this geometric approximation.
 ## Cauchy Stencils
 
 The owner DOF remains the center of one degree-three local harmonic Cauchy
-polynomial. Stencil construction performs a breadth-first expansion from its
-native patch over the complete topological adjacency graph, including non-G1
-edges, until the accumulated patches contain enough samples for the requested
-48 value and 28 normal data. Candidate samples within that topological
-neighborhood are finally ranked by three-dimensional Euclidean distance. The
-center DOF is retained, and the existing polynomial order remains unchanged.
+polynomial. Stencil construction always includes the source patch and its
+complete first topological ring, including non-G1 edges. If that pool still
+contains fewer than the requested 48 value samples, it expands by additional
+whole breadth-first rings. Candidate samples within the resulting topological
+neighborhood are then ranked by three-dimensional Euclidean distance; this
+lets points near a patch edge use the adjacent patch even when the source
+patch alone contains more than 48 DOFs. The center DOF is retained, 28 normal
+samples are the nearest subset of the 48 values, and the existing polynomial
+order remains unchanged.
 
 ## Validation
 

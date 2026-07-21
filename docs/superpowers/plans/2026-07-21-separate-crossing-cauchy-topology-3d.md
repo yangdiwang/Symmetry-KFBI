@@ -4,7 +4,7 @@
 
 **Goal:** Keep crossing-to-DOF ownership confined to G1 seams while allowing each local Cauchy fit to collect its 48/28 samples across topologically adjacent non-G1 patch edges.
 
-**Architecture:** `NativeNurbsSurface3D` stores a complete patch-edge adjacency graph in addition to its existing G1 graph. A reusable Cauchy selector expands the complete graph breadth-first by whole topological rings, stops once at least 48 DOFs are available, and then ranks only that pool by physical distance. The existing `2x2` parameter candidate function continues to use only `smooth_neighbors`.
+**Architecture:** `NativeNurbsSurface3D` stores a complete, potentially one-to-many patch adjacency graph in addition to its existing G1 edge-map graph. A reusable Cauchy selector always includes the first complete topological ring, expands by more whole rings if fewer than 48 DOFs are available, and then ranks only that pool by physical distance. The existing `2x2` parameter candidate function continues to use only `smooth_neighbors`.
 
 **Tech Stack:** C++17, Eigen, native NURBS patches, CMake/MSBuild, existing standalone 3D regression executable.
 
@@ -26,7 +26,7 @@
 - Test: `apps/native_nurbs_surface_3d_test.cpp`
 
 **Interfaces:**
-- Produces: `NativeNurbsSurface3D::topological_neighbors` with the same edge-pair mapping type as `smooth_neighbors`.
+- Produces: `NativeNurbsSurface3D::topological_patch_neighbors` as an adjacency list that supports one-to-many native edge partitions.
 - Produces: `std::vector<int> nearest_topological_cauchy_dofs(const NativeNurbsSurface3D&, const SurfaceDofCloud3D&, int center_dof, int count)`.
 - Preserves: `parameter_dof_candidates_2x2(...)` reads only `smooth_neighbors`.
 
@@ -35,7 +35,7 @@
 Extend `check_patch_regular` and `test_parameter_candidates` with checks equivalent to:
 
 ```cpp
-require(surface.topological_neighbors.size() == surface.patches.size(),
+require(surface.topological_patch_neighbors.size() == surface.patches.size(),
         surface.name + " topological-neighbor count");
 
 const SurfaceDofCloud3D lcloud = make_native_surface_dofs_3d(lprism, 3.0 / 16.0);
@@ -67,24 +67,23 @@ Run:
 cmake --build build --config Release --target native_nurbs_surface_3d_test --parallel 2
 ```
 
-Expected: compilation fails because `topological_neighbors` and
+Expected: compilation fails because `topological_patch_neighbors` and
 `nearest_topological_cauchy_dofs` do not exist.
 
 - [ ] **Step 3: Add complete edge adjacency without changing G1 lookup**
 
-Add `topological_neighbors` to `NativeNurbsSurface3D`. Make `append_patch`
-append empty entries to both graphs. Add an edge-matching pass that compares
-the two endpoints and midpoint of every unpaired native patch edge, records
-the paired edge and its orientation in `topological_neighbors`, and throws if
-one edge receives two topological neighbors. Existing `connect_smooth` must
-also register the same pair topologically, while the cylinder wall/cap and
-L-prism cap/side and side/side pairs remain absent from `smooth_neighbors`.
+Add `topological_patch_neighbors` to `NativeNurbsSurface3D`. Make
+`append_patch` append an empty adjacency list. Register every shared-edge
+patch pair symmetrically, including both cap patches touched by a long
+L-prism side edge. Existing `connect_smooth` must also register the same pair
+topologically, while cylinder wall/cap and L-prism cap/side and side/side
+pairs remain absent from `smooth_neighbors`.
 
 The resulting relationship is:
 
 ```cpp
-smooth_neighbors[patch][edge]       // G1 subset: crossing 2x2 lookup
-topological_neighbors[patch][edge]  // all shared edges: Cauchy BFS
+smooth_neighbors[patch][edge]          // G1 edge map: crossing 2x2 lookup
+topological_patch_neighbors[patch]     // all shared edges: Cauchy BFS
 ```
 
 - [ ] **Step 4: Remove the obsolete per-G1-component 48-DOF refinement**
@@ -109,11 +108,13 @@ Implement `nearest_topological_cauchy_dofs` as follows:
 visited = {center.patch_id};
 frontier = {center.patch_id};
 candidate_count = dofs_on(center.patch_id);
-while (candidate_count < count && !frontier.empty()) {
+expanded_one_ring = false;
+while ((!expanded_one_ring || candidate_count < count) && !frontier.empty()) {
     next = every unvisited topological neighbor of the whole frontier;
     sort_and_unique(next);
     add the entire next ring to visited and candidate_count;
     frontier = next;
+    expanded_one_ring = true;
 }
 if (candidate_count < count) throw runtime_error(...);
 sort all DOFs on visited patches by (distance_squared, dof_id);

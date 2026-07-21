@@ -261,59 +261,22 @@ CauchyStencilSet build_cauchy_stencils(const NativeNurbsSurface3D& surface,
                                        int requested_value_count,
                                        int requested_derivative_count)
 {
-    if (requested_value_count <= 0 || requested_derivative_count < 0)
+    if (requested_value_count <= 0 || requested_derivative_count < 0
+        || requested_derivative_count > requested_value_count) {
         throw std::invalid_argument("invalid Cauchy stencil sizes");
-    std::vector<std::vector<int>> patch_dofs(cloud.patches.size());
-    for (int q = 0; q < static_cast<int>(cloud.dofs.size()); ++q)
-        patch_dofs[static_cast<std::size_t>(cloud.dofs[q].patch_id)].push_back(q);
-
-    int minimum_candidate_count = std::numeric_limits<int>::max();
-    for (int patch_id = 0;
-         patch_id < static_cast<int>(cloud.patches.size());
-         ++patch_id) {
-        int count = 0;
-        const std::vector<int> component =
-            app3d::smooth_patch_component(surface, patch_id);
-        for (int adjacent : component)
-            count += static_cast<int>(patch_dofs[static_cast<std::size_t>(adjacent)].size());
-        minimum_candidate_count = std::min(minimum_candidate_count, count);
     }
 
     CauchyStencilSet result;
-    result.value_count = std::min(requested_value_count, minimum_candidate_count);
-    result.derivative_count = std::min(
-        requested_derivative_count, result.value_count);
-    if (result.value_count <= 0)
-        throw std::runtime_error("no candidates available for a Cauchy stencil");
+    result.value_count = requested_value_count;
+    result.derivative_count = requested_derivative_count;
     result.rows.reserve(cloud.dofs.size());
     result.incident_patch_count_min = std::numeric_limits<int>::max();
 
     for (int center = 0; center < static_cast<int>(cloud.dofs.size()); ++center) {
         const SurfaceDof& target = cloud.dofs[static_cast<std::size_t>(center)];
-        std::vector<std::pair<double, int>> candidates;
-        const std::vector<int> component =
-            app3d::smooth_patch_component(surface, target.patch_id);
-        for (int adjacent : component) {
-            for (int q : patch_dofs[static_cast<std::size_t>(adjacent)]) {
-                const double distance_sq =
-                    (cloud.dofs[static_cast<std::size_t>(q)].point - target.point)
-                    .squaredNorm();
-                candidates.emplace_back(distance_sq, q);
-            }
-        }
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const auto& a, const auto& b) {
-                      if (a.first != b.first)
-                          return a.first < b.first;
-                      return a.second < b.second;
-                  });
-        if (static_cast<int>(candidates.size()) < result.value_count)
-            throw std::runtime_error("Cauchy candidate count changed unexpectedly");
-
         CauchyStencil stencil;
-        stencil.value_ids.reserve(static_cast<std::size_t>(result.value_count));
-        for (int k = 0; k < result.value_count; ++k)
-            stencil.value_ids.push_back(candidates[static_cast<std::size_t>(k)].second);
+        stencil.value_ids = app3d::nearest_topological_cauchy_dofs(
+            surface, cloud, center, result.value_count);
         if (std::find(stencil.value_ids.begin(), stencil.value_ids.end(), center)
             == stencil.value_ids.end()) {
             throw std::runtime_error("Cauchy value stencil does not contain its center");
@@ -322,7 +285,8 @@ CauchyStencilSet build_cauchy_stencils(const NativeNurbsSurface3D& surface,
             stencil.value_ids.begin(),
             stencil.value_ids.begin() + result.derivative_count);
         stencil.radius_over_h = std::sqrt(
-            candidates[static_cast<std::size_t>(result.value_count - 1)].first) / h;
+            (cloud.dofs[static_cast<std::size_t>(stencil.value_ids.back())].point
+             - target.point).squaredNorm()) / h;
         std::set<int> selected_patches;
         for (int q : stencil.value_ids)
             selected_patches.insert(cloud.dofs[static_cast<std::size_t>(q)].patch_id);
@@ -2052,7 +2016,7 @@ void print_usage(const char* executable)
         << " [torus|cylinder|l_prism|all] [N ...]\n"
         << "  Each N must be a power of two and at least 16 (default: 16).\n"
         << "  This stage builds native NURBS parameter-cell-center surface\n"
-        << "  unknowns, G1-filtered 48/28 Cauchy stencils, validates\n"
+        << "  unknowns, topology-filtered 48/28 Cauchy stencils, validates\n"
         << "  fixed transfer routes, and executes the Neumann value-jump and\n"
         << "  Dirichlet normal-jump harmonic-jet GMRES formulations.\n";
 }
@@ -2105,7 +2069,7 @@ int main(int argc, char** argv)
                   << "  Neumann target: exterior value trace = 0\n"
                   << "  Dirichlet target: exterior normal trace = 0\n"
                   << "  current stage: native NURBS surface DOFs + "
-                     "G1 Cauchy topology + parameter-owned fixed routes\n"
+                     "topological Cauchy neighborhoods + G1 parameter-owned routes\n"
                   << "  levels=";
         for (std::size_t index = 0; index < levels.size(); ++index) {
             if (index != 0)
