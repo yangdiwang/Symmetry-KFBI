@@ -185,6 +185,10 @@ NurbsSurfaceModel3D::NurbsSurfaceModel3D(
     , patch_components_(std::move(patch_components))
     , connections_(std::move(connections))
 {
+    if (patches_.empty()) {
+        throw std::invalid_argument(
+            "NURBS surface model requires at least one patch");
+    }
     if (patch_components_.size() != patches_.size()) {
         throw std::invalid_argument(
             "NURBS patch component count must match patch count");

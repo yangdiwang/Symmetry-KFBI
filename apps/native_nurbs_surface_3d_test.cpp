@@ -225,6 +225,13 @@ void test_native_models()
 
 void test_native_surface_interval_topology()
 {
+    require_throws_type_contains<std::invalid_argument>(
+        [] {
+            (void)kfbim::geometry3d::NurbsSurfaceModel3D({}, {}, {});
+        },
+        "NURBS surface model requires at least one patch",
+        "empty NURBS surface model is rejected");
+
     struct Expected {
         GeometryKind3D kind;
         int patches;
