@@ -2,6 +2,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -47,6 +48,40 @@ using SurfaceDof = app3d::SurfaceDof3D;
 using SurfaceDofCloud = app3d::SurfaceDofCloud3D;
 using SurfacePatchInfo = app3d::SurfaceDofPatch3D;
 
+enum class CauchyStencilPolicy3D {
+    TopologicalNearest,
+    SamePatch,
+    BalancedPatches
+};
+
+std::string cauchy_policy_name(CauchyStencilPolicy3D policy)
+{
+    switch (policy) {
+    case CauchyStencilPolicy3D::TopologicalNearest:
+        return "topological_nearest";
+    case CauchyStencilPolicy3D::SamePatch:
+        return "same_patch";
+    case CauchyStencilPolicy3D::BalancedPatches:
+        return "balanced_patches";
+    }
+    throw std::runtime_error("unknown 3D Cauchy stencil policy");
+}
+
+CauchyStencilPolicy3D selected_cauchy_policy()
+{
+    const char* raw = std::getenv("KFBIM_3D_CAUCHY_POLICY");
+    if (raw == nullptr || std::string(raw).empty()
+        || std::string(raw) == "topological_nearest") {
+        return CauchyStencilPolicy3D::TopologicalNearest;
+    }
+    if (std::string(raw) == "same_patch")
+        return CauchyStencilPolicy3D::SamePatch;
+    if (std::string(raw) == "balanced_patches")
+        return CauchyStencilPolicy3D::BalancedPatches;
+    throw std::invalid_argument(
+        "KFBIM_3D_CAUCHY_POLICY must be topological_nearest, same_patch, or balanced_patches");
+}
+
 struct GeometryBundle {
     std::string name;
     std::string description;
@@ -74,16 +109,25 @@ struct CauchyStencil {
     std::vector<int> derivative_ids;
     double radius_over_h = 0.0;
     int incident_patch_count = 0;
+    int value_patch_imbalance = 0;
+    int derivative_patch_imbalance = 0;
 };
 
 struct CauchyStencilSet {
+    CauchyStencilPolicy3D policy = CauchyStencilPolicy3D::TopologicalNearest;
     int value_count = 0;
     int derivative_count = 0;
+    int value_count_min = 0;
+    int value_count_max = 0;
+    int derivative_count_min = 0;
+    int derivative_count_max = 0;
     std::vector<CauchyStencil> rows;
     double radius_max_over_h = 0.0;
     double radius_mean_over_h = 0.0;
     int incident_patch_count_min = 0;
     int incident_patch_count_max = 0;
+    int value_patch_imbalance_max = 0;
+    int derivative_patch_imbalance_max = 0;
 };
 
 struct SolveMetrics3D {
@@ -109,6 +153,7 @@ struct SolveMetrics3D {
 
 struct ReadinessResult {
     std::string geometry;
+    std::string cauchy_policy;
     int N = 0;
     double h = 0.0;
     int correction_panels = 0;
@@ -146,10 +191,19 @@ struct ReadinessResult {
     double surface_spacing_max_over_h = 0.0;
     int cauchy_value_neighbors = 0;
     int cauchy_derivative_neighbors = 0;
+    int cauchy_value_neighbors_min = 0;
+    int cauchy_value_neighbors_max = 0;
+    int cauchy_derivative_neighbors_min = 0;
+    int cauchy_derivative_neighbors_max = 0;
     double cauchy_radius_max_over_h = 0.0;
     double cauchy_radius_mean_over_h = 0.0;
     int cauchy_incident_patches_min = 0;
     int cauchy_incident_patches_max = 0;
+    int cauchy_value_patch_imbalance_max = 0;
+    int cauchy_derivative_patch_imbalance_max = 0;
+    double cauchy_condition_median = 0.0;
+    double cauchy_condition_p95 = 0.0;
+    double cauchy_condition_max = 0.0;
     SolveMetrics3D neumann;
     SolveMetrics3D dirichlet_normal;
 };
@@ -255,11 +309,48 @@ SurfaceCloudDiagnostics validate_surface_dofs(const SurfaceDofCloud& cloud,
     return result;
 }
 
+std::vector<int> select_cauchy_dofs(CauchyStencilPolicy3D policy,
+                                    const NativeNurbsSurface3D& surface,
+                                    const SurfaceDofCloud& cloud,
+                                    int center,
+                                    int count)
+{
+    switch (policy) {
+    case CauchyStencilPolicy3D::TopologicalNearest:
+        return app3d::nearest_topological_cauchy_dofs(
+            surface, cloud, center, count);
+    case CauchyStencilPolicy3D::SamePatch:
+        return app3d::nearest_same_patch_cauchy_dofs(cloud, center, count);
+    case CauchyStencilPolicy3D::BalancedPatches:
+        return app3d::balanced_topological_cauchy_dofs(
+            surface, cloud, center, count);
+    }
+    throw std::runtime_error("unknown Cauchy stencil selection policy");
+}
+
+int selected_patch_imbalance(const SurfaceDofCloud& cloud,
+                             const std::vector<int>& ids)
+{
+    std::map<int, int> counts;
+    for (int q : ids)
+        ++counts[cloud.dofs[static_cast<std::size_t>(q)].patch_id];
+    if (counts.empty())
+        return 0;
+    int minimum = std::numeric_limits<int>::max();
+    int maximum = 0;
+    for (const auto& item : counts) {
+        minimum = std::min(minimum, item.second);
+        maximum = std::max(maximum, item.second);
+    }
+    return maximum - minimum;
+}
+
 CauchyStencilSet build_cauchy_stencils(const NativeNurbsSurface3D& surface,
                                        const SurfaceDofCloud& cloud,
                                        double h,
                                        int requested_value_count,
-                                       int requested_derivative_count)
+                                       int requested_derivative_count,
+                                       CauchyStencilPolicy3D policy)
 {
     if (requested_value_count <= 0 || requested_derivative_count < 0
         || requested_derivative_count > requested_value_count) {
@@ -267,30 +358,55 @@ CauchyStencilSet build_cauchy_stencils(const NativeNurbsSurface3D& surface,
     }
 
     CauchyStencilSet result;
+    result.policy = policy;
     result.value_count = requested_value_count;
     result.derivative_count = requested_derivative_count;
+    result.value_count_min = std::numeric_limits<int>::max();
+    result.derivative_count_min = std::numeric_limits<int>::max();
     result.rows.reserve(cloud.dofs.size());
     result.incident_patch_count_min = std::numeric_limits<int>::max();
 
     for (int center = 0; center < static_cast<int>(cloud.dofs.size()); ++center) {
         const SurfaceDof& target = cloud.dofs[static_cast<std::size_t>(center)];
         CauchyStencil stencil;
-        stencil.value_ids = app3d::nearest_topological_cauchy_dofs(
-            surface, cloud, center, result.value_count);
+        stencil.value_ids = select_cauchy_dofs(
+            policy, surface, cloud, center, result.value_count);
+        stencil.derivative_ids = select_cauchy_dofs(
+            policy, surface, cloud, center, result.derivative_count);
         if (std::find(stencil.value_ids.begin(), stencil.value_ids.end(), center)
             == stencil.value_ids.end()) {
             throw std::runtime_error("Cauchy value stencil does not contain its center");
         }
-        stencil.derivative_ids.assign(
-            stencil.value_ids.begin(),
-            stencil.value_ids.begin() + result.derivative_count);
-        stencil.radius_over_h = std::sqrt(
-            (cloud.dofs[static_cast<std::size_t>(stencil.value_ids.back())].point
-             - target.point).squaredNorm()) / h;
+        if (std::find(stencil.derivative_ids.begin(),
+                      stencil.derivative_ids.end(), center)
+            == stencil.derivative_ids.end()) {
+            throw std::runtime_error(
+                "Cauchy normal stencil does not contain its center");
+        }
+        double radius_sq = 0.0;
+        for (int q : stencil.value_ids) {
+            radius_sq = std::max(
+                radius_sq,
+                (cloud.dofs[static_cast<std::size_t>(q)].point - target.point)
+                    .squaredNorm());
+        }
+        for (int q : stencil.derivative_ids) {
+            radius_sq = std::max(
+                radius_sq,
+                (cloud.dofs[static_cast<std::size_t>(q)].point - target.point)
+                    .squaredNorm());
+        }
+        stencil.radius_over_h = std::sqrt(radius_sq) / h;
         std::set<int> selected_patches;
         for (int q : stencil.value_ids)
             selected_patches.insert(cloud.dofs[static_cast<std::size_t>(q)].patch_id);
+        for (int q : stencil.derivative_ids)
+            selected_patches.insert(cloud.dofs[static_cast<std::size_t>(q)].patch_id);
         stencil.incident_patch_count = static_cast<int>(selected_patches.size());
+        stencil.value_patch_imbalance =
+            selected_patch_imbalance(cloud, stencil.value_ids);
+        stencil.derivative_patch_imbalance =
+            selected_patch_imbalance(cloud, stencil.derivative_ids);
 
         result.radius_max_over_h = std::max(
             result.radius_max_over_h, stencil.radius_over_h);
@@ -299,6 +415,21 @@ CauchyStencilSet build_cauchy_stencils(const NativeNurbsSurface3D& surface,
             result.incident_patch_count_min, stencil.incident_patch_count);
         result.incident_patch_count_max = std::max(
             result.incident_patch_count_max, stencil.incident_patch_count);
+        result.value_count_min = std::min(
+            result.value_count_min, static_cast<int>(stencil.value_ids.size()));
+        result.value_count_max = std::max(
+            result.value_count_max, static_cast<int>(stencil.value_ids.size()));
+        result.derivative_count_min = std::min(
+            result.derivative_count_min,
+            static_cast<int>(stencil.derivative_ids.size()));
+        result.derivative_count_max = std::max(
+            result.derivative_count_max,
+            static_cast<int>(stencil.derivative_ids.size()));
+        result.value_patch_imbalance_max = std::max(
+            result.value_patch_imbalance_max, stencil.value_patch_imbalance);
+        result.derivative_patch_imbalance_max = std::max(
+            result.derivative_patch_imbalance_max,
+            stencil.derivative_patch_imbalance);
         result.rows.push_back(std::move(stencil));
     }
     result.radius_mean_over_h /= static_cast<double>(result.rows.size());
@@ -470,6 +601,14 @@ public:
     }
 
     int dimension() const { return space_.dimension(); }
+    std::vector<double> condition_values() const
+    {
+        std::vector<double> result;
+        result.reserve(maps_.size());
+        for (const CauchyFitMap3D& map : maps_)
+            result.push_back(map.condition);
+        return result;
+    }
     const HarmonicPolynomialSpace3D& space() const { return space_; }
 
     Eigen::MatrixXd coefficients(const Eigen::VectorXd& value_jump,
@@ -482,11 +621,14 @@ public:
         for (int center = 0; center < size; ++center) {
             const CauchyStencil& stencil =
                 stencils_.rows[static_cast<std::size_t>(center)];
-            Eigen::VectorXd values(stencils_.value_count);
-            Eigen::VectorXd normals(stencils_.derivative_count);
-            for (int k = 0; k < stencils_.value_count; ++k)
+            const int value_count = static_cast<int>(stencil.value_ids.size());
+            const int normal_count =
+                static_cast<int>(stencil.derivative_ids.size());
+            Eigen::VectorXd values(value_count);
+            Eigen::VectorXd normals(normal_count);
+            for (int k = 0; k < value_count; ++k)
                 values[k] = value_jump[stencil.value_ids[static_cast<std::size_t>(k)]];
-            for (int k = 0; k < stencils_.derivative_count; ++k)
+            for (int k = 0; k < normal_count; ++k)
                 normals[k] = normal_jump[stencil.derivative_ids[static_cast<std::size_t>(k)]];
             const CauchyFitMap3D& map = maps_[static_cast<std::size_t>(center)];
             result.row(center) =
@@ -510,9 +652,13 @@ private:
         const SurfaceDof& center = cloud_.dofs[static_cast<std::size_t>(center_id)];
         const CauchyStencil& stencil =
             stencils_.rows[static_cast<std::size_t>(center_id)];
-        const int value_count = stencils_.value_count;
-        const int normal_count = stencils_.derivative_count;
+        const int value_count = static_cast<int>(stencil.value_ids.size());
+        const int normal_count = static_cast<int>(stencil.derivative_ids.size());
         const int rows = value_count + normal_count;
+        if (rows < dimension()) {
+            throw std::runtime_error(
+                "Cauchy fit has fewer conditions than cubic coefficients");
+        }
         Eigen::MatrixXd design(rows, dimension());
         Eigen::VectorXd sqrt_weights(rows);
 
@@ -542,6 +688,13 @@ private:
         const Eigen::MatrixXd weighted = sqrt_weights.asDiagonal() * design;
         Eigen::JacobiSVD<Eigen::MatrixXd> condition_svd(weighted);
         const Eigen::VectorXd singular = condition_svd.singularValues();
+        if (singular.size() != dimension() || singular.size() == 0
+            || !singular.allFinite() || !(singular[0] > 0.0)
+            || !(singular[singular.size() - 1] > 3.0e-12 * singular[0])) {
+            throw std::runtime_error(
+                "Cauchy fit is rank deficient at surface DOF "
+                + std::to_string(center_id));
+        }
         CauchyFitMap3D result;
         result.condition = singular[0] / singular[singular.size() - 1];
         const Eigen::MatrixXd pinv = svd_pseudoinverse(weighted, 3.0e-12);
@@ -686,6 +839,11 @@ public:
     }
 
     const SurfaceDofCloud& surface() const { return cloud_; }
+
+    std::vector<double> cauchy_condition_values() const
+    {
+        return fit_.condition_values();
+    }
 
     HarmonicJetField3D evaluate(const Eigen::VectorXd& value_jump,
                                 const Eigen::VectorXd& normal_jump) const
@@ -1210,6 +1368,33 @@ double vector_rms(const Eigen::VectorXd& values)
         : std::sqrt(values.squaredNorm() / static_cast<double>(values.size()));
 }
 
+struct ConditionStatistics3D {
+    double median = 0.0;
+    double p95 = 0.0;
+    double maximum = 0.0;
+};
+
+ConditionStatistics3D summarize_conditions(std::vector<double> values)
+{
+    if (values.empty())
+        throw std::invalid_argument("Cauchy condition list is empty");
+    if (!std::all_of(values.begin(), values.end(), [](double value) {
+            return std::isfinite(value) && value > 0.0;
+        })) {
+        throw std::runtime_error("Cauchy condition list contains invalid values");
+    }
+    std::sort(values.begin(), values.end());
+    ConditionStatistics3D result;
+    result.median = values[(values.size() - 1) / 2];
+    const std::size_t p95_index = std::min(
+        values.size() - 1,
+        static_cast<std::size_t>(
+            std::ceil(0.95 * static_cast<double>(values.size()))) - 1);
+    result.p95 = values[p95_index];
+    result.maximum = values.back();
+    return result;
+}
+
 double surface_weighted_mean(const SurfaceDofCloud& surface,
                              const Eigen::VectorXd& values)
 {
@@ -1511,7 +1696,9 @@ void write_panel_center_files(const std::filesystem::path& output_dir,
     std::ofstream stencil_csv = open_output_file(
         output_dir / (stem + "_cauchy_stencils.csv"));
     stencil_csv << std::setprecision(17);
-    stencil_csv << "q,patch_id,radius_over_h,incident_patch_count";
+    stencil_csv << "q,patch_id,radius_over_h,incident_patch_count,"
+                   "value_count,normal_count,value_patch_imbalance,"
+                   "normal_patch_imbalance";
     for (int k = 0; k < stencils.value_count; ++k)
         stencil_csv << ",value_" << k;
     for (int k = 0; k < stencils.derivative_count; ++k)
@@ -1523,18 +1710,31 @@ void write_panel_center_files(const std::filesystem::path& output_dir,
         stencil_csv << q << ','
                     << cloud.dofs[static_cast<std::size_t>(q)].patch_id << ','
                     << stencil.radius_over_h << ','
-                    << stencil.incident_patch_count;
+                    << stencil.incident_patch_count << ','
+                    << stencil.value_ids.size() << ','
+                    << stencil.derivative_ids.size() << ','
+                    << stencil.value_patch_imbalance << ','
+                    << stencil.derivative_patch_imbalance;
         for (int id : stencil.value_ids)
             stencil_csv << ',' << id;
+        for (int k = static_cast<int>(stencil.value_ids.size());
+             k < stencils.value_count; ++k) {
+            stencil_csv << ',';
+        }
         for (int id : stencil.derivative_ids)
             stencil_csv << ',' << id;
+        for (int k = static_cast<int>(stencil.derivative_ids.size());
+             k < stencils.derivative_count; ++k) {
+            stencil_csv << ',';
+        }
         stencil_csv << '\n';
     }
 }
 
 ReadinessResult run_readiness_case(GeometryKind kind,
                                    int N,
-                                   const std::filesystem::path& output_dir)
+                                   const std::filesystem::path& output_dir,
+                                   CauchyStencilPolicy3D cauchy_policy)
 {
     const double h = kBoxSide / static_cast<double>(N);
     CartesianGrid3D grid({kBoxMin, kBoxMin, kBoxMin},
@@ -1551,13 +1751,15 @@ ReadinessResult run_readiness_case(GeometryKind kind,
         surface_dofs,
         h,
         kCauchyValueNeighborCount,
-        kCauchyDerivativeNeighborCount);
+        kCauchyDerivativeNeighborCount,
+        cauchy_policy);
     write_surface_files(output_dir, geometry, N);
     write_panel_center_files(
         output_dir, geometry.name, N, surface_dofs, cauchy_stencils);
 
     ReadinessResult result;
     result.geometry = geometry.name;
+    result.cauchy_policy = cauchy_policy_name(cauchy_policy);
     result.N = N;
     result.h = h;
     result.correction_panels = geometry.correction_interface.num_panels();
@@ -1581,12 +1783,22 @@ ReadinessResult run_readiness_case(GeometryKind kind,
         surface_diagnostics.nearest_spacing_max_over_h;
     result.cauchy_value_neighbors = cauchy_stencils.value_count;
     result.cauchy_derivative_neighbors = cauchy_stencils.derivative_count;
+    result.cauchy_value_neighbors_min = cauchy_stencils.value_count_min;
+    result.cauchy_value_neighbors_max = cauchy_stencils.value_count_max;
+    result.cauchy_derivative_neighbors_min =
+        cauchy_stencils.derivative_count_min;
+    result.cauchy_derivative_neighbors_max =
+        cauchy_stencils.derivative_count_max;
     result.cauchy_radius_max_over_h = cauchy_stencils.radius_max_over_h;
     result.cauchy_radius_mean_over_h = cauchy_stencils.radius_mean_over_h;
     result.cauchy_incident_patches_min =
         cauchy_stencils.incident_patch_count_min;
     result.cauchy_incident_patches_max =
         cauchy_stencils.incident_patch_count_max;
+    result.cauchy_value_patch_imbalance_max =
+        cauchy_stencils.value_patch_imbalance_max;
+    result.cauchy_derivative_patch_imbalance_max =
+        cauchy_stencils.derivative_patch_imbalance_max;
 
     const auto dims = grid.dof_dims();
     Eigen::Vector3d grid_min(kBoxMin, kBoxMin, kBoxMin);
@@ -1704,6 +1916,11 @@ ReadinessResult run_readiness_case(GeometryKind kind,
         geometry.geometry_triangles,
         surface_dofs,
         cauchy_stencils);
+    const ConditionStatistics3D condition_statistics = summarize_conditions(
+        harmonic_pipeline.cauchy_condition_values());
+    result.cauchy_condition_median = condition_statistics.median;
+    result.cauchy_condition_p95 = condition_statistics.p95;
+    result.cauchy_condition_max = condition_statistics.maximum;
     const Eigen::VectorXd constant_value =
         Eigen::VectorXd::Ones(harmonic_pipeline.surface_size());
     const Eigen::VectorXd zero_normal =
@@ -1748,14 +1965,28 @@ ReadinessResult run_readiness_case(GeometryKind kind,
               << result.surface_spacing_min_over_h << '/'
               << result.surface_spacing_mean_over_h << '/'
               << result.surface_spacing_max_over_h << '\n'
-              << "  Cauchy values/normals="
+              << "  Cauchy policy=" << result.cauchy_policy
+              << " requested values/normals="
               << result.cauchy_value_neighbors << '/'
               << result.cauchy_derivative_neighbors
+              << " actual values min/max="
+              << result.cauchy_value_neighbors_min << '/'
+              << result.cauchy_value_neighbors_max
+              << " normals min/max="
+              << result.cauchy_derivative_neighbors_min << '/'
+              << result.cauchy_derivative_neighbors_max
               << " radius/h mean/max=" << result.cauchy_radius_mean_over_h
               << '/' << result.cauchy_radius_max_over_h
               << " selected patches min/max="
               << result.cauchy_incident_patches_min << '/'
-              << result.cauchy_incident_patches_max << '\n'
+              << result.cauchy_incident_patches_max
+              << " imbalance value/normal max="
+              << result.cauchy_value_patch_imbalance_max << '/'
+              << result.cauchy_derivative_patch_imbalance_max << '\n'
+              << "  Cauchy condition median/p95/max="
+              << result.cauchy_condition_median << '/'
+              << result.cauchy_condition_p95 << '/'
+              << result.cauchy_condition_max << '\n'
               << "  P2 correction panels/dofs=" << result.correction_panels
               << '/' << result.correction_dofs
               << " crossing_panels=" << result.crossing_panels
@@ -1835,7 +2066,7 @@ void write_summary(const std::filesystem::path& output_dir,
                          const std::vector<ReadinessResult>& rows) {
         std::ofstream csv = open_output_file(path);
         csv << std::setprecision(17);
-        csv << "geometry,N,h,correction_panels,correction_dofs,crossing_panels,"
+        csv << "geometry,cauchy_policy,N,h,correction_panels,correction_dofs,crossing_panels,"
                "feature_edges,feature_vertices,interior_nodes,exterior_nodes,"
                "label_mismatches,crossing_ops,exact_crossings,gap_crossings,"
                "endpoint_crossings,correction_nodes,correction_area,crossing_area,"
@@ -1847,11 +2078,16 @@ void write_summary(const std::filesystem::path& output_dir,
                "surface_dof_area,surface_area_relative_error,"
                "surface_spacing_min_over_h,surface_spacing_mean_over_h,"
                "surface_spacing_max_over_h,cauchy_value_neighbors,"
-               "cauchy_derivative_neighbors,cauchy_radius_max_over_h,"
+               "cauchy_derivative_neighbors,cauchy_value_neighbors_min,"
+               "cauchy_value_neighbors_max,cauchy_derivative_neighbors_min,"
+               "cauchy_derivative_neighbors_max,cauchy_radius_max_over_h,"
                "cauchy_radius_mean_over_h,cauchy_incident_patches_min,"
-               "cauchy_incident_patches_max\n";
+               "cauchy_incident_patches_max,cauchy_value_patch_imbalance_max,"
+               "cauchy_derivative_patch_imbalance_max,cauchy_condition_median,"
+               "cauchy_condition_p95,cauchy_condition_max\n";
         for (const ReadinessResult& row : rows)
-            csv << row.geometry << ',' << row.N << ',' << row.h << ','
+            csv << row.geometry << ',' << row.cauchy_policy << ','
+                << row.N << ',' << row.h << ','
                 << row.correction_panels << ',' << row.correction_dofs << ','
                 << row.crossing_panels << ',' << row.feature_edges << ','
                 << row.feature_vertices << ',' << row.interior_nodes << ','
@@ -1877,10 +2113,19 @@ void write_summary(const std::filesystem::path& output_dir,
                 << row.surface_spacing_max_over_h << ','
                 << row.cauchy_value_neighbors << ','
                 << row.cauchy_derivative_neighbors << ','
+                << row.cauchy_value_neighbors_min << ','
+                << row.cauchy_value_neighbors_max << ','
+                << row.cauchy_derivative_neighbors_min << ','
+                << row.cauchy_derivative_neighbors_max << ','
                 << row.cauchy_radius_max_over_h << ','
                 << row.cauchy_radius_mean_over_h << ','
                 << row.cauchy_incident_patches_min << ','
-                << row.cauchy_incident_patches_max << '\n';
+                << row.cauchy_incident_patches_max << ','
+                << row.cauchy_value_patch_imbalance_max << ','
+                << row.cauchy_derivative_patch_imbalance_max << ','
+                << row.cauchy_condition_median << ','
+                << row.cauchy_condition_p95 << ','
+                << row.cauchy_condition_max << '\n';
     };
     write_csv(output_dir / "geometry_readiness.csv", results);
     std::set<int> levels;
@@ -1930,7 +2175,7 @@ void write_solve_summaries(const std::filesystem::path& output_dir,
 
         std::ofstream csv = open_output_file(path);
         csv << std::setprecision(17);
-        csv << "geometry,N,h,dofs,formulation,iterations,converged,seconds,"
+        csv << "geometry,cauchy_policy,N,h,dofs,formulation,iterations,converged,seconds,"
                "gmres_relative_residual,operator_residual_linf,"
                "exterior_condition_linf,boundary_residual_linf,"
                "route_mismatch_linf,data_weighted_mean,density_weighted_mean,"
@@ -1977,7 +2222,8 @@ void write_solve_summaries(const std::filesystem::path& output_dir,
                     coarse_metric.exterior_bulk_l2,
                     metric.exterior_bulk_l2, coarse.h, row->h);
             }
-            csv << row->geometry << ',' << row->N << ',' << row->h << ','
+            csv << row->geometry << ',' << row->cauchy_policy << ','
+                << row->N << ',' << row->h << ','
                 << row->surface_dofs << ',' << metric.formulation << ','
                 << metric.iterations << ',' << metric.converged << ','
                 << metric.seconds << ',' << metric.gmres_relative_residual << ','
@@ -2018,7 +2264,9 @@ void print_usage(const char* executable)
         << "  This stage builds native NURBS parameter-cell-center surface\n"
         << "  unknowns, topology-filtered 48/28 Cauchy stencils, validates\n"
         << "  fixed transfer routes, and executes the Neumann value-jump and\n"
-        << "  Dirichlet normal-jump harmonic-jet GMRES formulations.\n";
+        << "  Dirichlet normal-jump harmonic-jet GMRES formulations.\n"
+        << "  KFBIM_3D_CAUCHY_POLICY selects topological_nearest (default),\n"
+        << "  same_patch, or balanced_patches.\n";
 }
 
 } // namespace
@@ -2046,6 +2294,7 @@ int main(int argc, char** argv)
                 levels.push_back(N);
             }
         }
+        const CauchyStencilPolicy3D cauchy_policy = selected_cauchy_policy();
 
         std::vector<GeometryKind> geometries;
         if (selection == "all") {
@@ -2057,19 +2306,23 @@ int main(int argc, char** argv)
         }
 
 #ifdef KFBIM_APP_OUTPUT_DIR
-        const std::filesystem::path output_dir =
+        std::filesystem::path output_dir =
             std::filesystem::path(KFBIM_APP_OUTPUT_DIR)
             / "neumann_exterior_zero_trace_3d";
 #else
-        const std::filesystem::path output_dir =
+        std::filesystem::path output_dir =
             "output/neumann_exterior_zero_trace_3d";
 #endif
+        if (cauchy_policy != CauchyStencilPolicy3D::TopologicalNearest)
+            output_dir /= cauchy_policy_name(cauchy_policy);
 
         std::cout << "KFBI3D harmonic-jet convergence study\n"
                   << "  Neumann target: exterior value trace = 0\n"
                   << "  Dirichlet target: exterior normal trace = 0\n"
                   << "  current stage: native NURBS surface DOFs + "
                      "topological Cauchy neighborhoods + G1 parameter-owned routes\n"
+                  << "  cauchy_policy=" << cauchy_policy_name(cauchy_policy)
+                  << '\n'
                   << "  levels=";
         for (std::size_t index = 0; index < levels.size(); ++index) {
             if (index != 0)
@@ -2081,7 +2334,8 @@ int main(int argc, char** argv)
         std::vector<ReadinessResult> results;
         for (int N : levels) {
             for (GeometryKind geometry : geometries)
-                results.push_back(run_readiness_case(geometry, N, output_dir));
+                results.push_back(run_readiness_case(
+                    geometry, N, output_dir, cauchy_policy));
         }
         write_summary(output_dir, results);
         write_solve_summaries(output_dir, results);

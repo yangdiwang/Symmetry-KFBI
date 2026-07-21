@@ -43,7 +43,10 @@ jobs:
           ./build/apps/neumann_exterior_trace_lshape_2d 24
           ./build/apps/neumann_harmonic_jet_case_2d ellipse 24
           ./build/apps/neumann_harmonic_jet_python_compatible_2d ellipse 24
-          ./build/apps/neumann_exterior_zero_trace_3d all 16
+          three_d_output="$(./build/apps/neumann_exterior_zero_trace_3d all 16)"
+          printf '%s\n' "$three_d_output"
+          printf '%s\n' "$three_d_output" | grep -Fq \
+            'cauchy_policy=topological_nearest'
           main_preset_output="$(
             env -u KFBIM_PYJET_DOF_MODE \
                 -u KFBIM_PYJET_SPREAD_MODE \
