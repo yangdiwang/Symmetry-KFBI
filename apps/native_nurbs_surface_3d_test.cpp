@@ -462,6 +462,113 @@ void test_rational_bezier_element_intersection()
             "control hull rejects an impossible line before Newton");
 }
 
+void test_bezier_element_intersection_isolates_all_roots_and_fails_safe()
+{
+    using kfbim::geometry::NurbsBasis1D;
+    using kfbim::geometry3d::NurbsSurfacePatch3D;
+
+    const NurbsSurfacePatch3D quadratic_graph(
+        NurbsBasis1D(2, {0.0, 0.0, 0.0, 1.0, 1.0, 1.0}),
+        NurbsBasis1D(1, {0.0, 0.0, 1.0, 1.0}),
+        {{{0.0, 0.0, 0.14}, {0.0, 1.0, 0.14}},
+         {{0.5, 0.0, -0.31}, {0.5, 1.0, -0.31}},
+         {{1.0, 0.0, 0.24}, {1.0, 1.0, 0.24}}},
+        {{1.0, 1.0}, {1.0, 1.0}, {1.0, 1.0}});
+    const kfbim::geometry3d::NurbsSurfaceModel3D model(
+        {quadratic_graph}, {0}, {});
+    const auto element =
+        kfbim::geometry3d::extract_rational_bezier_elements_3d(model).front();
+
+    kfbim::geometry3d::NurbsElementIntersectionOptions3D options;
+    options.geometry_tolerance = 1.0e-12;
+    const auto result = kfbim::geometry3d::intersect_nurbs_bezier_element_3d(
+        element, model.patch(0),
+        {0.0, 0.5, 0.0}, {1.0, 0.5, 0.0}, options);
+    require(result.roots.size() == 2
+                && std::abs(result.roots[0].u - 0.2) < 2.0e-11
+                && std::abs(result.roots[1].u - 0.7) < 2.0e-11,
+            "quadratic ruled graph returns both isolated roots");
+
+    options.max_subdivision_depth = 0;
+    require_throws_contains(
+        [&] {
+            (void)kfbim::geometry3d::intersect_nurbs_bezier_element_3d(
+                element, model.patch(0),
+                {0.0, 0.5, 0.0}, {1.0, 0.5, 0.0}, options);
+        },
+        "unresolved conservative NURBS intersection candidate",
+        "depth-zero multi-root box reports the unresolved diagnostic");
+}
+
+void test_ruled_overlap_certificate_is_physical_and_fail_safe()
+{
+    using kfbim::geometry::NurbsBasis1D;
+    using kfbim::geometry3d::NurbsSurfacePatch3D;
+
+    const kfbim::geometry3d::NurbsSurfaceModel3D cylinder_model(
+        {NurbsSurfacePatch3D::make_quarter_cylinder_patch(1.0, 0.0, 1.0)},
+        {0}, {});
+    const auto cylinder_element =
+        kfbim::geometry3d::extract_rational_bezier_elements_3d(
+            cylinder_model).front();
+    kfbim::geometry3d::NurbsElementIntersectionOptions3D options;
+    options.geometry_tolerance = 1.0e-12;
+    const auto ruled = kfbim::geometry3d::intersect_nurbs_bezier_element_3d(
+        cylinder_element, cylinder_model.patch(0),
+        {std::sqrt(0.5), std::sqrt(0.5), 0.2},
+        {std::sqrt(0.5), std::sqrt(0.5), 0.8}, options);
+    require(ruled.overlap_detected && ruled.roots.empty(),
+            "exact constant-weight cylinder ruling certifies overlap");
+
+    constexpr double large_coordinate = 1.0e12;
+    constexpr double weight_perturbation = 5.0e-13;
+    const std::vector<double> ruling_x{0.0, 0.5, 0.5, 0.5, 1.0};
+    std::vector<std::vector<Eigen::Vector3d>> controls(
+        3, std::vector<Eigen::Vector3d>(5));
+    for (int j = 0; j < 5; ++j) {
+        controls[0][static_cast<std::size_t>(j)] =
+            {ruling_x[static_cast<std::size_t>(j)], 0.0, 0.0};
+        controls[1][static_cast<std::size_t>(j)] =
+            {ruling_x[static_cast<std::size_t>(j)], large_coordinate, 0.0};
+        controls[2][static_cast<std::size_t>(j)] =
+            {ruling_x[static_cast<std::size_t>(j)], 0.0, large_coordinate};
+    }
+    std::vector<std::vector<double>> weights(
+        3, std::vector<double>(5, 1.0));
+    weights[1][1] += weight_perturbation;
+    weights[1][3] -= weight_perturbation;
+    const NurbsSurfacePatch3D near_ruled(
+        NurbsBasis1D(2, {0.0, 0.0, 0.0, 1.0, 1.0, 1.0}),
+        NurbsBasis1D(
+            4, {0.0, 0.0, 0.0, 0.0, 0.0,
+                1.0, 1.0, 1.0, 1.0, 1.0}),
+        std::move(controls), std::move(weights));
+    const kfbim::geometry3d::NurbsSurfaceModel3D near_model(
+        {near_ruled}, {0}, {});
+    const auto near_element =
+        kfbim::geometry3d::extract_rational_bezier_elements_3d(
+            near_model).front();
+
+    bool failed_safely = false;
+    try {
+        const auto near_result =
+            kfbim::geometry3d::intersect_nurbs_bezier_element_3d(
+                near_element, near_model.patch(0),
+                {0.0, 0.5 * large_coordinate,
+                      0.25 * large_coordinate},
+                {1.0, 0.5 * large_coordinate,
+                      0.25 * large_coordinate},
+                options);
+        failed_safely = !near_result.overlap_detected;
+    } catch (const std::exception& error) {
+        failed_safely = std::string(error.what()).find(
+            "unresolved conservative NURBS intersection candidate")
+            != std::string::npos;
+    }
+    require(failed_safely,
+            "near-separable large-coordinate control net cannot certify overlap");
+}
+
 void test_nonclamped_rational_bezier_extraction()
 {
     using kfbim::geometry::NurbsBasis1D;
@@ -1019,6 +1126,8 @@ int main()
         test_nurbs_basis_constructor_multiplicity_contract();
         test_benchmark_rational_bezier_elements_are_conservative();
         test_rational_bezier_element_intersection();
+        test_bezier_element_intersection_isolates_all_roots_and_fails_safe();
+        test_ruled_overlap_certificate_is_physical_and_fail_safe();
         test_nonclamped_rational_bezier_extraction();
         test_bezier_subdivision_rejects_collapsed_midpoint();
         test_bezier_split_preserves_large_finite_controls();
