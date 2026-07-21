@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -17,6 +18,131 @@ namespace {
 constexpr std::uint64_t kNodeMask =
     (std::uint64_t{1} << 62) - std::uint64_t{1};
 
+struct ClosedIntInterval {
+    int lower = 1;
+    int upper = 0;
+
+    bool empty() const
+    {
+        return lower > upper;
+    }
+};
+
+std::size_t checked_size_product(std::size_t first,
+                                 std::size_t second,
+                                 const char* message)
+{
+    if (first != 0
+        && second > std::numeric_limits<std::size_t>::max() / first) {
+        throw std::overflow_error(message);
+    }
+    return first * second;
+}
+
+std::size_t checked_size_add(std::size_t first,
+                             std::size_t second,
+                             const char* message)
+{
+    if (second > std::numeric_limits<std::size_t>::max() - first)
+        throw std::overflow_error(message);
+    return first + second;
+}
+
+int checked_size_to_int(std::size_t value, const char* message)
+{
+    if (value > static_cast<std::size_t>(
+                    std::numeric_limits<int>::max())) {
+        throw std::overflow_error(message);
+    }
+    return static_cast<int>(value);
+}
+
+int checked_add_int(int first, int second, const char* message)
+{
+    if ((second > 0
+         && first > std::numeric_limits<int>::max() - second)
+        || (second < 0
+            && first < std::numeric_limits<int>::min() - second)) {
+        throw std::overflow_error(message);
+    }
+    return first + second;
+}
+
+void checked_accumulate_int(int& total,
+                            int increment,
+                            const char* message)
+{
+    if (total < 0 || increment < 0)
+        throw std::overflow_error(message);
+    total = checked_add_int(total, increment, message);
+}
+
+ClosedIntInterval clamped_closed_integer_interval(
+    double lower,
+    double upper,
+    int target_lower,
+    int target_upper)
+{
+    if (!std::isfinite(lower) || !std::isfinite(upper)) {
+        throw std::overflow_error(
+            "non-finite Cartesian candidate index range");
+    }
+    if (target_lower > target_upper || lower > upper)
+        return {};
+
+    const double target_lower_double =
+        static_cast<double>(target_lower);
+    const double target_upper_double =
+        static_cast<double>(target_upper);
+    if (upper < target_lower_double || lower > target_upper_double)
+        return {};
+
+    const double clipped_lower = std::max(lower, target_lower_double);
+    const double clipped_upper = std::min(upper, target_upper_double);
+    if (!(clipped_lower >= target_lower_double
+          && clipped_lower <= target_upper_double
+          && clipped_upper >= target_lower_double
+          && clipped_upper <= target_upper_double
+          && clipped_lower <= clipped_upper
+          && std::trunc(clipped_lower) == clipped_lower
+          && std::trunc(clipped_upper) == clipped_upper)) {
+        throw std::overflow_error(
+            "Cartesian candidate index range cannot be represented");
+    }
+    return {static_cast<int>(clipped_lower),
+            static_cast<int>(clipped_upper)};
+}
+
+ClosedIntInterval candidate_index_interval(double lower,
+                                           double upper,
+                                           double origin,
+                                           double spacing,
+                                           double tolerance,
+                                           bool edge_starts,
+                                           int target_upper)
+{
+    const double expanded_lower = lower - origin - tolerance;
+    const double expanded_upper = upper - origin + tolerance;
+    if (!std::isfinite(expanded_lower)
+        || !std::isfinite(expanded_upper)) {
+        throw std::overflow_error(
+            "non-finite Cartesian candidate index range");
+    }
+    const double normalized_lower = expanded_lower / spacing;
+    const double normalized_upper = expanded_upper / spacing;
+    if (!std::isfinite(normalized_lower)
+        || !std::isfinite(normalized_upper)) {
+        throw std::overflow_error(
+            "non-finite Cartesian candidate index range");
+    }
+    double integer_lower = std::ceil(normalized_lower);
+    const double integer_upper = std::floor(normalized_upper);
+    if (edge_starts)
+        integer_lower -= 1.0;
+    return clamped_closed_integer_interval(
+        integer_lower, integer_upper, 0, target_upper);
+}
+
 std::uint64_t edge_key(int axis, int start_node)
 {
     return (std::uint64_t(axis) << 62)
@@ -27,17 +153,37 @@ void accumulate_intersection_diagnostics(
     NurbsSurfaceIntersectionDiagnostics3D& total,
     const NurbsSurfaceIntersectionDiagnostics3D& increment)
 {
-    total.candidate_elements += increment.candidate_elements;
-    total.triangle_seed_hits += increment.triangle_seed_hits;
-    total.triangle_seed_misses_recovered +=
-        increment.triangle_seed_misses_recovered;
-    total.subdivision_boxes += increment.subdivision_boxes;
-    total.newton_attempts += increment.newton_attempts;
-    total.newton_iterations += increment.newton_iterations;
-    total.same_patch_deduplications +=
-        increment.same_patch_deduplications;
-    total.seam_deduplications += increment.seam_deduplications;
-    total.unresolved_candidates += increment.unresolved_candidates;
+    checked_accumulate_int(
+        total.candidate_elements, increment.candidate_elements,
+        "NURBS intersection candidate diagnostic overflow");
+    checked_accumulate_int(
+        total.triangle_seed_hits, increment.triangle_seed_hits,
+        "NURBS triangle-seed diagnostic overflow");
+    checked_accumulate_int(
+        total.triangle_seed_misses_recovered,
+        increment.triangle_seed_misses_recovered,
+        "NURBS triangle-seed recovery diagnostic overflow");
+    checked_accumulate_int(
+        total.subdivision_boxes, increment.subdivision_boxes,
+        "NURBS subdivision diagnostic overflow");
+    checked_accumulate_int(
+        total.newton_attempts, increment.newton_attempts,
+        "NURBS Newton-attempt diagnostic overflow");
+    checked_accumulate_int(
+        total.newton_iterations, increment.newton_iterations,
+        "NURBS Newton-iteration diagnostic overflow");
+    checked_accumulate_int(
+        total.same_patch_deduplications,
+        increment.same_patch_deduplications,
+        "NURBS same-patch diagnostic overflow");
+    checked_accumulate_int(
+        total.seam_deduplications,
+        increment.seam_deduplications,
+        "NURBS seam diagnostic overflow");
+    checked_accumulate_int(
+        total.unresolved_candidates,
+        increment.unresolved_candidates,
+        "NURBS unresolved-candidate diagnostic overflow");
 }
 
 Eigen::Vector3d as_vector(const std::array<double, 3>& values)
@@ -67,6 +213,8 @@ std::string strict_box_error(const NurbsAabb3D& surface,
 
 struct NurbsCartesianDomain3D::Impl {
     std::array<int, 3> dims{{0, 0, 0}};
+    int plane_stride = 0;
+    int node_count = 0;
     std::array<std::vector<std::uint8_t>, 3> barriers;
     std::vector<NurbsSurfaceCrossing3D> crossings;
     std::unordered_map<std::uint64_t, int> crossing_by_edge;
@@ -90,12 +238,54 @@ struct NurbsCartesianDomain3D::Impl {
                     "NurbsCartesianDomain3D requires positive finite Cartesian spacing");
             }
         }
-        dims = grid.dof_dims();
-        if (std::any_of(dims.begin(), dims.end(), [](int extent) {
-                return extent < 2;
-            })) {
-            throw std::invalid_argument(
-                "NurbsCartesianDomain3D requires at least one Cartesian cell per axis");
+        const auto cells = grid.num_cells();
+        for (int axis = 0; axis < 3; ++axis) {
+            const int cell_count = cells[static_cast<std::size_t>(axis)];
+            if (cell_count < 1) {
+                throw std::invalid_argument(
+                    "NurbsCartesianDomain3D requires at least one Cartesian cell per axis");
+            }
+            if (cell_count > std::numeric_limits<int>::max() - 1) {
+                throw std::overflow_error(
+                    "Cartesian cell-to-node dimension overflow");
+            }
+            dims[static_cast<std::size_t>(axis)] = cell_count + 1;
+        }
+
+        const std::size_t nx_size = static_cast<std::size_t>(dims[0]);
+        const std::size_t ny_size = static_cast<std::size_t>(dims[1]);
+        const std::size_t nz_size = static_cast<std::size_t>(dims[2]);
+        const std::size_t plane_size = checked_size_product(
+            nx_size, ny_size, "Cartesian node-plane storage overflow");
+        if (plane_size > static_cast<std::size_t>(
+                std::numeric_limits<int>::max())) {
+            throw std::overflow_error(
+                "Cartesian node count exceeds int range");
+        }
+        const std::size_t node_count_size = checked_size_product(
+            plane_size, nz_size, "Cartesian node storage overflow");
+        if (node_count_size > static_cast<std::size_t>(
+                std::numeric_limits<int>::max())) {
+            throw std::overflow_error(
+                "Cartesian node count exceeds int range");
+        }
+        plane_stride = checked_size_to_int(
+            plane_size, "Cartesian node stride exceeds int range");
+        node_count = checked_size_to_int(
+            node_count_size, "Cartesian node count exceeds int range");
+
+        const Eigen::Vector3d box_lower = as_vector(grid.origin());
+        Eigen::Vector3d box_upper = box_lower;
+        for (int axis = 0; axis < 3; ++axis) {
+            const double extent =
+                spacing[static_cast<std::size_t>(axis)]
+                * static_cast<double>(
+                    cells[static_cast<std::size_t>(axis)]);
+            box_upper[axis] += extent;
+        }
+        if (!box_lower.allFinite() || !box_upper.allFinite()) {
+            throw std::overflow_error(
+                "Cartesian box bounds must be finite");
         }
 
         NurbsSurfaceIntersectorOptions3D intersector_options;
@@ -104,18 +294,21 @@ struct NurbsCartesianDomain3D::Impl {
             std::move(model), intersector_options);
         bounds = intersector.bounds();
         tolerance = intersector.geometry_tolerance();
-        diagnostics.nurbs_patch_count = intersector.model().num_patches();
-        diagnostics.bezier_element_count = static_cast<int>(
-            extract_rational_bezier_elements_3d(
-                intersector.model()).size());
-
-        const Eigen::Vector3d box_lower = as_vector(grid.origin());
-        Eigen::Vector3d box_upper = box_lower;
-        for (int axis = 0; axis < 3; ++axis) {
-            box_upper[axis] += spacing[static_cast<std::size_t>(axis)]
-                * static_cast<double>(
-                    dims[static_cast<std::size_t>(axis)] - 1);
+        if (!std::isfinite(tolerance) || tolerance < 0.0) {
+            throw std::overflow_error(
+                "NURBS geometry tolerance must be finite");
         }
+        diagnostics.nurbs_patch_count = checked_size_to_int(
+            intersector.model().patches().size(),
+            "NURBS patch diagnostic count overflow");
+        {
+            const std::vector<RationalBezierElement3D> bezier_elements =
+                extract_rational_bezier_elements_3d(intersector.model());
+            diagnostics.bezier_element_count = checked_size_to_int(
+                bezier_elements.size(),
+                "NURBS Bezier-element diagnostic count overflow");
+        }
+
         for (int axis = 0; axis < 3; ++axis) {
             if (!(bounds.lower[axis] > box_lower[axis]
                   && bounds.upper[axis] < box_upper[axis])) {
@@ -127,28 +320,47 @@ struct NurbsCartesianDomain3D::Impl {
         const int nx = dims[0];
         const int ny = dims[1];
         const int nz = dims[2];
+        const std::size_t x_barrier_size = checked_size_product(
+            checked_size_product(
+                static_cast<std::size_t>(nx - 1),
+                static_cast<std::size_t>(ny),
+                "Cartesian x-barrier row storage overflow"),
+            static_cast<std::size_t>(nz),
+            "Cartesian x-barrier storage overflow");
+        const std::size_t y_barrier_size = checked_size_product(
+            checked_size_product(
+                static_cast<std::size_t>(nx),
+                static_cast<std::size_t>(ny - 1),
+                "Cartesian y-barrier row storage overflow"),
+            static_cast<std::size_t>(nz),
+            "Cartesian y-barrier storage overflow");
+        const std::size_t z_barrier_size = checked_size_product(
+            checked_size_product(
+                static_cast<std::size_t>(nx),
+                static_cast<std::size_t>(ny),
+                "Cartesian z-barrier row storage overflow"),
+            static_cast<std::size_t>(nz - 1),
+            "Cartesian z-barrier storage overflow");
         barriers[0].assign(
-            static_cast<std::size_t>(nx - 1)
-                * static_cast<std::size_t>(ny)
-                * static_cast<std::size_t>(nz),
-            std::uint8_t{0});
+            x_barrier_size, std::uint8_t{0});
         barriers[1].assign(
-            static_cast<std::size_t>(nx)
-                * static_cast<std::size_t>(ny - 1)
-                * static_cast<std::size_t>(nz),
-            std::uint8_t{0});
+            y_barrier_size, std::uint8_t{0});
         barriers[2].assign(
-            static_cast<std::size_t>(nx)
-                * static_cast<std::size_t>(ny)
-                * static_cast<std::size_t>(nz - 1),
-            std::uint8_t{0});
+            z_barrier_size, std::uint8_t{0});
 
         const double maximum_spacing =
             *std::max_element(spacing.begin(), spacing.end());
+        const double maximum_leaf_extent = 2.0 * maximum_spacing;
+        if (!std::isfinite(maximum_leaf_extent)) {
+            throw std::overflow_error(
+                "NURBS acceleration leaf extent must be finite");
+        }
         const std::vector<RationalBezierElement3D> leaves =
-            intersector.acceleration_leaves(2.0 * maximum_spacing);
+            intersector.acceleration_leaves(maximum_leaf_extent);
         diagnostics.acceleration_leaf_count =
-            static_cast<int>(leaves.size());
+            checked_size_to_int(
+                leaves.size(),
+                "NURBS acceleration-leaf diagnostic count overflow");
 
         const auto origin = grid.origin();
         std::vector<std::uint64_t> candidate_keys;
@@ -156,21 +368,14 @@ struct NurbsCartesianDomain3D::Impl {
             const NurbsAabb3D leaf_bounds = leaf.bounds();
             for (int axis = 0; axis < 3; ++axis) {
                 const double h = spacing[static_cast<std::size_t>(axis)];
-                int start_min = static_cast<int>(std::ceil(
-                    (leaf_bounds.lower[axis]
-                        - origin[static_cast<std::size_t>(axis)]
-                        - tolerance) / h)) - 1;
-                int start_max = static_cast<int>(std::floor(
-                    (leaf_bounds.upper[axis]
-                        - origin[static_cast<std::size_t>(axis)]
-                        + tolerance) / h));
-                start_min = std::clamp(
-                    start_min, 0,
-                    dims[static_cast<std::size_t>(axis)] - 2);
-                start_max = std::clamp(
-                    start_max, 0,
-                    dims[static_cast<std::size_t>(axis)] - 2);
-                if (start_min > start_max)
+                const ClosedIntInterval start_range =
+                    candidate_index_interval(
+                        leaf_bounds.lower[axis],
+                        leaf_bounds.upper[axis],
+                        origin[static_cast<std::size_t>(axis)],
+                        h, tolerance, true,
+                        dims[static_cast<std::size_t>(axis)] - 2);
+                if (start_range.empty())
                     continue;
 
                 std::array<int, 3> transverse_min{{0, 0, 0}};
@@ -179,31 +384,19 @@ struct NurbsCartesianDomain3D::Impl {
                 for (int transverse = 0; transverse < 3; ++transverse) {
                     if (transverse == axis)
                         continue;
-                    const double transverse_h =
-                        spacing[static_cast<std::size_t>(transverse)];
-                    transverse_min[static_cast<std::size_t>(transverse)] =
-                        static_cast<int>(std::ceil(
-                            (leaf_bounds.lower[transverse]
-                                - origin[static_cast<std::size_t>(transverse)]
-                                - tolerance) / transverse_h));
-                    transverse_max[static_cast<std::size_t>(transverse)] =
-                        static_cast<int>(std::floor(
-                            (leaf_bounds.upper[transverse]
-                                - origin[static_cast<std::size_t>(transverse)]
-                                + tolerance) / transverse_h));
-                    transverse_min[static_cast<std::size_t>(transverse)] =
-                        std::clamp(
-                            transverse_min[static_cast<std::size_t>(transverse)],
-                            0,
+                    const ClosedIntInterval transverse_range =
+                        candidate_index_interval(
+                            leaf_bounds.lower[transverse],
+                            leaf_bounds.upper[transverse],
+                            origin[static_cast<std::size_t>(transverse)],
+                            spacing[static_cast<std::size_t>(transverse)],
+                            tolerance, false,
                             dims[static_cast<std::size_t>(transverse)] - 1);
+                    transverse_min[static_cast<std::size_t>(transverse)] =
+                        transverse_range.lower;
                     transverse_max[static_cast<std::size_t>(transverse)] =
-                        std::clamp(
-                            transverse_max[static_cast<std::size_t>(transverse)],
-                            0,
-                            dims[static_cast<std::size_t>(transverse)] - 1);
-                    empty = empty
-                        || transverse_min[static_cast<std::size_t>(transverse)]
-                            > transverse_max[static_cast<std::size_t>(transverse)];
+                        transverse_range.upper;
+                    empty = empty || transverse_range.empty();
                 }
                 if (empty)
                     continue;
@@ -213,31 +406,40 @@ struct NurbsCartesianDomain3D::Impl {
                          k <= transverse_max[2]; ++k) {
                         for (int j = transverse_min[1];
                              j <= transverse_max[1]; ++j) {
-                            for (int i = start_min; i <= start_max; ++i) {
+                            for (int i = start_range.lower;
+                                 i <= start_range.upper; ++i) {
                                 candidate_keys.push_back(
-                                    edge_key(axis, grid.index(i, j, k)));
+                                    edge_key(
+                                        axis,
+                                        structured_node_index(i, j, k)));
                             }
                         }
                     }
                 } else if (axis == 1) {
                     for (int k = transverse_min[2];
                          k <= transverse_max[2]; ++k) {
-                        for (int j = start_min; j <= start_max; ++j) {
+                        for (int j = start_range.lower;
+                             j <= start_range.upper; ++j) {
                             for (int i = transverse_min[0];
                                  i <= transverse_max[0]; ++i) {
                                 candidate_keys.push_back(
-                                    edge_key(axis, grid.index(i, j, k)));
+                                    edge_key(
+                                        axis,
+                                        structured_node_index(i, j, k)));
                             }
                         }
                     }
                 } else {
-                    for (int k = start_min; k <= start_max; ++k) {
+                    for (int k = start_range.lower;
+                         k <= start_range.upper; ++k) {
                         for (int j = transverse_min[1];
                              j <= transverse_max[1]; ++j) {
                             for (int i = transverse_min[0];
                                  i <= transverse_max[0]; ++i) {
                                 candidate_keys.push_back(
-                                    edge_key(axis, grid.index(i, j, k)));
+                                    edge_key(
+                                        axis,
+                                        structured_node_index(i, j, k)));
                             }
                         }
                     }
@@ -249,15 +451,29 @@ struct NurbsCartesianDomain3D::Impl {
             std::unique(candidate_keys.begin(), candidate_keys.end()),
             candidate_keys.end());
         diagnostics.candidate_grid_edge_count = candidate_keys.size();
-        crossings.reserve(candidate_keys.size());
-        crossing_by_edge.reserve(candidate_keys.size());
 
         for (const std::uint64_t key : candidate_keys) {
-            const int axis = static_cast<int>(key >> 62);
-            const int start_node = static_cast<int>(key & kNodeMask);
+            const std::uint64_t axis_bits = key >> 62;
+            if (axis_bits > 2)
+                throw std::overflow_error("invalid Cartesian edge key axis");
+            const int axis = static_cast<int>(axis_bits);
+            const std::uint64_t start_node_bits = key & kNodeMask;
+            if (start_node_bits > static_cast<std::uint64_t>(
+                    std::numeric_limits<int>::max())) {
+                throw std::overflow_error(
+                    "Cartesian edge-key node exceeds int range");
+            }
+            const int start_node = static_cast<int>(start_node_bits);
             const auto ijk = node_coordinates(start_node);
-            const int end_node = start_node
-                + (axis == 0 ? 1 : (axis == 1 ? nx : nx * ny));
+            const int axis_stride =
+                axis == 0 ? 1 : (axis == 1 ? nx : plane_stride);
+            const int end_node = checked_add_int(
+                start_node, axis_stride,
+                "Cartesian edge endpoint index overflow");
+            if (end_node >= node_count) {
+                throw std::overflow_error(
+                    "Cartesian edge endpoint is outside checked node storage");
+            }
             const Eigen::Vector3d start = as_vector(grid.coord(start_node));
             const Eigen::Vector3d end = as_vector(grid.coord(end_node));
             NurbsSurfaceIntersectionDiagnostics3D local_diagnostics;
@@ -274,11 +490,16 @@ struct NurbsCartesianDomain3D::Impl {
             barriers[static_cast<std::size_t>(axis)]
                     [barrier_index(axis, ijk[0], ijk[1], ijk[2])] =
                 std::uint8_t{1};
-            ++diagnostics.barrier_edge_counts[
-                static_cast<std::size_t>(axis)];
+            std::size_t& barrier_count =
+                diagnostics.barrier_edge_counts[
+                    static_cast<std::size_t>(axis)];
+            barrier_count = checked_size_add(
+                barrier_count, std::size_t{1},
+                "NURBS barrier diagnostic count overflow");
             diagnostics.maximum_root_residual = std::max(
                 diagnostics.maximum_root_residual, crossing->residual);
-            const int crossing_index = static_cast<int>(crossings.size());
+            const int crossing_index = checked_size_to_int(
+                crossings.size(), "NURBS crossing index exceeds int range");
             crossings.push_back(*crossing);
             crossing_by_edge.emplace(key, crossing_index);
         }
@@ -290,11 +511,33 @@ struct NurbsCartesianDomain3D::Impl {
     std::array<int, 3> node_coordinates(int node) const
     {
         const int nx = dims[0];
-        const int ny = dims[1];
-        const int plane = nx * ny;
-        const int k = node / plane;
-        const int remainder = node % plane;
+        const int k = node / plane_stride;
+        const int remainder = node % plane_stride;
         return {{remainder % nx, remainder / nx, k}};
+    }
+
+    int structured_node_index(int i, int j, int k) const
+    {
+        const std::size_t plane_offset = checked_size_product(
+            static_cast<std::size_t>(k),
+            static_cast<std::size_t>(plane_stride),
+            "Cartesian structured node index overflow");
+        const std::size_t row_offset = checked_size_product(
+            static_cast<std::size_t>(j),
+            static_cast<std::size_t>(dims[0]),
+            "Cartesian structured node index overflow");
+        const std::size_t index = checked_size_add(
+            checked_size_add(
+                plane_offset, row_offset,
+                "Cartesian structured node index overflow"),
+            static_cast<std::size_t>(i),
+            "Cartesian structured node index overflow");
+        if (index >= static_cast<std::size_t>(node_count)) {
+            throw std::overflow_error(
+                "Cartesian structured node index is outside checked storage");
+        }
+        return checked_size_to_int(
+            index, "Cartesian structured node index exceeds int range");
     }
 
     std::size_t barrier_index(int axis, int i, int j, int k) const
@@ -327,7 +570,6 @@ struct NurbsCartesianDomain3D::Impl {
 
     std::pair<int, int> adjacent_edge(int node_a, int node_b) const
     {
-        const int node_count = static_cast<int>(node_labels.size());
         if (node_a < 0 || node_a >= node_count
             || node_b < 0 || node_b >= node_count) {
             throw std::out_of_range(
@@ -366,7 +608,6 @@ struct NurbsCartesianDomain3D::Impl {
         const int nx = dims[0];
         const int ny = dims[1];
         const int nz = dims[2];
-        const int node_count = grid.num_dofs();
         std::vector<int> graph_component(
             static_cast<std::size_t>(node_count), -1);
         std::vector<int> representatives;
@@ -376,8 +617,9 @@ struct NurbsCartesianDomain3D::Impl {
         for (int seed = 0; seed < node_count; ++seed) {
             if (graph_component[static_cast<std::size_t>(seed)] >= 0)
                 continue;
-            const int component =
-                static_cast<int>(representatives.size());
+            const int component = checked_size_to_int(
+                representatives.size(),
+                "Cartesian grid-component index exceeds int range");
             representatives.push_back(seed);
             touches_box_boundary.push_back(false);
             diagnostics.component_sizes.push_back(0);
@@ -387,8 +629,12 @@ struct NurbsCartesianDomain3D::Impl {
 
             for (std::size_t head = 0; head < queue.size(); ++head) {
                 const int node = queue[head];
-                ++diagnostics.component_sizes[
-                    static_cast<std::size_t>(component)];
+                std::size_t& component_size =
+                    diagnostics.component_sizes[
+                        static_cast<std::size_t>(component)];
+                component_size = checked_size_add(
+                    component_size, std::size_t{1},
+                    "Cartesian component-size diagnostic overflow");
                 const auto ijk = node_coordinates(node);
                 const int i = ijk[0];
                 const int j = ijk[1];
@@ -406,9 +652,9 @@ struct NurbsCartesianDomain3D::Impl {
                     j > 0 && !barrier_at(1, i, j - 1, k) ? node - nx : -1,
                     j + 1 < ny && !barrier_at(1, i, j, k) ? node + nx : -1,
                     k > 0 && !barrier_at(2, i, j, k - 1)
-                        ? node - nx * ny : -1,
+                        ? node - plane_stride : -1,
                     k + 1 < nz && !barrier_at(2, i, j, k)
-                        ? node + nx * ny : -1}};
+                        ? node + plane_stride : -1}};
                 for (const int neighbor : neighbors) {
                     if (neighbor >= 0
                         && graph_component[
@@ -421,29 +667,33 @@ struct NurbsCartesianDomain3D::Impl {
             }
         }
 
-        diagnostics.grid_component_count =
-            static_cast<int>(representatives.size());
+        diagnostics.grid_component_count = checked_size_to_int(
+            representatives.size(),
+            "Cartesian grid-component diagnostic count overflow");
         std::vector<int> component_labels(representatives.size(), 0);
-        for (int component = 0;
-             component < static_cast<int>(representatives.size());
-             ++component) {
-            if (touches_box_boundary[
-                    static_cast<std::size_t>(component)]) {
-                component_labels[static_cast<std::size_t>(component)] = 0;
-                ++diagnostics.box_exterior_component_count;
+        for (std::size_t component = 0;
+             component < representatives.size(); ++component) {
+            if (touches_box_boundary[component]) {
+                component_labels[component] = 0;
+                diagnostics.box_exterior_component_count = checked_add_int(
+                    diagnostics.box_exterior_component_count, 1,
+                    "Cartesian box-exterior diagnostic count overflow");
             } else {
-                ++diagnostics.representative_query_count;
+                diagnostics.representative_query_count = checked_add_int(
+                    diagnostics.representative_query_count, 1,
+                    "Cartesian representative-query diagnostic count overflow");
                 const Eigen::Vector3d representative_point = as_vector(
-                    grid.coord(representatives[
-                        static_cast<std::size_t>(component)]));
+                    grid.coord(representatives[component]));
                 const std::vector<int> containing =
                     intersector.containing_components(
                         representative_point);
                 if (containing.empty()) {
-                    component_labels[static_cast<std::size_t>(component)] = 0;
+                    component_labels[component] = 0;
                 } else if (containing.size() == 1) {
-                    component_labels[static_cast<std::size_t>(component)] =
-                        containing.front() + 1;
+                    component_labels[component] =
+                        checked_add_int(
+                            containing.front(), 1,
+                            "NURBS component label exceeds int range");
                 } else {
                     throw std::runtime_error(
                         "overlapping NURBS solid components");
@@ -490,13 +740,14 @@ struct NurbsCartesianDomain3D::Impl {
         for (int k = 0; k < nz; ++k) {
             for (int j = 0; j < ny; ++j) {
                 for (int i = 0; i < nx; ++i) {
-                    const int node = (k * ny + j) * nx + i;
+                    const int node = structured_node_index(i, j, k);
                     if (i + 1 < nx)
                         verify_edge(0, i, j, k, node, node + 1);
                     if (j + 1 < ny)
                         verify_edge(1, i, j, k, node, node + nx);
                     if (k + 1 < nz)
-                        verify_edge(2, i, j, k, node, node + nx * ny);
+                        verify_edge(
+                            2, i, j, k, node, node + plane_stride);
                 }
             }
         }
@@ -514,7 +765,7 @@ NurbsCartesianDomain3D::NurbsCartesianDomain3D(
 int NurbsCartesianDomain3D::label(int node) const
 {
     if (node < 0
-        || node >= static_cast<int>(impl_->node_labels.size())) {
+        || node >= impl_->node_count) {
         throw std::out_of_range(
             "NURBS Cartesian node index is outside the grid");
     }

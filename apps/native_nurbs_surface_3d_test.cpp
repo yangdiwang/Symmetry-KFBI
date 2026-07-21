@@ -58,6 +58,24 @@ void require_throws_contains(Function&& function,
     throw std::runtime_error(message + ": no exception");
 }
 
+template <class Exception, class Function>
+void require_throws_type_contains(Function&& function,
+                                  const std::string& needle,
+                                  const std::string& message)
+{
+    try {
+        function();
+    } catch (const Exception& error) {
+        require(std::string(error.what()).find(needle) != std::string::npos,
+                message + ": " + error.what());
+        return;
+    } catch (const std::exception& error) {
+        throw std::runtime_error(
+            message + ": wrong exception type: " + error.what());
+    }
+    throw std::runtime_error(message + ": no exception");
+}
+
 template <class Function>
 void require_throws_contains_all(
     Function&& function,
@@ -1294,6 +1312,8 @@ void require_triangle_seed_independent_domain(
     const auto dims = grid.dof_dims();
     const double crossing_tolerance = 8.0 * std::max(
         seeded.geometry_tolerance(), unseeded.geometry_tolerance());
+    bool checked_reverse_crossing = false;
+    bool checked_missing_crossing = false;
     for (int k = 0; k < dims[2]; ++k) {
         for (int j = 0; j < dims[1]; ++j) {
             for (int i = 0; i < dims[0]; ++i) {
@@ -1311,8 +1331,19 @@ void require_triangle_seed_independent_domain(
                                 == unseeded.has_barrier_between(
                                     node, neighbor),
                             name + " barrier locations do not depend on triangle seeds");
-                    if (!seeded_barrier)
+                    if (!seeded_barrier) {
+                        if (!checked_missing_crossing) {
+                            require_throws_contains(
+                                [&] {
+                                    (void)seeded.crossing_between(
+                                        node, neighbor);
+                                },
+                                "no NURBS crossing between Cartesian nodes",
+                                name + " unblocked edge has no crossing record");
+                            checked_missing_crossing = true;
+                        }
                         continue;
+                    }
                     const auto& seeded_crossing =
                         seeded.crossing_between(node, neighbor);
                     const auto& unseeded_crossing =
@@ -1321,10 +1352,20 @@ void require_triangle_seed_independent_domain(
                                 - unseeded_crossing.point).norm()
                                 <= crossing_tolerance,
                             name + " crossing points do not depend on triangle seeds");
+                    if (!checked_reverse_crossing) {
+                        require(&seeded.crossing_between(neighbor, node)
+                                    == &seeded_crossing,
+                                name + " reverse endpoint lookup returns the same crossing");
+                        checked_reverse_crossing = true;
+                    }
                 }
             }
         }
     }
+    require(checked_reverse_crossing,
+            name + " has a barrier for reverse crossing lookup");
+    require(checked_missing_crossing,
+            name + " has an unblocked edge for missing crossing lookup");
 }
 
 void test_nurbs_cartesian_l_prism_labels()
@@ -1396,6 +1437,12 @@ void test_nurbs_cartesian_input_contracts()
 {
     const NativeNurbsSurface3D torus =
         make_native_nurbs_surface_3d(GeometryKind3D::Torus);
+    const auto open_model = [] {
+        return kfbim::geometry3d::NurbsSurfaceModel3D(
+            {kfbim::geometry3d::NurbsSurfacePatch3D::
+                 make_unit_square_xy()},
+            {0}, {});
+    };
     require_throws_contains(
         [&] {
             (void)kfbim::geometry3d::NurbsCartesianDomain3D(
@@ -1431,6 +1478,39 @@ void test_nurbs_cartesian_input_contracts()
         {"NURBS surface must lie strictly inside Cartesian box",
          "surface lower=(", "Cartesian box lower=("},
         "NURBS Cartesian domain reports non-strict box bounds");
+
+    require_throws_type_contains<std::overflow_error>(
+        [&] {
+            (void)kfbim::geometry3d::NurbsCartesianDomain3D(
+                kfbim::CartesianGrid3D(
+                    {0.0, 0.0, 0.0}, {1.0, 1.0, 1.0},
+                    {std::numeric_limits<int>::max(), 1, 1},
+                    kfbim::DofLayout3D::Node),
+                open_model());
+        },
+        "Cartesian cell-to-node dimension overflow",
+        "NURBS Cartesian domain rejects cell-to-node integer overflow");
+    require_throws_type_contains<std::overflow_error>(
+        [&] {
+            (void)kfbim::geometry3d::NurbsCartesianDomain3D(
+                kfbim::CartesianGrid3D(
+                    {0.0, 0.0, 0.0}, {1.0, 1.0, 1.0},
+                    {50000, 50000, 1}, kfbim::DofLayout3D::Node),
+                open_model());
+        },
+        "Cartesian node count exceeds int range",
+        "NURBS Cartesian domain rejects node-product integer overflow before allocation");
+    require_throws_type_contains<std::overflow_error>(
+        [&] {
+            const double largest = std::numeric_limits<double>::max();
+            (void)kfbim::geometry3d::NurbsCartesianDomain3D(
+                kfbim::CartesianGrid3D(
+                    {largest, 0.0, 0.0}, {largest, 1.0, 1.0},
+                    {1, 1, 1}, kfbim::DofLayout3D::Node),
+                open_model());
+        },
+        "Cartesian box bounds must be finite",
+        "NURBS Cartesian domain rejects non-finite box upper bounds before geometry queries");
 }
 
 void test_nurbs_cartesian_multiple_components()
