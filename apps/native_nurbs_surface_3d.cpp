@@ -17,7 +17,9 @@ namespace {
 constexpr double kPi = 3.141592653589793238462643383279502884;
 
 using geometry::NurbsBasis1D;
+using geometry3d::NurbsPatchEdgeConnection3D;
 using geometry3d::NurbsSurfacePatch3D;
+using geometry3d::full_patch_edge_interval;
 
 struct RationalQuarterArc2D {
     std::array<Eigen::Vector2d, 3> controls;
@@ -59,6 +61,7 @@ void append_patch(NativeNurbsSurface3D& surface,
     surface.patches.push_back(std::move(patch));
     surface.smooth_neighbors.emplace_back();
     surface.topological_patch_neighbors.emplace_back();
+    surface.patch_components.push_back(0);
 }
 
 void connect_topological_patches(NativeNurbsSurface3D& surface,
@@ -106,6 +109,32 @@ void connect_smooth(NativeNurbsSurface3D& surface,
         throw std::runtime_error("NURBS patch edge has multiple smooth neighbors");
     slot_a = SmoothPatchNeighbor3D{patch_b, edge_b, reversed};
     slot_b = SmoothPatchNeighbor3D{patch_a, edge_a, reversed};
+    surface.geometric_connections.push_back({
+        full_patch_edge_interval(
+            surface.patches[static_cast<std::size_t>(patch_a)], patch_a, edge_a),
+        full_patch_edge_interval(
+            surface.patches[static_cast<std::size_t>(patch_b)], patch_b, edge_b),
+        reversed,
+        true});
+}
+
+void connect_feature(NativeNurbsSurface3D& surface,
+                     int patch_a,
+                     PatchEdge3D edge_a,
+                     double begin_a,
+                     double end_a,
+                     int patch_b,
+                     PatchEdge3D edge_b,
+                     double begin_b,
+                     double end_b,
+                     bool reversed)
+{
+    connect_topological_patches(surface, patch_a, patch_b);
+    surface.geometric_connections.push_back({
+        {patch_a, edge_a, begin_a, end_a},
+        {patch_b, edge_b, begin_b, end_b},
+        reversed,
+        false});
 }
 
 NurbsSurfacePatch3D make_torus_quarter_patch(int u_quarter,
@@ -269,10 +298,18 @@ NativeNurbsSurface3D make_hollow_cylinder()
         }
     }
     for (int quarter = 0; quarter < 4; ++quarter) {
-        connect_topological_patches(surface, quarter, 8 + quarter);
-        connect_topological_patches(surface, quarter, 12 + quarter);
-        connect_topological_patches(surface, 4 + quarter, 8 + quarter);
-        connect_topological_patches(surface, 4 + quarter, 12 + quarter);
+        connect_feature(surface,
+            quarter, PatchEdge3D::VMax, 0.0, 1.0,
+            8 + quarter, PatchEdge3D::VMin, 0.0, 1.0, false);
+        connect_feature(surface,
+            quarter, PatchEdge3D::VMin, 0.0, 1.0,
+            12 + quarter, PatchEdge3D::VMax, 0.0, 1.0, false);
+        connect_feature(surface,
+            4 + quarter, PatchEdge3D::VMin, 0.0, 1.0,
+            8 + quarter, PatchEdge3D::VMax, 0.0, 1.0, false);
+        connect_feature(surface,
+            4 + quarter, PatchEdge3D::VMax, 0.0, 1.0,
+            12 + quarter, PatchEdge3D::VMin, 0.0, 1.0, false);
     }
     const double height = z1 - z0;
     surface.expected_area = 2.0 * kPi * (outer_radius + inner_radius) * height
@@ -363,17 +400,46 @@ NativeNurbsSurface3D make_l_prism()
     connect_smooth(surface, 3, PatchEdge3D::VMax,
                    5, PatchEdge3D::VMin, false);
 
-    const std::array<std::vector<int>, 6> boundary_cells{{
-        {0, 1}, {1}, {1}, {2}, {2}, {0, 2}}};
     for (int side = 0; side < 6; ++side) {
         const int side_patch = 6 + side;
-        connect_topological_patches(
-            surface, side_patch, 6 + (side + 1) % 6);
-        for (int cell : boundary_cells[static_cast<std::size_t>(side)]) {
-            connect_topological_patches(surface, side_patch, cell);
-            connect_topological_patches(surface, side_patch, 3 + cell);
-        }
+        connect_feature(surface,
+            side_patch, PatchEdge3D::UMax, 0.0, 1.0,
+            6 + (side + 1) % 6, PatchEdge3D::UMin, 0.0, 1.0, false);
     }
+
+    connect_feature(surface, 6, PatchEdge3D::VMin, 0.0, 0.5,
+                    0, PatchEdge3D::UMin, 0.0, 1.0, false);
+    connect_feature(surface, 6, PatchEdge3D::VMin, 0.5, 1.0,
+                    1, PatchEdge3D::UMin, 0.0, 1.0, false);
+    connect_feature(surface, 7, PatchEdge3D::VMin, 0.0, 1.0,
+                    1, PatchEdge3D::VMax, 0.0, 1.0, false);
+    connect_feature(surface, 8, PatchEdge3D::VMin, 0.0, 1.0,
+                    1, PatchEdge3D::UMax, 0.0, 1.0, true);
+    connect_feature(surface, 9, PatchEdge3D::VMin, 0.0, 1.0,
+                    2, PatchEdge3D::VMax, 0.0, 1.0, false);
+    connect_feature(surface, 10, PatchEdge3D::VMin, 0.0, 1.0,
+                    2, PatchEdge3D::UMax, 0.0, 1.0, true);
+    connect_feature(surface, 11, PatchEdge3D::VMin, 0.0, 0.5,
+                    2, PatchEdge3D::VMin, 0.0, 1.0, true);
+    connect_feature(surface, 11, PatchEdge3D::VMin, 0.5, 1.0,
+                    0, PatchEdge3D::VMin, 0.0, 1.0, true);
+
+    connect_feature(surface, 6, PatchEdge3D::VMax, 0.0, 0.5,
+                    3, PatchEdge3D::VMin, 0.0, 1.0, false);
+    connect_feature(surface, 6, PatchEdge3D::VMax, 0.5, 1.0,
+                    4, PatchEdge3D::VMin, 0.0, 1.0, false);
+    connect_feature(surface, 7, PatchEdge3D::VMax, 0.0, 1.0,
+                    4, PatchEdge3D::UMax, 0.0, 1.0, false);
+    connect_feature(surface, 8, PatchEdge3D::VMax, 0.0, 1.0,
+                    4, PatchEdge3D::VMax, 0.0, 1.0, true);
+    connect_feature(surface, 9, PatchEdge3D::VMax, 0.0, 1.0,
+                    5, PatchEdge3D::UMax, 0.0, 1.0, false);
+    connect_feature(surface, 10, PatchEdge3D::VMax, 0.0, 1.0,
+                    5, PatchEdge3D::VMax, 0.0, 1.0, true);
+    connect_feature(surface, 11, PatchEdge3D::VMax, 0.0, 0.5,
+                    5, PatchEdge3D::UMin, 0.0, 1.0, true);
+    connect_feature(surface, 11, PatchEdge3D::VMax, 0.5, 1.0,
+                    3, PatchEdge3D::UMin, 0.0, 1.0, true);
 
     surface.expected_area = 2.0 * 3.0 * arm * arm
                           + 8.0 * arm * (z1 - z0);
@@ -389,6 +455,11 @@ NativeNurbsSurface3D make_l_prism()
 }
 
 } // namespace
+
+geometry3d::NurbsSurfaceModel3D NativeNurbsSurface3D::geometry_model() const
+{
+    return {patches, patch_components, geometric_connections};
+}
 
 NativeNurbsSurface3D make_native_nurbs_surface_3d(GeometryKind3D kind)
 {

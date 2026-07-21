@@ -1,6 +1,7 @@
 #pragma once
 
 #include "src/geometry/nurbs_patch_triangulator_3d.hpp"
+#include "src/geometry/nurbs_surface_model_3d.hpp"
 
 #include <Eigen/Dense>
 
@@ -18,12 +19,7 @@ enum class GeometryKind3D {
     LPrism
 };
 
-enum class PatchEdge3D {
-    UMin = 0,
-    UMax = 1,
-    VMin = 2,
-    VMax = 3
-};
+using PatchEdge3D = geometry3d::NurbsPatchEdge3D;
 
 struct SmoothPatchNeighbor3D {
     int patch = -1;
@@ -39,8 +35,13 @@ struct NativeNurbsSurface3D {
     std::vector<std::array<std::optional<SmoothPatchNeighbor3D>, 4>>
         smooth_neighbors;
     std::vector<std::vector<int>> topological_patch_neighbors;
+    std::vector<geometry3d::NurbsPatchEdgeConnection3D>
+        geometric_connections;
+    std::vector<int> patch_components;
     double expected_area = 0.0;
     std::function<bool(const Eigen::Vector3d&)> exact_inside;
+
+    [[nodiscard]] geometry3d::NurbsSurfaceModel3D geometry_model() const;
 };
 
 struct SurfaceDof3D {

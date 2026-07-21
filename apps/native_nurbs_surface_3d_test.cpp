@@ -1,6 +1,7 @@
 #include "native_nurbs_surface_3d.hpp"
 
 #include "src/geometry/grid_pair_3d.hpp"
+#include "src/geometry/nurbs_surface_model_3d.hpp"
 #include "src/grid/cartesian_grid_3d.hpp"
 #include "src/transfer/laplace_correction_support.hpp"
 
@@ -32,6 +33,21 @@ void require(bool condition, const std::string& message)
 {
     if (!condition)
         throw std::runtime_error(message);
+}
+
+template <class Function>
+void require_throws_contains(Function&& function,
+                             const std::string& needle,
+                             const std::string& message)
+{
+    try {
+        function();
+    } catch (const std::exception& error) {
+        require(std::string(error.what()).find(needle) != std::string::npos,
+                message + ": " + error.what());
+        return;
+    }
+    throw std::runtime_error(message + ": no exception");
 }
 
 void check_patch_regular(const NativeNurbsSurface3D& surface)
@@ -131,6 +147,44 @@ void test_native_models()
                              + 8.0 * 0.60 * 1.30;
     require(std::abs(lprism.expected_area - lprism_area) < 1.0e-13,
             "L-prism exact area");
+}
+
+void test_native_surface_interval_topology()
+{
+    struct Expected {
+        GeometryKind3D kind;
+        int patches;
+        int connections;
+    };
+    for (const Expected expected : {
+             Expected{GeometryKind3D::Torus, 16, 32},
+             Expected{GeometryKind3D::HollowCylinder, 16, 32},
+             Expected{GeometryKind3D::LPrism, 12, 26}}) {
+        const NativeNurbsSurface3D surface =
+            make_native_nurbs_surface_3d(expected.kind);
+        const kfbim::geometry3d::NurbsSurfaceModel3D model =
+            surface.geometry_model();
+        const auto diagnostic = model.validate_closed();
+        require(model.num_patches() == expected.patches,
+                surface.name + " geometry-model patch count");
+        require(model.connections().size()
+                    == static_cast<std::size_t>(expected.connections),
+                surface.name + " interval-connection count");
+        require(diagnostic.uncovered_interval_count == 0
+                    && diagnostic.multiply_covered_interval_count == 0
+                    && diagnostic.position_mismatch_count == 0
+                    && diagnostic.orientation_mismatch_count == 0
+                    && diagnostic.g1_normal_mismatch_count == 0,
+                surface.name + " closed oriented interval topology");
+    }
+
+    const kfbim::geometry3d::NurbsSurfaceModel3D open_model(
+        {kfbim::geometry3d::NurbsSurfacePatch3D::make_unit_square_xy()},
+        {0}, {});
+    require_throws_contains(
+        [&] { (void)open_model.validate_closed(); },
+        "uncovered patch-edge interval",
+        "open NURBS patch is rejected by closed-topology validation");
 }
 
 double dof_area(const SurfaceDofCloud3D& cloud)
@@ -547,6 +601,7 @@ int main()
 {
     try {
         test_native_models();
+        test_native_surface_interval_topology();
         test_uniform_native_dofs();
         test_parameter_candidates();
         test_grid_edge_triangle_owners();
