@@ -843,7 +843,9 @@ std::vector<int> nearest_topological_cauchy_dofs(
     int candidate_count = cloud.patches[
         static_cast<std::size_t>(center_patch)].dof_count();
 
-    while (candidate_count < count && !frontier.empty()) {
+    bool expanded_one_ring = false;
+    while ((!expanded_one_ring || candidate_count < count)
+           && !frontier.empty()) {
         std::vector<int> next;
         for (int patch : frontier) {
             for (int neighbor : surface.topological_patch_neighbors[
@@ -866,6 +868,7 @@ std::vector<int> nearest_topological_cauchy_dofs(
                 static_cast<std::size_t>(patch)].dof_count();
         }
         frontier = std::move(next);
+        expanded_one_ring = true;
     }
     if (candidate_count < count) {
         throw std::runtime_error(

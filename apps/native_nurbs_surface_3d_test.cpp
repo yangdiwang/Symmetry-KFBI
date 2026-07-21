@@ -4,6 +4,7 @@
 #include "src/grid/cartesian_grid_3d.hpp"
 #include "src/transfer/laplace_correction_support.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <set>
@@ -38,6 +39,20 @@ void check_patch_regular(const NativeNurbsSurface3D& surface)
             surface.name + " smooth-neighbor count");
     require(surface.topological_patch_neighbors.size() == surface.patches.size(),
             surface.name + " topological-neighbor count");
+    for (int patch = 0; patch < static_cast<int>(surface.patches.size()); ++patch) {
+        for (int neighbor : surface.topological_patch_neighbors[
+                 static_cast<std::size_t>(patch)]) {
+            require(neighbor >= 0
+                        && neighbor < static_cast<int>(surface.patches.size())
+                        && neighbor != patch,
+                    surface.name + " valid topological neighbor");
+            const auto& reverse = surface.topological_patch_neighbors[
+                static_cast<std::size_t>(neighbor)];
+            require(std::find(reverse.begin(), reverse.end(), patch)
+                        != reverse.end(),
+                    surface.name + " symmetric topological adjacency");
+        }
+    }
     for (const auto& patch : surface.patches) {
         const double u = 0.5 * (patch.domain_start_u() + patch.domain_end_u());
         const double v = 0.5 * (patch.domain_start_v() + patch.domain_end_v());
@@ -56,6 +71,15 @@ void test_native_models()
         make_native_nurbs_surface_3d(GeometryKind3D::Torus);
     const NativeNurbsSurface3D cylinder =
         make_native_nurbs_surface_3d(GeometryKind3D::HollowCylinder);
+    const auto& outer_neighbors = cylinder.topological_patch_neighbors[0];
+    require(std::find(outer_neighbors.begin(), outer_neighbors.end(), 8)
+                != outer_neighbors.end()
+                && std::find(outer_neighbors.begin(), outer_neighbors.end(), 12)
+                       != outer_neighbors.end(),
+            "outer cylinder wall is topologically adjacent to both caps");
+    require(std::find(outer_neighbors.begin(), outer_neighbors.end(), 4)
+                == outer_neighbors.end(),
+            "outer and inner cylinder walls are not direct neighbors");
     const NativeNurbsSurface3D lprism =
         make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
 
@@ -284,6 +308,13 @@ void test_parameter_candidates()
             "periodic query must have four valid DOFs");
     require(contains_patch(periodic, torus_cloud, 12),
             "torus closed seam reaches previous u quarter");
+    const int torus_cauchy_center = torus_tensor.dof_index(
+        0, torus_tensor.nv / 2);
+    const std::vector<int> torus_cauchy =
+        nearest_topological_cauchy_dofs(
+            torus, torus_cloud, torus_cauchy_center, 48);
+    require(contains_non_source_patch(torus_cauchy, torus_cloud, 0),
+            "fine-grid Cauchy selector includes a topological seam neighbor");
 
     const NativeNurbsSurface3D lprism =
         make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
@@ -370,6 +401,12 @@ void test_parameter_candidates()
         require(smooth_patch_component(lprism, side).size() == 1,
                 "each L-prism side is a separate non-G1 component");
     }
+    const auto& long_side_neighbors = lprism.topological_patch_neighbors[6];
+    for (int expected : {0, 1, 3, 4, 7, 11}) {
+        require(std::find(long_side_neighbors.begin(), long_side_neighbors.end(),
+                          expected) != long_side_neighbors.end(),
+                "long L side retains one-to-many cap topology");
+    }
 
     const SurfaceDofCloud3D coarse_lcloud =
         make_native_surface_dofs_3d(lprism, 3.0 / 16.0);
@@ -381,6 +418,16 @@ void test_parameter_candidates()
             "L side Cauchy selector retains 48 values");
     require(contains_non_source_patch(l_cauchy, coarse_lcloud, 7),
             "L side Cauchy selector crosses a non-G1 topological edge");
+
+    const SurfaceDofCloud3D fine_lcloud =
+        make_native_surface_dofs_3d(lprism, 3.0 / 32.0);
+    const auto& fine_lside = fine_lcloud.patches[7];
+    const int fine_lcenter = fine_lside.dof_index(0, fine_lside.nv / 2);
+    const std::vector<int> fine_l_cauchy =
+        nearest_topological_cauchy_dofs(
+            lprism, fine_lcloud, fine_lcenter, 48);
+    require(contains_non_source_patch(fine_l_cauchy, fine_lcloud, 7),
+            "fine-grid L Cauchy selector crosses a non-G1 neighbor");
 
     const SurfaceDofCloud3D coarse_cylinder_cloud =
         make_native_surface_dofs_3d(cylinder, 3.0 / 16.0);
