@@ -95,10 +95,10 @@ struct RationalBezierElement3D {
 Create `src/geometry/rational_bezier_element_3d.cpp`. Move these private helpers and methods verbatim from the old implementation:
 
 ```text
+midpoint_if_representable
 expected_control_count
 validate_element
-normalized_coordinate
-bernstein_values
+evaluate_curve
 split_curve
 RationalBezierElement3D::u0/u1/v0/v1
 RationalBezierElement3D::control
@@ -115,6 +115,7 @@ The new implementation starts with:
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -146,7 +147,6 @@ Create `src/geometry/nurbs_bezier_extraction_3d.cpp`. Move these functions and a
 
 ```text
 HomogeneousNet
-homogeneous_patch
 validate_net
 insert_knot_u_once
 transpose
@@ -155,12 +155,17 @@ nonzero_spans
 extract_rational_bezier_elements_3d
 ```
 
+The old extraction function's final private `validate_element(element)` call
+becomes `(void)element.bounds()` so it invokes the same element validation
+through the unchanged public API without exposing a new cross-module helper.
+
 Use these includes:
 
 ```cpp
 #include "nurbs_bezier_extraction_3d.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -189,7 +194,12 @@ subdivide_rational_bezier_elements_to_extent_3d(
 } // namespace kfbim::geometry3d
 ```
 
-Create `src/geometry/rational_bezier_subdivision_3d.cpp`. Move `projected_control_variation` and `subdivide_rational_bezier_elements_to_extent_3d` verbatim. Preserve the exact depth-48 failure text and the current U/V direction-selection rule.
+Create `src/geometry/rational_bezier_subdivision_3d.cpp`. Move
+`has_representable_midpoint`, `projected_control_variation`, and
+`subdivide_rational_bezier_elements_to_extent_3d`. Replace the private
+`validate_element(element)` call with `(void)element.bounds()` so eager input
+validation is preserved through the unchanged element API. Preserve the exact
+depth-48 failure text and the current U/V direction-selection rule.
 
 Use these includes:
 
