@@ -537,6 +537,7 @@ struct GridPair3D::Impl {
     std::unique_ptr<NearestPointCloud3D> iface_cloud;
     std::vector<DistanceSample3D> p2_center_samples;
     std::unique_ptr<PointSpatialHash3D> p2_center_hash;
+    std::unique_ptr<NearestPointCloud3D> p2_center_cloud;
     std::vector<int> nearest_p2_center_for_node;
     std::vector<int> owner_p2_center_for_point;
     double p2_center_cache_radius = -1.0;
@@ -623,6 +624,8 @@ GridPair3D::GridPair3D(const CartesianGrid3D& grid,
             sample_points_for_hash(impl_->p2_center_samples);
         impl_->p2_center_hash = std::make_unique<PointSpatialHash3D>(
             p2_center_points, max_grid_spacing(grid));
+        impl_->p2_center_cloud = std::make_unique<NearestPointCloud3D>(
+            p2_center_points);
         impl_->nearest_p2_center_for_node.resize(N, -1);
         impl_->owner_p2_center_for_point.resize(Nq, -1);
         std::vector<double> owner_center_dist2(
@@ -671,10 +674,13 @@ GridPair3D::GridPair3D(const CartesianGrid3D& grid,
             if (impl_->nearest_p2_center_for_node[n] >= 0)
                 continue;
             const auto c = grid.coord(n);
-            const NearestResult3D nearest =
-                impl_->p2_center_hash->nearest({c[0], c[1], c[2]});
-            impl_->nearest_p2_center_for_node[n] = nearest.index;
-            impl_->min_iface_dist[n] = std::sqrt(nearest.dist2);
+            const Eigen::Vector3d point(c[0], c[1], c[2]);
+            const int nearest = impl_->p2_center_cloud->nearest_stable(point);
+            impl_->nearest_p2_center_for_node[n] = nearest;
+            impl_->min_iface_dist[n] = std::sqrt(squared_distance(
+                point,
+                impl_->p2_center_samples[
+                    static_cast<std::size_t>(nearest)].point));
         }
         t_center_cache = seconds_since(t_center_cache_start);
     } else {
