@@ -1,6 +1,7 @@
 #include "native_nurbs_surface_3d.hpp"
 
 #include "src/geometry/grid_pair_3d.hpp"
+#include "src/geometry/nurbs_bezier_intersection_3d.hpp"
 #include "src/geometry/rational_bezier_surface_3d.hpp"
 #include "src/geometry/nurbs_surface_model_3d.hpp"
 #include "src/grid/cartesian_grid_3d.hpp"
@@ -369,6 +370,52 @@ void test_benchmark_rational_bezier_elements_are_conservative()
                 surface.name + " benchmark element");
         }
     }
+}
+
+void test_rational_bezier_element_intersection()
+{
+    const kfbim::geometry3d::NurbsSurfaceModel3D plane_model(
+        {kfbim::geometry3d::NurbsSurfacePatch3D::make_unit_square_xy()},
+        {0}, {});
+    const auto plane_element =
+        kfbim::geometry3d::extract_rational_bezier_elements_3d(
+            plane_model).front();
+    kfbim::geometry3d::NurbsElementIntersectionOptions3D options;
+    options.geometry_tolerance = 1e-12;
+    const auto plane = kfbim::geometry3d::intersect_nurbs_bezier_element_3d(
+        plane_element, plane_model.patch(0),
+        {0.25, 0.75, -1.0}, {0.25, 0.75, 1.0}, options);
+    require(plane.roots.size() == 1
+                && std::abs(plane.roots[0].u - 0.25) < 2e-12
+                && std::abs(plane.roots[0].v - 0.75) < 2e-12
+                && std::abs(plane.roots[0].t - 0.5) < 2e-12,
+            "unit-plane native root");
+
+    const kfbim::geometry3d::NurbsSurfaceModel3D cylinder_model(
+        {kfbim::geometry3d::NurbsSurfacePatch3D::
+             make_quarter_cylinder_patch(1.0, 0.0, 1.0)},
+        {0}, {});
+    const auto cylinder_element =
+        kfbim::geometry3d::extract_rational_bezier_elements_3d(
+            cylinder_model).front();
+    const auto cylinder = kfbim::geometry3d::intersect_nurbs_bezier_element_3d(
+        cylinder_element, cylinder_model.patch(0),
+        {0.8, 0.5, 0.5}, {0.95, 0.5, 0.5}, options);
+    require(cylinder.roots.size() == 1
+                && std::abs(cylinder.roots[0].point.x() - std::sqrt(0.75))
+                       < 2e-12
+                && cylinder.roots[0].residual < 2e-12,
+            "quarter-cylinder native root");
+    require(cylinder.diagnostics.triangle_seed_hits == 0
+                && cylinder.diagnostics.roots_recovered_without_triangle_seed == 1,
+            "curved root survives triangle-seed miss");
+
+    const auto miss = kfbim::geometry3d::intersect_nurbs_bezier_element_3d(
+        plane_element, plane_model.patch(0),
+        {2.0, 2.0, -1.0}, {2.0, 2.0, 1.0}, options);
+    require(miss.roots.empty() && miss.diagnostics.newton_attempts == 0
+                && miss.diagnostics.conservative_rejections > 0,
+            "control hull rejects an impossible line before Newton");
 }
 
 void test_degree_zero_multispan_bezier_extraction()
@@ -971,6 +1018,7 @@ int main()
         test_interval_topology_rejects_tiny_overlap();
         test_rational_bezier_extraction_and_subdivision();
         test_benchmark_rational_bezier_elements_are_conservative();
+        test_rational_bezier_element_intersection();
         test_nonclamped_rational_bezier_extraction();
         test_degree_zero_multispan_bezier_extraction();
         test_discontinuous_multispan_bezier_extraction_is_rejected();

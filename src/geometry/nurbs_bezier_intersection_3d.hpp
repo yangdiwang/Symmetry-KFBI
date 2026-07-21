@@ -1,0 +1,54 @@
+#pragma once
+
+#include "rational_bezier_surface_3d.hpp"
+
+#include <Eigen/Dense>
+
+#include <vector>
+
+namespace kfbim::geometry3d {
+
+struct NurbsElementRoot3D {
+    int patch_index = -1;
+    int component = -1;
+    double u = 0.0;
+    double v = 0.0;
+    double t = 0.0;
+    Eigen::Vector3d point = Eigen::Vector3d::Zero();
+    Eigen::Vector3d normal = Eigen::Vector3d::Zero();
+    double residual = 0.0;
+    double transversality = 0.0;
+};
+
+struct NurbsElementIntersectionDiagnostics3D {
+    int subdivision_boxes = 0;
+    int conservative_rejections = 0;
+    int triangle_seed_hits = 0;
+    int newton_attempts = 0;
+    int newton_iterations = 0;
+    int roots_recovered_without_triangle_seed = 0;
+    int unresolved_boxes = 0;
+};
+
+struct NurbsElementIntersectionResult3D {
+    std::vector<NurbsElementRoot3D> roots;
+    NurbsElementIntersectionDiagnostics3D diagnostics;
+    bool overlap_detected = false;
+};
+
+struct NurbsElementIntersectionOptions3D {
+    double geometry_tolerance = 1e-12;
+    double parameter_tolerance = 1e-12;
+    int max_subdivision_depth = 36;
+    int max_newton_iterations = 24;
+    bool use_triangle_seed = true;
+};
+
+NurbsElementIntersectionResult3D intersect_nurbs_bezier_element_3d(
+    const RationalBezierElement3D& element,
+    const NurbsSurfacePatch3D& patch,
+    const Eigen::Vector3d& segment_start,
+    const Eigen::Vector3d& segment_end,
+    const NurbsElementIntersectionOptions3D& options);
+
+} // namespace kfbim::geometry3d
