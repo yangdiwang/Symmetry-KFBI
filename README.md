@@ -1,5 +1,15 @@
 # Symmetry-KFBI
 
+## 3D native-NURBS route
+
+The 3D app constructs the torus, hollow cylinder, and L prism from native
+NURBS patches. Interface DOFs are uniform native-parameter cell midpoints;
+grid crossings use triangle-interpolated `(u,v)` and exactly `2x2` candidate
+DOFs. Periodic/G1 seams are mapped, while both DOF selection and the 48/28
+local Cauchy stencil stop at non-G1 patch edges. Detailed `N=16,32,64`
+convergence results are recorded in
+[`docs/superpowers/results/2026-07-21-3d-harmonic-jet-results.md`](docs/superpowers/results/2026-07-21-3d-harmonic-jet-results.md).
+
 这是从原 KFBI 工作区中独立整理出的二维与三维算例仓库。仓库包含 `apps` 下的全部
 八个 C++ 算例、两个 Python 可视化脚本，以及它们实际依赖的 KFBI 核心源码和
 zFFT。构建不依赖原代码库的相对路径。
