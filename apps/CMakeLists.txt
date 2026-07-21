@@ -78,6 +78,7 @@ if(KFBIM_BUILD_3D)
     )
 
     target_link_libraries(neumann_exterior_zero_trace_3d PRIVATE
+        kfbim_3d_app_geometry
         kfbim_core
     )
 endif()

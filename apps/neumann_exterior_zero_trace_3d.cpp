@@ -19,6 +19,7 @@
 #include <Eigen/Dense>
 #include <Eigen/SVD>
 
+#include "native_nurbs_surface_3d.hpp"
 #include "src/bulk_solvers/laplace_zfft_bulk_solver_3d.hpp"
 #include "src/geometry/grid_pair_3d.hpp"
 #include "src/geometry/nurbs_patch_triangulator_3d.hpp"
@@ -34,49 +35,29 @@ using namespace kfbim;
 
 namespace {
 
-constexpr double kPi = 3.141592653589793238462643383279502884;
 constexpr double kBoxMin = -1.5;
 constexpr double kBoxSide = 3.0;
 constexpr double kTargetP2NodeSpacingOverH = 1.2;
 constexpr int kCauchyValueNeighborCount = 48;
 constexpr int kCauchyDerivativeNeighborCount = 28;
 
-enum class GeometryKind {
-    Torus,
-    HollowCylinder,
-    LPrism
-};
+using GeometryKind = app3d::GeometryKind3D;
+using NativeNurbsSurface3D = app3d::NativeNurbsSurface3D;
+using SurfaceDof = app3d::SurfaceDof3D;
+using SurfaceDofCloud = app3d::SurfaceDofCloud3D;
+using SurfacePatchInfo = app3d::SurfaceDofPatch3D;
 
 struct GeometryBundle {
     std::string name;
     std::string description;
+    NativeNurbsSurface3D native_surface;
     Interface3D correction_interface;
     Interface3D crossing_interface;
+    std::vector<geometry3d::NurbsParamTriangle3D> correction_triangles;
+    std::vector<geometry3d::NurbsParamTriangle3D> geometry_triangles;
     int feature_edges = 0;
     int feature_vertices = 0;
     std::function<bool(const Eigen::Vector3d&)> exact_inside;
-};
-
-struct SurfacePatchInfo {
-    std::string name;
-    std::vector<int> adjacent_patch_ids;
-};
-
-struct SurfaceDof {
-    Eigen::Vector3d point = Eigen::Vector3d::Zero();
-    Eigen::Vector3d normal = Eigen::Vector3d::Zero();
-    Eigen::Vector3d tangent1 = Eigen::Vector3d::Zero();
-    Eigen::Vector3d tangent2 = Eigen::Vector3d::Zero();
-    double weight = 0.0;
-    double parameter_a = 0.0;
-    double parameter_b = 0.0;
-    int patch_id = -1;
-};
-
-struct SurfaceDofCloud {
-    std::vector<SurfacePatchInfo> patches;
-    std::vector<SurfaceDof> dofs;
-    double expected_area = 0.0;
 };
 
 struct SurfaceCloudDiagnostics {
@@ -173,13 +154,6 @@ struct ReadinessResult {
     SolveMetrics3D dirichlet_normal;
 };
 
-double triangle_area(const Eigen::Vector3d& a,
-                     const Eigen::Vector3d& b,
-                     const Eigen::Vector3d& c)
-{
-    return 0.5 * (b - a).cross(c - a).norm();
-}
-
 bool is_power_of_two(int value)
 {
     return value > 0 && (value & (value - 1)) == 0;
@@ -219,260 +193,6 @@ Eigen::Vector3d manufactured_gradient_3d(const Eigen::Vector3d& point)
     };
 }
 
-std::pair<Eigen::Vector3d, Eigen::Vector3d>
-frame_from_normal(const Eigen::Vector3d& input_normal)
-{
-    Eigen::Vector3d normal = input_normal;
-    const double norm = normal.norm();
-    if (!(norm > 0.0) || !std::isfinite(norm))
-        throw std::runtime_error("cannot construct a frame from a zero normal");
-    normal /= norm;
-    const Eigen::Vector3d seed = std::abs(normal.z()) < 0.85
-        ? Eigen::Vector3d::UnitZ()
-        : Eigen::Vector3d::UnitX();
-    Eigen::Vector3d tangent1 = seed.cross(normal).normalized();
-    Eigen::Vector3d tangent2 = normal.cross(tangent1).normalized();
-    return {tangent1, tangent2};
-}
-
-void add_surface_dof(SurfaceDofCloud& cloud,
-                     int patch_id,
-                     const Eigen::Vector3d& point,
-                     const Eigen::Vector3d& input_normal,
-                     double weight,
-                     double parameter_a,
-                     double parameter_b)
-{
-    if (patch_id < 0 || patch_id >= static_cast<int>(cloud.patches.size()))
-        throw std::runtime_error("surface DOF has an invalid patch id");
-    if (!(weight > 0.0) || !std::isfinite(weight))
-        throw std::runtime_error("surface DOF has a non-positive weight");
-    Eigen::Vector3d normal = input_normal;
-    if (!(normal.norm() > 0.0))
-        throw std::runtime_error("surface DOF has a zero normal");
-    normal.normalize();
-    const auto frame = frame_from_normal(normal);
-    SurfaceDof dof;
-    dof.point = point;
-    dof.normal = normal;
-    dof.tangent1 = frame.first;
-    dof.tangent2 = frame.second;
-    dof.weight = weight;
-    dof.parameter_a = parameter_a;
-    dof.parameter_b = parameter_b;
-    dof.patch_id = patch_id;
-    cloud.dofs.push_back(dof);
-}
-
-SurfaceDofCloud make_torus_surface_dofs(double h)
-{
-    constexpr double cx = 0.07;
-    constexpr double cy = -0.04;
-    constexpr double cz = 0.03;
-    constexpr double major_radius = 0.55;
-    constexpr double minor_radius = 0.20;
-
-    SurfaceDofCloud cloud;
-    cloud.patches = {{"periodic_torus", {0}}};
-    cloud.expected_area = 4.0 * kPi * kPi * major_radius * minor_radius;
-
-    // A single periodic parameter patch.  Both periodic seams are panel
-    // boundaries, while every unknown is placed at a parameter-cell center.
-    const int nu = std::max(8, static_cast<int>(std::ceil(
-        2.0 * kPi * major_radius / h)));
-    const int nv = std::max(6, static_cast<int>(std::ceil(
-        2.0 * kPi * minor_radius / h)));
-    const double du = 2.0 * kPi / static_cast<double>(nu);
-    const double dv = 2.0 * kPi / static_cast<double>(nv);
-    cloud.dofs.reserve(static_cast<std::size_t>(nu * nv));
-    for (int i = 0; i < nu; ++i) {
-        const double u = (static_cast<double>(i) + 0.5) * du;
-        const double cu = std::cos(u);
-        const double su = std::sin(u);
-        for (int j = 0; j < nv; ++j) {
-            const double v = (static_cast<double>(j) + 0.5) * dv;
-            const double cv = std::cos(v);
-            const double sv = std::sin(v);
-            const double rho = major_radius + minor_radius * cv;
-            add_surface_dof(
-                cloud,
-                0,
-                {cx + rho * cu, cy + rho * su, cz + minor_radius * sv},
-                {cu * cv, su * cv, sv},
-                rho * minor_radius * du * dv,
-                u,
-                v);
-        }
-    }
-    return cloud;
-}
-
-SurfaceDofCloud make_cylinder_surface_dofs(double h)
-{
-    constexpr double cx = 0.06;
-    constexpr double cy = -0.05;
-    constexpr double cz = 0.02;
-    constexpr double outer_radius = 0.55;
-    constexpr double inner_radius = 0.25;
-    constexpr double half_height = 0.65;
-
-    SurfaceDofCloud cloud;
-    cloud.patches = {
-        {"outer_side", {0, 2, 3}},
-        {"inner_side", {1, 2, 3}},
-        {"top_annulus", {0, 1, 2}},
-        {"bottom_annulus", {0, 1, 3}}};
-    cloud.expected_area =
-        4.0 * kPi * (outer_radius + inner_radius) * half_height
-        + 2.0 * kPi * (outer_radius * outer_radius
-                       - inner_radius * inner_radius);
-
-    const int nz = std::max(2, static_cast<int>(std::ceil(
-        2.0 * half_height / h)));
-    const double dz = 2.0 * half_height / static_cast<double>(nz);
-    for (int patch_id : {0, 1}) {
-        const double radius = patch_id == 0 ? outer_radius : inner_radius;
-        const int ntheta = std::max(8, static_cast<int>(std::ceil(
-            2.0 * kPi * radius / h)));
-        const double dtheta = 2.0 * kPi / static_cast<double>(ntheta);
-        for (int i = 0; i < ntheta; ++i) {
-            const double theta = (static_cast<double>(i) + 0.5) * dtheta;
-            const double ct = std::cos(theta);
-            const double st = std::sin(theta);
-            const Eigen::Vector3d normal = patch_id == 0
-                ? Eigen::Vector3d(ct, st, 0.0)
-                : Eigen::Vector3d(-ct, -st, 0.0);
-            for (int k = 0; k < nz; ++k) {
-                const double z = cz - half_height
-                               + (static_cast<double>(k) + 0.5) * dz;
-                add_surface_dof(
-                    cloud,
-                    patch_id,
-                    {cx + radius * ct, cy + radius * st, z},
-                    normal,
-                    radius * dtheta * dz,
-                    theta,
-                    z);
-            }
-        }
-    }
-
-    // Each cap is split into concentric sector panels.  Radial and angular
-    // unknowns are strictly inside their parameter cells, and every weight is
-    // the exact sector-annulus area 0.5*(r1^2-r0^2)*dtheta.
-    const int nr = std::max(2, static_cast<int>(std::ceil(
-        (outer_radius - inner_radius) / h)));
-    const double dr = (outer_radius - inner_radius) / static_cast<double>(nr);
-    for (int ir = 0; ir < nr; ++ir) {
-        const double r0 = inner_radius + static_cast<double>(ir) * dr;
-        const double r1 = r0 + dr;
-        const double radius = 0.5 * (r0 + r1);
-        const int ntheta = std::max(8, static_cast<int>(std::ceil(
-            2.0 * kPi * radius / h)));
-        const double dtheta = 2.0 * kPi / static_cast<double>(ntheta);
-        const double weight = 0.5 * (r1 * r1 - r0 * r0) * dtheta;
-        for (int i = 0; i < ntheta; ++i) {
-            const double theta = (static_cast<double>(i) + 0.5) * dtheta;
-            const double x = cx + radius * std::cos(theta);
-            const double y = cy + radius * std::sin(theta);
-            add_surface_dof(
-                cloud, 2, {x, y, cz + half_height},
-                Eigen::Vector3d::UnitZ(), weight, radius, theta);
-            add_surface_dof(
-                cloud, 3, {x, y, cz - half_height},
-                -Eigen::Vector3d::UnitZ(), weight, radius, theta);
-        }
-    }
-    return cloud;
-}
-
-SurfaceDofCloud make_l_prism_surface_dofs(double h)
-{
-    constexpr double sx = 0.07;
-    constexpr double sy = -0.07;
-    constexpr double z0 = -0.63;
-    constexpr double z1 = 0.67;
-    constexpr double arm = 0.60;
-
-    SurfaceDofCloud cloud;
-    cloud.patches.resize(8);
-    const std::array<std::string, 6> side_names{{
-        "y_min", "x_max_y_neg", "y_zero_x_pos",
-        "x_zero_y_pos", "y_max_x_neg", "x_min"}};
-    for (int side = 0; side < 6; ++side) {
-        cloud.patches[static_cast<std::size_t>(side)].name = side_names[side];
-        cloud.patches[static_cast<std::size_t>(side)].adjacent_patch_ids = {
-            side, (side + 5) % 6, (side + 1) % 6, 6, 7};
-    }
-    cloud.patches[6] = {"top_l_face", {6, 0, 1, 2, 3, 4, 5}};
-    cloud.patches[7] = {"bottom_l_face", {7, 0, 1, 2, 3, 4, 5}};
-    cloud.expected_area = 2.0 * 3.0 * arm * arm
-                        + (8.0 * arm) * (z1 - z0);
-
-    const std::array<Eigen::Vector2d, 6> boundary{{
-        {sx - arm, sy - arm}, {sx + arm, sy - arm},
-        {sx + arm, sy},       {sx, sy},
-        {sx, sy + arm},       {sx - arm, sy + arm}}};
-    const Eigen::Vector3d vertical(0.0, 0.0, z1 - z0);
-    for (int side = 0; side < 6; ++side) {
-        const Eigen::Vector2d a = boundary[static_cast<std::size_t>(side)];
-        const Eigen::Vector2d b = boundary[static_cast<std::size_t>((side + 1) % 6)];
-        const Eigen::Vector3d edge(b.x() - a.x(), b.y() - a.y(), 0.0);
-        const double edge_length = edge.norm();
-        const int na = std::max(2, static_cast<int>(std::ceil(edge_length / h)));
-        const int nb = std::max(2, static_cast<int>(std::ceil((z1 - z0) / h)));
-        const Eigen::Vector3d normal = edge.cross(vertical).normalized();
-        const double weight = edge_length * (z1 - z0)
-                            / static_cast<double>(na * nb);
-        for (int ia = 0; ia < na; ++ia) {
-            const double alpha = (static_cast<double>(ia) + 0.5)
-                               / static_cast<double>(na);
-            for (int ib = 0; ib < nb; ++ib) {
-                const double beta = (static_cast<double>(ib) + 0.5)
-                              / static_cast<double>(nb);
-                const Eigen::Vector3d point(
-                    a.x() + alpha * (b.x() - a.x()),
-                    a.y() + alpha * (b.y() - a.y()),
-                    z0 + beta * (z1 - z0));
-                add_surface_dof(
-                    cloud, side, point, normal, weight, alpha, beta);
-            }
-        }
-    }
-
-    // Use an even number of cells so the two re-entrant half-lines are panel
-    // boundaries, never panel centers.  The missing upper-right quadrant is
-    // removed using exactly the L-face center test.
-    int nplanar = std::max(2, static_cast<int>(std::ceil(2.0 * arm / h)));
-    if (nplanar % 2 != 0)
-        ++nplanar;
-    const double ds = 2.0 * arm / static_cast<double>(nplanar);
-    for (int i = 0; i < nplanar; ++i) {
-        const double x = sx - arm + (static_cast<double>(i) + 0.5) * ds;
-        for (int j = 0; j < nplanar; ++j) {
-            const double y = sy - arm + (static_cast<double>(j) + 0.5) * ds;
-            if (!(x < sx || y < sy))
-                continue;
-            add_surface_dof(
-                cloud, 6, {x, y, z1}, Eigen::Vector3d::UnitZ(),
-                ds * ds, x, y);
-            add_surface_dof(
-                cloud, 7, {x, y, z0}, -Eigen::Vector3d::UnitZ(),
-                ds * ds, x, y);
-        }
-    }
-    return cloud;
-}
-
-SurfaceDofCloud make_surface_dofs(GeometryKind kind, double h)
-{
-    if (kind == GeometryKind::Torus)
-        return make_torus_surface_dofs(h);
-    if (kind == GeometryKind::HollowCylinder)
-        return make_cylinder_surface_dofs(h);
-    return make_l_prism_surface_dofs(h);
-}
-
 SurfaceCloudDiagnostics validate_surface_dofs(const SurfaceDofCloud& cloud,
                                               double h)
 {
@@ -482,13 +202,14 @@ SurfaceCloudDiagnostics validate_surface_dofs(const SurfaceDofCloud& cloud,
     SurfaceCloudDiagnostics result;
     for (std::size_t i = 0; i < cloud.patches.size(); ++i) {
         const SurfacePatchInfo& patch = cloud.patches[i];
-        if (patch.adjacent_patch_ids.empty()
-            || std::find(patch.adjacent_patch_ids.begin(),
-                         patch.adjacent_patch_ids.end(),
-                         static_cast<int>(i)) == patch.adjacent_patch_ids.end()) {
-            throw std::runtime_error("surface patch adjacency must include itself");
+        if (patch.smooth_patch_ids.empty()
+            || std::find(patch.smooth_patch_ids.begin(),
+                         patch.smooth_patch_ids.end(),
+                         static_cast<int>(i)) == patch.smooth_patch_ids.end()) {
+            throw std::runtime_error(
+                "surface patch smooth adjacency must include itself");
         }
-        for (int adjacent : patch.adjacent_patch_ids) {
+        for (int adjacent : patch.smooth_patch_ids) {
             if (adjacent < 0 || adjacent >= static_cast<int>(cloud.patches.size()))
                 throw std::runtime_error("surface patch has invalid adjacency");
         }
@@ -534,7 +255,8 @@ SurfaceCloudDiagnostics validate_surface_dofs(const SurfaceDofCloud& cloud,
     return result;
 }
 
-CauchyStencilSet build_cauchy_stencils(const SurfaceDofCloud& cloud,
+CauchyStencilSet build_cauchy_stencils(const NativeNurbsSurface3D& surface,
+                                       const SurfaceDofCloud& cloud,
                                        double h,
                                        int requested_value_count,
                                        int requested_derivative_count)
@@ -546,12 +268,13 @@ CauchyStencilSet build_cauchy_stencils(const SurfaceDofCloud& cloud,
         patch_dofs[static_cast<std::size_t>(cloud.dofs[q].patch_id)].push_back(q);
 
     int minimum_candidate_count = std::numeric_limits<int>::max();
-    for (const SurfacePatchInfo& patch : cloud.patches) {
+    for (int patch_id = 0;
+         patch_id < static_cast<int>(cloud.patches.size());
+         ++patch_id) {
         int count = 0;
-        std::set<int> unique_patches;
-        for (int adjacent : patch.adjacent_patch_ids)
-            unique_patches.insert(adjacent);
-        for (int adjacent : unique_patches)
+        const std::vector<int> component =
+            app3d::smooth_patch_component(surface, patch_id);
+        for (int adjacent : component)
             count += static_cast<int>(patch_dofs[static_cast<std::size_t>(adjacent)].size());
         minimum_candidate_count = std::min(minimum_candidate_count, count);
     }
@@ -567,12 +290,10 @@ CauchyStencilSet build_cauchy_stencils(const SurfaceDofCloud& cloud,
 
     for (int center = 0; center < static_cast<int>(cloud.dofs.size()); ++center) {
         const SurfaceDof& target = cloud.dofs[static_cast<std::size_t>(center)];
-        const SurfacePatchInfo& patch =
-            cloud.patches[static_cast<std::size_t>(target.patch_id)];
         std::vector<std::pair<double, int>> candidates;
-        std::set<int> unique_patches(
-            patch.adjacent_patch_ids.begin(), patch.adjacent_patch_ids.end());
-        for (int adjacent : unique_patches) {
+        const std::vector<int> component =
+            app3d::smooth_patch_component(surface, target.patch_id);
+        for (int adjacent : component) {
             for (int q : patch_dofs[static_cast<std::size_t>(adjacent)]) {
                 const double distance_sq =
                     (cloud.dofs[static_cast<std::size_t>(q)].point - target.point)
@@ -878,438 +599,10 @@ private:
     std::vector<CauchyFitMap3D> maps_;
 };
 
-struct TorusMeshData {
-    std::map<std::pair<int, int>, int> node_by_key;
-    std::vector<Eigen::Vector3d> points;
-    std::vector<Eigen::Vector3d> normals;
-    std::vector<double> weights;
-    std::vector<std::array<int, 3>> panels;
-    std::vector<std::array<int, 6>> panel_points;
-};
-
-int positive_mod(int value, int period)
-{
-    const int result = value % period;
-    return result < 0 ? result + period : result;
-}
-
-int add_torus_node(TorusMeshData& mesh, int iu, int iv, int nu, int nv)
-{
-    const int ku = positive_mod(iu, 2 * nu);
-    const int kv = positive_mod(iv, 2 * nv);
-    const std::pair<int, int> key{ku, kv};
-    const auto found = mesh.node_by_key.find(key);
-    if (found != mesh.node_by_key.end())
-        return found->second;
-
-    constexpr double cx = 0.07;
-    constexpr double cy = -0.04;
-    constexpr double cz = 0.03;
-    constexpr double major_radius = 0.55;
-    constexpr double minor_radius = 0.20;
-    const double u = kPi * static_cast<double>(ku) / static_cast<double>(nu);
-    const double v = kPi * static_cast<double>(kv) / static_cast<double>(nv);
-    const double cu = std::cos(u);
-    const double su = std::sin(u);
-    const double cv = std::cos(v);
-    const double sv = std::sin(v);
-    const double rho = major_radius + minor_radius * cv;
-
-    const int index = static_cast<int>(mesh.points.size());
-    mesh.node_by_key.emplace(key, index);
-    mesh.points.emplace_back(cx + rho * cu, cy + rho * su, cz + minor_radius * sv);
-    mesh.normals.emplace_back(cu * cv, su * cv, sv);
-    mesh.weights.push_back(0.0);
-    return index;
-}
-
-void add_torus_panel(TorusMeshData& mesh,
-                     int a, int b, int c, int eab, int ebc, int eca)
-{
-    mesh.panels.push_back({a, b, c});
-    mesh.panel_points.push_back({a, b, c, eab, ebc, eca});
-    const double weight = triangle_area(
-        mesh.points[a], mesh.points[b], mesh.points[c]) / 6.0;
-    for (int point : {a, b, c, eab, ebc, eca})
-        mesh.weights[static_cast<std::size_t>(point)] += weight;
-}
-
-Interface3D make_torus_interface(double h)
-{
-    constexpr double major_radius = 0.55;
-    constexpr double minor_radius = 0.20;
-    const double target_H = 2.0 * kTargetP2NodeSpacingOverH * h;
-    const int nu = std::max(8, static_cast<int>(std::lround(
-        2.0 * kPi * (major_radius + minor_radius) / target_H)));
-    const int nv = std::max(6, static_cast<int>(std::lround(
-        2.0 * kPi * minor_radius / target_H)));
-
-    TorusMeshData mesh;
-    for (int i = 0; i < nu; ++i) {
-        for (int j = 0; j < nv; ++j) {
-            const int a = add_torus_node(mesh, 2 * i, 2 * j, nu, nv);
-            const int b = add_torus_node(mesh, 2 * (i + 1), 2 * j, nu, nv);
-            const int c = add_torus_node(mesh, 2 * i, 2 * (j + 1), nu, nv);
-            const int d = add_torus_node(
-                mesh, 2 * (i + 1), 2 * (j + 1), nu, nv);
-            const int eab = add_torus_node(mesh, 2 * i + 1, 2 * j, nu, nv);
-            const int ebc = add_torus_node(
-                mesh, 2 * i + 1, 2 * j + 1, nu, nv);
-            const int eca = add_torus_node(mesh, 2 * i, 2 * j + 1, nu, nv);
-            add_torus_panel(mesh, a, b, c, eab, ebc, eca);
-
-            const int ebd = add_torus_node(
-                mesh, 2 * (i + 1), 2 * j + 1, nu, nv);
-            const int edc = add_torus_node(
-                mesh, 2 * i + 1, 2 * (j + 1), nu, nv);
-            add_torus_panel(mesh, b, d, c, ebd, edc, ebc);
-        }
-    }
-
-    const int nq = static_cast<int>(mesh.points.size());
-    const int np = static_cast<int>(mesh.panels.size());
-    Eigen::MatrixX3d points(nq, 3);
-    Eigen::MatrixX3d normals(nq, 3);
-    Eigen::VectorXd weights(nq);
-    for (int q = 0; q < nq; ++q) {
-        points.row(q) = mesh.points[static_cast<std::size_t>(q)].transpose();
-        normals.row(q) = mesh.normals[static_cast<std::size_t>(q)].transpose();
-        weights[q] = mesh.weights[static_cast<std::size_t>(q)];
-    }
-    Eigen::MatrixX3i panels(np, 3);
-    Eigen::MatrixXi panel_points(np, 6);
-    for (int p = 0; p < np; ++p) {
-        for (int j = 0; j < 3; ++j)
-            panels(p, j) = mesh.panels[static_cast<std::size_t>(p)][j];
-        for (int j = 0; j < 6; ++j)
-            panel_points(p, j) = mesh.panel_points[static_cast<std::size_t>(p)][j];
-    }
-    return Interface3D(points,
-                       panels,
-                       points,
-                       normals,
-                       weights,
-                       6,
-                       panel_points,
-                       Eigen::VectorXi::Zero(np),
-                       PanelNodeLayout3D::QuadraticLagrange);
-}
-
-struct CoarseTriangle {
-    std::array<int, 3> vertices;
-    int smooth_group = 0;
-};
-
-Interface3D make_hollow_cylinder_interface(double h)
-{
-    constexpr double cx = 0.06;
-    constexpr double cy = -0.05;
-    constexpr double cz = 0.02;
-    constexpr double outer_radius = 0.55;
-    constexpr double inner_radius = 0.25;
-    constexpr double half_height = 0.65;
-    const double target_H = 2.0 * kTargetP2NodeSpacingOverH * h;
-    const int ntheta = std::max(12, static_cast<int>(std::lround(
-        2.0 * kPi * outer_radius / target_H)));
-    const int nz = std::max(2, static_cast<int>(std::ceil(
-        2.0 * half_height / target_H)));
-    const int nr = std::max(1, static_cast<int>(std::ceil(
-        (outer_radius - inner_radius) / target_H)));
-
-    std::vector<Eigen::Vector3d> vertices;
-    auto add_vertex = [&](double radius, double theta, double z) {
-        const int id = static_cast<int>(vertices.size());
-        vertices.emplace_back(cx + radius * std::cos(theta),
-                              cy + radius * std::sin(theta), z);
-        return id;
-    };
-
-    std::vector<std::vector<int>> bottom_rings(
-        static_cast<std::size_t>(nr + 1),
-        std::vector<int>(static_cast<std::size_t>(ntheta)));
-    std::vector<std::vector<int>> top_rings = bottom_rings;
-    for (int ir = 0; ir <= nr; ++ir) {
-        const double radius = inner_radius
-            + (outer_radius - inner_radius) * static_cast<double>(ir)
-              / static_cast<double>(nr);
-        for (int i = 0; i < ntheta; ++i) {
-            const double theta = 2.0 * kPi * static_cast<double>(i)
-                               / static_cast<double>(ntheta);
-            bottom_rings[static_cast<std::size_t>(ir)][static_cast<std::size_t>(i)] =
-                add_vertex(radius, theta, cz - half_height);
-            top_rings[static_cast<std::size_t>(ir)][static_cast<std::size_t>(i)] =
-                add_vertex(radius, theta, cz + half_height);
-        }
-    }
-
-    std::vector<std::vector<int>> outer_rings(
-        static_cast<std::size_t>(nz + 1),
-        std::vector<int>(static_cast<std::size_t>(ntheta)));
-    std::vector<std::vector<int>> inner_rings = outer_rings;
-    for (int i = 0; i < ntheta; ++i) {
-        outer_rings[0][static_cast<std::size_t>(i)] =
-            bottom_rings[static_cast<std::size_t>(nr)][static_cast<std::size_t>(i)];
-        outer_rings[static_cast<std::size_t>(nz)][static_cast<std::size_t>(i)] =
-            top_rings[static_cast<std::size_t>(nr)][static_cast<std::size_t>(i)];
-        inner_rings[0][static_cast<std::size_t>(i)] =
-            bottom_rings[0][static_cast<std::size_t>(i)];
-        inner_rings[static_cast<std::size_t>(nz)][static_cast<std::size_t>(i)] =
-            top_rings[0][static_cast<std::size_t>(i)];
-    }
-    for (int k = 1; k < nz; ++k) {
-        const double z = cz - half_height
-            + 2.0 * half_height * static_cast<double>(k)
-              / static_cast<double>(nz);
-        for (int i = 0; i < ntheta; ++i) {
-            const double theta = 2.0 * kPi * static_cast<double>(i)
-                               / static_cast<double>(ntheta);
-            outer_rings[static_cast<std::size_t>(k)][static_cast<std::size_t>(i)] =
-                add_vertex(outer_radius, theta, z);
-            inner_rings[static_cast<std::size_t>(k)][static_cast<std::size_t>(i)] =
-                add_vertex(inner_radius, theta, z);
-        }
-    }
-
-    std::vector<CoarseTriangle> triangles;
-    for (int k = 0; k < nz; ++k) {
-        for (int i = 0; i < ntheta; ++i) {
-            const int ip = positive_mod(i + 1, ntheta);
-            const int a = outer_rings[static_cast<std::size_t>(k)][static_cast<std::size_t>(i)];
-            const int b = outer_rings[static_cast<std::size_t>(k)][static_cast<std::size_t>(ip)];
-            const int c = outer_rings[static_cast<std::size_t>(k + 1)][static_cast<std::size_t>(i)];
-            const int d = outer_rings[static_cast<std::size_t>(k + 1)][static_cast<std::size_t>(ip)];
-            triangles.push_back({{a, b, c}, 0});
-            triangles.push_back({{b, d, c}, 0});
-
-            const int ai = inner_rings[static_cast<std::size_t>(k)][static_cast<std::size_t>(i)];
-            const int bi = inner_rings[static_cast<std::size_t>(k)][static_cast<std::size_t>(ip)];
-            const int ci = inner_rings[static_cast<std::size_t>(k + 1)][static_cast<std::size_t>(i)];
-            const int di = inner_rings[static_cast<std::size_t>(k + 1)][static_cast<std::size_t>(ip)];
-            triangles.push_back({{ai, ci, bi}, 1});
-            triangles.push_back({{bi, ci, di}, 1});
-        }
-    }
-    for (int ir = 0; ir < nr; ++ir) {
-        for (int i = 0; i < ntheta; ++i) {
-            const int ip = positive_mod(i + 1, ntheta);
-            const int a = top_rings[static_cast<std::size_t>(ir)][static_cast<std::size_t>(i)];
-            const int b = top_rings[static_cast<std::size_t>(ir + 1)][static_cast<std::size_t>(i)];
-            const int c = top_rings[static_cast<std::size_t>(ir)][static_cast<std::size_t>(ip)];
-            const int d = top_rings[static_cast<std::size_t>(ir + 1)][static_cast<std::size_t>(ip)];
-            triangles.push_back({{a, b, c}, 2});
-            triangles.push_back({{b, d, c}, 2});
-
-            const int ab = bottom_rings[static_cast<std::size_t>(ir)][static_cast<std::size_t>(i)];
-            const int bb = bottom_rings[static_cast<std::size_t>(ir + 1)][static_cast<std::size_t>(i)];
-            const int cb = bottom_rings[static_cast<std::size_t>(ir)][static_cast<std::size_t>(ip)];
-            const int db = bottom_rings[static_cast<std::size_t>(ir + 1)][static_cast<std::size_t>(ip)];
-            triangles.push_back({{ab, cb, bb}, 3});
-            triangles.push_back({{bb, cb, db}, 3});
-        }
-    }
-
-    std::map<std::tuple<int, int, int>, int> point_by_key;
-    std::vector<Eigen::Vector3d> points;
-    std::vector<Eigen::Vector3d> normals;
-    std::vector<double> weights;
-    auto add_point = [&](int group, int va, int vb) {
-        const int lo = std::min(va, vb);
-        const int hi = std::max(va, vb);
-        const std::tuple<int, int, int> key{group, lo, hi};
-        const auto found = point_by_key.find(key);
-        if (found != point_by_key.end())
-            return found->second;
-
-        Eigen::Vector3d point = va == vb
-            ? vertices[static_cast<std::size_t>(va)]
-            : 0.5 * (vertices[static_cast<std::size_t>(va)]
-                     + vertices[static_cast<std::size_t>(vb)]);
-        Eigen::Vector3d normal = Eigen::Vector3d::Zero();
-        if (group == 0 || group == 1) {
-            Eigen::Vector2d radial(point.x() - cx, point.y() - cy);
-            if (radial.norm() <= 1.0e-14)
-                throw std::runtime_error("degenerate cylinder side point");
-            radial.normalize();
-            const double radius = group == 0 ? outer_radius : inner_radius;
-            point.x() = cx + radius * radial.x();
-            point.y() = cy + radius * radial.y();
-            normal = group == 0
-                ? Eigen::Vector3d(radial.x(), radial.y(), 0.0)
-                : Eigen::Vector3d(-radial.x(), -radial.y(), 0.0);
-        } else {
-            if (group == 2)
-                normal = Eigen::Vector3d::UnitZ();
-            else
-                normal = -Eigen::Vector3d::UnitZ();
-        }
-        const int index = static_cast<int>(points.size());
-        point_by_key.emplace(key, index);
-        points.push_back(point);
-        normals.push_back(normal);
-        weights.push_back(0.0);
-        return index;
-    };
-
-    const int np = static_cast<int>(triangles.size());
-    Eigen::MatrixX3i panels(np, 3);
-    Eigen::MatrixXi panel_points(np, 6);
-    Eigen::VectorXi smooth_groups(np);
-    for (int p = 0; p < np; ++p) {
-        const CoarseTriangle& triangle = triangles[static_cast<std::size_t>(p)];
-        const int a = triangle.vertices[0];
-        const int b = triangle.vertices[1];
-        const int c = triangle.vertices[2];
-        panels.row(p) << a, b, c;
-        smooth_groups[p] = triangle.smooth_group;
-        const std::array<int, 6> local{{
-            add_point(triangle.smooth_group, a, a),
-            add_point(triangle.smooth_group, b, b),
-            add_point(triangle.smooth_group, c, c),
-            add_point(triangle.smooth_group, a, b),
-            add_point(triangle.smooth_group, b, c),
-            add_point(triangle.smooth_group, c, a)}};
-        const double weight = triangle_area(vertices[a], vertices[b], vertices[c]) / 6.0;
-        for (int q = 0; q < 6; ++q) {
-            panel_points(p, q) = local[q];
-            weights[static_cast<std::size_t>(local[q])] += weight;
-        }
-    }
-
-    const int nv = static_cast<int>(vertices.size());
-    const int nq = static_cast<int>(points.size());
-    Eigen::MatrixX3d vertex_matrix(nv, 3);
-    Eigen::MatrixX3d point_matrix(nq, 3);
-    Eigen::MatrixX3d normal_matrix(nq, 3);
-    Eigen::VectorXd weight_vector(nq);
-    for (int i = 0; i < nv; ++i)
-        vertex_matrix.row(i) = vertices[static_cast<std::size_t>(i)].transpose();
-    for (int i = 0; i < nq; ++i) {
-        point_matrix.row(i) = points[static_cast<std::size_t>(i)].transpose();
-        normal_matrix.row(i) = normals[static_cast<std::size_t>(i)].transpose();
-        weight_vector[i] = weights[static_cast<std::size_t>(i)];
-    }
-    return Interface3D(vertex_matrix,
-                       panels,
-                       point_matrix,
-                       normal_matrix,
-                       weight_vector,
-                       6,
-                       panel_points,
-                       Eigen::VectorXi::Zero(np),
-                       smooth_groups,
-                       PanelNodeLayout3D::QuadraticLagrange);
-}
-
-using geometry3d::NurbsSurfacePatch3D;
-
-void add_l_prism_top(std::vector<NurbsSurfacePatch3D>& patches,
-                     double xmin, double xmax,
-                     double ymin, double ymax, double z)
-{
-    patches.push_back(NurbsSurfacePatch3D::make_bilinear_plane(
-        {xmin, ymin, z}, {xmax, ymin, z},
-        {xmin, ymax, z}, {xmax, ymax, z}));
-}
-
-void add_l_prism_bottom(std::vector<NurbsSurfacePatch3D>& patches,
-                        double xmin, double xmax,
-                        double ymin, double ymax, double z)
-{
-    patches.push_back(NurbsSurfacePatch3D::make_bilinear_plane(
-        {xmin, ymin, z}, {xmin, ymax, z},
-        {xmax, ymin, z}, {xmax, ymax, z}));
-}
-
-void add_l_prism_side(std::vector<NurbsSurfacePatch3D>& patches,
-                      const Eigen::Vector2d& a,
-                      const Eigen::Vector2d& b,
-                      double z0, double z1)
-{
-    patches.push_back(NurbsSurfacePatch3D::make_bilinear_plane(
-        {a.x(), a.y(), z0}, {b.x(), b.y(), z0},
-        {a.x(), a.y(), z1}, {b.x(), b.y(), z1}));
-}
-
-std::vector<NurbsSurfacePatch3D> make_l_prism_patches()
-{
-    // Keep all feature planes away from the N=2^k Cartesian nodes used by
-    // convergence studies; near-coincidence makes local-normal labels
-    // ambiguous at a sharp edge.
-    constexpr double sx = 0.07;
-    constexpr double sy = -0.07;
-    constexpr double z0 = -0.63;
-    constexpr double z1 = 0.67;
-    const std::array<std::array<double, 4>, 3> cells{{
-        {{sx - 0.60, sx, sy - 0.60, sy}},
-        {{sx, sx + 0.60, sy - 0.60, sy}},
-        {{sx - 0.60, sx, sy, sy + 0.60}}}};
-
-    std::vector<NurbsSurfacePatch3D> patches;
-    patches.reserve(12);
-    for (const auto& cell : cells)
-        add_l_prism_bottom(
-            patches, cell[0], cell[1], cell[2], cell[3], z0);
-    for (const auto& cell : cells)
-        add_l_prism_top(
-            patches, cell[0], cell[1], cell[2], cell[3], z1);
-
-    const std::array<Eigen::Vector2d, 6> boundary{{
-        {sx - 0.60, sy - 0.60}, {sx + 0.60, sy - 0.60},
-        {sx + 0.60, sy},        {sx, sy},
-        {sx, sy + 0.60},        {sx - 0.60, sy + 0.60}}};
-    for (std::size_t i = 0; i < boundary.size(); ++i)
-        add_l_prism_side(
-            patches, boundary[i], boundary[(i + 1) % boundary.size()], z0, z1);
-    return patches;
-}
-
 GeometryBundle make_geometry(GeometryKind kind, double h)
 {
-    if (kind == GeometryKind::Torus) {
-        Interface3D iface = make_torus_interface(h);
-        Interface3D crossing = iface;
-        return {"torus",
-                "smooth P2 torus (circular ring)",
-                std::move(iface),
-                std::move(crossing),
-                0,
-                0,
-                [](const Eigen::Vector3d& x) {
-                    constexpr double cx = 0.07;
-                    constexpr double cy = -0.04;
-                    constexpr double cz = 0.03;
-                    constexpr double R = 0.55;
-                    constexpr double r = 0.20;
-                    const double rho = std::hypot(x.x() - cx, x.y() - cy);
-                    return (rho - R) * (rho - R) + (x.z() - cz) * (x.z() - cz)
-                         < r * r;
-                }};
-    }
-    if (kind == GeometryKind::HollowCylinder) {
-        Interface3D iface = make_hollow_cylinder_interface(h);
-        Interface3D crossing = iface;
-        return {"cylinder",
-                "finite hollow cylinder with annular sector end caps",
-                std::move(iface),
-                std::move(crossing),
-                4,
-                0,
-                [](const Eigen::Vector3d& x) {
-                    constexpr double cx = 0.06;
-                    constexpr double cy = -0.05;
-                    constexpr double cz = 0.02;
-                    constexpr double outer_radius = 0.55;
-                    constexpr double inner_radius = 0.25;
-                    constexpr double half_height = 0.65;
-                    const double radial_sq =
-                        (x.x() - cx) * (x.x() - cx)
-                      + (x.y() - cy) * (x.y() - cy);
-                    return radial_sq > inner_radius * inner_radius
-                        && radial_sq < outer_radius * outer_radius
-                        && std::abs(x.z() - cz) < half_height;
-                }};
-    }
-
+    NativeNurbsSurface3D native_surface =
+        app3d::make_native_nurbs_surface_3d(kind);
     geometry3d::NurbsPatchTriangulatorOptions3D options;
     options.edge_buffer_factor = 0.5;
     options.edge_sample_step_factor = 1.0;
@@ -1319,27 +612,25 @@ GeometryBundle make_geometry(GeometryKind kind, double h)
     options.max_edge_over_H = 1.10;
     options.metric_ratio_tolerance = 1.50;
     options.max_depth = 6;
-    const auto triangulation =
+    geometry3d::NurbsPatchTriangulation3D triangulation =
         geometry3d::triangulate_nurbs_surface_patches_3d(
-            make_l_prism_patches(), h, options);
+            native_surface.patches, h, options);
+    std::string name = native_surface.name;
+    std::string description = native_surface.description;
+    std::function<bool(const Eigen::Vector3d&)> exact_inside =
+        native_surface.exact_inside;
     const int feature_edges = triangulation.summary.num_feature_edges;
     const int feature_vertices = triangulation.summary.num_feature_vertices;
-    return {"l_prism",
-            "edge-trimmed P2 correction surface plus seamless L-prism crossing surface",
-            triangulation.interface,
-            triangulation.geometry_interface,
+    return {std::move(name),
+            std::move(description),
+            std::move(native_surface),
+            std::move(triangulation.interface),
+            std::move(triangulation.geometry_interface),
+            std::move(triangulation.triangles),
+            std::move(triangulation.geometry_triangles),
             feature_edges,
             feature_vertices,
-            [](const Eigen::Vector3d& x) {
-                constexpr double sx = 0.07;
-                constexpr double sy = -0.07;
-                const double px = x.x() - sx;
-                const double py = x.y() - sy;
-                const bool in_plan =
-                    (px > -0.60 && px < 0.60 && py > -0.60 && py < 0.0)
-                 || (px > -0.60 && px < 0.0 && py > 0.0 && py < 0.60);
-                return in_plan && x.z() > -0.63 && x.z() < 0.67;
-            }};
+            std::move(exact_inside)};
 }
 
 Eigen::Vector3d grid_point(const CartesianGrid3D& grid, int node)
@@ -1387,10 +678,18 @@ class PanelCenterHarmonicJetKFBI3D {
 public:
     PanelCenterHarmonicJetKFBI3D(const CartesianGrid3D& grid,
                                  const GridPair3D& grid_pair,
+                                 const NativeNurbsSurface3D& native_surface,
+                                 const std::vector<geometry3d::NurbsParamTriangle3D>&
+                                     correction_triangles,
+                                 const std::vector<geometry3d::NurbsParamTriangle3D>&
+                                     geometry_triangles,
                                  const SurfaceDofCloud& cloud,
                                  const CauchyStencilSet& stencils)
         : grid_(grid)
         , grid_pair_(grid_pair)
+        , native_surface_(native_surface)
+        , correction_triangles_(correction_triangles)
+        , geometry_triangles_(geometry_triangles)
         , cloud_(cloud)
         , h_(grid.spacing()[0])
         , fit_(cloud, stencils, h_, 3)
@@ -1564,16 +863,44 @@ private:
                 displacement.dot(dof.normal)};
     }
 
-    int nearest_surface_dof(const Eigen::Vector3d& point,
-                            const Eigen::Vector3d* reference_normal) const
+    int surface_dof_for_crossing(const P2CrossingOwner3D& owner,
+                                 const Eigen::Vector3d& point) const
     {
+        const geometry3d::NurbsParamTriangle3D* triangle = nullptr;
+        Eigen::Vector3d barycentric = Eigen::Vector3d::Zero();
+        if (owner.geometry_panel_index >= 0
+            && owner.geometry_panel_index
+                   < static_cast<int>(geometry_triangles_.size())) {
+            triangle = &geometry_triangles_[
+                static_cast<std::size_t>(owner.geometry_panel_index)];
+            barycentric = owner.geometry_barycentric;
+        } else if (owner.panel_index >= 0
+                   && owner.panel_index
+                          < static_cast<int>(correction_triangles_.size())) {
+            triangle = &correction_triangles_[
+                static_cast<std::size_t>(owner.panel_index)];
+            barycentric = owner.barycentric;
+        }
+        if (triangle == nullptr)
+            throw std::runtime_error("crossing has no native NURBS triangle owner");
+        const Eigen::Vector2d uv = app3d::interpolate_triangle_parameter(
+            *triangle, barycentric);
+        const std::array<int, 4> candidates =
+            app3d::parameter_dof_candidates_2x2(
+                native_surface_, cloud_, triangle->patch_index,
+                uv.x(), uv.y());
+        const geometry3d::NurbsSurfaceDerivatives3D derivatives =
+            native_surface_.patches[
+                static_cast<std::size_t>(triangle->patch_index)]
+                .evaluate_with_derivatives(uv.x(), uv.y());
+        Eigen::Vector3d reference_normal =
+            derivatives.du.cross(derivatives.dv).normalized();
         int nearest = -1;
         double best = std::numeric_limits<double>::infinity();
         for (int pass = 0; pass < 2 && nearest < 0; ++pass) {
-            for (int q = 0; q < surface_size(); ++q) {
+            for (int q : candidates) {
                 const SurfaceDof& dof = cloud_.dofs[static_cast<std::size_t>(q)];
-                if (pass == 0 && reference_normal != nullptr
-                    && dof.normal.dot(*reference_normal) < 0.50) {
+                if (pass == 0 && dof.normal.dot(reference_normal) < 0.50) {
                     continue;
                 }
                 const double distance = (dof.point - point).squaredNorm();
@@ -1584,7 +911,8 @@ private:
             }
         }
         if (nearest < 0)
-            throw std::runtime_error("failed to associate a crossing with a surface DOF");
+            throw std::runtime_error(
+                "failed to associate a crossing with four parameter DOFs");
         return nearest;
     }
 
@@ -1601,21 +929,7 @@ private:
             const double phase = std::max(0.0, std::min(1.0, owner.edge_parameter));
             const Eigen::Vector3d hit = a + phase * (b - a);
 
-            Eigen::Vector3d reference_normal = Eigen::Vector3d::Zero();
-            const Eigen::Vector3d* normal_ptr = nullptr;
-            if (owner.geometry_panel_index >= 0) {
-                reference_normal = geometry3d::panel_oriented_normal(
-                    grid_pair_.crossing_geometry(),
-                    owner.geometry_panel_index,
-                    owner.geometry_barycentric);
-                normal_ptr = &reference_normal;
-            } else if (owner.panel_index >= 0) {
-                reference_normal = geometry3d::panel_oriented_normal(
-                    grid_pair_.interface(), owner.panel_index, owner.barycentric);
-                normal_ptr = &reference_normal;
-            }
-
-            const int center = nearest_surface_dof(hit, normal_ptr);
+            const int center = surface_dof_for_crossing(owner, hit);
             const Eigen::Vector3d xi =
                 local_coordinate(center, grid_point(grid_, op.correction_node));
             HarmonicCrossingRow3D row;
@@ -1731,6 +1045,9 @@ private:
 
     const CartesianGrid3D& grid_;
     const GridPair3D& grid_pair_;
+    const NativeNurbsSurface3D& native_surface_;
+    const std::vector<geometry3d::NurbsParamTriangle3D>& correction_triangles_;
+    const std::vector<geometry3d::NurbsParamTriangle3D>& geometry_triangles_;
     const SurfaceDofCloud& cloud_;
     double h_ = 0.0;
     PanelCenterCauchyFit3D fit_;
@@ -2193,16 +1510,17 @@ void write_panel_center_files(const std::filesystem::path& output_dir,
 
     std::ofstream patch_csv = open_output_file(
         output_dir / (stem + "_surface_patches.csv"));
-    patch_csv << "patch_id,patch_name,adjacent_patch_ids\n";
+    patch_csv << "patch_id,patch_name,nu,nv,smooth_patch_ids\n";
     for (int patch_id = 0;
          patch_id < static_cast<int>(cloud.patches.size()); ++patch_id) {
         const SurfacePatchInfo& patch =
             cloud.patches[static_cast<std::size_t>(patch_id)];
-        patch_csv << patch_id << ',' << patch.name << ',';
-        for (std::size_t j = 0; j < patch.adjacent_patch_ids.size(); ++j) {
+        patch_csv << patch_id << ',' << patch.name << ','
+                  << patch.nu << ',' << patch.nv << ',';
+        for (std::size_t j = 0; j < patch.smooth_patch_ids.size(); ++j) {
             if (j != 0)
                 patch_csv << ';';
-            patch_csv << patch.adjacent_patch_ids[j];
+            patch_csv << patch.smooth_patch_ids[j];
         }
         patch_csv << '\n';
     }
@@ -2210,13 +1528,14 @@ void write_panel_center_files(const std::filesystem::path& output_dir,
     std::ofstream dof_csv = open_output_file(
         output_dir / (stem + "_surface_panel_center_dofs.csv"));
     dof_csv << std::setprecision(17);
-    dof_csv << "q,patch_id,patch_name,parameter_a,parameter_b,"
+    dof_csv << "q,patch_id,patch_name,i,j,u,v,"
                "x,y,z,nx,ny,nz,t1x,t1y,t1z,t2x,t2y,t2z,weight\n";
     for (int q = 0; q < static_cast<int>(cloud.dofs.size()); ++q) {
         const SurfaceDof& dof = cloud.dofs[static_cast<std::size_t>(q)];
         dof_csv << q << ',' << dof.patch_id << ','
                 << cloud.patches[static_cast<std::size_t>(dof.patch_id)].name
-                << ',' << dof.parameter_a << ',' << dof.parameter_b << ','
+                << ',' << dof.i << ',' << dof.j << ','
+                << dof.u << ',' << dof.v << ','
                 << dof.point.x() << ',' << dof.point.y() << ',' << dof.point.z() << ','
                 << dof.normal.x() << ',' << dof.normal.y() << ',' << dof.normal.z() << ','
                 << dof.tangent1.x() << ',' << dof.tangent1.y() << ','
@@ -2259,10 +1578,12 @@ ReadinessResult run_readiness_case(GeometryKind kind,
                          {N, N, N},
                          DofLayout3D::Node);
     GeometryBundle geometry = make_geometry(kind, h);
-    const SurfaceDofCloud surface_dofs = make_surface_dofs(kind, h);
+    const SurfaceDofCloud surface_dofs =
+        app3d::make_native_surface_dofs_3d(geometry.native_surface, h);
     const SurfaceCloudDiagnostics surface_diagnostics =
         validate_surface_dofs(surface_dofs, h);
     const CauchyStencilSet cauchy_stencils = build_cauchy_stencils(
+        geometry.native_surface,
         surface_dofs,
         h,
         kCauchyValueNeighborCount,
@@ -2412,7 +1733,13 @@ ReadinessResult run_readiness_case(GeometryKind kind,
     }
 
     PanelCenterHarmonicJetKFBI3D harmonic_pipeline(
-        grid, grid_pair, surface_dofs, cauchy_stencils);
+        grid,
+        grid_pair,
+        geometry.native_surface,
+        geometry.correction_triangles,
+        geometry.geometry_triangles,
+        surface_dofs,
+        cauchy_stencils);
     const Eigen::VectorXd constant_value =
         Eigen::VectorXd::Ones(harmonic_pipeline.surface_size());
     const Eigen::VectorXd zero_normal =
@@ -2724,8 +2051,8 @@ void print_usage(const char* executable)
         << "usage: " << executable
         << " [torus|cylinder|l_prism|all] [N ...]\n"
         << "  Each N must be a power of two and at least 16 (default: 16).\n"
-        << "  This stage builds independent parameter-panel-center surface\n"
-        << "  unknowns, topology-filtered 48/28 Cauchy stencils, validates\n"
+        << "  This stage builds native NURBS parameter-cell-center surface\n"
+        << "  unknowns, G1-filtered 48/28 Cauchy stencils, validates\n"
         << "  fixed transfer routes, and executes the Neumann value-jump and\n"
         << "  Dirichlet normal-jump harmonic-jet GMRES formulations.\n";
 }
@@ -2777,8 +2104,8 @@ int main(int argc, char** argv)
         std::cout << "KFBI3D harmonic-jet convergence study\n"
                   << "  Neumann target: exterior value trace = 0\n"
                   << "  Dirichlet target: exterior normal trace = 0\n"
-                  << "  current stage: parameter-panel-center surface DOFs + "
-                     "topological Cauchy stencils + fixed routes\n"
+                  << "  current stage: native NURBS surface DOFs + "
+                     "G1 Cauchy topology + parameter-owned fixed routes\n"
                   << "  levels=";
         for (std::size_t index = 0; index < levels.size(); ++index) {
             if (index != 0)

@@ -84,7 +84,8 @@ struct SurfaceDofCloud3D {
 
 [[nodiscard]] SurfaceDofCloud3D make_native_surface_dofs_3d(
     const NativeNurbsSurface3D& surface,
-    double h);
+    double h,
+    int minimum_smooth_component_dofs = 48);
 
 [[nodiscard]] std::array<int, 4> parameter_dof_candidates_2x2(
     const NativeNurbsSurface3D& surface,

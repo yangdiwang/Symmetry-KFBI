@@ -6,6 +6,7 @@
 #include <cmath>
 #include <queue>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -419,7 +420,8 @@ std::pair<Eigen::Vector3d, Eigen::Vector3d> tangent_frame(
 
 SurfaceDofCloud3D make_native_surface_dofs_3d(
     const NativeNurbsSurface3D& surface,
-    double h)
+    double h,
+    int minimum_smooth_component_dofs)
 {
     if (!std::isfinite(h) || h <= 0.0)
         throw std::invalid_argument("native surface DOFs require positive h");
@@ -428,10 +430,16 @@ SurfaceDofCloud3D make_native_surface_dofs_3d(
         || surface.smooth_neighbors.size() != surface.patches.size()) {
         throw std::invalid_argument("native surface metadata is inconsistent");
     }
+    if (minimum_smooth_component_dofs < 1) {
+        throw std::invalid_argument(
+            "native surface minimum component DOFs must be positive");
+    }
 
     SurfaceDofCloud3D cloud;
     cloud.expected_area = surface.expected_area;
     cloud.patches.reserve(surface.patches.size());
+    std::vector<double> direction_length_u(surface.patches.size(), 0.0);
+    std::vector<double> direction_length_v(surface.patches.size(), 0.0);
     for (int patch_id = 0;
          patch_id < static_cast<int>(surface.patches.size());
          ++patch_id) {
@@ -439,15 +447,18 @@ SurfaceDofCloud3D make_native_surface_dofs_3d(
             surface.patches[static_cast<std::size_t>(patch_id)];
         SurfaceDofPatch3D tensor_patch;
         tensor_patch.name = surface.patch_names[static_cast<std::size_t>(patch_id)];
+        direction_length_u[static_cast<std::size_t>(patch_id)] =
+            max_sampled_direction_length(patch, true);
+        direction_length_v[static_cast<std::size_t>(patch_id)] =
+            max_sampled_direction_length(patch, false);
         tensor_patch.nu = std::max(
             2,
             static_cast<int>(std::ceil(
-                max_sampled_direction_length(patch, true) / h)));
+                direction_length_u[static_cast<std::size_t>(patch_id)] / h)));
         tensor_patch.nv = std::max(
             2,
             static_cast<int>(std::ceil(
-                max_sampled_direction_length(patch, false) / h)));
-        tensor_patch.first_dof = static_cast<int>(cloud.dofs.size());
+                direction_length_v[static_cast<std::size_t>(patch_id)] / h)));
         tensor_patch.smooth_patch_ids.push_back(patch_id);
         for (const auto& neighbor_slot :
              surface.smooth_neighbors[static_cast<std::size_t>(patch_id)]) {
@@ -461,7 +472,90 @@ SurfaceDofCloud3D make_native_surface_dofs_3d(
         }
         std::sort(tensor_patch.smooth_patch_ids.begin(),
                   tensor_patch.smooth_patch_ids.end());
+        cloud.patches.push_back(std::move(tensor_patch));
+    }
 
+    // A glued 2x2 tensor neighborhood must preserve distinct along-edge rows.
+    // Propagate the larger count across every smooth edge until all coupled
+    // patch directions agree. The parameter locations remain uniformly spaced
+    // inside every native patch.
+    auto harmonize_smooth_edge_counts = [&]() {
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (int patch_id = 0;
+                 patch_id < static_cast<int>(cloud.patches.size());
+                 ++patch_id) {
+                for (int edge_value = 0; edge_value < 4; ++edge_value) {
+                    const auto& connection = surface.smooth_neighbors[
+                        static_cast<std::size_t>(patch_id)]
+                        [static_cast<std::size_t>(edge_value)];
+                    if (!connection)
+                        continue;
+                    const PatchEdge3D edge =
+                        static_cast<PatchEdge3D>(edge_value);
+                    SurfaceDofPatch3D& source =
+                        cloud.patches[static_cast<std::size_t>(patch_id)];
+                    SurfaceDofPatch3D& destination = cloud.patches[
+                        static_cast<std::size_t>(connection->patch)];
+                    int& source_count =
+                        edge == PatchEdge3D::UMin || edge == PatchEdge3D::UMax
+                            ? source.nv : source.nu;
+                    int& destination_count =
+                        connection->edge == PatchEdge3D::UMin
+                                || connection->edge == PatchEdge3D::UMax
+                            ? destination.nv : destination.nu;
+                    const int shared_count =
+                        std::max(source_count, destination_count);
+                    if (source_count != shared_count
+                        || destination_count != shared_count) {
+                        source_count = shared_count;
+                        destination_count = shared_count;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    };
+    harmonize_smooth_edge_counts();
+
+    std::vector<bool> component_processed(surface.patches.size(), false);
+    for (int seed = 0; seed < static_cast<int>(surface.patches.size()); ++seed) {
+        if (component_processed[static_cast<std::size_t>(seed)])
+            continue;
+        const std::vector<int> component = smooth_patch_component(surface, seed);
+        const int per_patch_target =
+            (minimum_smooth_component_dofs
+             + static_cast<int>(component.size()) - 1)
+            / static_cast<int>(component.size());
+        for (int patch_id : component) {
+            component_processed[static_cast<std::size_t>(patch_id)] = true;
+            SurfaceDofPatch3D& patch =
+                cloud.patches[static_cast<std::size_t>(patch_id)];
+            while (patch.dof_count() < per_patch_target) {
+                const double physical_u =
+                    direction_length_u[static_cast<std::size_t>(patch_id)]
+                    / static_cast<double>(patch.nu);
+                const double physical_v =
+                    direction_length_v[static_cast<std::size_t>(patch_id)]
+                    / static_cast<double>(patch.nv);
+                if (physical_u >= physical_v)
+                    ++patch.nu;
+                else
+                    ++patch.nv;
+            }
+        }
+    }
+    harmonize_smooth_edge_counts();
+
+    for (int patch_id = 0;
+         patch_id < static_cast<int>(surface.patches.size());
+         ++patch_id) {
+        const NurbsSurfacePatch3D& patch =
+            surface.patches[static_cast<std::size_t>(patch_id)];
+        SurfaceDofPatch3D& tensor_patch =
+            cloud.patches[static_cast<std::size_t>(patch_id)];
+        tensor_patch.first_dof = static_cast<int>(cloud.dofs.size());
         const double u0 = patch.domain_start_u();
         const double u1 = patch.domain_end_u();
         const double v0 = patch.domain_start_v();
@@ -495,7 +589,6 @@ SurfaceDofCloud3D make_native_surface_dofs_3d(
                                       j});
             }
         }
-        cloud.patches.push_back(std::move(tensor_patch));
     }
     return cloud;
 }
@@ -682,8 +775,14 @@ std::array<int, 4> parameter_dof_candidates_2x2(
         }
     }
     const std::set<int> unique(result.begin(), result.end());
-    if (unique.size() != result.size())
-        throw std::runtime_error("2x2 parameter lookup did not produce four DOFs");
+    if (unique.size() != result.size()) {
+        std::ostringstream message;
+        message << "2x2 parameter lookup did not produce four DOFs: patch="
+                << patch_id << " uv=(" << u << ',' << v << ") ids="
+                << result[0] << ',' << result[1] << ','
+                << result[2] << ',' << result[3];
+        throw std::runtime_error(message.str());
+    }
     return result;
 }
 

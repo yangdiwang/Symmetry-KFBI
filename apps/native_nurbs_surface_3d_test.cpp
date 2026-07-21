@@ -123,6 +123,38 @@ double check_dof_cloud(const NativeNurbsSurface3D& surface, double h)
         require(tensor_patch.dof_count() == tensor_patch.nu * tensor_patch.nv,
                 surface.name + " dense tensor indexing");
     }
+    for (int patch_id = 0;
+         patch_id < static_cast<int>(surface.patches.size());
+         ++patch_id) {
+        for (int edge_index = 0; edge_index < 4; ++edge_index) {
+            const auto& connection =
+                surface.smooth_neighbors[static_cast<std::size_t>(patch_id)]
+                                        [static_cast<std::size_t>(edge_index)];
+            if (!connection)
+                continue;
+            const PatchEdge3D edge = static_cast<PatchEdge3D>(edge_index);
+            const auto& source = cloud.patches[static_cast<std::size_t>(patch_id)];
+            const auto& destination =
+                cloud.patches[static_cast<std::size_t>(connection->patch)];
+            const int source_along =
+                edge == PatchEdge3D::UMin || edge == PatchEdge3D::UMax
+                    ? source.nv : source.nu;
+            const int destination_along =
+                connection->edge == PatchEdge3D::UMin
+                        || connection->edge == PatchEdge3D::UMax
+                    ? destination.nv : destination.nu;
+            require(source_along == destination_along,
+                    surface.name + " G1 seam has matching tensor rows");
+        }
+        const std::vector<int> component =
+            smooth_patch_component(surface, patch_id);
+        int component_dofs = 0;
+        for (int component_patch : component)
+            component_dofs += cloud.patches[
+                static_cast<std::size_t>(component_patch)].dof_count();
+        require(component_dofs >= 48,
+                surface.name + " G1 component supports 48 Cauchy values");
+    }
     for (const auto& dof : cloud.dofs) {
         require(dof.patch_id >= 0
                     && dof.patch_id < static_cast<int>(surface.patches.size()),
@@ -292,6 +324,26 @@ void test_parameter_candidates()
 
     require(smooth_patch_component(torus, 0).size() == 16,
             "torus smooth component contains every native patch");
+
+    const NativeNurbsSurface3D cylinder =
+        make_native_nurbs_surface_3d(GeometryKind3D::HollowCylinder);
+    for (int first : {0, 4, 8, 12}) {
+        const std::vector<int> component =
+            smooth_patch_component(cylinder, first);
+        require(component.size() == 4,
+                "each cylinder sheet has four smooth quarter patches");
+        for (int patch : component)
+            require(patch >= first && patch < first + 4,
+                    "cylinder smooth component cannot cross a sharp circle");
+    }
+    require(smooth_patch_component(lprism, 0).size() == 3,
+            "L-prism bottom contains three smooth native patches");
+    require(smooth_patch_component(lprism, 3).size() == 3,
+            "L-prism top contains three smooth native patches");
+    for (int side = 6; side < 12; ++side) {
+        require(smooth_patch_component(lprism, side).size() == 1,
+                "each L-prism side is a separate non-G1 component");
+    }
 }
 
 void test_grid_edge_triangle_owners()
