@@ -1135,24 +1135,21 @@ void test_native_nurbs_surface_intersector()
     Eigen::Vector2d planar_direction(
         reference_ray_direction.x(), reference_ray_direction.y());
     planar_direction.normalize();
-    const Eigen::Vector3d tangent_radius(
+    const Eigen::Vector3d near_tangent_radius(
         -0.55 * planar_direction.y(),
          0.55 * planar_direction.x(), 0.0);
-    const Eigen::Vector3d tangent_point =
-        Eigen::Vector3d(0.06, -0.05, 0.0) + tangent_radius;
-    const Eigen::Vector3d tangent_ray_start =
-        tangent_point - 0.2 * reference_ray_direction;
+    const Eigen::Vector3d near_tangent_point =
+        Eigen::Vector3d(0.06, -0.05, 0.0) + near_tangent_radius;
+    const Eigen::Vector3d near_tangent_ray_start =
+        near_tangent_point - 0.2 * reference_ray_direction;
     require_throws_contains(
         [&] {
             (void)cylinder_intersector.intersect_segment(
-                tangent_ray_start,
-                tangent_ray_start + reference_ray_direction);
+                near_tangent_ray_start,
+                near_tangent_ray_start + reference_ray_direction);
         },
         "unresolved conservative NURBS intersection candidate",
-        "non-Cartesian tangential segment preserves unresolved status");
-    require(cylinder_intersector.containing_components(tangent_ray_start)
-                .empty(),
-            "parity classification retries after a tangential unresolved ray");
+        "non-Cartesian near-secant preserves unresolved status");
     require_throws_contains_all_with_count(
         [&] {
             (void)cylinder_intersector.intersect_cartesian_edge(

@@ -248,7 +248,7 @@ bool roots_match_connection(const NurbsSurfaceCrossing3D& first_root,
         || matches_orientation(second_root, first_root);
 }
 
-std::optional<NurbsSurfaceCrossing3D> certified_tangential_contact(
+std::optional<NurbsSurfaceCrossing3D> find_cartesian_tangent_witness(
     const RationalBezierElement3D& element,
     const NurbsSurfacePatch3D& patch,
     const Eigen::Vector3d& start,
@@ -502,7 +502,9 @@ certified_complete_cartesian_tangent(
             geometry_tolerance)) {
         return std::nullopt;
     }
-    const auto tangent = certified_tangential_contact(
+    // This numerical witness is considered only after the exact Bernstein
+    // certificate above has bounded the Cartesian query to one root.
+    const auto tangent = find_cartesian_tangent_witness(
         element, patch, start, end, geometry_tolerance);
     if (!tangent)
         return std::nullopt;
@@ -861,15 +863,14 @@ NurbsSurfaceIntersector3D::intersect_segment(
     const Eigen::Vector3d& start,
     const Eigen::Vector3d& end) const
 {
-    return intersect_segment_impl(start, end, nullptr, false);
+    return intersect_segment_impl(start, end, nullptr);
 }
 
 NurbsSurfaceIntersectionResult3D
 NurbsSurfaceIntersector3D::intersect_segment_impl(
     const Eigen::Vector3d& start,
     const Eigen::Vector3d& end,
-    const NurbsCartesianEdgeQuery3D* cartesian_edge,
-    bool parity_ray) const
+    const NurbsCartesianEdgeQuery3D* cartesian_edge) const
 {
     if (!start.allFinite() || !end.allFinite())
         throw std::invalid_argument("NURBS intersection segment must be finite");
@@ -930,7 +931,7 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
         ++result.diagnostics.candidate_elements;
         const RationalBezierElement3D& element =
             elements_[static_cast<std::size_t>(candidate)];
-        if (cartesian_edge == nullptr && !parity_ray) {
+        if (cartesian_edge == nullptr) {
             const NurbsElementIntersectionResult3D local =
                 intersect_nurbs_bezier_element_3d(
                     element, model_.patch(element.patch_index),
@@ -990,14 +991,10 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
             const NurbsElementIntersectionResult3D& partial =
                 error.partial_result();
             accumulate_local(partial);
-            const auto tangent = parity_ray
-                ? certified_tangential_contact(
-                    element, model_.patch(element.patch_index),
-                    start, end, geometry_tolerance_)
-                : certified_complete_cartesian_tangent(
-                    element, model_.patch(element.patch_index),
-                    &partial, start, end, cartesian_edge->axis,
-                    geometry_tolerance_);
+            const auto tangent = certified_complete_cartesian_tangent(
+                element, model_.patch(element.patch_index),
+                &partial, start, end, cartesian_edge->axis,
+                geometry_tolerance_);
             if (tangent)
                 tangential_roots.push_back(*tangent);
             else
@@ -1005,7 +1002,7 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
         }
     }
 
-    if (cartesian_edge == nullptr && !parity_ray) {
+    if (cartesian_edge == nullptr) {
         result.crossings = canonicalize_roots(
             std::move(roots), model_, geometry_tolerance_, segment_length,
             result.diagnostics);
@@ -1014,61 +1011,6 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
     std::vector<NurbsSurfaceCrossing3D> all_roots = roots;
     all_roots.insert(
         all_roots.end(), tangential_roots.begin(), tangential_roots.end());
-    if (parity_ray) {
-        NurbsCartesianEdgeQuery3D ray;
-        ray.axis = -1;
-        ray.start = start;
-        ray.end = end;
-        if (result.overlap_detected) {
-            throw std::runtime_error(cartesian_edge_diagnostic(
-                "surface overlaps Cartesian edge", ray, all_roots));
-        }
-        const double endpoint_tolerance =
-            segment_parameter_tolerance(
-                geometry_tolerance_, segment_length);
-        if (std::any_of(
-                all_roots.begin(), all_roots.end(),
-                [&](const auto& root) {
-                    return root.edge_parameter <= endpoint_tolerance
-                        || root.edge_parameter
-                            >= 1.0 - endpoint_tolerance;
-                })) {
-            throw std::runtime_error(cartesian_edge_diagnostic(
-                "surface intersects Cartesian node", ray, all_roots));
-        }
-        if (std::any_of(
-                all_roots.begin(), all_roots.end(), [&](const auto& root) {
-                    return root_on_non_g1_feature(root, model_);
-                })) {
-            throw FeatureEdgeAlignment(std::move(all_roots));
-        }
-        // A residual-limited double root perturbs transversality by
-        // O(sqrt(geometry_tolerance / geometry_scale)). A parity ray may
-        // safely discard this near-tangent band and retry another direction;
-        // ordinary and Cartesian-edge queries remain fail-closed.
-        const double parity_transversality_tolerance = std::max(
-            1e-10, 8.0 * std::sqrt(
-                geometry_tolerance_
-                / std::max(bounds_.diameter(), geometry_tolerance_)));
-        if (!tangential_roots.empty()
-            || std::any_of(
-                roots.begin(), roots.end(), [&](const auto& root) {
-                    return root.transversality
-                        <= parity_transversality_tolerance;
-                })) {
-            throw std::runtime_error(cartesian_edge_diagnostic(
-                "tangential Cartesian edge contact", ray, all_roots));
-        }
-        if (unresolved) {
-            throw std::runtime_error(cartesian_edge_diagnostic(
-                "unresolved conservative NURBS intersection candidate",
-                ray, all_roots));
-        }
-        result.crossings = canonicalize_roots(
-            std::move(all_roots), model_, geometry_tolerance_,
-            segment_length, result.diagnostics);
-        return result;
-    }
     if (result.overlap_detected) {
         throw std::runtime_error(cartesian_edge_diagnostic(
             "surface overlaps Cartesian edge", *cartesian_edge, all_roots));
@@ -1123,7 +1065,7 @@ NurbsSurfaceIntersector3D::intersect_cartesian_edge(
     NurbsSurfaceIntersectionResult3D result;
     try {
         result = intersect_segment_impl(
-            edge.start, edge.end, &edge, false);
+            edge.start, edge.end, &edge);
     } catch (const FeatureEdgeAlignment& alignment) {
         throw std::runtime_error(cartesian_edge_diagnostic(
             "non-G1 feature-edge alignment", edge, alignment.roots()));
@@ -1167,7 +1109,7 @@ std::vector<int> NurbsSurfaceIntersector3D::containing_components(
 
         try {
             const NurbsSurfaceIntersectionResult3D result =
-                intersect_segment_impl(point, end, nullptr, true);
+                intersect_segment(point, end);
             NurbsCartesianEdgeQuery3D ray;
             ray.axis = -1;
             ray.start = point;
