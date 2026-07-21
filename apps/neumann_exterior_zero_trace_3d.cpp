@@ -129,6 +129,11 @@ struct ReadinessResult {
     double constant_exterior_trace_linf = 0.0;
     double constant_interior_trace_linf = 0.0;
     double constant_bulk_linf = 0.0;
+    double harmonic_constant_exterior_trace_linf = 0.0;
+    double harmonic_constant_interior_trace_linf = 0.0;
+    double harmonic_constant_exterior_normal_linf = 0.0;
+    double harmonic_constant_interior_normal_linf = 0.0;
+    double harmonic_constant_bulk_linf = 0.0;
     int surface_patches = 0;
     int surface_dofs = 0;
     double surface_dof_area = 0.0;
@@ -1364,7 +1369,7 @@ public:
         , grid_pair_(grid_pair)
         , cloud_(cloud)
         , h_(grid.spacing()[0])
-        , fit_(cloud, stencils, h_, 4)
+        , fit_(cloud, stencils, h_, 3)
         , bulk_(grid, ZfftBcType::Dirichlet, 0.0, 2)
         , correction_support_(build_laplace_correction_support_3d(
               grid_pair, "PanelCenterHarmonicJetKFBI3D"))
@@ -1406,13 +1411,55 @@ public:
                 * row.evaluation.dot(
                     result.coefficients.row(row.center_dof).transpose());
         }
-        bulk_.solve(rhs, result.potential);
+        // The spread correction is assembled for Delta_h, while the project
+        // bulk solver accepts the right-hand side of -Delta_h.
+        bulk_.solve(-rhs, result.potential);
         return result;
     }
 
     Eigen::VectorXd exterior_trace(const HarmonicJetField3D& field,
                                    const Eigen::VectorXd& value_jump,
                                    const Eigen::VectorXd& normal_jump) const
+    {
+        return recover_trace(
+            continued_samples(field, value_jump, normal_jump, false),
+            c0_weights_, 1.0);
+    }
+
+    Eigen::VectorXd interior_trace(const HarmonicJetField3D& field,
+                                   const Eigen::VectorXd& value_jump,
+                                   const Eigen::VectorXd& normal_jump) const
+    {
+        return recover_trace(
+            continued_samples(field, value_jump, normal_jump, true),
+            c0_weights_, 1.0);
+    }
+
+    Eigen::VectorXd exterior_normal_trace(
+        const HarmonicJetField3D& field,
+        const Eigen::VectorXd& value_jump,
+        const Eigen::VectorXd& normal_jump) const
+    {
+        return recover_trace(
+            continued_samples(field, value_jump, normal_jump, false),
+            c1_weights_, 1.0 / h_);
+    }
+
+    Eigen::VectorXd interior_normal_trace(
+        const HarmonicJetField3D& field,
+        const Eigen::VectorXd& value_jump,
+        const Eigen::VectorXd& normal_jump) const
+    {
+        return recover_trace(
+            continued_samples(field, value_jump, normal_jump, true),
+            c1_weights_, 1.0 / h_);
+    }
+
+private:
+    Eigen::MatrixXd continued_samples(const HarmonicJetField3D& field,
+                                      const Eigen::VectorXd& value_jump,
+                                      const Eigen::VectorXd& normal_jump,
+                                      bool interior_continuation) const
     {
         const int size = surface_size();
         if (field.potential.size() != grid_.num_dofs()
@@ -1423,9 +1470,8 @@ public:
                 "exterior trace received incompatible field or jump sizes");
         }
 
-        Eigen::VectorXd trace(size);
+        Eigen::MatrixXd samples = Eigen::MatrixXd::Zero(size, 8);
         for (int center = 0; center < size; ++center) {
-            std::array<double, 8> samples{};
             for (int side = 0; side < 2; ++side) {
                 for (int layer = 0; layer < 4; ++layer) {
                     const HarmonicTraceSample3D& sample = trace_samples_[
@@ -1438,28 +1484,47 @@ public:
                     }
                     value += sample.correction_evaluation.dot(
                         field.coefficients.row(center).transpose());
-                    samples[static_cast<std::size_t>(4 * side + layer)] = value;
+                    samples(center, 4 * side + layer) = value;
                 }
             }
 
-            // Interior samples are converted to the exterior continuation by
-            // subtracting [W] + rho[W_n], with rho=-tau*h on the inner side.
-            for (int layer = 0; layer < 4; ++layer) {
-                samples[static_cast<std::size_t>(layer)] -= value_jump[center];
-                samples[static_cast<std::size_t>(layer)] +=
-                    normal_layers_[static_cast<std::size_t>(layer)]
-                    * h_ * normal_jump[center];
+            if (interior_continuation) {
+                // At rho=+tau*h, W^- = W^+ + [W] + rho[W_n].
+                for (int layer = 0; layer < 4; ++layer) {
+                    samples(center, 4 + layer) += value_jump[center];
+                    samples(center, 4 + layer) +=
+                        normal_layers_[static_cast<std::size_t>(layer)]
+                        * h_ * normal_jump[center];
+                }
+            } else {
+                // At rho=-tau*h, W^+ = W^- - [W] - rho[W_n].
+                for (int layer = 0; layer < 4; ++layer) {
+                    samples(center, layer) -= value_jump[center];
+                    samples(center, layer) +=
+                        normal_layers_[static_cast<std::size_t>(layer)]
+                        * h_ * normal_jump[center];
+                }
             }
+        }
+        return samples;
+    }
+
+    Eigen::VectorXd recover_trace(
+        const Eigen::MatrixXd& samples,
+        const std::array<double, 8>& weights,
+        double scale) const
+    {
+        Eigen::VectorXd trace(samples.rows());
+        for (int center = 0; center < samples.rows(); ++center) {
             double value = 0.0;
             for (int q = 0; q < 8; ++q)
-                value += c0_weights_[static_cast<std::size_t>(q)]
-                       * samples[static_cast<std::size_t>(q)];
-            trace[center] = value;
+                value += weights[static_cast<std::size_t>(q)]
+                       * samples(center, q);
+            trace[center] = scale * value;
         }
         return trace;
     }
 
-private:
     std::size_t trace_sample_index(int center, int side, int layer) const
     {
         return static_cast<std::size_t>((center * 2 + side) * 4 + layer);
@@ -1552,18 +1617,22 @@ private:
         for (int axis = 0; axis < 3; ++axis) {
             const double coordinate =
                 (query[axis] - origin[static_cast<std::size_t>(axis)]) / h_;
-            lo[static_cast<std::size_t>(axis)] =
-                static_cast<int>(std::floor(coordinate));
+            if (coordinate < 0.0
+                || coordinate
+                   > static_cast<double>(dims[static_cast<std::size_t>(axis)] - 1)) {
+                throw std::runtime_error(
+                    "normal-layer sample exits the embedding box");
+            }
+            const int floor_index = static_cast<int>(std::floor(coordinate));
+            const int start = std::max(
+                0,
+                std::min(floor_index - 1,
+                         dims[static_cast<std::size_t>(axis)] - 4));
+            lo[static_cast<std::size_t>(axis)] = start + 1;
             const double fraction = coordinate
                 - static_cast<double>(lo[static_cast<std::size_t>(axis)]);
             axis_weights[static_cast<std::size_t>(axis)] =
                 cubic_lagrange_weights(fraction);
-            if (lo[static_cast<std::size_t>(axis)] - 1 < 0
-                || lo[static_cast<std::size_t>(axis)] + 2
-                   >= dims[static_cast<std::size_t>(axis)]) {
-                throw std::runtime_error(
-                    "normal-layer tricubic stencil exits the embedding box");
-            }
         }
 
         // Four Cartesian slices are first interpolated by a 4x4 bicubic
@@ -1630,8 +1699,10 @@ private:
             design(4 + q, 5) = xp * xp * xp;
         }
         const Eigen::MatrixXd pinv = svd_pseudoinverse(design, 1.0e-13);
-        for (int q = 0; q < 8; ++q)
+        for (int q = 0; q < 8; ++q) {
             c0_weights_[static_cast<std::size_t>(q)] = pinv(0, q);
+            c1_weights_[static_cast<std::size_t>(q)] = pinv(1, q);
+        }
     }
 
     const CartesianGrid3D& grid_;
@@ -1645,6 +1716,7 @@ private:
     std::vector<HarmonicTraceSample3D> trace_samples_;
     const std::array<double, 4> normal_layers_{{0.5, 1.5, 2.5, 3.5}};
     std::array<double, 8> c0_weights_{};
+    std::array<double, 8> c1_weights_{};
 };
 
 class ExteriorZeroTraceOperator3D final : public IKFBIOperator {
@@ -2028,6 +2100,40 @@ ReadinessResult run_readiness_case(GeometryKind kind,
         throw std::runtime_error("constant value-jump readiness probe produced NaN/Inf");
     }
 
+    PanelCenterHarmonicJetKFBI3D harmonic_pipeline(
+        grid, grid_pair, surface_dofs, cauchy_stencils);
+    const Eigen::VectorXd constant_value =
+        Eigen::VectorXd::Ones(harmonic_pipeline.surface_size());
+    const Eigen::VectorXd zero_normal =
+        Eigen::VectorXd::Zero(harmonic_pipeline.surface_size());
+    const HarmonicJetField3D harmonic_probe =
+        harmonic_pipeline.evaluate(constant_value, zero_normal);
+    result.harmonic_constant_exterior_trace_linf =
+        harmonic_pipeline.exterior_trace(
+            harmonic_probe, constant_value, zero_normal).lpNorm<Eigen::Infinity>();
+    result.harmonic_constant_interior_trace_linf =
+        (harmonic_pipeline.interior_trace(
+             harmonic_probe, constant_value, zero_normal).array() - 1.0)
+        .matrix().lpNorm<Eigen::Infinity>();
+    result.harmonic_constant_exterior_normal_linf =
+        harmonic_pipeline.exterior_normal_trace(
+            harmonic_probe, constant_value, zero_normal).lpNorm<Eigen::Infinity>();
+    result.harmonic_constant_interior_normal_linf =
+        harmonic_pipeline.interior_normal_trace(
+            harmonic_probe, constant_value, zero_normal).lpNorm<Eigen::Infinity>();
+    for (int n = 0; n < grid.num_dofs(); ++n) {
+        const double expected = grid_pair.domain_label(n) > 0 ? 1.0 : 0.0;
+        result.harmonic_constant_bulk_linf = std::max(
+            result.harmonic_constant_bulk_linf,
+            std::abs(harmonic_probe.potential[n] - expected));
+    }
+    if (!std::isfinite(result.harmonic_constant_exterior_trace_linf)
+        || !std::isfinite(result.harmonic_constant_exterior_normal_linf)
+        || !std::isfinite(result.harmonic_constant_bulk_linf)) {
+        throw std::runtime_error(
+            "harmonic-jet constant probe produced NaN/Inf");
+    }
+
     std::cout << "[ready] " << geometry.name << " - " << geometry.description << '\n'
               << "  panel-center surface patches/dofs="
               << result.surface_patches << '/' << result.surface_dofs
@@ -2065,7 +2171,14 @@ ReadinessResult run_readiness_case(GeometryKind kind,
               << result.constant_A1_linf
               << " exterior_trace=" << result.constant_exterior_trace_linf
               << " interior_trace_err=" << result.constant_interior_trace_linf
-              << " bulk_err=" << result.constant_bulk_linf << '\n';
+              << " bulk_err=" << result.constant_bulk_linf << '\n'
+              << "  cubic harmonic-jet [u]=1 probe: exterior/interior trace="
+              << result.harmonic_constant_exterior_trace_linf << '/'
+              << result.harmonic_constant_interior_trace_linf
+              << " exterior/interior normal="
+              << result.harmonic_constant_exterior_normal_linf << '/'
+              << result.harmonic_constant_interior_normal_linf
+              << " bulk_err=" << result.harmonic_constant_bulk_linf << '\n';
     return result;
 }
 
@@ -2085,6 +2198,9 @@ void write_summary(const std::filesystem::path& output_dir,
                "endpoint_crossings,correction_nodes,correction_area,crossing_area,"
                "normal_error,box_margin_over_h,A1_linf,exterior_trace_linf,"
                "interior_trace_error,bulk_error,surface_patches,surface_dofs,"
+               "harmonic_exterior_trace_linf,harmonic_interior_trace_linf,"
+               "harmonic_exterior_normal_linf,harmonic_interior_normal_linf,"
+               "harmonic_bulk_linf,"
                "surface_dof_area,surface_area_relative_error,"
                "surface_spacing_min_over_h,surface_spacing_mean_over_h,"
                "surface_spacing_max_over_h,cauchy_value_neighbors,"
@@ -2105,7 +2221,13 @@ void write_summary(const std::filesystem::path& output_dir,
                 << row.constant_exterior_trace_linf << ','
                 << row.constant_interior_trace_linf << ','
                 << row.constant_bulk_linf << ',' << row.surface_patches << ','
-                << row.surface_dofs << ',' << row.surface_dof_area << ','
+                << row.surface_dofs << ','
+                << row.harmonic_constant_exterior_trace_linf << ','
+                << row.harmonic_constant_interior_trace_linf << ','
+                << row.harmonic_constant_exterior_normal_linf << ','
+                << row.harmonic_constant_interior_normal_linf << ','
+                << row.harmonic_constant_bulk_linf << ','
+                << row.surface_dof_area << ','
                 << row.surface_area_relative_error << ','
                 << row.surface_spacing_min_over_h << ','
                 << row.surface_spacing_mean_over_h << ','
