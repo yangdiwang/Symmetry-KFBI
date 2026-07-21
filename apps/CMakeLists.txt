@@ -27,6 +27,14 @@ add_executable(dirichlet_harmonic_jet_python_compatible_2d
 )
 
 if(KFBIM_BUILD_3D)
+    add_library(kfbim_3d_app_geometry STATIC
+        native_nurbs_surface_3d.cpp
+    )
+
+    add_executable(native_nurbs_surface_3d_test
+        native_nurbs_surface_3d_test.cpp
+    )
+
     add_executable(neumann_exterior_zero_trace_3d
         neumann_exterior_zero_trace_3d.cpp
     )
@@ -61,6 +69,14 @@ target_link_libraries(dirichlet_harmonic_jet_python_compatible_2d PRIVATE
 )
 
 if(KFBIM_BUILD_3D)
+    target_link_libraries(kfbim_3d_app_geometry PUBLIC
+        kfbim_core
+    )
+
+    target_link_libraries(native_nurbs_surface_3d_test PRIVATE
+        kfbim_3d_app_geometry
+    )
+
     target_link_libraries(neumann_exterior_zero_trace_3d PRIVATE
         kfbim_core
     )
@@ -109,5 +125,7 @@ target_compile_features(neumann_harmonic_jet_case_2d PRIVATE cxx_std_17)
 target_compile_features(neumann_harmonic_jet_python_compatible_2d PRIVATE cxx_std_17)
 target_compile_features(dirichlet_harmonic_jet_python_compatible_2d PRIVATE cxx_std_17)
 if(KFBIM_BUILD_3D)
+    target_compile_features(kfbim_3d_app_geometry PUBLIC cxx_std_17)
+    target_compile_features(native_nurbs_surface_3d_test PRIVATE cxx_std_17)
     target_compile_features(neumann_exterior_zero_trace_3d PRIVATE cxx_std_17)
 endif()
