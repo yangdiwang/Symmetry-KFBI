@@ -51,6 +51,31 @@ jobs:
             'cauchy_degree=3 restrict_grid_degree=3 restrict_normal_degree=3'
           printf '%s\n' "$three_d_output" | grep -Fq \
             'cauchy_counts=48/28'
+          three_d_override_output="$(
+            KFBIM_3D_CAUCHY_POLICY=same_patch \
+            KFBIM_3D_CAUCHY_VALUE_COUNT=24 \
+            KFBIM_3D_CAUCHY_NORMAL_COUNT=20 \
+              ./build/apps/neumann_exterior_zero_trace_3d l_prism 16 \
+              2>&1 || true
+          )"
+          printf '%s\n' "$three_d_override_output"
+          printf '%s\n' "$three_d_override_output" | grep -Fq \
+            'cauchy_counts=24/20'
+          printf '%s\n' "$three_d_override_output" | grep -Fq \
+            '[dirichlet-normal] converged/iterations=1/'
+          for invalid_counts in '0 6' '-1 6' 'abc 6' '10 12'; do
+            read -r value_count normal_count <<< "$invalid_counts"
+            if invalid_output="$(
+              KFBIM_3D_CAUCHY_VALUE_COUNT="$value_count" \
+              KFBIM_3D_CAUCHY_NORMAL_COUNT="$normal_count" \
+                ./build/apps/neumann_exterior_zero_trace_3d l_prism 16 2>&1
+            )"; then
+              echo "invalid 3D Cauchy counts unexpectedly succeeded: $invalid_counts"
+              exit 1
+            fi
+            printf '%s\n' "$invalid_output" | grep -Eq \
+              'must be a positive integer|may not exceed'
+          done
           main_preset_output="$(
             env -u KFBIM_PYJET_DOF_MODE \
                 -u KFBIM_PYJET_SPREAD_MODE \
