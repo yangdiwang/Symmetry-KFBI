@@ -20,6 +20,7 @@ using kfbim::app3d::SurfaceDofCloud3D;
 using kfbim::app3d::interpolate_triangle_parameter;
 using kfbim::app3d::make_native_nurbs_surface_3d;
 using kfbim::app3d::make_native_surface_dofs_3d;
+using kfbim::app3d::nearest_topological_cauchy_dofs;
 using kfbim::app3d::parameter_dof_candidates_2x2;
 using kfbim::app3d::smooth_patch_component;
 
@@ -35,6 +36,8 @@ void check_patch_regular(const NativeNurbsSurface3D& surface)
             surface.name + " patch-name count");
     require(surface.smooth_neighbors.size() == surface.patches.size(),
             surface.name + " smooth-neighbor count");
+    require(surface.topological_patch_neighbors.size() == surface.patches.size(),
+            surface.name + " topological-neighbor count");
     for (const auto& patch : surface.patches) {
         const double u = 0.5 * (patch.domain_start_u() + patch.domain_end_u());
         const double v = 0.5 * (patch.domain_start_v() + patch.domain_end_v());
@@ -146,14 +149,12 @@ double check_dof_cloud(const NativeNurbsSurface3D& surface, double h)
             require(source_along == destination_along,
                     surface.name + " G1 seam has matching tensor rows");
         }
-        const std::vector<int> component =
-            smooth_patch_component(surface, patch_id);
-        int component_dofs = 0;
-        for (int component_patch : component)
-            component_dofs += cloud.patches[
-                static_cast<std::size_t>(component_patch)].dof_count();
-        require(component_dofs >= 48,
-                surface.name + " G1 component supports 48 Cauchy values");
+        const auto& tensor =
+            cloud.patches[static_cast<std::size_t>(patch_id)];
+        const int center = tensor.dof_index(tensor.nu / 2, tensor.nv / 2);
+        require(nearest_topological_cauchy_dofs(
+                    surface, cloud, center, 48).size() == 48,
+                surface.name + " topological neighborhood supports 48 values");
     }
     for (const auto& dof : cloud.dofs) {
         require(dof.patch_id >= 0
@@ -238,6 +239,30 @@ bool all_on_patch(const std::array<int, 4>& ids,
     return true;
 }
 
+bool contains_non_source_patch(const std::vector<int>& ids,
+                               const SurfaceDofCloud3D& cloud,
+                               int source_patch)
+{
+    for (int id : ids) {
+        if (cloud.dofs[static_cast<std::size_t>(id)].patch_id != source_patch)
+            return true;
+    }
+    return false;
+}
+
+bool no_patch_in_range(const std::vector<int>& ids,
+                       const SurfaceDofCloud3D& cloud,
+                       int first,
+                       int end)
+{
+    for (int id : ids) {
+        const int patch = cloud.dofs[static_cast<std::size_t>(id)].patch_id;
+        if (patch >= first && patch < end)
+            return false;
+    }
+    return true;
+}
+
 void test_parameter_candidates()
 {
     const NativeNurbsSurface3D torus =
@@ -297,6 +322,7 @@ void test_parameter_candidates()
         SmoothPatchNeighbor3D{1, PatchEdge3D::UMax, true};
     reversed.smooth_neighbors[1][static_cast<int>(PatchEdge3D::UMax)] =
         SmoothPatchNeighbor3D{0, PatchEdge3D::UMax, true};
+    reversed.topological_patch_neighbors = {{1}, {0}};
     reversed.expected_area = 2.0;
     reversed.exact_inside = [](const Eigen::Vector3d&) { return false; };
     const SurfaceDofCloud3D reversed_cloud =
@@ -344,6 +370,31 @@ void test_parameter_candidates()
         require(smooth_patch_component(lprism, side).size() == 1,
                 "each L-prism side is a separate non-G1 component");
     }
+
+    const SurfaceDofCloud3D coarse_lcloud =
+        make_native_surface_dofs_3d(lprism, 3.0 / 16.0);
+    const auto& lside = coarse_lcloud.patches[7];
+    const int lcenter = lside.dof_index(lside.nu / 2, lside.nv / 2);
+    const std::vector<int> l_cauchy = nearest_topological_cauchy_dofs(
+        lprism, coarse_lcloud, lcenter, 48);
+    require(l_cauchy.size() == 48,
+            "L side Cauchy selector retains 48 values");
+    require(contains_non_source_patch(l_cauchy, coarse_lcloud, 7),
+            "L side Cauchy selector crosses a non-G1 topological edge");
+
+    const SurfaceDofCloud3D coarse_cylinder_cloud =
+        make_native_surface_dofs_3d(cylinder, 3.0 / 16.0);
+    const auto& outer_wall = coarse_cylinder_cloud.patches[0];
+    const int cylinder_center = outer_wall.dof_index(
+        outer_wall.nu / 2, outer_wall.nv / 2);
+    const std::vector<int> cylinder_cauchy =
+        nearest_topological_cauchy_dofs(
+            cylinder, coarse_cylinder_cloud, cylinder_center, 48);
+    require(cylinder_cauchy.size() == 48,
+            "cylinder Cauchy selector retains 48 values");
+    require(no_patch_in_range(
+                cylinder_cauchy, coarse_cylinder_cloud, 4, 8),
+            "outer-wall Cauchy selector does not jump to the inner wall");
 }
 
 void test_grid_edge_triangle_owners()

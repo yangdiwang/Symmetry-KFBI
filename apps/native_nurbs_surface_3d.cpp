@@ -58,6 +58,32 @@ void append_patch(NativeNurbsSurface3D& surface,
     surface.patch_names.push_back(std::move(name));
     surface.patches.push_back(std::move(patch));
     surface.smooth_neighbors.emplace_back();
+    surface.topological_patch_neighbors.emplace_back();
+}
+
+void connect_topological_patches(NativeNurbsSurface3D& surface,
+                                 int patch_a,
+                                 int patch_b)
+{
+    if (patch_a < 0 || patch_a >= static_cast<int>(surface.patches.size())
+        || patch_b < 0 || patch_b >= static_cast<int>(surface.patches.size())
+        || patch_a == patch_b) {
+        throw std::out_of_range(
+            "topological NURBS connection has invalid patch");
+    }
+    auto insert_unique = [](std::vector<int>& neighbors, int patch) {
+        if (std::find(neighbors.begin(), neighbors.end(), patch)
+            == neighbors.end()) {
+            neighbors.push_back(patch);
+            std::sort(neighbors.begin(), neighbors.end());
+        }
+    };
+    insert_unique(
+        surface.topological_patch_neighbors[static_cast<std::size_t>(patch_a)],
+        patch_b);
+    insert_unique(
+        surface.topological_patch_neighbors[static_cast<std::size_t>(patch_b)],
+        patch_a);
 }
 
 void connect_smooth(NativeNurbsSurface3D& surface,
@@ -71,6 +97,7 @@ void connect_smooth(NativeNurbsSurface3D& surface,
         || patch_b < 0 || patch_b >= static_cast<int>(surface.patches.size())) {
         throw std::out_of_range("smooth NURBS connection has invalid patch");
     }
+    connect_topological_patches(surface, patch_a, patch_b);
     auto& slot_a = surface.smooth_neighbors[static_cast<std::size_t>(patch_a)]
                                            [static_cast<std::size_t>(edge_index(edge_a))];
     auto& slot_b = surface.smooth_neighbors[static_cast<std::size_t>(patch_b)]
@@ -241,6 +268,12 @@ NativeNurbsSurface3D make_hollow_cylinder()
                            false);
         }
     }
+    for (int quarter = 0; quarter < 4; ++quarter) {
+        connect_topological_patches(surface, quarter, 8 + quarter);
+        connect_topological_patches(surface, quarter, 12 + quarter);
+        connect_topological_patches(surface, 4 + quarter, 8 + quarter);
+        connect_topological_patches(surface, 4 + quarter, 12 + quarter);
+    }
     const double height = z1 - z0;
     surface.expected_area = 2.0 * kPi * (outer_radius + inner_radius) * height
         + 2.0 * kPi * (outer_radius * outer_radius
@@ -329,6 +362,18 @@ NativeNurbsSurface3D make_l_prism()
                    4, PatchEdge3D::UMin, false);
     connect_smooth(surface, 3, PatchEdge3D::VMax,
                    5, PatchEdge3D::VMin, false);
+
+    const std::array<std::vector<int>, 6> boundary_cells{{
+        {0, 1}, {1}, {1}, {2}, {2}, {0, 2}}};
+    for (int side = 0; side < 6; ++side) {
+        const int side_patch = 6 + side;
+        connect_topological_patches(
+            surface, side_patch, 6 + (side + 1) % 6);
+        for (int cell : boundary_cells[static_cast<std::size_t>(side)]) {
+            connect_topological_patches(surface, side_patch, cell);
+            connect_topological_patches(surface, side_patch, 3 + cell);
+        }
+    }
 
     surface.expected_area = 2.0 * 3.0 * arm * arm
                           + 8.0 * arm * (z1 - z0);
@@ -420,19 +465,16 @@ std::pair<Eigen::Vector3d, Eigen::Vector3d> tangent_frame(
 
 SurfaceDofCloud3D make_native_surface_dofs_3d(
     const NativeNurbsSurface3D& surface,
-    double h,
-    int minimum_smooth_component_dofs)
+    double h)
 {
     if (!std::isfinite(h) || h <= 0.0)
         throw std::invalid_argument("native surface DOFs require positive h");
     if (surface.patches.empty()
         || surface.patch_names.size() != surface.patches.size()
-        || surface.smooth_neighbors.size() != surface.patches.size()) {
+        || surface.smooth_neighbors.size() != surface.patches.size()
+        || surface.topological_patch_neighbors.size()
+               != surface.patches.size()) {
         throw std::invalid_argument("native surface metadata is inconsistent");
-    }
-    if (minimum_smooth_component_dofs < 1) {
-        throw std::invalid_argument(
-            "native surface minimum component DOFs must be positive");
     }
 
     SurfaceDofCloud3D cloud;
@@ -517,35 +559,6 @@ SurfaceDofCloud3D make_native_surface_dofs_3d(
             }
         }
     };
-    harmonize_smooth_edge_counts();
-
-    std::vector<bool> component_processed(surface.patches.size(), false);
-    for (int seed = 0; seed < static_cast<int>(surface.patches.size()); ++seed) {
-        if (component_processed[static_cast<std::size_t>(seed)])
-            continue;
-        const std::vector<int> component = smooth_patch_component(surface, seed);
-        const int per_patch_target =
-            (minimum_smooth_component_dofs
-             + static_cast<int>(component.size()) - 1)
-            / static_cast<int>(component.size());
-        for (int patch_id : component) {
-            component_processed[static_cast<std::size_t>(patch_id)] = true;
-            SurfaceDofPatch3D& patch =
-                cloud.patches[static_cast<std::size_t>(patch_id)];
-            while (patch.dof_count() < per_patch_target) {
-                const double physical_u =
-                    direction_length_u[static_cast<std::size_t>(patch_id)]
-                    / static_cast<double>(patch.nu);
-                const double physical_v =
-                    direction_length_v[static_cast<std::size_t>(patch_id)]
-                    / static_cast<double>(patch.nv);
-                if (physical_u >= physical_v)
-                    ++patch.nu;
-                else
-                    ++patch.nv;
-            }
-        }
-    }
     harmonize_smooth_edge_counts();
 
     for (int patch_id = 0;
@@ -795,6 +808,105 @@ Eigen::Vector2d interpolate_triangle_parameter(
     return barycentric.x() * triangle.uv[0]
          + barycentric.y() * triangle.uv[1]
          + barycentric.z() * triangle.uv[2];
+}
+
+std::vector<int> nearest_topological_cauchy_dofs(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud3D& cloud,
+    int center_dof,
+    int count)
+{
+    if (center_dof < 0
+        || center_dof >= static_cast<int>(cloud.dofs.size())) {
+        throw std::out_of_range("Cauchy center DOF is outside the surface cloud");
+    }
+    if (count <= 0)
+        throw std::invalid_argument("Cauchy sample count must be positive");
+    if (surface.patches.size() != cloud.patches.size()
+        || surface.topological_patch_neighbors.size()
+               != surface.patches.size()) {
+        throw std::invalid_argument(
+            "Cauchy selection requires complete patch topology");
+    }
+
+    const int center_patch =
+        cloud.dofs[static_cast<std::size_t>(center_dof)].patch_id;
+    if (center_patch < 0
+        || center_patch >= static_cast<int>(cloud.patches.size())) {
+        throw std::runtime_error("Cauchy center DOF has invalid patch ownership");
+    }
+
+    std::vector<bool> visited(surface.patches.size(), false);
+    visited[static_cast<std::size_t>(center_patch)] = true;
+    std::vector<int> included{center_patch};
+    std::vector<int> frontier{center_patch};
+    int candidate_count = cloud.patches[
+        static_cast<std::size_t>(center_patch)].dof_count();
+
+    while (candidate_count < count && !frontier.empty()) {
+        std::vector<int> next;
+        for (int patch : frontier) {
+            for (int neighbor : surface.topological_patch_neighbors[
+                     static_cast<std::size_t>(patch)]) {
+                if (neighbor < 0
+                    || neighbor >= static_cast<int>(surface.patches.size())) {
+                    throw std::runtime_error(
+                        "Cauchy topology contains an invalid patch");
+                }
+                if (!visited[static_cast<std::size_t>(neighbor)]) {
+                    visited[static_cast<std::size_t>(neighbor)] = true;
+                    next.push_back(neighbor);
+                }
+            }
+        }
+        std::sort(next.begin(), next.end());
+        for (int patch : next) {
+            included.push_back(patch);
+            candidate_count += cloud.patches[
+                static_cast<std::size_t>(patch)].dof_count();
+        }
+        frontier = std::move(next);
+    }
+    if (candidate_count < count) {
+        throw std::runtime_error(
+            "topological Cauchy neighborhood has too few surface DOFs");
+    }
+
+    const Eigen::Vector3d& center_point =
+        cloud.dofs[static_cast<std::size_t>(center_dof)].point;
+    std::vector<std::pair<double, int>> candidates;
+    candidates.reserve(static_cast<std::size_t>(candidate_count));
+    for (int patch : included) {
+        const SurfaceDofPatch3D& tensor =
+            cloud.patches[static_cast<std::size_t>(patch)];
+        for (int local = 0; local < tensor.dof_count(); ++local) {
+            const int q = tensor.first_dof + local;
+            if (q < 0 || q >= static_cast<int>(cloud.dofs.size())) {
+                throw std::runtime_error(
+                    "Cauchy patch has invalid contiguous DOF range");
+            }
+            const double distance_sq =
+                (cloud.dofs[static_cast<std::size_t>(q)].point - center_point)
+                .squaredNorm();
+            candidates.emplace_back(distance_sq, q);
+        }
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [](const auto& a, const auto& b) {
+                  if (a.first != b.first)
+                      return a.first < b.first;
+                  return a.second < b.second;
+              });
+
+    std::vector<int> result;
+    result.reserve(static_cast<std::size_t>(count));
+    for (int k = 0; k < count; ++k)
+        result.push_back(candidates[static_cast<std::size_t>(k)].second);
+    if (std::find(result.begin(), result.end(), center_dof) == result.end()) {
+        throw std::runtime_error(
+            "topological Cauchy selection lost its center DOF");
+    }
+    return result;
 }
 
 std::vector<int> smooth_patch_component(const NativeNurbsSurface3D& surface,

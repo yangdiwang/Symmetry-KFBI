@@ -38,6 +38,7 @@ struct NativeNurbsSurface3D {
     std::vector<std::string> patch_names;
     std::vector<std::array<std::optional<SmoothPatchNeighbor3D>, 4>>
         smooth_neighbors;
+    std::vector<std::vector<int>> topological_patch_neighbors;
     double expected_area = 0.0;
     std::function<bool(const Eigen::Vector3d&)> exact_inside;
 };
@@ -84,8 +85,13 @@ struct SurfaceDofCloud3D {
 
 [[nodiscard]] SurfaceDofCloud3D make_native_surface_dofs_3d(
     const NativeNurbsSurface3D& surface,
-    double h,
-    int minimum_smooth_component_dofs = 48);
+    double h);
+
+[[nodiscard]] std::vector<int> nearest_topological_cauchy_dofs(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud3D& cloud,
+    int center_dof,
+    int count);
 
 [[nodiscard]] std::array<int, 4> parameter_dof_candidates_2x2(
     const NativeNurbsSurface3D& surface,
