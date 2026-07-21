@@ -355,4 +355,147 @@ NativeNurbsSurface3D make_native_nurbs_surface_3d(GeometryKind3D kind)
     throw std::invalid_argument("unknown native 3D geometry kind");
 }
 
+namespace {
+
+double sampled_isoline_length(const NurbsSurfacePatch3D& patch,
+                              bool varying_u,
+                              double fixed_fraction)
+{
+    constexpr int segments = 16;
+    const double u0 = patch.domain_start_u();
+    const double u1 = patch.domain_end_u();
+    const double v0 = patch.domain_start_v();
+    const double v1 = patch.domain_end_v();
+    auto point = [&](double fraction) {
+        const double u_fraction = varying_u ? fraction : fixed_fraction;
+        const double v_fraction = varying_u ? fixed_fraction : fraction;
+        return patch.evaluate(
+            u0 + u_fraction * (u1 - u0),
+            v0 + v_fraction * (v1 - v0));
+    };
+    Eigen::Vector3d previous = point(0.0);
+    double length = 0.0;
+    for (int segment = 1; segment <= segments; ++segment) {
+        const Eigen::Vector3d current =
+            point(static_cast<double>(segment) / segments);
+        length += (current - previous).norm();
+        previous = current;
+    }
+    return length;
+}
+
+double max_sampled_direction_length(const NurbsSurfacePatch3D& patch,
+                                    bool varying_u)
+{
+    double result = 0.0;
+    for (int transverse = 0; transverse < 5; ++transverse) {
+        result = std::max(
+            result,
+            sampled_isoline_length(
+                patch, varying_u, 0.25 * static_cast<double>(transverse)));
+    }
+    return result;
+}
+
+std::pair<Eigen::Vector3d, Eigen::Vector3d> tangent_frame(
+    const Eigen::Vector3d& du,
+    const Eigen::Vector3d& normal)
+{
+    Eigen::Vector3d tangent1 = du - du.dot(normal) * normal;
+    if (tangent1.norm() <= 1.0e-14) {
+        const Eigen::Vector3d axis = std::abs(normal.x()) < 0.8
+            ? Eigen::Vector3d::UnitX()
+            : Eigen::Vector3d::UnitY();
+        tangent1 = axis - axis.dot(normal) * normal;
+    }
+    tangent1.normalize();
+    Eigen::Vector3d tangent2 = normal.cross(tangent1).normalized();
+    return {tangent1, tangent2};
+}
+
+} // namespace
+
+SurfaceDofCloud3D make_native_surface_dofs_3d(
+    const NativeNurbsSurface3D& surface,
+    double h)
+{
+    if (!std::isfinite(h) || h <= 0.0)
+        throw std::invalid_argument("native surface DOFs require positive h");
+    if (surface.patches.empty()
+        || surface.patch_names.size() != surface.patches.size()
+        || surface.smooth_neighbors.size() != surface.patches.size()) {
+        throw std::invalid_argument("native surface metadata is inconsistent");
+    }
+
+    SurfaceDofCloud3D cloud;
+    cloud.expected_area = surface.expected_area;
+    cloud.patches.reserve(surface.patches.size());
+    for (int patch_id = 0;
+         patch_id < static_cast<int>(surface.patches.size());
+         ++patch_id) {
+        const NurbsSurfacePatch3D& patch =
+            surface.patches[static_cast<std::size_t>(patch_id)];
+        SurfaceDofPatch3D tensor_patch;
+        tensor_patch.name = surface.patch_names[static_cast<std::size_t>(patch_id)];
+        tensor_patch.nu = std::max(
+            2,
+            static_cast<int>(std::ceil(
+                max_sampled_direction_length(patch, true) / h)));
+        tensor_patch.nv = std::max(
+            2,
+            static_cast<int>(std::ceil(
+                max_sampled_direction_length(patch, false) / h)));
+        tensor_patch.first_dof = static_cast<int>(cloud.dofs.size());
+        tensor_patch.smooth_patch_ids.push_back(patch_id);
+        for (const auto& neighbor_slot :
+             surface.smooth_neighbors[static_cast<std::size_t>(patch_id)]) {
+            if (neighbor_slot
+                && std::find(tensor_patch.smooth_patch_ids.begin(),
+                             tensor_patch.smooth_patch_ids.end(),
+                             neighbor_slot->patch)
+                       == tensor_patch.smooth_patch_ids.end()) {
+                tensor_patch.smooth_patch_ids.push_back(neighbor_slot->patch);
+            }
+        }
+        std::sort(tensor_patch.smooth_patch_ids.begin(),
+                  tensor_patch.smooth_patch_ids.end());
+
+        const double u0 = patch.domain_start_u();
+        const double u1 = patch.domain_end_u();
+        const double v0 = patch.domain_start_v();
+        const double v1 = patch.domain_end_v();
+        const double du_parameter =
+            (u1 - u0) / static_cast<double>(tensor_patch.nu);
+        const double dv_parameter =
+            (v1 - v0) / static_cast<double>(tensor_patch.nv);
+        for (int i = 0; i < tensor_patch.nu; ++i) {
+            const double u = u0 + (static_cast<double>(i) + 0.5) * du_parameter;
+            for (int j = 0; j < tensor_patch.nv; ++j) {
+                const double v =
+                    v0 + (static_cast<double>(j) + 0.5) * dv_parameter;
+                const geometry3d::NurbsSurfaceDerivatives3D d =
+                    patch.evaluate_with_derivatives(u, v);
+                Eigen::Vector3d normal = d.du.cross(d.dv);
+                const double jacobian = normal.norm();
+                if (!std::isfinite(jacobian) || jacobian <= 1.0e-14)
+                    throw std::runtime_error("native NURBS DOF has degenerate Jacobian");
+                normal /= jacobian;
+                const auto tangents = tangent_frame(d.du, normal);
+                cloud.dofs.push_back({d.point,
+                                      normal,
+                                      tangents.first,
+                                      tangents.second,
+                                      jacobian * du_parameter * dv_parameter,
+                                      u,
+                                      v,
+                                      patch_id,
+                                      i,
+                                      j});
+            }
+        }
+        cloud.patches.push_back(std::move(tensor_patch));
+    }
+    return cloud;
+}
+
 } // namespace kfbim::app3d

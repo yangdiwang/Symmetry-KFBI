@@ -9,7 +9,9 @@ namespace {
 
 using kfbim::app3d::GeometryKind3D;
 using kfbim::app3d::NativeNurbsSurface3D;
+using kfbim::app3d::SurfaceDofCloud3D;
 using kfbim::app3d::make_native_nurbs_surface_3d;
+using kfbim::app3d::make_native_surface_dofs_3d;
 
 void require(bool condition, const std::string& message)
 {
@@ -91,12 +93,82 @@ void test_native_models()
             "L-prism exact area");
 }
 
+double dof_area(const SurfaceDofCloud3D& cloud)
+{
+    double result = 0.0;
+    for (const auto& dof : cloud.dofs)
+        result += dof.weight;
+    return result;
+}
+
+double check_dof_cloud(const NativeNurbsSurface3D& surface, double h)
+{
+    const SurfaceDofCloud3D cloud = make_native_surface_dofs_3d(surface, h);
+    require(cloud.patches.size() == surface.patches.size(),
+            surface.name + " one DOF patch per NURBS patch");
+    require(!cloud.dofs.empty(), surface.name + " nonempty DOF cloud");
+    for (const auto& tensor_patch : cloud.patches) {
+        require(tensor_patch.nu >= 2 && tensor_patch.nv >= 2,
+                surface.name + " at least two cells per parameter direction");
+        require(tensor_patch.dof_count() == tensor_patch.nu * tensor_patch.nv,
+                surface.name + " dense tensor indexing");
+    }
+    for (const auto& dof : cloud.dofs) {
+        require(dof.patch_id >= 0
+                    && dof.patch_id < static_cast<int>(surface.patches.size()),
+                surface.name + " valid native patch ownership");
+        const auto& patch = surface.patches[static_cast<std::size_t>(dof.patch_id)];
+        require(dof.u > patch.domain_start_u()
+                    && dof.u < patch.domain_end_u(),
+                surface.name + " strict interior u center");
+        require(dof.v > patch.domain_start_v()
+                    && dof.v < patch.domain_end_v(),
+                surface.name + " strict interior v center");
+        require((dof.point - patch.evaluate(dof.u, dof.v)).norm() < 1.0e-13,
+                surface.name + " native point evaluation");
+        require(std::abs(dof.normal.norm() - 1.0) < 1.0e-13,
+                surface.name + " unit normal");
+        require(std::abs(dof.tangent1.norm() - 1.0) < 1.0e-13
+                    && std::abs(dof.tangent2.norm() - 1.0) < 1.0e-13
+                    && std::abs(dof.tangent1.dot(dof.tangent2)) < 1.0e-13
+                    && std::abs(dof.normal.dot(dof.tangent1)) < 1.0e-13
+                    && std::abs(dof.normal.dot(dof.tangent2)) < 1.0e-13,
+                surface.name + " orthonormal local frame");
+        require(dof.weight > 0.0 && std::isfinite(dof.weight),
+                surface.name + " positive finite midpoint weight");
+        const double offset = 0.1 * h;
+        require(surface.exact_inside(dof.point - offset * dof.normal),
+                surface.name + " inward normal enters domain");
+        require(!surface.exact_inside(dof.point + offset * dof.normal),
+                surface.name + " outward normal exits domain");
+    }
+    return std::abs(dof_area(cloud) - surface.expected_area)
+         / surface.expected_area;
+}
+
+void test_uniform_native_dofs()
+{
+    for (GeometryKind3D kind : {GeometryKind3D::Torus,
+                                GeometryKind3D::HollowCylinder,
+                                GeometryKind3D::LPrism}) {
+        const NativeNurbsSurface3D surface = make_native_nurbs_surface_3d(kind);
+        const double coarse_error = check_dof_cloud(surface, 3.0 / 16.0);
+        const double fine_error = check_dof_cloud(surface, 3.0 / 32.0);
+        require(fine_error < 3.0e-2,
+                surface.name + " midpoint area accuracy at N=32");
+        require((coarse_error < 1.0e-12 && fine_error < 1.0e-12)
+                    || fine_error < coarse_error,
+                surface.name + " midpoint area improves under refinement");
+    }
+}
+
 } // namespace
 
 int main()
 {
     try {
         test_native_models();
+        test_uniform_native_dofs();
         std::cout << "native NURBS model tests passed\n";
         return 0;
     } catch (const std::exception& error) {

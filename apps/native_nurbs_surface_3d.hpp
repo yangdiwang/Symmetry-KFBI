@@ -42,7 +42,48 @@ struct NativeNurbsSurface3D {
     std::function<bool(const Eigen::Vector3d&)> exact_inside;
 };
 
+struct SurfaceDof3D {
+    Eigen::Vector3d point = Eigen::Vector3d::Zero();
+    Eigen::Vector3d normal = Eigen::Vector3d::Zero();
+    Eigen::Vector3d tangent1 = Eigen::Vector3d::Zero();
+    Eigen::Vector3d tangent2 = Eigen::Vector3d::Zero();
+    double weight = 0.0;
+    double u = 0.0;
+    double v = 0.0;
+    int patch_id = -1;
+    int i = -1;
+    int j = -1;
+};
+
+struct SurfaceDofPatch3D {
+    std::string name;
+    int nu = 0;
+    int nv = 0;
+    int first_dof = 0;
+    std::vector<int> smooth_patch_ids;
+
+    [[nodiscard]] int dof_index(int i, int j) const
+    {
+        return first_dof + i * nv + j;
+    }
+
+    [[nodiscard]] int dof_count() const
+    {
+        return nu * nv;
+    }
+};
+
+struct SurfaceDofCloud3D {
+    std::vector<SurfaceDofPatch3D> patches;
+    std::vector<SurfaceDof3D> dofs;
+    double expected_area = 0.0;
+};
+
 [[nodiscard]] NativeNurbsSurface3D make_native_nurbs_surface_3d(
     GeometryKind3D kind);
+
+[[nodiscard]] SurfaceDofCloud3D make_native_surface_dofs_3d(
+    const NativeNurbsSurface3D& surface,
+    double h);
 
 } // namespace kfbim::app3d
