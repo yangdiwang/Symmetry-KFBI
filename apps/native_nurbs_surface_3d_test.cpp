@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -18,9 +19,11 @@ using kfbim::app3d::NativeNurbsSurface3D;
 using kfbim::app3d::PatchEdge3D;
 using kfbim::app3d::SmoothPatchNeighbor3D;
 using kfbim::app3d::SurfaceDofCloud3D;
+using kfbim::app3d::balanced_topological_cauchy_dofs;
 using kfbim::app3d::interpolate_triangle_parameter;
 using kfbim::app3d::make_native_nurbs_surface_3d;
 using kfbim::app3d::make_native_surface_dofs_3d;
+using kfbim::app3d::nearest_same_patch_cauchy_dofs;
 using kfbim::app3d::nearest_topological_cauchy_dofs;
 using kfbim::app3d::parameter_dof_candidates_2x2;
 using kfbim::app3d::smooth_patch_component;
@@ -418,6 +421,17 @@ void test_parameter_candidates()
             "L side Cauchy selector retains 48 values");
     require(contains_non_source_patch(l_cauchy, coarse_lcloud, 7),
             "L side Cauchy selector crosses a non-G1 topological edge");
+    const std::vector<int> same_patch = nearest_same_patch_cauchy_dofs(
+        coarse_lcloud, lcenter, 48);
+    require(same_patch.size() == static_cast<std::size_t>(lside.dof_count()),
+            "same-patch Cauchy selector uses every available coarse DOF");
+    require(std::find(same_patch.begin(), same_patch.end(), lcenter)
+                != same_patch.end(),
+            "same-patch Cauchy selector retains its center");
+    for (int q : same_patch) {
+        require(coarse_lcloud.dofs[static_cast<std::size_t>(q)].patch_id == 7,
+                "same-patch Cauchy selector cannot cross a patch edge");
+    }
 
     const SurfaceDofCloud3D fine_lcloud =
         make_native_surface_dofs_3d(lprism, 3.0 / 32.0);
@@ -428,6 +442,38 @@ void test_parameter_candidates()
             lprism, fine_lcloud, fine_lcenter, 48);
     require(contains_non_source_patch(fine_l_cauchy, fine_lcloud, 7),
             "fine-grid L Cauchy selector crosses a non-G1 neighbor");
+    const std::vector<int> balanced = balanced_topological_cauchy_dofs(
+        lprism, fine_lcloud, fine_lcenter, 48);
+    require(balanced.size() == 48,
+            "balanced Cauchy selector retains the requested count");
+    require(std::find(balanced.begin(), balanced.end(), fine_lcenter)
+                != balanced.end(),
+            "balanced Cauchy selector retains its center");
+    std::set<int> control_patches;
+    for (int q : fine_l_cauchy) {
+        control_patches.insert(
+            fine_lcloud.dofs[static_cast<std::size_t>(q)].patch_id);
+    }
+    require(control_patches.size() > 1,
+            "fine-grid control stencil must activate multiple patches");
+    std::map<int, int> balanced_counts;
+    for (int q : balanced) {
+        const int patch =
+            fine_lcloud.dofs[static_cast<std::size_t>(q)].patch_id;
+        require(control_patches.count(patch) == 1,
+                "balanced Cauchy selector cannot activate a distant patch");
+        ++balanced_counts[patch];
+    }
+    require(balanced_counts.size() == control_patches.size(),
+            "balanced Cauchy selector retains every active patch");
+    int balanced_min = 48;
+    int balanced_max = 0;
+    for (const auto& item : balanced_counts) {
+        balanced_min = std::min(balanced_min, item.second);
+        balanced_max = std::max(balanced_max, item.second);
+    }
+    require(balanced_max - balanced_min <= 1,
+            "balanced Cauchy patch counts differ by at most one");
 
     const SurfaceDofCloud3D coarse_cylinder_cloud =
         make_native_surface_dofs_3d(cylinder, 3.0 / 16.0);

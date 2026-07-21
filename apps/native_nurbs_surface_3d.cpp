@@ -754,6 +754,109 @@ std::array<int, 2> bracketing_center_indices(double parameter,
     return {{lower, lower + 1}};
 }
 
+using DistanceDofPair = std::pair<double, int>;
+
+bool distance_dof_less(const DistanceDofPair& a,
+                       const DistanceDofPair& b)
+{
+    if (a.first != b.first)
+        return a.first < b.first;
+    return a.second < b.second;
+}
+
+struct TopologicalCauchyCandidates {
+    int center_patch = -1;
+    std::vector<DistanceDofPair> sorted;
+};
+
+TopologicalCauchyCandidates build_topological_cauchy_candidates(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud3D& cloud,
+    int center_dof,
+    int count)
+{
+    if (center_dof < 0
+        || center_dof >= static_cast<int>(cloud.dofs.size())) {
+        throw std::out_of_range("Cauchy center DOF is outside the surface cloud");
+    }
+    if (count <= 0)
+        throw std::invalid_argument("Cauchy sample count must be positive");
+    if (surface.patches.size() != cloud.patches.size()
+        || surface.topological_patch_neighbors.size()
+               != surface.patches.size()) {
+        throw std::invalid_argument(
+            "Cauchy selection requires complete patch topology");
+    }
+
+    TopologicalCauchyCandidates result;
+    result.center_patch =
+        cloud.dofs[static_cast<std::size_t>(center_dof)].patch_id;
+    if (result.center_patch < 0
+        || result.center_patch >= static_cast<int>(cloud.patches.size())) {
+        throw std::runtime_error("Cauchy center DOF has invalid patch ownership");
+    }
+
+    std::vector<bool> visited(surface.patches.size(), false);
+    visited[static_cast<std::size_t>(result.center_patch)] = true;
+    std::vector<int> included{result.center_patch};
+    std::vector<int> frontier{result.center_patch};
+    int candidate_count = cloud.patches[
+        static_cast<std::size_t>(result.center_patch)].dof_count();
+
+    bool expanded_one_ring = false;
+    while ((!expanded_one_ring || candidate_count < count)
+           && !frontier.empty()) {
+        std::vector<int> next;
+        for (int patch : frontier) {
+            for (int neighbor : surface.topological_patch_neighbors[
+                     static_cast<std::size_t>(patch)]) {
+                if (neighbor < 0
+                    || neighbor >= static_cast<int>(surface.patches.size())) {
+                    throw std::runtime_error(
+                        "Cauchy topology contains an invalid patch");
+                }
+                if (!visited[static_cast<std::size_t>(neighbor)]) {
+                    visited[static_cast<std::size_t>(neighbor)] = true;
+                    next.push_back(neighbor);
+                }
+            }
+        }
+        std::sort(next.begin(), next.end());
+        for (int patch : next) {
+            included.push_back(patch);
+            candidate_count += cloud.patches[
+                static_cast<std::size_t>(patch)].dof_count();
+        }
+        frontier = std::move(next);
+        expanded_one_ring = true;
+    }
+    if (candidate_count < count) {
+        throw std::runtime_error(
+            "topological Cauchy neighborhood has too few surface DOFs");
+    }
+
+    const Eigen::Vector3d& center_point =
+        cloud.dofs[static_cast<std::size_t>(center_dof)].point;
+    result.sorted.reserve(static_cast<std::size_t>(candidate_count));
+    for (int patch : included) {
+        const SurfaceDofPatch3D& tensor =
+            cloud.patches[static_cast<std::size_t>(patch)];
+        for (int local = 0; local < tensor.dof_count(); ++local) {
+            const int q = tensor.first_dof + local;
+            if (q < 0 || q >= static_cast<int>(cloud.dofs.size())) {
+                throw std::runtime_error(
+                    "Cauchy patch has invalid contiguous DOF range");
+            }
+            result.sorted.emplace_back(
+                (cloud.dofs[static_cast<std::size_t>(q)].point - center_point)
+                    .squaredNorm(),
+                q);
+        }
+    }
+    std::sort(result.sorted.begin(), result.sorted.end(), distance_dof_less);
+    return result;
+}
+
 } // namespace
 
 std::array<int, 4> parameter_dof_candidates_2x2(
@@ -816,98 +919,127 @@ std::vector<int> nearest_topological_cauchy_dofs(
     int center_dof,
     int count)
 {
+    const TopologicalCauchyCandidates candidates =
+        build_topological_cauchy_candidates(surface, cloud, center_dof, count);
+
+    std::vector<int> result;
+    result.reserve(static_cast<std::size_t>(count));
+    for (int k = 0; k < count; ++k)
+        result.push_back(candidates.sorted[static_cast<std::size_t>(k)].second);
+    if (std::find(result.begin(), result.end(), center_dof) == result.end()) {
+        throw std::runtime_error(
+            "topological Cauchy selection lost its center DOF");
+    }
+    return result;
+}
+
+std::vector<int> nearest_same_patch_cauchy_dofs(
+    const SurfaceDofCloud3D& cloud,
+    int center_dof,
+    int count)
+{
     if (center_dof < 0
         || center_dof >= static_cast<int>(cloud.dofs.size())) {
         throw std::out_of_range("Cauchy center DOF is outside the surface cloud");
     }
     if (count <= 0)
         throw std::invalid_argument("Cauchy sample count must be positive");
-    if (surface.patches.size() != cloud.patches.size()
-        || surface.topological_patch_neighbors.size()
-               != surface.patches.size()) {
-        throw std::invalid_argument(
-            "Cauchy selection requires complete patch topology");
-    }
-
-    const int center_patch =
+    const int patch_id =
         cloud.dofs[static_cast<std::size_t>(center_dof)].patch_id;
-    if (center_patch < 0
-        || center_patch >= static_cast<int>(cloud.patches.size())) {
+    if (patch_id < 0
+        || patch_id >= static_cast<int>(cloud.patches.size())) {
         throw std::runtime_error("Cauchy center DOF has invalid patch ownership");
     }
+    const SurfaceDofPatch3D& patch =
+        cloud.patches[static_cast<std::size_t>(patch_id)];
+    if (patch.dof_count() <= 0)
+        throw std::runtime_error("same-patch Cauchy neighborhood is empty");
 
-    std::vector<bool> visited(surface.patches.size(), false);
-    visited[static_cast<std::size_t>(center_patch)] = true;
-    std::vector<int> included{center_patch};
-    std::vector<int> frontier{center_patch};
-    int candidate_count = cloud.patches[
-        static_cast<std::size_t>(center_patch)].dof_count();
-
-    bool expanded_one_ring = false;
-    while ((!expanded_one_ring || candidate_count < count)
-           && !frontier.empty()) {
-        std::vector<int> next;
-        for (int patch : frontier) {
-            for (int neighbor : surface.topological_patch_neighbors[
-                     static_cast<std::size_t>(patch)]) {
-                if (neighbor < 0
-                    || neighbor >= static_cast<int>(surface.patches.size())) {
-                    throw std::runtime_error(
-                        "Cauchy topology contains an invalid patch");
-                }
-                if (!visited[static_cast<std::size_t>(neighbor)]) {
-                    visited[static_cast<std::size_t>(neighbor)] = true;
-                    next.push_back(neighbor);
-                }
-            }
+    const Eigen::Vector3d& center_point =
+        cloud.dofs[static_cast<std::size_t>(center_dof)].point;
+    std::vector<DistanceDofPair> candidates;
+    candidates.reserve(static_cast<std::size_t>(patch.dof_count()));
+    for (int local = 0; local < patch.dof_count(); ++local) {
+        const int q = patch.first_dof + local;
+        if (q < 0 || q >= static_cast<int>(cloud.dofs.size())) {
+            throw std::runtime_error(
+                "same-patch Cauchy neighborhood has an invalid DOF range");
         }
-        std::sort(next.begin(), next.end());
-        for (int patch : next) {
-            included.push_back(patch);
-            candidate_count += cloud.patches[
-                static_cast<std::size_t>(patch)].dof_count();
-        }
-        frontier = std::move(next);
-        expanded_one_ring = true;
+        candidates.emplace_back(
+            (cloud.dofs[static_cast<std::size_t>(q)].point - center_point)
+                .squaredNorm(),
+            q);
     }
-    if (candidate_count < count) {
-        throw std::runtime_error(
-            "topological Cauchy neighborhood has too few surface DOFs");
+    std::sort(candidates.begin(), candidates.end(), distance_dof_less);
+    const int selected = std::min(count, static_cast<int>(candidates.size()));
+    std::vector<int> result;
+    result.reserve(static_cast<std::size_t>(selected));
+    for (int k = 0; k < selected; ++k)
+        result.push_back(candidates[static_cast<std::size_t>(k)].second);
+    if (std::find(result.begin(), result.end(), center_dof) == result.end())
+        throw std::runtime_error("same-patch Cauchy selection lost its center DOF");
+    return result;
+}
+
+std::vector<int> balanced_topological_cauchy_dofs(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud3D& cloud,
+    int center_dof,
+    int count)
+{
+    const TopologicalCauchyCandidates candidates =
+        build_topological_cauchy_candidates(surface, cloud, center_dof, count);
+    std::set<int> active_patch_set;
+    for (int k = 0; k < count; ++k) {
+        const int q = candidates.sorted[static_cast<std::size_t>(k)].second;
+        active_patch_set.insert(
+            cloud.dofs[static_cast<std::size_t>(q)].patch_id);
+    }
+    std::vector<int> active_patches(
+        active_patch_set.begin(), active_patch_set.end());
+    std::vector<std::vector<int>> groups(active_patches.size());
+    for (const DistanceDofPair& candidate : candidates.sorted) {
+        const int patch =
+            cloud.dofs[static_cast<std::size_t>(candidate.second)].patch_id;
+        const auto found = std::lower_bound(
+            active_patches.begin(), active_patches.end(), patch);
+        if (found != active_patches.end() && *found == patch) {
+            groups[static_cast<std::size_t>(found - active_patches.begin())]
+                .push_back(candidate.second);
+        }
+    }
+
+    std::vector<std::size_t> cursors(groups.size(), 0);
+    std::vector<int> result;
+    result.reserve(static_cast<std::size_t>(count));
+    while (static_cast<int>(result.size()) < count) {
+        bool progressed = false;
+        for (std::size_t group = 0;
+             group < groups.size() && static_cast<int>(result.size()) < count;
+             ++group) {
+            if (cursors[group] >= groups[group].size())
+                continue;
+            result.push_back(groups[group][cursors[group]++]);
+            progressed = true;
+        }
+        if (!progressed) {
+            throw std::runtime_error(
+                "balanced Cauchy neighborhood cannot fill the requested count");
+        }
     }
 
     const Eigen::Vector3d& center_point =
         cloud.dofs[static_cast<std::size_t>(center_dof)].point;
-    std::vector<std::pair<double, int>> candidates;
-    candidates.reserve(static_cast<std::size_t>(candidate_count));
-    for (int patch : included) {
-        const SurfaceDofPatch3D& tensor =
-            cloud.patches[static_cast<std::size_t>(patch)];
-        for (int local = 0; local < tensor.dof_count(); ++local) {
-            const int q = tensor.first_dof + local;
-            if (q < 0 || q >= static_cast<int>(cloud.dofs.size())) {
-                throw std::runtime_error(
-                    "Cauchy patch has invalid contiguous DOF range");
-            }
-            const double distance_sq =
-                (cloud.dofs[static_cast<std::size_t>(q)].point - center_point)
-                .squaredNorm();
-            candidates.emplace_back(distance_sq, q);
-        }
-    }
-    std::sort(candidates.begin(), candidates.end(),
-              [](const auto& a, const auto& b) {
-                  if (a.first != b.first)
-                      return a.first < b.first;
-                  return a.second < b.second;
-              });
-
-    std::vector<int> result;
-    result.reserve(static_cast<std::size_t>(count));
-    for (int k = 0; k < count; ++k)
-        result.push_back(candidates[static_cast<std::size_t>(k)].second);
+    std::sort(result.begin(), result.end(), [&](int a, int b) {
+        return distance_dof_less(
+            {(cloud.dofs[static_cast<std::size_t>(a)].point - center_point)
+                 .squaredNorm(), a},
+            {(cloud.dofs[static_cast<std::size_t>(b)].point - center_point)
+                 .squaredNorm(), b});
+    });
     if (std::find(result.begin(), result.end(), center_dof) == result.end()) {
         throw std::runtime_error(
-            "topological Cauchy selection lost its center DOF");
+            "balanced Cauchy selection lost its center DOF");
     }
     return result;
 }
