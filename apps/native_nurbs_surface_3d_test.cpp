@@ -275,7 +275,8 @@ void check_bezier_element_samples(
                 + (element.v1() - element.v0()) * iv / 4.0;
             const Eigen::Vector3d exact = patch.evaluate(u, v);
             require((element.evaluate(u, v) - exact).norm() < 2.0e-12,
-                    context + " Bezier extraction preserves NURBS evaluation");
+                    context + " Bezier extraction preserves NURBS evaluation at ("
+                        + std::to_string(iu) + ", " + std::to_string(iv) + ")");
             require(element.bounds().contains(exact, 2.0e-12),
                     context + " Bezier control hull conservatively bounds surface");
         }
@@ -369,6 +370,51 @@ void test_benchmark_rational_bezier_elements_are_conservative()
     }
 }
 
+void test_degree_zero_multispan_bezier_extraction()
+{
+    using kfbim::geometry::NurbsBasis1D;
+    using kfbim::geometry3d::NurbsSurfacePatch3D;
+    const NurbsSurfacePatch3D patch(
+        NurbsBasis1D(0, {0.0, 0.5, 1.0}),
+        NurbsBasis1D(0, {0.0, 1.0}),
+        {{{0.0, 0.0, 0.0}},
+         {{2.0, 0.0, 0.0}}},
+        {{1.0}, {1.0}});
+    const kfbim::geometry3d::NurbsSurfaceModel3D model({patch}, {0}, {});
+    const auto elements =
+        kfbim::geometry3d::extract_rational_bezier_elements_3d(model);
+    require(elements.size() == 2,
+            "degree-zero U spans produce two Bezier elements");
+    require((elements[0].evaluate(0.25, 0.5) - patch.evaluate(0.25, 0.5)).norm()
+                < 2.0e-12,
+            "first degree-zero Bezier span preserves NURBS evaluation");
+    require((elements[1].evaluate(0.75, 0.5) - patch.evaluate(0.75, 0.5)).norm()
+                < 2.0e-12,
+            "second degree-zero Bezier span preserves NURBS evaluation");
+}
+
+void test_discontinuous_multispan_bezier_extraction_is_rejected()
+{
+    using kfbim::geometry::NurbsBasis1D;
+    using kfbim::geometry3d::NurbsSurfacePatch3D;
+    const NurbsSurfacePatch3D patch(
+        NurbsBasis1D(1, {0.0, 0.0, 0.5, 0.5, 1.0, 1.0}),
+        NurbsBasis1D(1, {0.0, 0.0, 1.0, 1.0}),
+        {{{0.0, 0.0, 0.0}, {0.0, 1.0, 0.0}},
+         {{1.0, 0.0, 0.0}, {1.0, 1.0, 0.0}},
+         {{3.0, 0.0, 0.0}, {3.0, 1.0, 0.0}},
+         {{4.0, 0.0, 0.0}, {4.0, 1.0, 0.0}}},
+        {{1.0, 1.0}, {1.0, 1.0}, {1.0, 1.0}, {1.0, 1.0}});
+    const kfbim::geometry3d::NurbsSurfaceModel3D model({patch}, {0}, {});
+    require_throws_contains(
+        [&] {
+            (void)kfbim::geometry3d::
+                extract_rational_bezier_elements_3d(model);
+        },
+        "interior knot multiplicity exceeds degree",
+        "fully discontinuous interior break is rejected");
+}
+
 void test_nonclamped_rational_bezier_extraction()
 {
     using kfbim::geometry::NurbsBasis1D;
@@ -387,6 +433,33 @@ void test_nonclamped_rational_bezier_extraction()
             "non-clamped active domain produces one Bezier element");
     check_bezier_element_samples(
         elements.front(), patch, "non-clamped element");
+
+    const NurbsSurfacePatch3D cubic_patch(
+        NurbsBasis1D(3, {0, 1, 2, 3, 4, 4, 5, 6}),
+        NurbsBasis1D(1, {0, 0, 1, 1}),
+        {{{0.0, 0.0, 0.0}, {0.0, 1.0, 0.0}},
+         {{1.0, 0.0, 0.0}, {1.0, 1.0, 0.0}},
+         {{2.0, 0.0, 0.0}, {2.0, 1.0, 0.0}},
+         {{3.0, 0.0, 0.0}, {3.0, 1.0, 0.0}}},
+        {{1.0, 1.0}, {1.0, 1.0}, {1.0, 1.0}, {1.0, 1.0}});
+    const kfbim::geometry3d::NurbsSurfaceModel3D cubic_model(
+        {cubic_patch}, {0}, {});
+    const auto cubic_elements =
+        kfbim::geometry3d::extract_rational_bezier_elements_3d(cubic_model);
+    require(cubic_elements.size() == 1,
+            "non-clamped cubic active domain produces one Bezier element");
+    const std::array<double, 4> expected_cubic_x{
+        13.0 / 12.0, 1.5, 2.0, 2.5};
+    for (int i = 0; i < 4; ++i) {
+        const Eigen::Vector4d& control = cubic_elements.front().control(i, 0);
+        require(std::abs(control.x() / control.w()
+                         - expected_cubic_x[static_cast<std::size_t>(i)])
+                    < 2.0e-12,
+                "non-clamped cubic extraction has exact control "
+                    + std::to_string(i));
+    }
+    check_bezier_element_samples(
+        cubic_elements.front(), cubic_patch, "non-clamped cubic element");
 }
 
 void test_bezier_subdivision_rejects_collapsed_midpoint()
@@ -836,6 +909,8 @@ int main()
         test_rational_bezier_extraction_and_subdivision();
         test_benchmark_rational_bezier_elements_are_conservative();
         test_nonclamped_rational_bezier_extraction();
+        test_degree_zero_multispan_bezier_extraction();
+        test_discontinuous_multispan_bezier_extraction_is_rejected();
         test_bezier_subdivision_rejects_collapsed_midpoint();
         test_uniform_native_dofs();
         test_parameter_candidates();
