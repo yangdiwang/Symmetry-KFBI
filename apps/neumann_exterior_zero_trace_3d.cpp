@@ -195,6 +195,25 @@ struct ReadinessResult {
     int exact_crossings = 0;
     int gap_crossings = 0;
     int endpoint_crossings = 0;
+    int nurbs_patches = 0;
+    int bezier_elements = 0;
+    int acceleration_leaves = 0;
+    std::size_t candidate_grid_edges = 0;
+    int triangle_seed_hits = 0;
+    int triangle_seed_misses_recovered = 0;
+    int subdivision_boxes = 0;
+    int newton_attempts = 0;
+    int newton_iterations = 0;
+    int seam_deduplications = 0;
+    std::size_t barrier_x = 0;
+    std::size_t barrier_y = 0;
+    std::size_t barrier_z = 0;
+    int grid_components = 0;
+    int box_exterior_components = 0;
+    int representative_queries = 0;
+    double nurbs_geometry_tolerance = 0.0;
+    double nurbs_root_residual_max = 0.0;
+    int triangle_fallback_crossings = 0;
     int correction_nodes = 0;
     double correction_area = 0.0;
     double crossing_area = 0.0;
@@ -1869,6 +1888,36 @@ ReadinessResult run_readiness_case(GeometryKind kind,
                          geometry.correction_interface,
                          geometry.crossing_interface,
                          domain);
+    const geometry3d::NurbsCartesianDomainDiagnostics3D&
+        native_diagnostics = grid_pair.nurbs_domain_diagnostics();
+    result.nurbs_patches = native_diagnostics.nurbs_patch_count;
+    result.bezier_elements = native_diagnostics.bezier_element_count;
+    result.acceleration_leaves = native_diagnostics.acceleration_leaf_count;
+    result.candidate_grid_edges =
+        native_diagnostics.candidate_grid_edge_count;
+    result.triangle_seed_hits =
+        native_diagnostics.intersections.triangle_seed_hits;
+    result.triangle_seed_misses_recovered =
+        native_diagnostics.intersections.triangle_seed_misses_recovered;
+    result.subdivision_boxes =
+        native_diagnostics.intersections.subdivision_boxes;
+    result.newton_attempts =
+        native_diagnostics.intersections.newton_attempts;
+    result.newton_iterations =
+        native_diagnostics.intersections.newton_iterations;
+    result.seam_deduplications =
+        native_diagnostics.intersections.seam_deduplications;
+    result.barrier_x = native_diagnostics.barrier_edge_counts[0];
+    result.barrier_y = native_diagnostics.barrier_edge_counts[1];
+    result.barrier_z = native_diagnostics.barrier_edge_counts[2];
+    result.grid_components = native_diagnostics.grid_component_count;
+    result.box_exterior_components =
+        native_diagnostics.box_exterior_component_count;
+    result.representative_queries =
+        native_diagnostics.representative_query_count;
+    result.nurbs_geometry_tolerance = domain->geometry_tolerance();
+    result.nurbs_root_residual_max =
+        native_diagnostics.maximum_root_residual;
     for (int n = 0; n < grid.num_dofs(); ++n) {
         const bool numerical_inside = grid_pair.domain_label(n) > 0;
         const auto coordinate = grid.coord(n);
@@ -1906,6 +1955,7 @@ ReadinessResult run_readiness_case(GeometryKind kind,
     }
 
     std::set<std::pair<int, int>> crossing_edges;
+    bool all_native_owners_exact = true;
     for (const LaplaceCrossingCorrectionOp& op : support.crossing_ops) {
         const std::pair<int, int> edge{
             std::min(op.rhs_node, op.correction_node),
@@ -1914,20 +1964,33 @@ ReadinessResult run_readiness_case(GeometryKind kind,
             continue;
         const P2CrossingOwner3D owner =
             grid_pair.p2_crossing_owner_between(edge.first, edge.second);
-        if (owner.status != P2CrossingOwnerStatus3D::ExactIntersection
-            || owner.nurbs_patch_index < 0
-            || !owner.nurbs_parameter.allFinite()
-            || !owner.crossing_point.allFinite()) {
-            throw std::runtime_error(
-                "native readiness crossing owner is not exact");
-        }
         if (owner.status == P2CrossingOwnerStatus3D::ExactIntersection)
             ++result.exact_crossings;
         else if (owner.status == P2CrossingOwnerStatus3D::GapFallback)
             ++result.gap_crossings;
         else
             ++result.endpoint_crossings;
+
+        // surface_dof_for_crossing uses legacy triangle/barycentric ownership
+        // exactly when the owner has no native NURBS patch.
+        if (owner.nurbs_patch_index < 0)
+            ++result.triangle_fallback_crossings;
+        if (owner.status != P2CrossingOwnerStatus3D::ExactIntersection
+            || owner.nurbs_patch_index < 0
+            || !owner.nurbs_parameter.allFinite()
+            || !owner.crossing_point.allFinite()) {
+            all_native_owners_exact = false;
+        }
     }
+    if (result.gap_crossings != 0)
+        throw std::runtime_error(
+            "native readiness crossing owner used gap fallback");
+    if (result.triangle_fallback_crossings != 0)
+        throw std::runtime_error(
+            "native readiness crossing owner used legacy triangle/barycentric fallback");
+    if (!all_native_owners_exact)
+        throw std::runtime_error(
+            "native readiness crossing owner is not exact");
 
     LaplaceQuadraticPatchCenterSpread3D spread(grid_pair, 0.0);
     LaplaceFftBulkSolverZfft3D bulk(
@@ -2013,6 +2076,15 @@ ReadinessResult run_readiness_case(GeometryKind kind,
         grid, grid_pair, harmonic_pipeline);
 
     std::cout << "[ready] " << geometry.name << " - " << geometry.description << '\n'
+              << "domain_label_mode=nurbs_barrier_components barriers="
+              << result.barrier_x << '/' << result.barrier_y << '/'
+              << result.barrier_z << " components=" << result.grid_components
+              << '/' << result.box_exterior_components
+              << " queries=" << result.representative_queries
+              << " root_residual=" << result.nurbs_root_residual_max
+              << " gap_crossings=" << result.gap_crossings
+              << " triangle_fallback_crossings="
+              << result.triangle_fallback_crossings << '\n'
               << "  panel-center surface patches/dofs="
               << result.surface_patches << '/' << result.surface_dofs
               << " area=" << result.surface_dof_area
@@ -2140,7 +2212,14 @@ void write_summary(const std::filesystem::path& output_dir,
                "cauchy_radius_mean_over_h,cauchy_incident_patches_min,"
                "cauchy_incident_patches_max,cauchy_value_patch_imbalance_max,"
                "cauchy_derivative_patch_imbalance_max,cauchy_condition_median,"
-               "cauchy_condition_p95,cauchy_condition_max\n";
+               "cauchy_condition_p95,cauchy_condition_max,nurbs_patches,"
+               "bezier_elements,acceleration_leaves,candidate_grid_edges,"
+               "triangle_seed_hits,triangle_seed_misses_recovered,subdivision_boxes,"
+               "newton_attempts,newton_iterations,seam_deduplications,"
+               "barrier_x,barrier_y,barrier_z,grid_components,"
+               "box_exterior_components,representative_queries,"
+               "nurbs_geometry_tolerance,nurbs_root_residual_max,"
+               "triangle_fallback_crossings\n";
         for (const ReadinessResult& row : rows)
             csv << row.geometry << ',' << row.cauchy_policy << ','
                 << row.N << ',' << row.h << ','
@@ -2181,7 +2260,21 @@ void write_summary(const std::filesystem::path& output_dir,
                 << row.cauchy_derivative_patch_imbalance_max << ','
                 << row.cauchy_condition_median << ','
                 << row.cauchy_condition_p95 << ','
-                << row.cauchy_condition_max << '\n';
+                << row.cauchy_condition_max << ','
+                << row.nurbs_patches << ',' << row.bezier_elements << ','
+                << row.acceleration_leaves << ','
+                << row.candidate_grid_edges << ','
+                << row.triangle_seed_hits << ','
+                << row.triangle_seed_misses_recovered << ','
+                << row.subdivision_boxes << ',' << row.newton_attempts << ','
+                << row.newton_iterations << ',' << row.seam_deduplications << ','
+                << row.barrier_x << ',' << row.barrier_y << ','
+                << row.barrier_z << ',' << row.grid_components << ','
+                << row.box_exterior_components << ','
+                << row.representative_queries << ','
+                << row.nurbs_geometry_tolerance << ','
+                << row.nurbs_root_residual_max << ','
+                << row.triangle_fallback_crossings << '\n';
     };
     write_csv(output_dir / "geometry_readiness.csv", results);
     std::set<int> levels;
