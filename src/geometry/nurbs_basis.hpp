@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <initializer_list>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -19,8 +20,40 @@ public:
         , knots_(std::move(knots))
         , tolerance_(tolerance)
     {
-        validate();
+        validate_scalar_options();
+        const auto encoding = encode_expanded_knots();
+        (void)validate_knot_encoding(encoding.first, encoding.second);
+        validate_expanded_size_and_domain();
     }
+
+    NurbsBasis1D(int degree,
+                 std::vector<double> unique_knots,
+                 std::vector<int> multiplicities,
+                 double tolerance = kNurbsBasisTolerance)
+        : degree_(degree)
+        , tolerance_(tolerance)
+    {
+        validate_scalar_options();
+        const std::size_t expanded_size =
+            validate_knot_encoding(unique_knots, multiplicities);
+        knots_.reserve(expanded_size);
+        for (std::size_t i = 0; i < unique_knots.size(); ++i) {
+            knots_.insert(knots_.end(),
+                          static_cast<std::size_t>(multiplicities[i]),
+                          unique_knots[i]);
+        }
+        validate_expanded_size_and_domain();
+    }
+
+    NurbsBasis1D(int degree,
+                 std::initializer_list<double> unique_knots,
+                 std::initializer_list<int> multiplicities,
+                 double tolerance = kNurbsBasisTolerance)
+        : NurbsBasis1D(degree,
+                       std::vector<double>(unique_knots),
+                       std::vector<int>(multiplicities),
+                       tolerance)
+    {}
 
     [[nodiscard]] int degree() const noexcept { return degree_; }
 
@@ -240,24 +273,100 @@ private:
     std::vector<double> knots_;
     double tolerance_;
 
-    void validate() const
+    void validate_scalar_options() const
     {
         if (degree_ < 0)
             throw std::invalid_argument("NURBS basis degree must be nonnegative");
         if (!std::isfinite(tolerance_) || tolerance_ <= 0.0)
             throw std::invalid_argument(
                 "NURBS basis tolerance must be positive and finite");
-        if (knots_.size() < static_cast<std::size_t>(2 * degree_ + 2))
-            throw std::invalid_argument(
-                "knot vector is too small for the requested degree");
+    }
 
-        for (std::size_t i = 0; i < knots_.size(); ++i) {
-            if (!std::isfinite(knots_[i]))
+    [[nodiscard]] std::pair<std::vector<double>, std::vector<int>>
+    encode_expanded_knots() const
+    {
+        std::vector<double> unique_knots;
+        std::vector<int> multiplicities;
+        for (double knot : knots_) {
+            if (!std::isfinite(knot))
                 throw std::invalid_argument("knot vector entries must be finite");
-            if (i > 0 && knots_[i] + tolerance_ < knots_[i - 1])
-                throw std::invalid_argument("knot vector must be nondecreasing");
+            if (unique_knots.empty() || knot > unique_knots.back()) {
+                unique_knots.push_back(knot);
+                multiplicities.push_back(1);
+            } else if (knot == unique_knots.back()) {
+                ++multiplicities.back();
+            } else {
+                throw std::invalid_argument(
+                    "knot vector must be nondecreasing");
+            }
+        }
+        return {std::move(unique_knots), std::move(multiplicities)};
+    }
+
+    [[nodiscard]] std::size_t validate_knot_encoding(
+        const std::vector<double>& unique_knots,
+        const std::vector<int>& multiplicities) const
+    {
+        if (unique_knots.size() != multiplicities.size()) {
+            throw std::invalid_argument(
+                "unique knots and multiplicities must have the same size");
+        }
+        if (unique_knots.size() < 2) {
+            throw std::invalid_argument(
+                "a NURBS basis needs at least two unique knot values");
         }
 
+        std::size_t expanded_size = 0;
+        const std::size_t endpoint_limit =
+            static_cast<std::size_t>(degree_) + 1;
+        const std::size_t interior_limit =
+            static_cast<std::size_t>(degree_);
+        for (std::size_t i = 0; i < unique_knots.size(); ++i) {
+            if (!std::isfinite(unique_knots[i])) {
+                throw std::invalid_argument(
+                    "unique knot values must be finite");
+            }
+            if (i > 0 && !(unique_knots[i] > unique_knots[i - 1])) {
+                throw std::invalid_argument(
+                    "unique knot values must be strictly increasing");
+            }
+            if (multiplicities[i] <= 0) {
+                throw std::invalid_argument(
+                    "knot multiplicities must be positive");
+            }
+
+            const bool endpoint =
+                i == 0 || i + 1 == unique_knots.size();
+            const std::size_t multiplicity =
+                static_cast<std::size_t>(multiplicities[i]);
+            if (endpoint && multiplicity > endpoint_limit) {
+                throw std::invalid_argument(
+                    "NURBS basis endpoint knot multiplicity must not exceed "
+                    "degree plus one");
+            }
+            if (!endpoint && multiplicity > interior_limit) {
+                throw std::invalid_argument(
+                    "NURBS basis interior knot multiplicity must not exceed "
+                    "degree; split into separate patches");
+            }
+            if (multiplicity > knots_.max_size() - expanded_size) {
+                throw std::invalid_argument(
+                    "expanded knot vector is too large");
+            }
+            expanded_size += multiplicity;
+        }
+        return expanded_size;
+    }
+
+    void validate_expanded_size_and_domain() const
+    {
+        const std::size_t degree_plus_one =
+            static_cast<std::size_t>(degree_) + 1;
+        if (degree_plus_one > knots_.max_size() / 2
+            || knots_.size() < 2 * degree_plus_one) {
+            throw std::invalid_argument(
+                "knot vector is too small for the requested degree");
+        }
         if (domain_end() <= domain_start() + tolerance_)
             throw std::invalid_argument(
                 "NURBS basis parameter domain must have positive length");

@@ -143,10 +143,6 @@ void insert_knot_u_once(HomogeneousNet& net,
     const int span = static_cast<int>(
         std::distance(knots.begin(), std::upper_bound(knots.begin(), knots.end(), knot))) - 1;
     const int multiplicity = static_cast<int>(std::count(knots.begin(), knots.end(), knot));
-    if (multiplicity > degree) {
-        throw std::invalid_argument(
-            "Bezier extraction knot insertion exceeds its supported multiplicity");
-    }
     const int unchanged_prefix_end = span - degree;
     const int shifted_suffix_begin = span - multiplicity;
     if (unchanged_prefix_end < 0
@@ -221,13 +217,6 @@ void refine_active_knots_u(HomogeneousNet& net,
     for (const double knot : active_knots) {
         const int multiplicity =
             static_cast<int>(std::count(knots.begin(), knots.end(), knot));
-        if (knot > domain_start && knot < domain_end
-            && multiplicity > degree) {
-            throw std::invalid_argument(
-                "Bezier extraction interior knot multiplicity exceeds degree "
-                + std::to_string(degree) + " at knot "
-                + std::to_string(knot));
-        }
         const int target_multiplicity =
             (knot == domain_start || knot == domain_end) ? degree + 1 : degree;
         for (int insertion = multiplicity; insertion < target_multiplicity;

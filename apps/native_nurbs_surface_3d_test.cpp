@@ -352,6 +352,50 @@ void test_rational_bezier_extraction_and_subdivision()
         "extent subdivision reports its depth-48 failure");
 }
 
+void test_nurbs_basis_constructor_multiplicity_contract()
+{
+    using kfbim::geometry::NurbsBasis1D;
+
+    const NurbsBasis1D basis(
+        2, {0.0, 0.5, 1.0}, {3, 2, 3});
+    require(basis.knots()
+                == std::vector<double>({0.0, 0.0, 0.0, 0.5, 0.5,
+                                        1.0, 1.0, 1.0}),
+            "the maximum legal internal multiplicity p expands exactly");
+
+    require_throws_contains(
+        [] { (void)NurbsBasis1D(2, {0.0, 0.5, 1.0}, {3, 3, 3}); },
+        "interior knot multiplicity",
+        "unique-knot constructor rejects an internal p+1 break");
+    require_throws_contains(
+        [] {
+            (void)NurbsBasis1D(
+                2, {0.0, 0.0, 0.0, 0.5, 0.5, 0.5, 1.0, 1.0, 1.0});
+        },
+        "interior knot multiplicity",
+        "expanded-knot constructor cannot bypass the internal p+1 rule");
+    require_throws_contains(
+        [] { (void)NurbsBasis1D(2, {0.0, 1.0}, {3}); },
+        "same size",
+        "unique knots and multiplicities must have matching sizes");
+    require_throws_contains(
+        [] { (void)NurbsBasis1D(2, {0.0, 0.5, 1.0}, {4, 1, 3}); },
+        "endpoint knot multiplicity",
+        "endpoint multiplicity cannot exceed p+1");
+    require_throws_contains(
+        [] { (void)NurbsBasis1D(2, {0.0, 0.5, 1.0}, {3, 0, 3}); },
+        "positive",
+        "knot multiplicities must be positive");
+    require_throws_contains(
+        [] { (void)NurbsBasis1D(2, {0.0, 0.75, 0.5}, {3, 1, 3}); },
+        "strictly increasing",
+        "unique knot values must be ordered strictly increasingly");
+    require_throws_contains(
+        [] { (void)NurbsBasis1D(0, {0.0, 0.5, 1.0}, {1, 1, 1}); },
+        "split into separate patches",
+        "degree-zero multispan geometry must be split into patches");
+}
+
 void test_benchmark_rational_bezier_elements_are_conservative()
 {
     for (GeometryKind3D kind : {GeometryKind3D::Torus,
@@ -416,51 +460,6 @@ void test_rational_bezier_element_intersection()
     require(miss.roots.empty() && miss.diagnostics.newton_attempts == 0
                 && miss.diagnostics.conservative_rejections > 0,
             "control hull rejects an impossible line before Newton");
-}
-
-void test_degree_zero_multispan_bezier_extraction()
-{
-    using kfbim::geometry::NurbsBasis1D;
-    using kfbim::geometry3d::NurbsSurfacePatch3D;
-    const NurbsSurfacePatch3D patch(
-        NurbsBasis1D(0, {0.0, 0.5, 1.0}),
-        NurbsBasis1D(0, {0.0, 1.0}),
-        {{{0.0, 0.0, 0.0}},
-         {{2.0, 0.0, 0.0}}},
-        {{1.0}, {1.0}});
-    const kfbim::geometry3d::NurbsSurfaceModel3D model({patch}, {0}, {});
-    const auto elements =
-        kfbim::geometry3d::extract_rational_bezier_elements_3d(model);
-    require(elements.size() == 2,
-            "degree-zero U spans produce two Bezier elements");
-    require((elements[0].evaluate(0.25, 0.5) - patch.evaluate(0.25, 0.5)).norm()
-                < 2.0e-12,
-            "first degree-zero Bezier span preserves NURBS evaluation");
-    require((elements[1].evaluate(0.75, 0.5) - patch.evaluate(0.75, 0.5)).norm()
-                < 2.0e-12,
-            "second degree-zero Bezier span preserves NURBS evaluation");
-}
-
-void test_discontinuous_multispan_bezier_extraction_is_rejected()
-{
-    using kfbim::geometry::NurbsBasis1D;
-    using kfbim::geometry3d::NurbsSurfacePatch3D;
-    const NurbsSurfacePatch3D patch(
-        NurbsBasis1D(1, {0.0, 0.0, 0.5, 0.5, 1.0, 1.0}),
-        NurbsBasis1D(1, {0.0, 0.0, 1.0, 1.0}),
-        {{{0.0, 0.0, 0.0}, {0.0, 1.0, 0.0}},
-         {{1.0, 0.0, 0.0}, {1.0, 1.0, 0.0}},
-         {{3.0, 0.0, 0.0}, {3.0, 1.0, 0.0}},
-         {{4.0, 0.0, 0.0}, {4.0, 1.0, 0.0}}},
-        {{1.0, 1.0}, {1.0, 1.0}, {1.0, 1.0}, {1.0, 1.0}});
-    const kfbim::geometry3d::NurbsSurfaceModel3D model({patch}, {0}, {});
-    require_throws_contains(
-        [&] {
-            (void)kfbim::geometry3d::
-                extract_rational_bezier_elements_3d(model);
-        },
-        "interior knot multiplicity exceeds degree",
-        "fully discontinuous interior break is rejected");
 }
 
 void test_nonclamped_rational_bezier_extraction()
@@ -1017,11 +1016,10 @@ int main()
         test_interval_topology_rejects_tiny_gap();
         test_interval_topology_rejects_tiny_overlap();
         test_rational_bezier_extraction_and_subdivision();
+        test_nurbs_basis_constructor_multiplicity_contract();
         test_benchmark_rational_bezier_elements_are_conservative();
         test_rational_bezier_element_intersection();
         test_nonclamped_rational_bezier_extraction();
-        test_degree_zero_multispan_bezier_extraction();
-        test_discontinuous_multispan_bezier_extraction_is_rejected();
         test_bezier_subdivision_rejects_collapsed_midpoint();
         test_bezier_split_preserves_large_finite_controls();
         test_bezier_rejects_extreme_degree_control_count();
