@@ -62,15 +62,17 @@ python -m pip install -r requirements.txt
 | `neumann_harmonic_jet_case_2d` | 原 P2 harmonic-jet 算例 | `build/apps/neumann_harmonic_jet_case_2d ellipse 24` |
 | `neumann_harmonic_jet_python_compatible_2d` | 新自由度与 restrict 格式比较，支持椭圆、花瓣和偏心圆 | `build/apps/neumann_harmonic_jet_python_compatible_2d circle 24` |
 | `dirichlet_harmonic_jet_python_compatible_2d` | 同一 spread/restrict 框架、并存一类/二类格式的 Dirichlet BVP | `build/apps/dirichlet_harmonic_jet_python_compatible_2d all 32 64 128 256 512` |
-| `neumann_exterior_zero_trace_3d` | 圆环、空心圆柱和 L 棱柱的三维外零迹 Neumann 几何与传递链就绪检查 | `build/apps/neumann_exterior_zero_trace_3d all 16` |
+| `neumann_exterior_zero_trace_3d` | 圆环、空心圆柱和 L 棱柱的三维 Neumann 一类/Dirichlet 法向二类收敛实验 | `build/apps/neumann_exterior_zero_trace_3d all 16 32 64` |
 
 在 Windows 上可执行文件名带 `.exe`。研究计算可省略末尾的 `24`，使用程序内置的
 多层网格；快速命令只用于检查完整运行链路。
 
-三维入口在参数面板中心建立曲面自由度，构造拓扑过滤的局部 Cauchy stencil，
-并检查固定 spread/restrict 路由和常数 jump 探针。当前 readiness 模式已经编译
-外迹为零的 GMRES 算法，但按阶段约定不执行最终数值迭代；运行输出写入
-`output/neumann_exterior_zero_trace_3d/`。
+三维入口在参数面板中心建立曲面自由度，使用同一套三次调和 Cauchy 多项式完成
+spread 和 restrict。restrict 采用 4×4×4 三次网格插值与法向三次联合拟合，并在
+恢复法向导数时除以 `h`。程序同时执行 Neumann 外侧值迹为零的一类格式，以及
+Dirichlet 外侧法向迹为零、以法向 jump 为未知量的二类格式；多层误差、GMRES
+残差和观测阶分别写入 `output/neumann_exterior_zero_trace_3d/` 下的
+`neumann_results.csv` 与 `dirichlet_normal_results.csv`。
 
 `neumann_harmonic_jet_python_compatible_2d` 的 `circle` 几何与
 `neumann_exterior_trace_circle_2d` 使用同一个圆：圆心 `(0.07, -0.04)`、半径
