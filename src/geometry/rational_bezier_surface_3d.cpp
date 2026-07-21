@@ -33,6 +33,11 @@ std::size_t expected_control_count(const RationalBezierElement3D& element)
 {
     if (element.degree_u < 0 || element.degree_v < 0)
         throw std::invalid_argument("Bezier element degree must be nonnegative");
+    if (element.degree_u == std::numeric_limits<int>::max()
+        || element.degree_v == std::numeric_limits<int>::max()) {
+        throw std::invalid_argument(
+            "Bezier element degree is too large for inclusive indexing");
+    }
     const std::size_t maximum = std::numeric_limits<std::size_t>::max();
     const auto checked_extent = [maximum](int degree) {
         if (static_cast<std::uintmax_t>(degree)
@@ -216,6 +221,13 @@ void refine_active_knots_u(HomogeneousNet& net,
     for (const double knot : active_knots) {
         const int multiplicity =
             static_cast<int>(std::count(knots.begin(), knots.end(), knot));
+        if (knot > domain_start && knot < domain_end
+            && multiplicity > degree) {
+            throw std::invalid_argument(
+                "Bezier extraction interior knot multiplicity exceeds degree "
+                + std::to_string(degree) + " at knot "
+                + std::to_string(knot));
+        }
         const int target_multiplicity =
             (knot == domain_start || knot == domain_end) ? degree + 1 : degree;
         for (int insertion = multiplicity; insertion < target_multiplicity;

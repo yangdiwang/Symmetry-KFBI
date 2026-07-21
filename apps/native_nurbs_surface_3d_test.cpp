@@ -394,7 +394,7 @@ void test_degree_zero_multispan_bezier_extraction()
             "second degree-zero Bezier span preserves NURBS evaluation");
 }
 
-void test_discontinuous_multispan_bezier_extraction()
+void test_discontinuous_multispan_bezier_extraction_is_rejected()
 {
     using kfbim::geometry::NurbsBasis1D;
     using kfbim::geometry3d::NurbsSurfacePatch3D;
@@ -407,22 +407,13 @@ void test_discontinuous_multispan_bezier_extraction()
          {{4.0, 0.0, 0.0}, {4.0, 1.0, 0.0}}},
         {{1.0, 1.0}, {1.0, 1.0}, {1.0, 1.0}, {1.0, 1.0}});
     const kfbim::geometry3d::NurbsSurfaceModel3D model({patch}, {0}, {});
-    const auto elements =
-        kfbim::geometry3d::extract_rational_bezier_elements_3d(model);
-    require(elements.size() == 2,
-            "fully discontinuous U break produces two Bezier elements");
-    for (const auto& element : elements) {
-        const double u = 0.5 * (element.u0() + element.u1());
-        for (int iv = 0; iv <= 4; ++iv) {
-            const double v = element.v0()
-                + (element.v1() - element.v0()) * iv / 4.0;
-            const Eigen::Vector3d exact = patch.evaluate(u, v);
-            require((element.evaluate(u, v) - exact).norm() < 2.0e-12,
-                    "discontinuous Bezier span preserves NURBS evaluation");
-            require(element.bounds().contains(exact, 2.0e-12),
-                    "discontinuous Bezier span has conservative bounds");
-        }
-    }
+    require_throws_contains(
+        [&] {
+            (void)kfbim::geometry3d::
+                extract_rational_bezier_elements_3d(model);
+        },
+        "interior knot multiplicity exceeds degree",
+        "fully discontinuous interior break is rejected");
 }
 
 void test_nonclamped_rational_bezier_extraction()
@@ -541,8 +532,8 @@ void test_bezier_split_preserves_large_finite_controls()
 void test_bezier_rejects_extreme_degree_control_count()
 {
     kfbim::geometry3d::RationalBezierElement3D element;
-    element.degree_u = std::numeric_limits<int>::max();
-    element.degree_v = std::numeric_limits<int>::max();
+    element.degree_u = std::numeric_limits<int>::max() / 2 + 1;
+    element.degree_v = std::numeric_limits<int>::max() / 2 + 1;
     element.parameter_u0 = 0.0;
     element.parameter_u1 = 1.0;
     element.parameter_v0 = 0.0;
@@ -551,6 +542,13 @@ void test_bezier_rejects_extreme_degree_control_count()
         [&] { (void)element.bounds(); },
         "Bezier element control count is too large",
         "extreme Bezier degrees are rejected before count overflow");
+
+    element.degree_u = std::numeric_limits<int>::max();
+    element.degree_v = 0;
+    require_throws_contains(
+        [&] { (void)element.bounds(); },
+        "Bezier element degree is too large for inclusive indexing",
+        "maximum integer Bezier degree is rejected before adding one");
 }
 
 double dof_area(const SurfaceDofCloud3D& cloud)
@@ -975,7 +973,7 @@ int main()
         test_benchmark_rational_bezier_elements_are_conservative();
         test_nonclamped_rational_bezier_extraction();
         test_degree_zero_multispan_bezier_extraction();
-        test_discontinuous_multispan_bezier_extraction();
+        test_discontinuous_multispan_bezier_extraction_is_rejected();
         test_bezier_subdivision_rejects_collapsed_midpoint();
         test_bezier_split_preserves_large_finite_controls();
         test_bezier_rejects_extreme_degree_control_count();
