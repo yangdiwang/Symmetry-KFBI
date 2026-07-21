@@ -9,6 +9,11 @@
 
 namespace kfbim {
 
+namespace geometry3d {
+class NurbsCartesianDomain3D;
+struct NurbsCartesianDomainDiagnostics3D;
+} // namespace geometry3d
+
 enum class P2CrossingOwnerStatus3D {
     ExactIntersection,
     GapFallback,
@@ -24,9 +29,16 @@ struct P2CrossingOwner3D {
     // surfaces coincide; otherwise this is the selected center coordinate.
     Eigen::Vector3d barycentric = Eigen::Vector3d::Zero();
     // Approximate hit on the complete flat corner-triangle geometry. These
-    // fields remain unset only for EndpointNearestCenter.
+    // legacy fields remain unset for native NURBS owners and endpoint-only
+    // center selection.
     int geometry_panel_index = -1;
     Eigen::Vector3d geometry_barycentric = Eigen::Vector3d::Zero();
+    int nurbs_patch_index = -1;
+    Eigen::Vector2d nurbs_parameter = Eigen::Vector2d::Zero();
+    Eigen::Vector3d crossing_point = Eigen::Vector3d::Zero();
+    Eigen::Vector3d crossing_normal = Eigen::Vector3d::Zero();
+    int surface_component = -1;
+    double crossing_residual = 0.0;
     P2CrossingOwnerStatus3D status =
         P2CrossingOwnerStatus3D::EndpointNearestCenter;
 };
@@ -39,6 +51,11 @@ public:
     GridPair3D(const CartesianGrid3D& grid,
                const Interface3D& correction_interface,
                const Interface3D& crossing_geometry);
+    GridPair3D(
+        const CartesianGrid3D& grid,
+        const Interface3D& correction_interface,
+        const Interface3D& crossing_geometry,
+        std::shared_ptr<const geometry3d::NurbsCartesianDomain3D> nurbs_domain);
     ~GridPair3D();
     GridPair3D(const GridPair3D&)            = delete;
     GridPair3D& operator=(const GridPair3D&) = delete;
@@ -63,6 +80,9 @@ public:
 
     // domain label: 0 = Ω⁻ (exterior), 1,2,... = Ω⁺ (interior) of each component
     int domain_label(int bulk_node_idx) const;
+    bool has_nurbs_domain() const noexcept;
+    const geometry3d::NurbsCartesianDomainDiagnostics3D&
+        nurbs_domain_diagnostics() const;
 
     bool is_near_interface(int bulk_node_idx, double radius) const;
 
@@ -95,6 +115,7 @@ private:
     const CartesianGrid3D& grid_;
     const Interface3D&     interface_;
     const Interface3D&     crossing_geometry_;
+    std::shared_ptr<const geometry3d::NurbsCartesianDomain3D> nurbs_domain_;
 
     // CGAL structures built in constructor (pimpl to avoid leaking CGAL headers)
     struct Impl;

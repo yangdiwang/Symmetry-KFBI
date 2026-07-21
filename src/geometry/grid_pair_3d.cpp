@@ -1,4 +1,5 @@
 #include "grid_pair_3d.hpp"
+#include "nurbs_cartesian_domain_3d.hpp"
 #include "p2_surface_3d.hpp"
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
 #include <CGAL/Surface_mesh.h>
@@ -568,6 +569,51 @@ static std::vector<int> build_p2_nearest_center_domain_labels(
     return labels;
 }
 
+static const geometry3d::NurbsSurfaceCrossing3D& require_native_crossing(
+    const geometry3d::NurbsCartesianDomain3D& domain,
+    int node,
+    int neighbor)
+{
+    try {
+        if (domain.has_barrier_between(node, neighbor))
+            return domain.crossing_between(node, neighbor);
+    } catch (const std::exception&) {
+    }
+    throw std::runtime_error(
+        "label-changing edge has no native NURBS crossing");
+}
+
+static void verify_native_label_crossing_invariant(
+    const CartesianGrid3D& grid,
+    const std::vector<int>& labels,
+    const geometry3d::NurbsCartesianDomain3D& domain)
+{
+    const auto dims = grid.dof_dims();
+    for (int k = 0; k < dims[2]; ++k) {
+        for (int j = 0; j < dims[1]; ++j) {
+            for (int i = 0; i < dims[0]; ++i) {
+                const int node = grid.index(i, j, k);
+                for (int axis = 0; axis < 3; ++axis) {
+                    std::array<int, 3> neighbor_index{{i, j, k}};
+                    if (++neighbor_index[static_cast<std::size_t>(axis)]
+                        >= dims[static_cast<std::size_t>(axis)]) {
+                        continue;
+                    }
+                    const int neighbor = grid.index(
+                        neighbor_index[0],
+                        neighbor_index[1],
+                        neighbor_index[2]);
+                    if ((labels[static_cast<std::size_t>(node)] > 0)
+                        != (labels[static_cast<std::size_t>(neighbor)] > 0)) {
+                        (void)require_native_crossing(
+                            domain, node, neighbor);
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ============================================================================
 // Pimpl
 // ============================================================================
@@ -608,16 +654,26 @@ struct GridPair3D::Impl {
 // Constructor
 // ============================================================================
 GridPair3D::GridPair3D(const CartesianGrid3D& grid, const Interface3D& iface)
-    : GridPair3D(grid, iface, iface)
+    : GridPair3D(grid, iface, iface, nullptr)
 {
 }
 
 GridPair3D::GridPair3D(const CartesianGrid3D& grid,
                        const Interface3D& iface,
                        const Interface3D& crossing_geometry)
+    : GridPair3D(grid, iface, crossing_geometry, nullptr)
+{
+}
+
+GridPair3D::GridPair3D(
+    const CartesianGrid3D& grid,
+    const Interface3D& iface,
+    const Interface3D& crossing_geometry,
+    std::shared_ptr<const geometry3d::NurbsCartesianDomain3D> nurbs_domain)
     : grid_(grid)
     , interface_(iface)
     , crossing_geometry_(crossing_geometry)
+    , nurbs_domain_(std::move(nurbs_domain))
     , impl_(std::make_unique<Impl>())
 {
     const bool profile = profile_grid_pair_3d();
@@ -636,6 +692,11 @@ GridPair3D::GridPair3D(const CartesianGrid3D& grid,
     if (active_p2 && !crossing_p2) {
         throw std::invalid_argument(
             "GridPair3D P2 correction interface requires P2 crossing geometry");
+    }
+    if (nurbs_domain_
+        && nurbs_domain_->labels().size() != static_cast<std::size_t>(N)) {
+        throw std::invalid_argument(
+            "GridPair3D native NURBS domain label count does not match the grid");
     }
 
     // ------------------------------------------------------------------
@@ -664,38 +725,40 @@ GridPair3D::GridPair3D(const CartesianGrid3D& grid,
     std::vector<int> closest_sample_idx;
 
     if (active_p2) {
-        impl_->crossing_mesh = std::make_unique<CMesh3>();
-        std::vector<CMesh3::Vertex_index> mesh_vertices;
-        mesh_vertices.reserve(crossing_geometry.num_vertices());
-        for (int vertex = 0; vertex < crossing_geometry.num_vertices(); ++vertex) {
-            mesh_vertices.push_back(impl_->crossing_mesh->add_vertex(CPoint3(
-                crossing_geometry.vertices()(vertex, 0),
-                crossing_geometry.vertices()(vertex, 1),
-                crossing_geometry.vertices()(vertex, 2))));
-        }
-        for (int panel = 0; panel < crossing_geometry.num_panels(); ++panel) {
-            const CFace3 face = impl_->crossing_mesh->add_face(
-                mesh_vertices[static_cast<std::size_t>(
-                    crossing_geometry.panels()(panel, 0))],
-                mesh_vertices[static_cast<std::size_t>(
-                    crossing_geometry.panels()(panel, 1))],
-                mesh_vertices[static_cast<std::size_t>(
-                    crossing_geometry.panels()(panel, 2))]);
-            if (face == CMesh3::null_face()) {
-                throw std::runtime_error(
-                    "failed to build the P2 crossing-geometry triangle mesh");
+        if (!nurbs_domain_) {
+            impl_->crossing_mesh = std::make_unique<CMesh3>();
+            std::vector<CMesh3::Vertex_index> mesh_vertices;
+            mesh_vertices.reserve(crossing_geometry.num_vertices());
+            for (int vertex = 0; vertex < crossing_geometry.num_vertices(); ++vertex) {
+                mesh_vertices.push_back(impl_->crossing_mesh->add_vertex(CPoint3(
+                    crossing_geometry.vertices()(vertex, 0),
+                    crossing_geometry.vertices()(vertex, 1),
+                    crossing_geometry.vertices()(vertex, 2))));
             }
-            if (face.idx() >= impl_->geometry_panel_for_face.size()) {
-                impl_->geometry_panel_for_face.resize(
-                    static_cast<std::size_t>(face.idx()) + 1, -1);
+            for (int panel = 0; panel < crossing_geometry.num_panels(); ++panel) {
+                const CFace3 face = impl_->crossing_mesh->add_face(
+                    mesh_vertices[static_cast<std::size_t>(
+                        crossing_geometry.panels()(panel, 0))],
+                    mesh_vertices[static_cast<std::size_t>(
+                        crossing_geometry.panels()(panel, 1))],
+                    mesh_vertices[static_cast<std::size_t>(
+                        crossing_geometry.panels()(panel, 2))]);
+                if (face == CMesh3::null_face()) {
+                    throw std::runtime_error(
+                        "failed to build the P2 crossing-geometry triangle mesh");
+                }
+                if (face.idx() >= impl_->geometry_panel_for_face.size()) {
+                    impl_->geometry_panel_for_face.resize(
+                        static_cast<std::size_t>(face.idx()) + 1, -1);
+                }
+                impl_->geometry_panel_for_face[face.idx()] = panel;
             }
-            impl_->geometry_panel_for_face[face.idx()] = panel;
+            impl_->crossing_tree = std::make_unique<CAabbTree3>(
+                faces(*impl_->crossing_mesh).first,
+                faces(*impl_->crossing_mesh).second,
+                *impl_->crossing_mesh);
+            impl_->crossing_tree->accelerate_distance_queries();
         }
-        impl_->crossing_tree = std::make_unique<CAabbTree3>(
-            faces(*impl_->crossing_mesh).first,
-            faces(*impl_->crossing_mesh).second,
-            *impl_->crossing_mesh);
-        impl_->crossing_tree->accelerate_distance_queries();
 
         impl_->p2_center_samples = p2_expansion_center_samples_3d(iface);
         const std::vector<Eigen::Vector3d> p2_center_points =
@@ -801,6 +864,22 @@ GridPair3D::GridPair3D(const CartesianGrid3D& grid,
 
     impl_->domain_label_vec.resize(N, 0);
     const ProfileClock3D::time_point t_label_start = ProfileClock3D::now();
+    if (nurbs_domain_) {
+        impl_->domain_label_vec = nurbs_domain_->labels();
+        verify_native_label_crossing_invariant(
+            grid, impl_->domain_label_vec, *nurbs_domain_);
+
+        const double t_label = seconds_since(t_label_start);
+        if (profile) {
+            const double total = seconds_since(t_total_start);
+            std::printf("      GridPair3D Ngrid=%d Niface=%d samples=%zu components=%d label_mode=native-nurbs\n",
+                        N, Nq, impl_->p2_center_samples.size(), Nc);
+            std::printf("        closest_bulk %.6fs sample_setup %.6fs sample_nearest %.6fs center_cache %.6fs domain_labels %.6fs total %.6fs\n",
+                        t_closest_bulk, t_sample_setup, t_sample_nearest,
+                        t_center_cache, t_label, total);
+        }
+        return;
+    }
     if (active_p2) {
         impl_->domain_label_vec = build_p2_nearest_center_domain_labels(
             grid,
@@ -943,6 +1022,28 @@ P2CrossingOwner3D GridPair3D::p2_crossing_owner_between(int a, int b) const {
     owner.barycentric = sample.barycentric;
     owner.status = P2CrossingOwnerStatus3D::EndpointNearestCenter;
 
+    if (nurbs_domain_) {
+        if ((impl_->domain_label_vec[static_cast<std::size_t>(a)] > 0)
+            != (impl_->domain_label_vec[static_cast<std::size_t>(b)] > 0)) {
+            const geometry3d::NurbsSurfaceCrossing3D& crossing =
+                require_native_crossing(*nurbs_domain_, a, b);
+            owner.nurbs_patch_index = crossing.patch_index;
+            owner.nurbs_parameter = {crossing.u, crossing.v};
+            owner.crossing_point = crossing.point;
+            owner.crossing_normal = crossing.normal;
+            owner.surface_component = crossing.component;
+            owner.crossing_residual = crossing.residual;
+            const Eigen::Vector3d edge = pb - pa;
+            owner.edge_parameter = std::max(
+                0.0,
+                std::min(1.0,
+                         (owner.crossing_point - pa).dot(edge)
+                             / edge.squaredNorm()));
+            owner.status = P2CrossingOwnerStatus3D::ExactIntersection;
+        }
+        return owner;
+    }
+
     if (impl_->crossing_tree && !impl_->crossing_tree->empty()) {
         const CSegment3 segment(CPoint3(pa.x(), pa.y(), pa.z()),
                                 CPoint3(pb.x(), pb.y(), pb.z()));
@@ -1007,6 +1108,19 @@ int GridPair3D::nearest_p2_expansion_center_for_interface_point(
 
 int GridPair3D::domain_label(int n) const {
     return impl_->domain_label_vec[n];
+}
+
+bool GridPair3D::has_nurbs_domain() const noexcept
+{
+    return static_cast<bool>(nurbs_domain_);
+}
+
+const geometry3d::NurbsCartesianDomainDiagnostics3D&
+GridPair3D::nurbs_domain_diagnostics() const
+{
+    if (!nurbs_domain_)
+        throw std::runtime_error("GridPair3D has no native NURBS domain");
+    return nurbs_domain_->diagnostics();
 }
 
 bool GridPair3D::is_near_interface(int n, double radius) const {

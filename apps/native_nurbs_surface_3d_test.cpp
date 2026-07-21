@@ -17,6 +17,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -1377,11 +1378,12 @@ void test_nurbs_cartesian_l_prism_labels()
         {-0.5625, -0.703125, -0.6328125},
         {h, h, h}, {54, 54, 58}, kfbim::DofLayout3D::Node);
 
-    const kfbim::geometry3d::NurbsCartesianDomain3D domain(
-        grid, surface.geometry_model());
-    require(domain.label(grid.index(27, 27, 4)) == 1,
+    const auto domain = std::make_shared<const
+        kfbim::geometry3d::NurbsCartesianDomain3D>(
+            grid, surface.geometry_model());
+    require(domain->label(grid.index(27, 27, 4)) == 1,
             "L-prism reentrant lower-arm node is inside");
-    require(domain.label(grid.index(28, 28, 4)) == 0,
+    require(domain->label(grid.index(28, 28, 4)) == 0,
             "L-prism missing quadrant is outside");
 
     int mismatches = 0;
@@ -1389,13 +1391,124 @@ void test_nurbs_cartesian_l_prism_labels()
         const auto x = grid.coord(node);
         const Eigen::Vector3d point(x[0], x[1], x[2]);
         const bool exact = surface.exact_inside(point);
-        mismatches += (domain.label(node) > 0) != exact ? 1 : 0;
+        mismatches += (domain->label(node) > 0) != exact ? 1 : 0;
     }
     require(mismatches == 0, "L-prism cropped-grid labels are exact");
-    require(domain.diagnostics().barrier_edge_counts[0]
-                + domain.diagnostics().barrier_edge_counts[1]
-                + domain.diagnostics().barrier_edge_counts[2] > 0,
+    require(domain->diagnostics().barrier_edge_counts[0]
+                + domain->diagnostics().barrier_edge_counts[1]
+                + domain->diagnostics().barrier_edge_counts[2] > 0,
             "native crossings create Cartesian barriers");
+
+    const auto triangulation =
+        kfbim::geometry3d::triangulate_nurbs_surface_patches_3d(
+            surface.patches, h);
+    kfbim::GridPair3D pair(grid,
+                           triangulation.interface,
+                           triangulation.geometry_interface,
+                           domain);
+    require(pair.has_nurbs_domain(),
+            "GridPair reports its native NURBS domain");
+    require(&pair.nurbs_domain_diagnostics() == &domain->diagnostics(),
+            "GridPair exposes the shared native-domain diagnostics");
+    require(pair.domain_label(grid.index(27, 27, 4)) == 1,
+            "GridPair uses NURBS barrier labels");
+
+    const auto dims = grid.dof_dims();
+    int crossing_edges = 0;
+    for (int k = 0; k < dims[2]; ++k) {
+        for (int j = 0; j < dims[1]; ++j) {
+            for (int i = 0; i < dims[0]; ++i) {
+                const int node = grid.index(i, j, k);
+                for (int axis = 0; axis < 3; ++axis) {
+                    std::array<int, 3> neighbor_index{{i, j, k}};
+                    if (++neighbor_index[static_cast<std::size_t>(axis)]
+                        >= dims[static_cast<std::size_t>(axis)]) {
+                        continue;
+                    }
+                    const int neighbor = grid.index(
+                        neighbor_index[0],
+                        neighbor_index[1],
+                        neighbor_index[2]);
+                    if ((pair.domain_label(node) > 0)
+                        == (pair.domain_label(neighbor) > 0)) {
+                        continue;
+                    }
+
+                    ++crossing_edges;
+                    const kfbim::P2CrossingOwner3D owner =
+                        pair.p2_crossing_owner_between(node, neighbor);
+                    require(owner.status
+                                == kfbim::P2CrossingOwnerStatus3D::
+                                       ExactIntersection,
+                            "native label-changing edge has an exact owner");
+                    require(owner.nurbs_patch_index >= 0
+                                && owner.nurbs_patch_index
+                                       < static_cast<int>(surface.patches.size()),
+                            "native crossing owner has a valid NURBS patch");
+                    require(owner.nurbs_parameter.allFinite(),
+                            "native crossing owner has finite parameters");
+                    require(owner.crossing_point.allFinite()
+                                && owner.crossing_normal.allFinite(),
+                            "native crossing owner has finite geometry");
+                    require(owner.surface_component >= 0,
+                            "native crossing owner has a surface component");
+                    require(std::isfinite(owner.crossing_residual)
+                                && owner.crossing_residual
+                                       <= domain->geometry_tolerance(),
+                            "native crossing owner residual is within tolerance");
+
+                    const auto& native =
+                        domain->crossing_between(node, neighbor);
+                    require(owner.nurbs_patch_index == native.patch_index
+                                && owner.surface_component == native.component,
+                            "native crossing owner preserves patch and component");
+                    require((owner.nurbs_parameter
+                                - Eigen::Vector2d(native.u, native.v)).norm()
+                                <= 1.0e-15
+                                && (owner.crossing_point - native.point).norm()
+                                       <= 1.0e-15
+                                && (owner.crossing_normal - native.normal).norm()
+                                       <= 1.0e-15
+                                && std::abs(owner.crossing_residual
+                                            - native.residual) <= 1.0e-15,
+                            "native crossing owner preserves authoritative fields");
+
+                    const auto a_coord = grid.coord(node);
+                    const auto b_coord = grid.coord(neighbor);
+                    const Eigen::Vector3d a(
+                        a_coord[0], a_coord[1], a_coord[2]);
+                    const Eigen::Vector3d b(
+                        b_coord[0], b_coord[1], b_coord[2]);
+                    const Eigen::Vector3d edge = b - a;
+                    require(owner.edge_parameter >= 0.0
+                                && owner.edge_parameter <= 1.0,
+                            "native crossing owner has a directed edge parameter");
+                    require((owner.crossing_point
+                                - (a + owner.edge_parameter * edge)).norm()
+                                <= 8.0 * domain->geometry_tolerance(),
+                            "native crossing point lies on the Cartesian edge");
+                    const auto surface_point = surface.patches[
+                        static_cast<std::size_t>(owner.nurbs_patch_index)]
+                        .evaluate(owner.nurbs_parameter.x(),
+                                  owner.nurbs_parameter.y());
+                    require((owner.crossing_point - surface_point).norm()
+                                <= 8.0 * domain->geometry_tolerance(),
+                            "native crossing point lies on its NURBS patch");
+
+                    const kfbim::P2CrossingOwner3D reverse =
+                        pair.p2_crossing_owner_between(neighbor, node);
+                    require((reverse.crossing_point - owner.crossing_point).norm()
+                                <= 1.0e-15
+                                && std::abs(reverse.edge_parameter
+                                            + owner.edge_parameter - 1.0)
+                                       <= 8.0 * domain->geometry_tolerance(),
+                            "native crossing phase follows the requested direction");
+                }
+            }
+        }
+    }
+    require(crossing_edges > 0,
+            "L-prism native GridPair has label-changing edges");
 }
 
 void test_nurbs_cartesian_curved_targets_and_triangle_independence()
@@ -1933,6 +2046,12 @@ void test_grid_edge_triangle_owners()
         kfbim::DofLayout3D::Node);
     kfbim::GridPair3D pair(
         grid, triangulation.interface, triangulation.geometry_interface);
+    require(!pair.has_nurbs_domain(),
+            "legacy GridPair has no native NURBS domain");
+    require_throws_contains(
+        [&] { (void)pair.nurbs_domain_diagnostics(); },
+        "no native NURBS domain",
+        "legacy GridPair rejects native diagnostics access");
     const kfbim::LaplaceCorrectionSupport3D support =
         kfbim::build_laplace_correction_support_3d(
             pair, "native NURBS crossing-owner test");

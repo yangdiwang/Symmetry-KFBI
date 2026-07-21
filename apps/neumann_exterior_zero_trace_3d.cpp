@@ -10,6 +10,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -23,6 +24,7 @@
 #include "native_nurbs_surface_3d.hpp"
 #include "src/bulk_solvers/laplace_zfft_bulk_solver_3d.hpp"
 #include "src/geometry/grid_pair_3d.hpp"
+#include "src/geometry/nurbs_cartesian_domain_3d.hpp"
 #include "src/geometry/nurbs_patch_triangulator_3d.hpp"
 #include "src/geometry/p2_surface_3d.hpp"
 #include "src/gmres/gmres.hpp"
@@ -1013,32 +1015,38 @@ private:
     int surface_dof_for_crossing(const P2CrossingOwner3D& owner,
                                  const Eigen::Vector3d& point) const
     {
-        const geometry3d::NurbsParamTriangle3D* triangle = nullptr;
-        Eigen::Vector3d barycentric = Eigen::Vector3d::Zero();
-        if (owner.geometry_panel_index >= 0
-            && owner.geometry_panel_index
-                   < static_cast<int>(geometry_triangles_.size())) {
-            triangle = &geometry_triangles_[
-                static_cast<std::size_t>(owner.geometry_panel_index)];
-            barycentric = owner.geometry_barycentric;
-        } else if (owner.panel_index >= 0
-                   && owner.panel_index
-                          < static_cast<int>(correction_triangles_.size())) {
-            triangle = &correction_triangles_[
-                static_cast<std::size_t>(owner.panel_index)];
-            barycentric = owner.barycentric;
+        int patch = owner.nurbs_patch_index;
+        Eigen::Vector2d uv = owner.nurbs_parameter;
+        if (patch < 0) {
+            const geometry3d::NurbsParamTriangle3D* triangle = nullptr;
+            Eigen::Vector3d barycentric = Eigen::Vector3d::Zero();
+            if (owner.geometry_panel_index >= 0
+                && owner.geometry_panel_index
+                       < static_cast<int>(geometry_triangles_.size())) {
+                triangle = &geometry_triangles_[
+                    static_cast<std::size_t>(owner.geometry_panel_index)];
+                barycentric = owner.geometry_barycentric;
+            } else if (owner.panel_index >= 0
+                       && owner.panel_index
+                              < static_cast<int>(correction_triangles_.size())) {
+                triangle = &correction_triangles_[
+                    static_cast<std::size_t>(owner.panel_index)];
+                barycentric = owner.barycentric;
+            }
+            if (triangle == nullptr) {
+                throw std::runtime_error(
+                    "crossing has no native NURBS triangle owner");
+            }
+            patch = triangle->patch_index;
+            uv = app3d::interpolate_triangle_parameter(
+                *triangle, barycentric);
         }
-        if (triangle == nullptr)
-            throw std::runtime_error("crossing has no native NURBS triangle owner");
-        const Eigen::Vector2d uv = app3d::interpolate_triangle_parameter(
-            *triangle, barycentric);
         const std::array<int, 4> candidates =
             app3d::parameter_dof_candidates_2x2(
-                native_surface_, cloud_, triangle->patch_index,
-                uv.x(), uv.y());
+                native_surface_, cloud_, patch, uv.x(), uv.y());
         const geometry3d::NurbsSurfaceDerivatives3D derivatives =
             native_surface_.patches[
-                static_cast<std::size_t>(triangle->patch_index)]
+                static_cast<std::size_t>(patch)]
                 .evaluate_with_derivatives(uv.x(), uv.y());
         Eigen::Vector3d reference_normal =
             derivatives.du.cross(derivatives.dv).normalized();
@@ -1074,7 +1082,9 @@ private:
             const Eigen::Vector3d a = grid_point(grid_, op.rhs_node);
             const Eigen::Vector3d b = grid_point(grid_, op.correction_node);
             const double phase = std::max(0.0, std::min(1.0, owner.edge_parameter));
-            const Eigen::Vector3d hit = a + phase * (b - a);
+            const Eigen::Vector3d hit = owner.nurbs_patch_index >= 0
+                ? owner.crossing_point
+                : a + phase * (b - a);
 
             const int center = surface_dof_for_crossing(owner, hit);
             const Eigen::Vector3d xi =
@@ -1770,6 +1780,9 @@ ReadinessResult run_readiness_case(GeometryKind kind,
                          {N, N, N},
                          DofLayout3D::Node);
     GeometryBundle geometry = make_geometry(kind, h);
+    const auto domain = std::make_shared<const
+        geometry3d::NurbsCartesianDomain3D>(
+            grid, geometry.native_surface.geometry_model());
     const SurfaceDofCloud surface_dofs =
         app3d::make_native_surface_dofs_3d(geometry.native_surface, h);
     const SurfaceCloudDiagnostics surface_diagnostics =
@@ -1834,20 +1847,18 @@ ReadinessResult run_readiness_case(GeometryKind kind,
         kBoxMin + static_cast<double>(dims[0] - 1) * h,
         kBoxMin + static_cast<double>(dims[1] - 1) * h,
         kBoxMin + static_cast<double>(dims[2] - 1) * h);
-    double min_margin = std::numeric_limits<double>::infinity();
-    for (int q = 0; q < geometry.crossing_interface.num_points(); ++q) {
-        const Eigen::Vector3d point =
-            geometry.crossing_interface.points().row(q).transpose();
-        min_margin = std::min(min_margin, (point - grid_min).minCoeff());
-        min_margin = std::min(min_margin, (grid_max - point).minCoeff());
-    }
+    const geometry3d::NurbsAabb3D& surface_bounds = domain->surface_bounds();
+    const double min_margin = std::min(
+        (surface_bounds.lower - grid_min).minCoeff(),
+        (grid_max - surface_bounds.upper).minCoeff());
     result.min_box_margin_over_h = min_margin / h;
     if (result.min_box_margin_over_h < 2.0)
         throw std::runtime_error("surface is too close to the Cartesian box boundary");
 
     GridPair3D grid_pair(grid,
                          geometry.correction_interface,
-                         geometry.crossing_interface);
+                         geometry.crossing_interface,
+                         domain);
     for (int n = 0; n < grid.num_dofs(); ++n) {
         const bool numerical_inside = grid_pair.domain_label(n) > 0;
         const auto coordinate = grid.coord(n);
@@ -1893,6 +1904,13 @@ ReadinessResult run_readiness_case(GeometryKind kind,
             continue;
         const P2CrossingOwner3D owner =
             grid_pair.p2_crossing_owner_between(edge.first, edge.second);
+        if (owner.status != P2CrossingOwnerStatus3D::ExactIntersection
+            || owner.nurbs_patch_index < 0
+            || !owner.nurbs_parameter.allFinite()
+            || !owner.crossing_point.allFinite()) {
+            throw std::runtime_error(
+                "native readiness crossing owner is not exact");
+        }
         if (owner.status == P2CrossingOwnerStatus3D::ExactIntersection)
             ++result.exact_crossings;
         else if (owner.status == P2CrossingOwnerStatus3D::GapFallback)
