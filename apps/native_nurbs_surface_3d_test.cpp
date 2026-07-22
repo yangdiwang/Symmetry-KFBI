@@ -790,6 +790,75 @@ void test_bezier_element_intersection_isolates_all_roots_and_fails_safe()
         "depth-zero multi-root box reports the unresolved diagnostic");
 }
 
+void test_analytic_ruled_graph_root_cases()
+{
+    using kfbim::geometry::NurbsBasis1D;
+    using kfbim::geometry3d::NurbsSurfaceModel3D;
+    using kfbim::geometry3d::NurbsSurfacePatch3D;
+    using kfbim::geometry3d::UnresolvedNurbsIntersectionCandidate3D;
+
+    const auto solve_graph = [](
+        int degree, const std::vector<double>& bernstein_coefficients) {
+        std::vector<double> knots(
+            static_cast<std::size_t>(2 * (degree + 1)), 1.0);
+        std::fill(knots.begin(), knots.begin() + degree + 1, 0.0);
+        std::vector<std::vector<Eigen::Vector3d>> controls(
+            static_cast<std::size_t>(degree + 1),
+            std::vector<Eigen::Vector3d>(2));
+        std::vector<std::vector<double>> weights(
+            static_cast<std::size_t>(degree + 1),
+            std::vector<double>(2, 1.0));
+        for (int i = 0; i <= degree; ++i) {
+            for (int j = 0; j < 2; ++j) {
+                controls[static_cast<std::size_t>(i)]
+                        [static_cast<std::size_t>(j)] = {
+                    static_cast<double>(i) / degree,
+                    static_cast<double>(j),
+                    bernstein_coefficients[static_cast<std::size_t>(i)]};
+            }
+        }
+        const NurbsSurfaceModel3D model(
+            {NurbsSurfacePatch3D(
+                NurbsBasis1D(degree, knots),
+                NurbsBasis1D(1, {0.0, 0.0, 1.0, 1.0}),
+                std::move(controls), std::move(weights))},
+            {0}, {});
+        const auto element =
+            kfbim::geometry3d::extract_rational_bezier_elements_3d(model)
+                .front();
+        kfbim::geometry3d::NurbsElementIntersectionOptions3D options;
+        options.geometry_tolerance = 1.0e-12;
+        try {
+            return std::make_pair(
+                kfbim::geometry3d::intersect_nurbs_bezier_element_3d(
+                    element, model.patch(0),
+                    {0.0, 0.5, 0.0}, {1.0, 0.5, 0.0}, options),
+                false);
+        } catch (const UnresolvedNurbsIntersectionCandidate3D& error) {
+            return std::make_pair(error.partial_result(), true);
+        }
+    };
+
+    const auto three = solve_graph(3, {-0.08, 0.14, -0.14, 0.08});
+    require(!three.second && three.first.roots.size() == 3
+                && std::abs(three.first.roots[0].u - 0.2) < 2.0e-10
+                && std::abs(three.first.roots[1].u - 0.5) < 2.0e-10
+                && std::abs(three.first.roots[2].u - 0.8) < 2.0e-10,
+            "cubic ruled graph returns all three transverse roots");
+
+    const auto contact = solve_graph(2, {0.25, -0.25, 0.25});
+    require(contact.first.roots.size() == 1
+                && std::abs(contact.first.roots.front().u - 0.5) < 2.0e-10
+                && contact.first.roots.front().transversality < 1.0e-10,
+            "quadratic ruled graph preserves its tangent contact");
+
+    const auto odd_flat = solve_graph(
+        3, {-0.125, 0.125, -0.125, 0.125});
+    require(odd_flat.second
+                && odd_flat.first.diagnostics.unresolved_boxes > 0,
+            "zero-derivative odd crossing remains an unresolved candidate");
+}
+
 void test_ruled_overlap_certificate_is_physical_and_fail_safe()
 {
     using kfbim::geometry::NurbsBasis1D;
@@ -1226,17 +1295,14 @@ void test_tangent_witness_does_not_swallow_unresolved_candidate()
         },
         "unresolved conservative NURBS intersection candidate",
         "tangent witness preserves a coexisting unresolved candidate");
-    require_throws_contains_all_with_count(
-        [&] {
-            (void)intersector.intersect_cartesian_edge(
-                kfbim::geometry3d::NurbsCartesianEdgeQuery3D{
-                    0, 60, 61, 62,
-                    {0.0, 0.5, 0.0}, {1.0, 0.5, 0.0}});
-        },
-        {"unresolved conservative NURBS intersection candidate",
-         "axis=0", "(60,61,62)"},
-        "root=(patch=", 1,
-        "Cartesian unresolved query retains grid and root context");
+    const auto unresolved_edge = intersector.intersect_cartesian_edge(
+        kfbim::geometry3d::NurbsCartesianEdgeQuery3D{
+            0, 60, 61, 62,
+            {0.0, 0.5, 0.0}, {1.0, 0.5, 0.0}});
+    require(!unresolved_edge.root_count_known
+                && !unresolved_edge.parity_known_from_roots
+                && !unresolved_edge.crossings.empty(),
+            "Cartesian unresolved query preserves roots and unknown parity");
 }
 
 void test_native_nurbs_surface_intersector()
@@ -1278,15 +1344,13 @@ void test_native_nurbs_surface_intersector()
                 && grid_scaled_intersector.query_element_count()
                        > torus_intersector.query_element_count(),
             "extent-limited Bezier leaves are the actual BVH query elements");
-    kfbim::geometry3d::NurbsSurfaceIntersectionDiagnostics3D
-        grid_scaled_diagnostics;
     const auto grid_scaled_hit =
         grid_scaled_intersector.intersect_cartesian_edge(
             NurbsCartesianEdgeQuery3D{
                 0, 7, 8, 9,
-                {0.80, -0.04, 0.03}, {0.84, -0.04, 0.03}},
-            &grid_scaled_diagnostics);
-    require(grid_scaled_hit
+                {0.80, -0.04, 0.03}, {0.84, -0.04, 0.03}});
+    const auto& grid_scaled_diagnostics = grid_scaled_hit.diagnostics;
+    require(grid_scaled_hit.crossings.size() == 1
                 && grid_scaled_diagnostics.maximum_subdivision_depth_reached <= 4
                 && grid_scaled_diagnostics.unresolved_candidates == 0,
             "grid-scaled Cartesian query obeys the local depth-four budget");
@@ -1295,16 +1359,14 @@ void test_native_nurbs_surface_intersector()
     app_grid_options.maximum_element_extent = 0.375;
     const NurbsSurfaceIntersector3D app_grid_intersector(
         torus.geometry_model(), app_grid_options);
-    kfbim::geometry3d::NurbsSurfaceIntersectionDiagnostics3D
-        app_grid_diagnostics;
     const auto app_grid_miss =
         app_grid_intersector.intersect_cartesian_edge(
             NurbsCartesianEdgeQuery3D{
                 0, 9, 5, 9,
                 {0.1875, -0.5625, 0.1875},
-                {0.375, -0.5625, 0.1875}},
-            &app_grid_diagnostics);
-    require(!app_grid_miss
+                {0.375, -0.5625, 0.1875}});
+    const auto& app_grid_diagnostics = app_grid_miss.diagnostics;
+    require(app_grid_miss.crossings.empty()
                 && app_grid_diagnostics.maximum_subdivision_depth_reached <= 4
                 && app_grid_diagnostics.unresolved_candidates == 0
                 && app_grid_diagnostics.closest_point_failures == 0
@@ -1318,16 +1380,14 @@ void test_native_nurbs_surface_intersector()
     fine_grid_options.maximum_element_extent = 0.046875;
     const NurbsSurfaceIntersector3D fine_grid_intersector(
         torus.geometry_model(), fine_grid_options);
-    kfbim::geometry3d::NurbsSurfaceIntersectionDiagnostics3D
-        fine_grid_diagnostics;
     const auto fine_grid_hit =
         fine_grid_intersector.intersect_cartesian_edge(
             NurbsCartesianEdgeQuery3D{
                 0, 92, 60, 57,
                 {0.65625, -0.09375, -0.1640625},
-                {0.6796875, -0.09375, -0.1640625}},
-            &fine_grid_diagnostics);
-    require(fine_grid_hit
+                {0.6796875, -0.09375, -0.1640625}});
+    const auto& fine_grid_diagnostics = fine_grid_hit.diagnostics;
+    require(fine_grid_hit.crossings.size() == 1
                 && fine_grid_diagnostics.maximum_subdivision_depth_reached <= 4
                 && fine_grid_diagnostics.unresolved_candidates == 0
                 && fine_grid_diagnostics.terminal_certificate_boxes > 0
@@ -1343,21 +1403,23 @@ void test_native_nurbs_surface_intersector()
     const NurbsCartesianEdgeQuery3D seam_edge{
         0, 1, 2, 3,
         {0.80, -0.04, 0.03}, {0.84, -0.04, 0.03}};
-    kfbim::geometry3d::NurbsSurfaceIntersectionDiagnostics3D
-        seam_edge_diagnostics;
-    const auto seam_crossing = torus_intersector.intersect_cartesian_edge(
-        seam_edge, &seam_edge_diagnostics);
-    require(seam_crossing
-                && seam_crossing->component == 0
-                && seam_crossing->residual
+    const auto seam_crossing =
+        torus_intersector.intersect_cartesian_edge(seam_edge);
+    const auto& seam_edge_diagnostics = seam_crossing.diagnostics;
+    require(seam_crossing.crossings.size() == 1
+                && seam_crossing.crossings.front().component == 0
+                && seam_crossing.crossings.front().residual
                        <= torus_intersector.geometry_tolerance()
-                && std::abs(seam_crossing->normal.norm() - 1.0) < 1.0e-12
+                && std::abs(
+                    seam_crossing.crossings.front().normal.norm() - 1.0)
+                       < 1.0e-12
                 && seam_edge_diagnostics.seam_deduplications >= 1,
             "single Cartesian crossing returns canonical root data");
-    require(!torus_intersector.intersect_cartesian_edge(
-                 NurbsCartesianEdgeQuery3D{
-                     0, 4, 5, 6, {2.0, 2.0, 2.0}, {2.1, 2.0, 2.0}}),
-            "Cartesian edge with zero roots returns nullopt");
+    require(torus_intersector.intersect_cartesian_edge(
+                NurbsCartesianEdgeQuery3D{
+                    0, 4, 5, 6, {2.0, 2.0, 2.0}, {2.1, 2.0, 2.0}})
+                .crossings.empty(),
+            "Cartesian edge with zero roots returns an empty result");
 
     kfbim::geometry3d::NurbsSurfaceIntersectorOptions3D no_seed_options;
     no_seed_options.use_triangle_seeds = false;
@@ -1412,16 +1474,14 @@ void test_native_nurbs_surface_intersector()
                 && torus_intersector.containing_components(
                     {0.07, -0.04, 0.03}).empty(),
             "torus component parity distinguishes tube from central void");
-    require_throws_contains_all_with_count(
-        [&] {
-            (void)torus_intersector.intersect_cartesian_edge(
-                NurbsCartesianEdgeQuery3D{
-                    0, 10, 11, 12,
-                    {-1.0, -0.04, 0.03}, {1.0, -0.04, 0.03}});
-        },
-        {"multiple crossings on Cartesian edge", "axis=0", "(10,11,12)"},
-        "root=(patch=", 2,
-        "torus Cartesian edge rejects multiple crossings");
+    const auto long_torus_edge = torus_intersector.intersect_cartesian_edge(
+        NurbsCartesianEdgeQuery3D{
+            0, 10, 11, 12,
+            {-1.0, -0.04, 0.03}, {1.0, -0.04, 0.03}});
+    require(long_torus_edge.crossings.size() == 4
+                && long_torus_edge.toggled_components.empty()
+                && long_torus_edge.parity_known_from_roots,
+            "torus Cartesian edge retains all four transverse crossings");
 
     const NativeNurbsSurface3D cylinder =
         make_native_nurbs_surface_3d(GeometryKind3D::HollowCylinder);
@@ -1433,16 +1493,15 @@ void test_native_nurbs_surface_intersector()
     cylinder_grid_options.maximum_element_extent = 0.09375;
     const NurbsSurfaceIntersector3D cylinder_grid_intersector(
         cylinder.geometry_model(), cylinder_grid_options);
-    kfbim::geometry3d::NurbsSurfaceIntersectionDiagnostics3D
-        cylinder_grid_diagnostics;
     const auto cylinder_grid_miss =
         cylinder_grid_intersector.intersect_cartesian_edge(
             NurbsCartesianEdgeQuery3D{
                 0, 41, 22, 38,
                 {0.421875, -0.46875, 0.28125},
-                {0.46875, -0.46875, 0.28125}},
-            &cylinder_grid_diagnostics);
-    require(!cylinder_grid_miss
+                {0.46875, -0.46875, 0.28125}});
+    const auto& cylinder_grid_diagnostics =
+        cylinder_grid_miss.diagnostics;
+    require(cylinder_grid_miss.crossings.empty()
                 && cylinder_grid_diagnostics
                        .maximum_subdivision_depth_reached <= 4
                 && cylinder_grid_diagnostics.unresolved_candidates == 0
@@ -1450,16 +1509,15 @@ void test_native_nurbs_surface_intersector()
                 && cylinder_grid_diagnostics
                        .terminal_misses_by_closest_point > 0,
             "N=64 cylinder endpoint minimum is a resolved terminal miss");
-    require_throws_contains_all_with_count(
-        [&] {
-            (void)cylinder_grid_intersector.intersect_cartesian_edge(
-                NurbsCartesianEdgeQuery3D{
-                    1, 20, 21, 22,
-                    {0.61, -0.10, 0.0}, {0.61, 0.0, 0.0}});
-        },
-        {"tangential Cartesian edge contact", "axis=1", "(20,21,22)"},
-        "root=(patch=", 1,
-        "extent-limited cylinder leaf preserves tangency diagnostics");
+    const auto grid_tangent =
+        cylinder_grid_intersector.intersect_cartesian_edge(
+            NurbsCartesianEdgeQuery3D{
+                1, 20, 21, 22,
+                {0.61, -0.10, 0.0}, {0.61, 0.0, 0.0}});
+    require(grid_tangent.crossings.size() == 1
+                && grid_tangent.has_near_tangent_candidate
+                && !grid_tangent.parity_known_from_roots,
+            "extent-limited cylinder leaf preserves a tangent candidate");
 
     const auto smooth_hit = cylinder_intersector.intersect_segment(
         {0.06, 0.48, 0.0}, {0.06, 0.52, 0.0});
@@ -1492,16 +1550,15 @@ void test_native_nurbs_surface_intersector()
         },
         "unresolved conservative NURBS intersection candidate",
         "non-Cartesian near-secant preserves unresolved status");
-    require_throws_contains_all_with_count(
-        [&] {
-            (void)cylinder_intersector.intersect_cartesian_edge(
-                NurbsCartesianEdgeQuery3D{
-                    1, 20, 21, 22,
-                    {0.61, -0.10, 0.0}, {0.61, 0.0, 0.0}});
-        },
-        {"tangential Cartesian edge contact", "axis=1", "(20,21,22)"},
-        "root=(patch=", 1,
-        "cylinder Cartesian edge rejects tangential contact");
+    const auto cylinder_tangent =
+        cylinder_intersector.intersect_cartesian_edge(
+            NurbsCartesianEdgeQuery3D{
+                1, 20, 21, 22,
+                {0.61, -0.10, 0.0}, {0.61, 0.0, 0.0}});
+    require(cylinder_tangent.crossings.size() == 1
+                && cylinder_tangent.has_near_tangent_candidate
+                && !cylinder_tangent.parity_known_from_roots,
+            "cylinder Cartesian edge reports rather than rejects tangency");
     const double outer_endpoint_y =
         -0.05 - std::sqrt(0.55 * 0.55 - 0.25 * 0.25);
     require_throws_contains_all_with_count(
@@ -1912,6 +1969,33 @@ void test_nurbs_cartesian_curved_targets_and_triangle_independence()
         grid, cylinder.geometry_model(),
         grid.index(17, 16, 15), grid.index(25, 16, 15),
         "hollow cylinder");
+}
+
+void test_cartesian_edge_collects_multiple_crossings()
+{
+    using kfbim::geometry3d::NurbsCartesianEdgeQuery3D;
+    using kfbim::geometry3d::NurbsSurfaceIntersector3D;
+    using kfbim::geometry3d::NurbsSurfaceIntersectorOptions3D;
+
+    const NativeNurbsSurface3D torus =
+        make_native_nurbs_surface_3d(GeometryKind3D::Torus);
+    NurbsSurfaceIntersectorOptions3D options;
+    options.maximum_element_extent = 0.1;
+    options.local_max_subdivision_depth = 4;
+    const NurbsSurfaceIntersector3D intersector(
+        torus.geometry_model(), options);
+
+    const auto result = intersector.intersect_cartesian_edge(
+        NurbsCartesianEdgeQuery3D{
+            0, 6, 11, 8,
+            {0.0, -0.04, 0.03},
+            {1.0, -0.04, 0.03}});
+    require(result.crossings.size() == 2,
+            "Cartesian edge retains both torus crossings");
+    require(result.toggled_components.empty(),
+            "two torus crossings have even component parity");
+    require(result.parity_known_from_roots,
+            "two transverse torus roots determine parity");
 }
 
 void test_nurbs_cartesian_under_resolved_torus_fails_fast()
@@ -2482,6 +2566,7 @@ int main()
         test_closest_point_classifies_terminal_intersection_boxes();
         test_rational_bezier_element_intersection();
         test_bezier_element_intersection_isolates_all_roots_and_fails_safe();
+        test_analytic_ruled_graph_root_cases();
         test_ruled_overlap_certificate_is_physical_and_fail_safe();
         test_exact_predicate_triangle_seed_on_thin_element();
         test_reweighted_ruled_overlap_certificate();
@@ -2497,6 +2582,7 @@ int main()
         test_nurbs_cartesian_input_contracts();
         test_nurbs_cartesian_multiple_components();
         test_nurbs_cartesian_curved_targets_and_triangle_independence();
+        test_cartesian_edge_collects_multiple_crossings();
         test_uniform_native_dofs();
         test_parameter_candidates();
         test_grid_edge_triangle_owners();

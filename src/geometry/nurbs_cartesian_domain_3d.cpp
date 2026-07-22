@@ -520,16 +520,25 @@ struct NurbsCartesianDomain3D::Impl {
             }
             const Eigen::Vector3d start = as_vector(grid.coord(start_node));
             const Eigen::Vector3d end = as_vector(grid.coord(end_node));
-            NurbsSurfaceIntersectionDiagnostics3D local_diagnostics;
-            const std::optional<NurbsSurfaceCrossing3D> crossing =
+            const NurbsCartesianEdgeIntersections3D edge_result =
                 intersector.intersect_cartesian_edge(
                     NurbsCartesianEdgeQuery3D{
-                        axis, ijk[0], ijk[1], ijk[2], start, end},
-                    &local_diagnostics);
+                        axis, ijk[0], ijk[1], ijk[2], start, end});
             accumulate_intersection_diagnostics(
-                diagnostics.intersections, local_diagnostics);
-            if (!crossing)
+                diagnostics.intersections, edge_result.diagnostics);
+            if (!edge_result.root_count_known
+                || !edge_result.parity_known_from_roots) {
+                throw std::runtime_error(
+                    "ambiguous intersection on Cartesian edge");
+            }
+            if (edge_result.crossings.empty())
                 continue;
+            if (edge_result.crossings.size() > 1) {
+                throw std::runtime_error(
+                    "multiple crossings on Cartesian edge");
+            }
+            const NurbsSurfaceCrossing3D& crossing =
+                edge_result.crossings.front();
 
             barriers[static_cast<std::size_t>(axis)]
                     [barrier_index(axis, ijk[0], ijk[1], ijk[2])] =
@@ -541,10 +550,10 @@ struct NurbsCartesianDomain3D::Impl {
                 barrier_count, std::size_t{1},
                 "NURBS barrier diagnostic count overflow");
             diagnostics.maximum_root_residual = std::max(
-                diagnostics.maximum_root_residual, crossing->residual);
+                diagnostics.maximum_root_residual, crossing.residual);
             const int crossing_index = checked_size_to_int(
                 crossings.size(), "NURBS crossing index exceeds int range");
-            crossings.push_back(*crossing);
+            crossings.push_back(crossing);
             crossing_by_edge.emplace(key, crossing_index);
         }
 

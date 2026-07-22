@@ -7,7 +7,6 @@
 
 #include <cstddef>
 #include <limits>
-#include <optional>
 #include <vector>
 
 namespace kfbim::geometry3d {
@@ -59,6 +58,15 @@ struct NurbsCartesianEdgeQuery3D {
     Eigen::Vector3d end = Eigen::Vector3d::Zero();
 };
 
+struct NurbsCartesianEdgeIntersections3D {
+    std::vector<NurbsSurfaceCrossing3D> crossings;
+    std::vector<int> toggled_components;
+    NurbsSurfaceIntersectionDiagnostics3D diagnostics;
+    bool root_count_known = true;
+    bool parity_known_from_roots = true;
+    bool has_near_tangent_candidate = false;
+};
+
 struct NurbsSurfaceIntersectorOptions3D {
     bool use_triangle_seeds = true;
     int bvh_leaf_size = 8;
@@ -82,9 +90,9 @@ public:
     NurbsSurfaceIntersectionResult3D intersect_segment(
         const Eigen::Vector3d& start,
         const Eigen::Vector3d& end) const;
-    std::optional<NurbsSurfaceCrossing3D> intersect_cartesian_edge(
-        const NurbsCartesianEdgeQuery3D& edge,
-        NurbsSurfaceIntersectionDiagnostics3D* diagnostics = nullptr) const;
+    NurbsCartesianEdgeIntersections3D intersect_cartesian_edge(
+        const NurbsCartesianEdgeQuery3D& edge) const;
+
     std::vector<int> containing_components(
         const Eigen::Vector3d& point) const;
     std::vector<RationalBezierElement3D> acceleration_leaves(

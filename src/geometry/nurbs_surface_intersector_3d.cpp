@@ -610,7 +610,8 @@ std::vector<NurbsSurfaceCrossing3D> canonicalize_roots(
     const NurbsSurfaceModel3D& model,
     double geometry_tolerance,
     double segment_length,
-    NurbsSurfaceIntersectionDiagnostics3D& diagnostics)
+    NurbsSurfaceIntersectionDiagnostics3D& diagnostics,
+    bool reject_unrelated_coincidence)
 {
     std::sort(roots.begin(), roots.end(),
               [](const auto& first, const auto& second) {
@@ -682,7 +683,8 @@ std::vector<NurbsSurfaceCrossing3D> canonicalize_roots(
     for (int first = 0; first < static_cast<int>(patch_unique.size()); ++first) {
         for (int second = first + 1;
              second < static_cast<int>(patch_unique.size()); ++second) {
-            if (patch_unique[static_cast<std::size_t>(first)].patch_index
+            if (reject_unrelated_coincidence
+                && patch_unique[static_cast<std::size_t>(first)].patch_index
                     != patch_unique[static_cast<std::size_t>(second)].patch_index
                 && coincident_root(
                     patch_unique[static_cast<std::size_t>(first)],
@@ -937,7 +939,6 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
     NurbsSurfaceIntersectionResult3D result;
     std::vector<NurbsSurfaceCrossing3D> roots;
     std::vector<NurbsSurfaceCrossing3D> tangential_roots;
-    bool unresolved = false;
     const auto accumulate_work =
         [&](const NurbsElementIntersectionResult3D& work,
             bool include_unresolved) {
@@ -1099,15 +1100,13 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
                 geometry_tolerance_);
             if (tangent)
                 tangential_roots.push_back(*tangent);
-            else
-                unresolved = true;
         }
     }
 
     if (cartesian_edge == nullptr) {
         result.crossings = canonicalize_roots(
             std::move(roots), model_, geometry_tolerance_, segment_length,
-            result.diagnostics);
+            result.diagnostics, true);
         return result;
     }
     std::vector<NurbsSurfaceCrossing3D> all_roots = roots;
@@ -1132,37 +1131,16 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
         })) {
         throw FeatureEdgeAlignment(std::move(all_roots));
     }
-    if (unresolved) {
-        throw std::runtime_error(cartesian_edge_diagnostic(
-            "unresolved conservative NURBS intersection candidate",
-            *cartesian_edge, all_roots));
-    }
-
     result.crossings = canonicalize_roots(
         std::move(all_roots), model_, geometry_tolerance_, segment_length,
-        result.diagnostics);
-    if (!tangential_roots.empty()
-        || std::any_of(
-            result.crossings.begin(), result.crossings.end(),
-            [](const auto& root) {
-                return root.transversality <= 1e-10;
-            })) {
-        throw std::runtime_error(cartesian_edge_diagnostic(
-            "tangential Cartesian edge contact", *cartesian_edge,
-            result.crossings));
-    }
-    if (result.crossings.size() > 1) {
-        throw std::runtime_error(cartesian_edge_diagnostic(
-            "multiple crossings on Cartesian edge", *cartesian_edge,
-            result.crossings));
-    }
+        result.diagnostics,
+        result.diagnostics.unresolved_candidates == 0);
     return result;
 }
 
-std::optional<NurbsSurfaceCrossing3D>
+NurbsCartesianEdgeIntersections3D
 NurbsSurfaceIntersector3D::intersect_cartesian_edge(
-    const NurbsCartesianEdgeQuery3D& edge,
-    NurbsSurfaceIntersectionDiagnostics3D* diagnostics) const
+    const NurbsCartesianEdgeQuery3D& edge) const
 {
     NurbsSurfaceIntersectionResult3D result;
     try {
@@ -1176,12 +1154,34 @@ NurbsSurfaceIntersector3D::intersect_cartesian_edge(
             "coincident roots on unrelated NURBS patches", edge,
             coincidence.roots()));
     }
-    if (diagnostics != nullptr)
-        *diagnostics = result.diagnostics;
-    const auto& roots = result.crossings;
-    if (roots.empty())
-        return std::nullopt;
-    return roots.front();
+
+    NurbsCartesianEdgeIntersections3D edge_result;
+    edge_result.crossings = std::move(result.crossings);
+    edge_result.diagnostics = result.diagnostics;
+    edge_result.root_count_known =
+        edge_result.diagnostics.unresolved_candidates == 0;
+
+    std::vector<bool> odd(
+        static_cast<std::size_t>(model_.num_components()), false);
+    for (const NurbsSurfaceCrossing3D& root : edge_result.crossings) {
+        if (root.transversality <= 1.0e-10) {
+            edge_result.has_near_tangent_candidate = true;
+            continue;
+        }
+        odd[static_cast<std::size_t>(root.component)] =
+            !odd[static_cast<std::size_t>(root.component)];
+    }
+    edge_result.parity_known_from_roots =
+        edge_result.root_count_known
+        && !edge_result.has_near_tangent_candidate;
+    if (edge_result.parity_known_from_roots) {
+        for (int component = 0;
+             component < static_cast<int>(odd.size()); ++component) {
+            if (odd[static_cast<std::size_t>(component)])
+                edge_result.toggled_components.push_back(component);
+        }
+    }
+    return edge_result;
 }
 
 std::vector<int> NurbsSurfaceIntersector3D::containing_components(

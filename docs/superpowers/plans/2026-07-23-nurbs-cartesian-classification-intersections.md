@@ -58,14 +58,14 @@ NurbsCartesianEdgeIntersections3D intersect_cartesian_edge(
     const NurbsCartesianEdgeQuery3D& edge) const;
 ~~~
 
-- [ ] Add analytic ruled-graph tests for two roots, three roots, quadratic contact, and zero-derivative odd crossing.
-- [ ] Build and run native_nurbs_surface_3d_test; expect the old optional return type or multiple-crossing exception to fail.
-- [ ] Add the result type and remove the fatal multiple-crossing/tangential branches from the Cartesian wrapper.
-- [ ] Keep endpoint and overlap degeneracies fatal.
-- [ ] Toggle obvious transverse roots per component; mark near-tangent/unresolved parity unknown.
-- [ ] Update existing edge tests to inspect result.crossings.
-- [ ] Run GREEN.
-- [ ] Commit: feat: return all Cartesian NURBS crossings.
+- [x] Add analytic ruled-graph tests for two roots, three roots, quadratic contact, and zero-derivative odd crossing.
+- [x] Build and run native_nurbs_surface_3d_test; expect the old optional return type or multiple-crossing exception to fail.
+- [x] Add the result type and remove the fatal multiple-crossing/tangential branches from the Cartesian wrapper.
+- [x] Keep endpoint and overlap degeneracies fatal.
+- [x] Toggle obvious transverse roots per component; mark near-tangent/unresolved parity unknown.
+- [x] Update existing edge tests to inspect result.crossings.
+- [x] Run GREEN.
+- [x] Commit: feat: return all Cartesian NURBS crossings.
 
 Analytic tests use S(u,v)=(u,v,f(u)), L(t)=(t,0.5,0), and:
 - f=(u-0.3)(u-0.7): two roots, even same-component parity.
