@@ -1,4 +1,5 @@
 #include "nurbs_bezier_intersection_3d.hpp"
+#include "nurbs_bezier_segment_closest_point_3d.hpp"
 
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
 #include <CGAL/intersections.h>
@@ -44,6 +45,13 @@ struct TriangleSeed {
     double t = 0.0;
 };
 
+struct NativeNewtonOutcome {
+    std::optional<NurbsElementRoot3D> root;
+    TriangleSeed best_state;
+    double best_residual = std::numeric_limits<double>::infinity();
+    bool ill_conditioned = false;
+};
+
 struct PendingBox {
     RationalBezierElement3D element;
     int depth = 0;
@@ -56,6 +64,22 @@ struct Interval {
 
 using IntervalNet =
     std::vector<std::vector<std::array<Interval, 2>>>;
+
+void checked_accumulate_diagnostic(int& total,
+                                   int increment,
+                                   const char* message)
+{
+    if (total < 0 || increment < 0
+        || total > std::numeric_limits<int>::max() - increment) {
+        throw std::overflow_error(message);
+    }
+    total += increment;
+}
+
+void checked_increment_diagnostic(int& value, const char* message)
+{
+    checked_accumulate_diagnostic(value, 1, message);
+}
 
 double midpoint(double begin, double end)
 {
@@ -100,9 +124,12 @@ void validate_inputs(const RationalBezierElement3D& element,
     }
     if (options.max_subdivision_depth < 0)
         throw std::invalid_argument("NURBS intersection depth must be nonnegative");
-    if (options.max_newton_iterations <= 0) {
+    if (options.max_newton_iterations <= 0
+        || options.max_newton_iterations
+               > std::numeric_limits<int>::max() / 2) {
         throw std::invalid_argument(
-            "NURBS intersection Newton iteration limit must be positive");
+            "NURBS intersection Newton iteration limit must be positive "
+            "and permit closest-point accounting");
     }
     const double segment_length = (segment_end - segment_start).norm();
     if (!std::isfinite(segment_length)
@@ -605,7 +632,9 @@ std::vector<TriangleSeed> corner_triangle_seeds(
     const auto append = [&](const std::optional<TriangleSeed>& seed) {
         if (!seed)
             return;
-        ++triangle_seed_hits;
+        checked_increment_diagnostic(
+            triangle_seed_hits,
+            "NURBS triangle-seed diagnostic overflow");
         const bool duplicate = std::any_of(
             seeds.begin(), seeds.end(), [&](const TriangleSeed& existing) {
                 return std::abs(existing.u - seed->u) <= parameter_tolerance
@@ -624,7 +653,7 @@ std::vector<TriangleSeed> corner_triangle_seeds(
     return seeds;
 }
 
-std::optional<NurbsElementRoot3D> native_newton(
+NativeNewtonOutcome native_newton(
     const RationalBezierElement3D& box,
     const NurbsSurfacePatch3D& patch,
     const SegmentFrame& frame,
@@ -632,8 +661,12 @@ std::optional<NurbsElementRoot3D> native_newton(
     const NurbsElementIntersectionOptions3D& options,
     NurbsElementIntersectionDiagnostics3D& diagnostics)
 {
-    ++diagnostics.newton_attempts;
+    checked_increment_diagnostic(
+        diagnostics.newton_attempts,
+        "NURBS Newton-attempt diagnostic overflow");
     Eigen::Vector3d state(seed.u, seed.v, seed.t);
+    NativeNewtonOutcome outcome;
+    outcome.best_state = seed;
 
     const auto in_box = [&](const Eigen::Vector3d& candidate) {
         return candidate.x() >= box.u0() - options.parameter_tolerance
@@ -650,8 +683,9 @@ std::optional<NurbsElementRoot3D> native_newton(
         return candidate;
     };
     if (!state.allFinite() || !in_box(state))
-        return std::nullopt;
+        return outcome;
     state = clamp_to_box(state);
+    outcome.best_state = {state.x(), state.y(), state.z()};
 
     for (int iteration = 0; iteration <= options.max_newton_iterations;
          ++iteration) {
@@ -662,15 +696,23 @@ std::optional<NurbsElementRoot3D> native_newton(
         const Eigen::Vector3d residual_vector =
             derivatives.point - segment_point;
         const double residual = residual_vector.norm();
-        if (!std::isfinite(residual))
-            return std::nullopt;
+        if (!std::isfinite(residual)) {
+            outcome.ill_conditioned = true;
+            return outcome;
+        }
+        if (residual < outcome.best_residual) {
+            outcome.best_residual = residual;
+            outcome.best_state = {state.x(), state.y(), state.z()};
+        }
         if (residual <= options.geometry_tolerance
             && state.z() >= -options.parameter_tolerance
             && state.z() <= 1.0 + options.parameter_tolerance) {
             const Eigen::Vector3d cross = derivatives.du.cross(derivatives.dv);
             const double normal_norm = cross.norm();
-            if (!std::isfinite(normal_norm) || normal_norm <= 0.0)
-                return std::nullopt;
+            if (!std::isfinite(normal_norm) || normal_norm <= 0.0) {
+                outcome.ill_conditioned = true;
+                return outcome;
+            }
             NurbsElementRoot3D root;
             root.patch_index = box.patch_index;
             root.component = box.component;
@@ -682,7 +724,8 @@ std::optional<NurbsElementRoot3D> native_newton(
             root.residual = residual;
             root.transversality =
                 std::abs(root.normal.dot(frame.direction));
-            return root;
+            outcome.root = std::move(root);
+            return outcome;
         }
         if (iteration == options.max_newton_iterations)
             break;
@@ -692,12 +735,18 @@ std::optional<NurbsElementRoot3D> native_newton(
         jacobian.col(1) = derivatives.dv;
         jacobian.col(2) = -frame.delta;
         Eigen::FullPivLU<Eigen::Matrix3d> factorization(jacobian);
-        if (factorization.rank() < 3)
-            return std::nullopt;
+        if (factorization.rank() < 3) {
+            outcome.ill_conditioned = true;
+            return outcome;
+        }
         const Eigen::Vector3d step = factorization.solve(-residual_vector);
-        if (!step.allFinite())
-            return std::nullopt;
-        ++diagnostics.newton_iterations;
+        if (!step.allFinite()) {
+            outcome.ill_conditioned = true;
+            return outcome;
+        }
+        checked_increment_diagnostic(
+            diagnostics.newton_iterations,
+            "NURBS Newton-iteration diagnostic overflow");
 
         bool accepted = false;
         double step_scale = 1.0;
@@ -721,10 +770,13 @@ std::optional<NurbsElementRoot3D> native_newton(
             }
             step_scale *= 0.5;
         }
-        if (!accepted)
-            return std::nullopt;
+        if (!accepted) {
+            outcome.ill_conditioned = true;
+            return outcome;
+        }
     }
-    return std::nullopt;
+    outcome.ill_conditioned = true;
+    return outcome;
 }
 
 bool roots_agree(const NurbsElementRoot3D& first,
@@ -758,6 +810,370 @@ bool append_root(std::vector<NurbsElementRoot3D>& roots,
     }
     roots.push_back(std::move(root));
     return true;
+}
+
+NurbsElementSegmentClosestPointResult3D run_closest_point_assistance(
+    const RationalBezierElement3D& box,
+    const NurbsSurfacePatch3D& patch,
+    const SegmentFrame& frame,
+    const NurbsElementIntersectionOptions3D& options,
+    NurbsElementIntersectionDiagnostics3D& diagnostics,
+    std::optional<Eigen::Vector2d> preferred_seed)
+{
+    NurbsElementSegmentClosestPointOptions3D closest_options;
+    closest_options.distance_tolerance = options.geometry_tolerance;
+    closest_options.parameter_tolerance = options.parameter_tolerance;
+    closest_options.max_iterations =
+        std::max(36, options.max_newton_iterations);
+    checked_increment_diagnostic(
+        diagnostics.closest_point_attempts,
+        "NURBS closest-point attempt diagnostic overflow");
+    const auto result =
+        closest_point_nurbs_bezier_element_to_segment_3d(
+            box, patch, frame.start, frame.start + frame.delta,
+            closest_options, preferred_seed);
+    checked_accumulate_diagnostic(
+        diagnostics.closest_point_iterations, result.iterations,
+        "NURBS closest-point iteration diagnostic overflow");
+    return result;
+}
+
+bool control_hull_separates_from_segment(
+    const RationalBezierElement3D& box,
+    const SegmentFrame& frame,
+    const Eigen::Vector3d& preferred_separation,
+    double contact_tolerance)
+{
+    // Exhaustive edge/triangle support-direction enumeration is cubic in the
+    // control count. High-degree generic inputs fail closed instead of
+    // allowing terminal certification to become an unbounded workload.
+    constexpr std::size_t maximum_exhaustive_control_points = 16;
+    if (box.homogeneous_controls.size()
+        > maximum_exhaustive_control_points) {
+        return false;
+    }
+    std::vector<Eigen::Vector3d> differences;
+    differences.reserve(2 * box.homogeneous_controls.size());
+    const Eigen::Vector3d segment_end =
+        frame.start + frame.delta;
+    for (const Eigen::Vector4d& homogeneous : box.homogeneous_controls) {
+        if (!homogeneous.allFinite() || !(homogeneous.w() > 0.0))
+            return false;
+        const Eigen::Vector3d point =
+            homogeneous.head<3>() / homogeneous.w();
+        if (!point.allFinite())
+            return false;
+        differences.push_back(point - frame.start);
+        differences.push_back(point - segment_end);
+    }
+    if (differences.empty())
+        return false;
+
+    const auto separates = [&](const Eigen::Vector3d& candidate) {
+        const double candidate_norm = candidate.norm();
+        if (!std::isfinite(candidate_norm)
+            || candidate_norm <= contact_tolerance) {
+            return false;
+        }
+        const Eigen::Vector3d axis = candidate / candidate_norm;
+        double minimum_projection =
+            std::numeric_limits<double>::infinity();
+        double projection_scale = 1.0;
+        for (const Eigen::Vector3d& difference : differences) {
+            const double projection = axis.dot(difference);
+            if (!std::isfinite(projection))
+                return false;
+            minimum_projection =
+                std::min(minimum_projection, projection);
+            projection_scale =
+                std::max(projection_scale, std::abs(projection));
+        }
+        const double roundoff =
+            1024.0 * std::numeric_limits<double>::epsilon()
+            * projection_scale;
+        return minimum_projection
+            > contact_tolerance + roundoff;
+    };
+
+    if (separates(preferred_separation)) {
+        return true;
+    }
+    for (const Eigen::Vector3d& vertex : differences) {
+        if (separates(vertex))
+            return true;
+    }
+
+    const auto closest_on_segment = [](
+        const Eigen::Vector3d& first,
+        const Eigen::Vector3d& second) -> Eigen::Vector3d {
+        const Eigen::Vector3d delta = second - first;
+        const double denominator = delta.squaredNorm();
+        if (!(denominator > 0.0) || !std::isfinite(denominator))
+            return first;
+        const double parameter = std::clamp(
+            -first.dot(delta) / denominator, 0.0, 1.0);
+        return first + parameter * delta;
+    };
+    for (std::size_t first = 0; first < differences.size(); ++first) {
+        for (std::size_t second = first + 1;
+             second < differences.size(); ++second) {
+            if (separates(closest_on_segment(
+                    differences[first], differences[second]))) {
+                return true;
+            }
+        }
+    }
+
+    const auto closest_on_triangle = [](
+        const Eigen::Vector3d& a,
+        const Eigen::Vector3d& b,
+        const Eigen::Vector3d& c) -> Eigen::Vector3d {
+        const Eigen::Vector3d ab = b - a;
+        const Eigen::Vector3d ac = c - a;
+        const Eigen::Vector3d ap = -a;
+        const double d1 = ab.dot(ap);
+        const double d2 = ac.dot(ap);
+        if (d1 <= 0.0 && d2 <= 0.0)
+            return a;
+
+        const Eigen::Vector3d bp = -b;
+        const double d3 = ab.dot(bp);
+        const double d4 = ac.dot(bp);
+        if (d3 >= 0.0 && d4 <= d3)
+            return b;
+
+        const double vc = d1 * d4 - d3 * d2;
+        if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0) {
+            const double parameter = d1 / (d1 - d3);
+            return a + parameter * ab;
+        }
+
+        const Eigen::Vector3d cp = -c;
+        const double d5 = ab.dot(cp);
+        const double d6 = ac.dot(cp);
+        if (d6 >= 0.0 && d5 <= d6)
+            return c;
+
+        const double vb = d5 * d2 - d1 * d6;
+        if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0) {
+            const double parameter = d2 / (d2 - d6);
+            return a + parameter * ac;
+        }
+
+        const double va = d3 * d6 - d5 * d4;
+        if (va <= 0.0
+            && d4 - d3 >= 0.0
+            && d5 - d6 >= 0.0) {
+            const double parameter =
+                (d4 - d3) / ((d4 - d3) + (d5 - d6));
+            return b + parameter * (c - b);
+        }
+
+        const double denominator = va + vb + vc;
+        if (!(denominator > 0.0)
+            || !std::isfinite(denominator)) {
+            return Eigen::Vector3d::Zero();
+        }
+        const double inverse = 1.0 / denominator;
+        const double v = vb * inverse;
+        const double w = vc * inverse;
+        return a + v * ab + w * ac;
+    };
+    for (std::size_t first = 0; first < differences.size(); ++first) {
+        for (std::size_t second = first + 1;
+             second < differences.size(); ++second) {
+            for (std::size_t third = second + 1;
+                 third < differences.size(); ++third) {
+                if (separates(closest_on_triangle(
+                        differences[first],
+                        differences[second],
+                        differences[third]))) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+constexpr int kTerminalCertificateSubdivisionDepth = 6;
+
+bool certifies_terminal_separation(
+    const RationalBezierElement3D& box,
+    const SegmentFrame& frame,
+    const Eigen::Vector3d& preferred_separation,
+    double geometry_tolerance,
+    NurbsElementIntersectionDiagnostics3D& diagnostics,
+    int remaining_depth = kTerminalCertificateSubdivisionDepth,
+    int certificate_depth = 0)
+{
+    checked_increment_diagnostic(
+        diagnostics.terminal_certificate_boxes,
+        "NURBS terminal-certificate box diagnostic overflow");
+    diagnostics.maximum_terminal_certificate_depth_reached = std::max(
+        diagnostics.maximum_terminal_certificate_depth_reached,
+        certificate_depth);
+    if (!is_conservative_candidate(
+            projected_ranges(box, frame), frame, geometry_tolerance)) {
+        return true;
+    }
+    const double contact_tolerance = 8.0 * geometry_tolerance;
+    if (control_hull_separates_from_segment(
+            box, frame, preferred_separation, contact_tolerance)) {
+        return true;
+    }
+    if (remaining_depth <= 0)
+        return false;
+
+    bool split_along_u =
+        projected_control_variation(box, true)
+        >= projected_control_variation(box, false);
+    if (split_along_u
+        && !has_representable_midpoint(box.u0(), box.u1())) {
+        split_along_u = false;
+    } else if (!split_along_u
+               && !has_representable_midpoint(box.v0(), box.v1())) {
+        split_along_u = true;
+    }
+    if ((split_along_u
+            && !has_representable_midpoint(box.u0(), box.u1()))
+        || (!split_along_u
+            && !has_representable_midpoint(box.v0(), box.v1()))) {
+        return false;
+    }
+
+    const auto children =
+        split_along_u ? box.split_u() : box.split_v();
+    return certifies_terminal_separation(
+               children[0], frame, preferred_separation,
+               geometry_tolerance, diagnostics,
+               remaining_depth - 1, certificate_depth + 1)
+        && certifies_terminal_separation(
+               children[1], frame, preferred_separation,
+               geometry_tolerance, diagnostics,
+               remaining_depth - 1, certificate_depth + 1);
+}
+
+bool certifies_terminal_single_root(
+    const RationalBezierElement3D& box,
+    const NurbsElementRoot3D& known_root,
+    const SegmentFrame& frame,
+    const Eigen::Vector3d& preferred_separation,
+    double geometry_tolerance,
+    NurbsElementIntersectionDiagnostics3D& diagnostics,
+    int remaining_depth = kTerminalCertificateSubdivisionDepth,
+    int certificate_depth = 0)
+{
+    checked_increment_diagnostic(
+        diagnostics.terminal_certificate_boxes,
+        "NURBS terminal-certificate box diagnostic overflow");
+    diagnostics.maximum_terminal_certificate_depth_reached = std::max(
+        diagnostics.maximum_terminal_certificate_depth_reached,
+        certificate_depth);
+    if (!is_conservative_candidate(
+            projected_ranges(box, frame), frame, geometry_tolerance)) {
+        return true;
+    }
+    const bool contains_known_root =
+        known_root.u >= box.u0() && known_root.u <= box.u1()
+        && known_root.v >= box.v0() && known_root.v <= box.v1();
+    if (contains_known_root
+        && certifies_unique_transverse_root(
+            box, known_root, frame)) {
+        return true;
+    }
+    const double contact_tolerance = 8.0 * geometry_tolerance;
+    if (control_hull_separates_from_segment(
+            box, frame, preferred_separation, contact_tolerance)) {
+        return true;
+    }
+    if (remaining_depth <= 0)
+        return false;
+
+    bool split_along_u =
+        projected_control_variation(box, true)
+        >= projected_control_variation(box, false);
+    if (split_along_u
+        && !has_representable_midpoint(box.u0(), box.u1())) {
+        split_along_u = false;
+    } else if (!split_along_u
+               && !has_representable_midpoint(box.v0(), box.v1())) {
+        split_along_u = true;
+    }
+    if ((split_along_u
+            && !has_representable_midpoint(box.u0(), box.u1()))
+        || (!split_along_u
+            && !has_representable_midpoint(box.v0(), box.v1()))) {
+        return false;
+    }
+
+    const auto children =
+        split_along_u ? box.split_u() : box.split_v();
+    return certifies_terminal_single_root(
+               children[0], known_root, frame, preferred_separation,
+               geometry_tolerance, diagnostics,
+               remaining_depth - 1, certificate_depth + 1)
+        && certifies_terminal_single_root(
+               children[1], known_root, frame, preferred_separation,
+               geometry_tolerance, diagnostics,
+               remaining_depth - 1, certificate_depth + 1);
+}
+
+std::optional<NurbsElementRoot3D> root_from_closest_point(
+    const RationalBezierElement3D& box,
+    const NurbsSurfacePatch3D& patch,
+    const SegmentFrame& frame,
+    const NurbsElementIntersectionOptions3D& options,
+    const NurbsElementSegmentClosestPointResult3D& closest)
+{
+    const double contact_tolerance = 8.0 * options.geometry_tolerance;
+    if (!closest.converged || !std::isfinite(closest.distance)
+        || closest.distance > contact_tolerance
+        || closest.u < box.u0() - options.parameter_tolerance
+        || closest.u > box.u1() + options.parameter_tolerance
+        || closest.v < box.v0() - options.parameter_tolerance
+        || closest.v > box.v1() + options.parameter_tolerance
+        || closest.t < -options.parameter_tolerance
+        || closest.t > 1.0 + options.parameter_tolerance) {
+        return std::nullopt;
+    }
+
+    const double u = std::clamp(closest.u, box.u0(), box.u1());
+    const double v = std::clamp(closest.v, box.v0(), box.v1());
+    const double t = std::clamp(closest.t, 0.0, 1.0);
+    const NurbsSurfaceDerivatives3D derivatives =
+        patch.evaluate_with_derivatives(u, v);
+    const Eigen::Vector3d segment_point = frame.start + t * frame.delta;
+    const double residual = (derivatives.point - segment_point).norm();
+    const Eigen::Vector3d cross = derivatives.du.cross(derivatives.dv);
+    const double normal_norm = cross.norm();
+    if (!std::isfinite(residual) || residual > contact_tolerance
+        || !std::isfinite(normal_norm) || normal_norm <= 0.0) {
+        return std::nullopt;
+    }
+
+    NurbsElementRoot3D root;
+    root.patch_index = box.patch_index;
+    root.component = box.component;
+    root.u = u;
+    root.v = v;
+    root.t = t;
+    root.point = derivatives.point;
+    root.normal = cross / normal_norm;
+    root.residual = residual;
+    const double measured_transversality =
+        std::abs(root.normal.dot(frame.direction));
+    const double geometry_scale = std::max(
+        {box.bounds().max_extent(), frame.length,
+         options.geometry_tolerance});
+    const double reliable_tangency_tolerance = std::max(
+        32.0 * std::sqrt(std::numeric_limits<double>::epsilon()),
+        std::sqrt(contact_tolerance / geometry_scale));
+    root.transversality =
+        measured_transversality <= reliable_tangency_tolerance
+        ? 0.0
+        : measured_transversality;
+    return root;
 }
 
 bool root_lies_in_box(const NurbsElementRoot3D& root,
@@ -1246,10 +1662,14 @@ NurbsElementIntersectionResult3D intersect_nurbs_bezier_element_3d(
 
     NurbsElementIntersectionResult3D result;
     const ProjectedRanges initial_ranges = projected_ranges(element, frame);
-    ++result.diagnostics.subdivision_boxes;
+    checked_increment_diagnostic(
+        result.diagnostics.subdivision_boxes,
+        "NURBS subdivision-box diagnostic overflow");
     if (!is_conservative_candidate(
             initial_ranges, frame, options.geometry_tolerance)) {
-        ++result.diagnostics.conservative_rejections;
+        checked_increment_diagnostic(
+            result.diagnostics.conservative_rejections,
+            "NURBS conservative-rejection diagnostic overflow");
         return result;
     }
 
@@ -1263,10 +1683,10 @@ NurbsElementIntersectionResult3D intersect_nurbs_bezier_element_3d(
             element, frame, options.parameter_tolerance,
             result.diagnostics.triangle_seed_hits);
         for (const TriangleSeed& seed : seeds) {
-            const auto root = native_newton(
+            const auto outcome = native_newton(
                 element, patch, frame, seed, options, result.diagnostics);
-            if (root)
-                (void)append_root(result.roots, *root, options);
+            if (outcome.root)
+                (void)append_root(result.roots, *outcome.root, options);
         }
     }
 
@@ -1275,19 +1695,28 @@ NurbsElementIntersectionResult3D intersect_nurbs_bezier_element_3d(
     while (!pending.empty()) {
         PendingBox current = std::move(pending.back());
         pending.pop_back();
+        result.diagnostics.maximum_subdivision_depth_reached = std::max(
+            result.diagnostics.maximum_subdivision_depth_reached,
+            current.depth);
         if (skipped_initial_count)
             skipped_initial_count = false;
         else
-            ++result.diagnostics.subdivision_boxes;
+            checked_increment_diagnostic(
+                result.diagnostics.subdivision_boxes,
+                "NURBS subdivision-box diagnostic overflow");
 
         const ProjectedRanges ranges = projected_ranges(current.element, frame);
         if (!is_conservative_candidate(
                 ranges, frame, options.geometry_tolerance)) {
-            ++result.diagnostics.conservative_rejections;
+            checked_increment_diagnostic(
+                result.diagnostics.conservative_rejections,
+                "NURBS conservative-rejection diagnostic overflow");
             continue;
         }
 
         std::optional<NurbsElementRoot3D> box_root;
+        NativeNewtonOutcome newton_outcome;
+        bool attempted_midpoint_newton = false;
         const auto existing = std::find_if(
             result.roots.begin(), result.roots.end(),
             [&](const NurbsElementRoot3D& root) {
@@ -1296,20 +1725,123 @@ NurbsElementIntersectionResult3D intersect_nurbs_bezier_element_3d(
         if (existing != result.roots.end()) {
             box_root = *existing;
         } else {
-            box_root = native_newton(
+            attempted_midpoint_newton = true;
+            newton_outcome = native_newton(
                 current.element, patch, frame,
                 midpoint_seed(current.element, frame),
                 options, result.diagnostics);
+            box_root = newton_outcome.root;
             if (box_root && append_root(result.roots, *box_root, options))
-                ++result.diagnostics.roots_recovered_without_triangle_seed;
+                checked_increment_diagnostic(
+                    result.diagnostics.roots_recovered_without_triangle_seed,
+                    "NURBS seed-recovery diagnostic overflow");
+        }
+
+        std::optional<NurbsElementSegmentClosestPointResult3D> closest_result;
+        const auto preferred_closest_seed = [&]()
+            -> std::optional<Eigen::Vector2d> {
+            if (box_root)
+                return Eigen::Vector2d(box_root->u, box_root->v);
+            if (attempted_midpoint_newton
+                && std::isfinite(newton_outcome.best_residual)) {
+                return Eigen::Vector2d(
+                    newton_outcome.best_state.u,
+                    newton_outcome.best_state.v);
+            }
+            return std::nullopt;
+        };
+        const auto run_closest = [&]() {
+            if (!closest_result) {
+                closest_result = run_closest_point_assistance(
+                    current.element, patch, frame, options,
+                    result.diagnostics, preferred_closest_seed());
+            }
+        };
+
+        if (!box_root && attempted_midpoint_newton
+            && newton_outcome.ill_conditioned) {
+            run_closest();
+            if (const auto closest_root = root_from_closest_point(
+                    current.element, patch, frame, options,
+                    *closest_result)) {
+                box_root = *closest_root;
+                if (append_root(result.roots, *closest_root, options))
+                    checked_increment_diagnostic(
+                        result.diagnostics.roots_recovered_by_closest_point,
+                        "NURBS closest-point recovery diagnostic overflow");
+            }
         }
         if (box_root && certifies_unique_transverse_root(
                 current.element, *box_root, frame)) {
             continue;
         }
 
+        const auto classify_terminal_box = [&]() {
+            run_closest();
+            const double contact_tolerance =
+                8.0 * options.geometry_tolerance;
+            if (!closest_result->converged
+                || !std::isfinite(closest_result->distance)) {
+                checked_increment_diagnostic(
+                    result.diagnostics.closest_point_failures,
+                    "NURBS closest-point failure diagnostic overflow");
+                checked_increment_diagnostic(
+                    result.diagnostics.unresolved_boxes,
+                    "NURBS unresolved-box diagnostic overflow");
+                return;
+            }
+            if (closest_result->distance > contact_tolerance) {
+                if (box_root
+                    || !certifies_terminal_separation(
+                        current.element, frame,
+                        closest_result->surface_point
+                            - closest_result->segment_point,
+                        options.geometry_tolerance,
+                        result.diagnostics)) {
+                    checked_increment_diagnostic(
+                        result.diagnostics.unresolved_boxes,
+                        "NURBS unresolved-box diagnostic overflow");
+                } else {
+                    checked_increment_diagnostic(
+                        result.diagnostics.terminal_misses_by_closest_point,
+                        "NURBS terminal-miss diagnostic overflow");
+                }
+                return;
+            }
+
+            const auto closest_root = root_from_closest_point(
+                current.element, patch, frame, options,
+                *closest_result);
+            if (!closest_root) {
+                checked_increment_diagnostic(
+                    result.diagnostics.closest_point_failures,
+                    "NURBS closest-point failure diagnostic overflow");
+                checked_increment_diagnostic(
+                    result.diagnostics.unresolved_boxes,
+                    "NURBS unresolved-box diagnostic overflow");
+                return;
+            }
+            box_root = *closest_root;
+            if (append_root(result.roots, *closest_root, options))
+                checked_increment_diagnostic(
+                    result.diagnostics.roots_recovered_by_closest_point,
+                    "NURBS closest-point recovery diagnostic overflow");
+
+            if (certifies_terminal_single_root(
+                    current.element, *closest_root, frame,
+                    closest_result->surface_point
+                        - closest_result->segment_point,
+                    options.geometry_tolerance,
+                    result.diagnostics)) {
+                return;
+            }
+            checked_increment_diagnostic(
+                result.diagnostics.unresolved_boxes,
+                "NURBS unresolved-box diagnostic overflow");
+        };
+
         if (current.depth >= options.max_subdivision_depth) {
-            ++result.diagnostics.unresolved_boxes;
+            classify_terminal_box();
             continue;
         }
 
@@ -1331,7 +1863,7 @@ NurbsElementIntersectionResult3D intersect_nurbs_bezier_element_3d(
             || (!split_along_u
                 && !has_representable_midpoint(
                     current.element.v0(), current.element.v1()))) {
-            ++result.diagnostics.unresolved_boxes;
+            classify_terminal_box();
             continue;
         }
 

@@ -42,6 +42,7 @@ if(KFBIM_BUILD_3D)
         geometry/p2_projection_3d.cpp
         geometry/nurbs_patch_triangulator_3d.cpp
         geometry/nurbs_bezier_intersection_3d.cpp
+        geometry/nurbs_bezier_segment_closest_point_3d.cpp
         geometry/nurbs_cartesian_domain_3d.cpp
         geometry/nurbs_surface_intersector_3d.cpp
         geometry/nurbs_bezier_extraction_3d.cpp

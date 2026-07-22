@@ -19,6 +19,7 @@ struct NurbsCartesianDomainDiagnostics3D {
     int bezier_element_count = 0;
     int acceleration_leaf_count = 0;
     std::size_t candidate_grid_edge_count = 0;
+    double maximum_query_element_extent = 0.0;
     std::array<std::size_t, 3> barrier_edge_counts{{0, 0, 0}};
     int grid_component_count = 0;
     int box_exterior_component_count = 0;

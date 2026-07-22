@@ -3,6 +3,7 @@
 #include "src/geometry/grid_pair_3d.hpp"
 #include "src/geometry/nurbs_bezier_extraction_3d.hpp"
 #include "src/geometry/nurbs_bezier_intersection_3d.hpp"
+#include "src/geometry/nurbs_bezier_segment_closest_point_3d.hpp"
 #include "src/geometry/nurbs_cartesian_domain_3d.hpp"
 #include "src/geometry/rational_bezier_element_3d.hpp"
 #include "src/geometry/rational_bezier_subdivision_3d.hpp"
@@ -540,6 +541,217 @@ void test_rational_bezier_element_intersection()
             "control hull rejects an impossible line before Newton");
 }
 
+void test_nurbs_bezier_segment_closest_point()
+{
+    using kfbim::geometry3d::NurbsElementSegmentClosestPointOptions3D;
+    using kfbim::geometry3d::NurbsSurfaceModel3D;
+    using kfbim::geometry3d::NurbsSurfacePatch3D;
+    using kfbim::geometry3d::closest_point_nurbs_bezier_element_to_segment_3d;
+
+    NurbsElementSegmentClosestPointOptions3D options;
+    options.distance_tolerance = 1.0e-12;
+    options.parameter_tolerance = 1.0e-12;
+
+    const NurbsSurfaceModel3D plane_model(
+        {NurbsSurfacePatch3D::make_unit_square_xy()}, {0}, {});
+    const auto plane_element =
+        kfbim::geometry3d::extract_rational_bezier_elements_3d(
+            plane_model).front();
+    const auto separated =
+        closest_point_nurbs_bezier_element_to_segment_3d(
+            plane_element, plane_model.patch(0),
+            {0.3, 0.4, 0.25}, {0.3, 0.4, 0.75}, options);
+    require(separated.converged
+                && std::abs(separated.u - 0.3) < 2.0e-10
+                && std::abs(separated.v - 0.4) < 2.0e-10
+                && std::abs(separated.t) < 2.0e-10
+                && std::abs(separated.distance - 0.25) < 2.0e-10,
+            "bounded closest point finds a positive-distance endpoint minimum");
+
+    const NurbsSurfaceModel3D cylinder_model(
+        {NurbsSurfacePatch3D::make_quarter_cylinder_patch(1.0, 0.0, 1.0)},
+        {0}, {});
+    const auto cylinder_element =
+        kfbim::geometry3d::extract_rational_bezier_elements_3d(
+            cylinder_model).front();
+    const double coordinate = std::sqrt(0.5);
+    const Eigen::Vector3d contact(coordinate, coordinate, 0.5);
+    const Eigen::Vector3d tangent(-coordinate, coordinate, 0.0);
+    const auto touching =
+        closest_point_nurbs_bezier_element_to_segment_3d(
+            cylinder_element, cylinder_model.patch(0),
+            contact - 0.25 * tangent,
+            contact + 0.25 * tangent,
+            options,
+            Eigen::Vector2d(0.45, 0.55));
+    require(touching.converged
+                && touching.distance < 2.0e-11
+                && std::abs(touching.u - 0.5) < 2.0e-9
+                && std::abs(touching.v - 0.5) < 2.0e-9
+                && std::abs(touching.t - 0.5) < 2.0e-9,
+            "bounded closest point recovers a curved tangential contact");
+}
+
+void test_closest_point_classifies_terminal_intersection_boxes()
+{
+    using kfbim::geometry::NurbsBasis1D;
+    using kfbim::geometry3d::NurbsElementIntersectionOptions3D;
+    using kfbim::geometry3d::NurbsSurfaceModel3D;
+    using kfbim::geometry3d::NurbsSurfacePatch3D;
+
+    const NurbsSurfacePatch3D separated_plane(
+        NurbsBasis1D(1, {0.0, 0.0, 1.0, 1.0}),
+        NurbsBasis1D(1, {0.0, 0.0, 1.0, 1.0}),
+        {{{0.0, -1.0, 2.0}, {0.0, 2.0, -1.0}},
+         {{1.0, -1.0, 2.0}, {1.0, 2.0, -1.0}}},
+        {{1.0, 1.0}, {1.0, 1.0}});
+    const NurbsSurfaceModel3D separated_model(
+        {separated_plane}, {0}, {});
+    const auto separated_element =
+        kfbim::geometry3d::extract_rational_bezier_elements_3d(
+            separated_model).front();
+
+    NurbsElementIntersectionOptions3D options;
+    options.geometry_tolerance = 1.0e-12;
+    options.parameter_tolerance = 1.0e-12;
+    options.max_subdivision_depth = 0;
+    options.use_triangle_seed = false;
+    const auto miss =
+        kfbim::geometry3d::intersect_nurbs_bezier_element_3d(
+            separated_element, separated_model.patch(0),
+            {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, options);
+    require(miss.roots.empty()
+                && miss.diagnostics.closest_point_attempts == 1
+                && miss.diagnostics.terminal_misses_by_closest_point == 1
+                && miss.diagnostics.closest_point_failures == 0
+                && miss.diagnostics.unresolved_boxes == 0
+                && miss.diagnostics.maximum_subdivision_depth_reached == 0
+                && miss.diagnostics.terminal_certificate_boxes == 1
+                && miss.diagnostics
+                       .maximum_terminal_certificate_depth_reached == 0,
+            "control-hull separation certifies a terminal miss");
+
+    std::vector<double> degree_five_knots(6, 0.0);
+    degree_five_knots.insert(degree_five_knots.end(), 6, 1.0);
+    std::vector<std::vector<Eigen::Vector3d>> high_degree_controls(
+        6, std::vector<Eigen::Vector3d>(6, Eigen::Vector3d::Zero()));
+    std::vector<std::vector<double>> high_degree_weights(
+        6, std::vector<double>(6, 1.0));
+    for (int i = 0; i < 6; ++i) {
+        for (int j = 0; j < 6; ++j) {
+            const double u = static_cast<double>(i) / 5.0;
+            const double v = static_cast<double>(j) / 5.0;
+            high_degree_controls[static_cast<std::size_t>(i)]
+                                [static_cast<std::size_t>(j)] =
+                {u, -1.0 + 3.0 * v, 2.0 - 3.0 * v};
+        }
+    }
+    const NurbsSurfaceModel3D high_degree_model(
+        {NurbsSurfacePatch3D(
+            NurbsBasis1D(5, degree_five_knots),
+            NurbsBasis1D(5, degree_five_knots),
+            std::move(high_degree_controls),
+            std::move(high_degree_weights))},
+        {0}, {});
+    const auto high_degree_element =
+        kfbim::geometry3d::extract_rational_bezier_elements_3d(
+            high_degree_model).front();
+    const auto high_degree_miss =
+        kfbim::geometry3d::intersect_nurbs_bezier_element_3d(
+            high_degree_element, high_degree_model.patch(0),
+            {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, options);
+    require(high_degree_miss.roots.empty()
+                && high_degree_miss.diagnostics.unresolved_boxes == 0
+                && high_degree_miss.diagnostics.terminal_certificate_boxes > 1
+                && high_degree_miss.diagnostics
+                       .maximum_terminal_certificate_depth_reached <= 6,
+            "high-degree terminal certification has bounded work");
+
+    const NurbsSurfacePatch3D two_root_graph(
+        NurbsBasis1D(2, {0.0, 0.0, 0.0, 1.0, 1.0, 1.0}),
+        NurbsBasis1D(1, {0.0, 0.0, 1.0, 1.0}),
+        {{{0.0, 0.0, 0.16}, {0.0, 1.0, 0.16}},
+         {{0.5, 0.0, -0.34}, {0.5, 1.0, -0.34}},
+         {{1.0, 0.0, 0.16}, {1.0, 1.0, 0.16}}},
+        {{1.0, 1.0}, {1.0, 1.0}, {1.0, 1.0}});
+    const NurbsSurfaceModel3D two_root_model(
+        {two_root_graph}, {0}, {});
+    const auto two_root_element =
+        kfbim::geometry3d::extract_rational_bezier_elements_3d(
+            two_root_model).front();
+
+    kfbim::geometry3d::NurbsElementSegmentClosestPointOptions3D
+        arbitration_options;
+    arbitration_options.distance_tolerance = 1.0e-12;
+    arbitration_options.parameter_tolerance = 1.0e-12;
+    arbitration_options.max_iterations = 1;
+    const auto closer_failed_seed =
+        kfbim::geometry3d::closest_point_nurbs_bezier_element_to_segment_3d(
+            two_root_element, two_root_model.patch(0),
+            {0.0, 0.5, 0.0}, {1.0, 0.5, 0.0}, arbitration_options,
+            Eigen::Vector2d(0.3, 0.5));
+    require(!closer_failed_seed.converged
+                && closer_failed_seed.distance < 0.02
+                && std::abs(closer_failed_seed.u - 0.5) > 0.1,
+            "closer failed seed is retained over a farther stationary seed");
+    arbitration_options.max_iterations =
+        std::numeric_limits<int>::max();
+    require_throws_contains(
+        [&] {
+            (void)kfbim::geometry3d::
+                closest_point_nurbs_bezier_element_to_segment_3d(
+                    two_root_element, two_root_model.patch(0),
+                    {0.0, 0.5, 0.0}, {1.0, 0.5, 0.0},
+                    arbitration_options);
+        },
+        "permit two-seed accounting",
+        "closest-point iteration count rejects signed overflow");
+
+    require_throws_type_contains<
+        kfbim::geometry3d::UnresolvedNurbsIntersectionCandidate3D>(
+        [&] {
+            (void)kfbim::geometry3d::intersect_nurbs_bezier_element_3d(
+                two_root_element, two_root_model.patch(0),
+                {0.0, 0.5, 0.0}, {1.0, 0.5, 0.0}, options);
+        },
+        "unresolved conservative NURBS intersection candidate",
+        "stationary positive distance cannot hide two terminal roots");
+
+    const NurbsSurfaceModel3D cylinder_model(
+        {NurbsSurfacePatch3D::make_quarter_cylinder_patch(1.0, 0.0, 1.0)},
+        {0}, {});
+    const auto cylinder_element =
+        kfbim::geometry3d::extract_rational_bezier_elements_3d(
+            cylinder_model).front();
+    const auto contact_data =
+        cylinder_model.patch(0).evaluate_with_derivatives(0.4, 0.6);
+    const Eigen::Vector3d contact = contact_data.point;
+    const Eigen::Vector3d tangent = contact_data.du.normalized();
+    options.max_newton_iterations = 1;
+    bool tangent_failed_closed = false;
+    try {
+        (void)kfbim::geometry3d::intersect_nurbs_bezier_element_3d(
+            cylinder_element, cylinder_model.patch(0),
+            contact - 0.25 * tangent,
+            contact + 0.25 * tangent,
+            options);
+    } catch (
+        const kfbim::geometry3d::UnresolvedNurbsIntersectionCandidate3D&
+            error) {
+        const auto& partial = error.partial_result();
+        tangent_failed_closed =
+            partial.roots.size() == 1
+            && partial.roots.front().residual
+                   <= 8.0 * options.geometry_tolerance
+            && partial.roots.front().transversality < 1.0e-10
+            && partial.diagnostics.closest_point_attempts == 1
+            && partial.diagnostics.roots_recovered_by_closest_point == 1
+            && partial.diagnostics.unresolved_boxes == 1;
+    }
+    require(tangent_failed_closed,
+            "uncertified terminal tangent is retained in a fail-closed result");
+}
+
 void test_bezier_element_intersection_isolates_all_roots_and_fails_safe()
 {
     using kfbim::geometry::NurbsBasis1D;
@@ -1053,6 +1265,76 @@ void test_native_nurbs_surface_intersector()
             }),
             "all acceleration leaves satisfy requested extent");
 
+    kfbim::geometry3d::NurbsSurfaceIntersectorOptions3D
+        grid_scaled_options;
+    grid_scaled_options.maximum_element_extent = 0.05;
+    grid_scaled_options.local_max_subdivision_depth = 4;
+    const NurbsSurfaceIntersector3D grid_scaled_intersector(
+        torus.geometry_model(), grid_scaled_options);
+    require(grid_scaled_intersector.query_element_count()
+                == grid_scaled_intersector.acceleration_leaves(0.05).size()
+                && grid_scaled_intersector.maximum_query_element_extent()
+                       <= 0.05 + 1.0e-13
+                && grid_scaled_intersector.query_element_count()
+                       > torus_intersector.query_element_count(),
+            "extent-limited Bezier leaves are the actual BVH query elements");
+    kfbim::geometry3d::NurbsSurfaceIntersectionDiagnostics3D
+        grid_scaled_diagnostics;
+    const auto grid_scaled_hit =
+        grid_scaled_intersector.intersect_cartesian_edge(
+            NurbsCartesianEdgeQuery3D{
+                0, 7, 8, 9,
+                {0.80, -0.04, 0.03}, {0.84, -0.04, 0.03}},
+            &grid_scaled_diagnostics);
+    require(grid_scaled_hit
+                && grid_scaled_diagnostics.maximum_subdivision_depth_reached <= 4
+                && grid_scaled_diagnostics.unresolved_candidates == 0,
+            "grid-scaled Cartesian query obeys the local depth-four budget");
+
+    auto app_grid_options = grid_scaled_options;
+    app_grid_options.maximum_element_extent = 0.375;
+    const NurbsSurfaceIntersector3D app_grid_intersector(
+        torus.geometry_model(), app_grid_options);
+    kfbim::geometry3d::NurbsSurfaceIntersectionDiagnostics3D
+        app_grid_diagnostics;
+    const auto app_grid_miss =
+        app_grid_intersector.intersect_cartesian_edge(
+            NurbsCartesianEdgeQuery3D{
+                0, 9, 5, 9,
+                {0.1875, -0.5625, 0.1875},
+                {0.375, -0.5625, 0.1875}},
+            &app_grid_diagnostics);
+    require(!app_grid_miss
+                && app_grid_diagnostics.maximum_subdivision_depth_reached <= 4
+                && app_grid_diagnostics.unresolved_candidates == 0
+                && app_grid_diagnostics.closest_point_failures == 0
+                && app_grid_diagnostics.terminal_misses_by_closest_point > 0
+                && app_grid_diagnostics.terminal_certificate_boxes > 0
+                && app_grid_diagnostics
+                       .maximum_terminal_certificate_depth_reached <= 6,
+            "N=16 torus endpoint minimum is a resolved terminal miss");
+
+    auto fine_grid_options = grid_scaled_options;
+    fine_grid_options.maximum_element_extent = 0.046875;
+    const NurbsSurfaceIntersector3D fine_grid_intersector(
+        torus.geometry_model(), fine_grid_options);
+    kfbim::geometry3d::NurbsSurfaceIntersectionDiagnostics3D
+        fine_grid_diagnostics;
+    const auto fine_grid_hit =
+        fine_grid_intersector.intersect_cartesian_edge(
+            NurbsCartesianEdgeQuery3D{
+                0, 92, 60, 57,
+                {0.65625, -0.09375, -0.1640625},
+                {0.6796875, -0.09375, -0.1640625}},
+            &fine_grid_diagnostics);
+    require(fine_grid_hit
+                && fine_grid_diagnostics.maximum_subdivision_depth_reached <= 4
+                && fine_grid_diagnostics.unresolved_candidates == 0
+                && fine_grid_diagnostics.terminal_certificate_boxes > 0
+                && fine_grid_diagnostics
+                       .maximum_terminal_certificate_depth_reached <= 6,
+            "N=128 torus terminal certificate resolves one crossing");
+
     const auto seam_hit = torus_intersector.intersect_segment(
         {0.80, -0.04, 0.03}, {0.84, -0.04, 0.03});
     require(seam_hit.crossings.size() == 1
@@ -1146,6 +1428,39 @@ void test_native_nurbs_surface_intersector()
     const NurbsSurfaceIntersector3D cylinder_intersector(
         cylinder.geometry_model());
     require_intersector_bounds_dense_samples(cylinder, cylinder_intersector);
+
+    auto cylinder_grid_options = grid_scaled_options;
+    cylinder_grid_options.maximum_element_extent = 0.09375;
+    const NurbsSurfaceIntersector3D cylinder_grid_intersector(
+        cylinder.geometry_model(), cylinder_grid_options);
+    kfbim::geometry3d::NurbsSurfaceIntersectionDiagnostics3D
+        cylinder_grid_diagnostics;
+    const auto cylinder_grid_miss =
+        cylinder_grid_intersector.intersect_cartesian_edge(
+            NurbsCartesianEdgeQuery3D{
+                0, 41, 22, 38,
+                {0.421875, -0.46875, 0.28125},
+                {0.46875, -0.46875, 0.28125}},
+            &cylinder_grid_diagnostics);
+    require(!cylinder_grid_miss
+                && cylinder_grid_diagnostics
+                       .maximum_subdivision_depth_reached <= 4
+                && cylinder_grid_diagnostics.unresolved_candidates == 0
+                && cylinder_grid_diagnostics.closest_point_failures == 0
+                && cylinder_grid_diagnostics
+                       .terminal_misses_by_closest_point > 0,
+            "N=64 cylinder endpoint minimum is a resolved terminal miss");
+    require_throws_contains_all_with_count(
+        [&] {
+            (void)cylinder_grid_intersector.intersect_cartesian_edge(
+                NurbsCartesianEdgeQuery3D{
+                    1, 20, 21, 22,
+                    {0.61, -0.10, 0.0}, {0.61, 0.0, 0.0}});
+        },
+        {"tangential Cartesian edge contact", "axis=1", "(20,21,22)"},
+        "root=(patch=", 1,
+        "extent-limited cylinder leaf preserves tangency diagnostics");
+
     const auto smooth_hit = cylinder_intersector.intersect_segment(
         {0.06, 0.48, 0.0}, {0.06, 0.52, 0.0});
     require(smooth_hit.crossings.size() == 1
@@ -1405,6 +1720,20 @@ void test_nurbs_cartesian_l_prism_labels()
                 + domain->diagnostics().barrier_edge_counts[1]
                 + domain->diagnostics().barrier_edge_counts[2] > 0,
             "native crossings create Cartesian barriers");
+    require(domain->diagnostics().acceleration_leaf_count
+                > domain->diagnostics().bezier_element_count
+                && domain->diagnostics().maximum_query_element_extent
+                       <= 2.0 * h + domain->geometry_tolerance(),
+            "Cartesian domain builds its query BVH from physical 2h leaves");
+    require(domain->diagnostics().intersections
+                    .maximum_subdivision_depth_reached <= 4
+                && domain->diagnostics().intersections
+                       .unresolved_candidates == 0
+                && domain->diagnostics().intersections
+                       .closest_point_failures == 0
+                && domain->diagnostics().intersections
+                       .maximum_terminal_certificate_depth_reached <= 6,
+            "Cartesian domain obeys depth four without unresolved closest solves");
 
     const auto triangulation =
         kfbim::geometry3d::triangulate_nurbs_surface_patches_3d(
@@ -1592,13 +1921,13 @@ void test_nurbs_cartesian_under_resolved_torus_fails_fast()
         {34, 33, 31}, kfbim::DofLayout3D::Node);
     const NativeNurbsSurface3D torus =
         make_native_nurbs_surface_3d(GeometryKind3D::Torus);
-    require_throws_contains_all(
+    require_throws_contains(
         [&] {
             (void)kfbim::geometry3d::NurbsCartesianDomain3D(
                 grid, torus.geometry_model());
         },
-        {"multiple crossings on Cartesian edge", "axis=0", "(6,13,19)"},
-        "under-resolved torus Cartesian grid fails instead of dropping a crossing");
+        "multiple crossings on Cartesian edge",
+        "under-resolved torus Cartesian grid fails closed before labeling");
 }
 
 void test_nurbs_cartesian_input_contracts()
@@ -2149,6 +2478,8 @@ int main()
         test_rational_bezier_extraction_and_subdivision();
         test_nurbs_basis_constructor_multiplicity_contract();
         test_benchmark_rational_bezier_elements_are_conservative();
+        test_nurbs_bezier_segment_closest_point();
+        test_closest_point_classifies_terminal_intersection_boxes();
         test_rational_bezier_element_intersection();
         test_bezier_element_intersection_isolates_all_roots_and_fails_safe();
         test_ruled_overlap_certificate_is_physical_and_fail_safe();

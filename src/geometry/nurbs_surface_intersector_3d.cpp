@@ -26,6 +26,21 @@ using ExactKernel = CGAL::Exact_predicates_exact_constructions_kernel;
 using ExactScalar = ExactKernel::FT;
 constexpr int kFeatureProbeSubdivisionDepth = 16;
 
+void checked_accumulate_diagnostic(int& total,
+                                   int increment,
+                                   const char* message)
+{
+    if (total < 0 || increment < 0
+        || total > std::numeric_limits<int>::max() - increment) {
+        throw std::overflow_error(message);
+    }
+    total += increment;
+}
+
+void checked_increment_diagnostic(int& value, const char* message)
+{
+    checked_accumulate_diagnostic(value, 1, message);
+}
 
 NurbsSurfaceCrossing3D as_surface_crossing(
     const NurbsElementRoot3D& root)
@@ -375,14 +390,13 @@ certify_single_root_cartesian_ruling(
         || patch.basis_u().num_basis_functions()
                 != element.degree_u + 1
         || patch.basis_v().num_basis_functions()
-                != element.degree_v + 1
-        || element.u0() != patch.domain_start_u()
-        || element.u1() != patch.domain_end_u()
-        || element.v0() != patch.domain_start_v()
-        || element.v1() != patch.domain_end_v()) {
+                != element.degree_v + 1) {
         return std::nullopt;
     }
 
+    // The single-span source patch is the exact geometry certificate. The
+    // numerical tangent witness below is still restricted to the current BVH
+    // leaf, so a tangent elsewhere cannot clear an unresolved leaf.
     const auto point = [&](int curved, int ruling) -> const Eigen::Vector3d& {
         const auto& controls = patch.control_net();
         return curve_along_u
@@ -485,7 +499,6 @@ certify_single_root_cartesian_ruling(
     return CartesianRulingCertificate{
         curve_along_u, ruling_axis, support_axis};
 }
-
 std::optional<NurbsSurfaceCrossing3D>
 certified_complete_cartesian_tangent(
     const RationalBezierElement3D& element,
@@ -621,7 +634,9 @@ std::vector<NurbsSurfaceCrossing3D> canonicalize_roots(
         if (duplicate == patch_unique.end()) {
             patch_unique.push_back(root);
         } else {
-            ++diagnostics.same_patch_deduplications;
+            checked_increment_diagnostic(
+                diagnostics.same_patch_deduplications,
+                "NURBS same-patch diagnostic overflow");
             const double minimum_transversality = std::min(
                 duplicate->transversality, root.transversality);
             if (root.residual < duplicate->residual)
@@ -690,7 +705,9 @@ std::vector<NurbsSurfaceCrossing3D> canonicalize_roots(
             canonical.push_back(
                 patch_unique[static_cast<std::size_t>(root_index)]);
         } else {
-            ++diagnostics.seam_deduplications;
+            checked_increment_diagnostic(
+                diagnostics.seam_deduplications,
+                "NURBS seam diagnostic overflow");
             NurbsSurfaceCrossing3D& current =
                 canonical[static_cast<std::size_t>(output)];
             const NurbsSurfaceCrossing3D& candidate =
@@ -760,9 +777,29 @@ NurbsSurfaceIntersector3D::NurbsSurfaceIntersector3D(
     bounds_ = model_.control_bounds();
     geometry_tolerance_ =
         std::max(1e-12 * bounds_.diameter(), 1e-14);
-    elements_ = extract_rational_bezier_elements_3d(model_);
     if (options_.bvh_leaf_size <= 0)
         throw std::invalid_argument("NURBS BVH leaf size must be positive");
+    if (options_.local_max_subdivision_depth < 0) {
+        throw std::invalid_argument(
+            "NURBS local intersection depth must be nonnegative");
+    }
+    if (std::isnan(options_.maximum_element_extent)
+        || options_.maximum_element_extent <= 0.0) {
+        throw std::invalid_argument(
+            "NURBS maximum element extent must be positive");
+    }
+    std::vector<RationalBezierElement3D> base_elements =
+        extract_rational_bezier_elements_3d(model_);
+    if (std::isfinite(options_.maximum_element_extent)) {
+        elements_ = subdivide_rational_bezier_elements_to_extent_3d(
+            base_elements, options_.maximum_element_extent);
+    } else {
+        elements_ = std::move(base_elements);
+    }
+    for (const RationalBezierElement3D& element : elements_) {
+        maximum_query_element_extent_ = std::max(
+            maximum_query_element_extent_, element.bounds().max_extent());
+    }
     element_order_.resize(elements_.size());
     std::iota(element_order_.begin(), element_order_.end(), 0);
     if (!elements_.empty()) {
@@ -785,6 +822,17 @@ const NurbsAabb3D& NurbsSurfaceIntersector3D::bounds() const
 double NurbsSurfaceIntersector3D::geometry_tolerance() const
 {
     return geometry_tolerance_;
+}
+
+std::size_t NurbsSurfaceIntersector3D::query_element_count() const noexcept
+{
+    return elements_.size();
+}
+
+double NurbsSurfaceIntersector3D::
+maximum_query_element_extent() const noexcept
+{
+    return maximum_query_element_extent_;
 }
 
 int NurbsSurfaceIntersector3D::build_bvh_node(int begin, int end)
@@ -890,20 +938,72 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
     std::vector<NurbsSurfaceCrossing3D> roots;
     std::vector<NurbsSurfaceCrossing3D> tangential_roots;
     bool unresolved = false;
+    const auto accumulate_work =
+        [&](const NurbsElementIntersectionResult3D& work,
+            bool include_unresolved) {
+            checked_accumulate_diagnostic(
+                result.diagnostics.triangle_seed_hits,
+                work.diagnostics.triangle_seed_hits,
+                "NURBS triangle-seed diagnostic overflow");
+            checked_accumulate_diagnostic(
+                result.diagnostics.triangle_seed_misses_recovered,
+                work.diagnostics.roots_recovered_without_triangle_seed,
+                "NURBS triangle-seed recovery diagnostic overflow");
+            checked_accumulate_diagnostic(
+                result.diagnostics.subdivision_boxes,
+                work.diagnostics.subdivision_boxes,
+                "NURBS subdivision diagnostic overflow");
+            checked_accumulate_diagnostic(
+                result.diagnostics.newton_attempts,
+                work.diagnostics.newton_attempts,
+                "NURBS Newton-attempt diagnostic overflow");
+            checked_accumulate_diagnostic(
+                result.diagnostics.newton_iterations,
+                work.diagnostics.newton_iterations,
+                "NURBS Newton-iteration diagnostic overflow");
+            if (include_unresolved) {
+                checked_accumulate_diagnostic(
+                    result.diagnostics.unresolved_candidates,
+                    work.diagnostics.unresolved_boxes,
+                    "NURBS unresolved-candidate diagnostic overflow");
+            }
+            result.diagnostics.maximum_subdivision_depth_reached = std::max(
+                result.diagnostics.maximum_subdivision_depth_reached,
+                work.diagnostics.maximum_subdivision_depth_reached);
+            checked_accumulate_diagnostic(
+                result.diagnostics.terminal_certificate_boxes,
+                work.diagnostics.terminal_certificate_boxes,
+                "NURBS terminal-certificate diagnostic overflow");
+            result.diagnostics.maximum_terminal_certificate_depth_reached =
+                std::max(
+                    result.diagnostics
+                        .maximum_terminal_certificate_depth_reached,
+                    work.diagnostics
+                        .maximum_terminal_certificate_depth_reached);
+            checked_accumulate_diagnostic(
+                result.diagnostics.closest_point_attempts,
+                work.diagnostics.closest_point_attempts,
+                "NURBS closest-point attempt diagnostic overflow");
+            checked_accumulate_diagnostic(
+                result.diagnostics.closest_point_iterations,
+                work.diagnostics.closest_point_iterations,
+                "NURBS closest-point iteration diagnostic overflow");
+            checked_accumulate_diagnostic(
+                result.diagnostics.roots_recovered_by_closest_point,
+                work.diagnostics.roots_recovered_by_closest_point,
+                "NURBS closest-point recovery diagnostic overflow");
+            checked_accumulate_diagnostic(
+                result.diagnostics.terminal_misses_by_closest_point,
+                work.diagnostics.terminal_misses_by_closest_point,
+                "NURBS closest-point terminal-miss diagnostic overflow");
+            checked_accumulate_diagnostic(
+                result.diagnostics.closest_point_failures,
+                work.diagnostics.closest_point_failures,
+                "NURBS closest-point failure diagnostic overflow");
+        };
     const auto accumulate_local =
         [&](const NurbsElementIntersectionResult3D& local) {
-            result.diagnostics.triangle_seed_hits +=
-                local.diagnostics.triangle_seed_hits;
-            result.diagnostics.triangle_seed_misses_recovered +=
-                local.diagnostics.roots_recovered_without_triangle_seed;
-            result.diagnostics.subdivision_boxes +=
-                local.diagnostics.subdivision_boxes;
-            result.diagnostics.newton_attempts +=
-                local.diagnostics.newton_attempts;
-            result.diagnostics.newton_iterations +=
-                local.diagnostics.newton_iterations;
-            result.diagnostics.unresolved_candidates +=
-                local.diagnostics.unresolved_boxes;
+            accumulate_work(local, true);
             result.overlap_detected =
                 result.overlap_detected || local.overlap_detected;
             for (const NurbsElementRoot3D& root : local.roots)
@@ -911,38 +1011,38 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
         };
     const auto accumulate_probe_work =
         [&](const NurbsElementIntersectionResult3D& probe) {
-            result.diagnostics.triangle_seed_hits +=
-                probe.diagnostics.triangle_seed_hits;
-            result.diagnostics.triangle_seed_misses_recovered +=
-                probe.diagnostics.roots_recovered_without_triangle_seed;
-            result.diagnostics.subdivision_boxes +=
-                probe.diagnostics.subdivision_boxes;
-            result.diagnostics.newton_attempts +=
-                probe.diagnostics.newton_attempts;
-            result.diagnostics.newton_iterations +=
-                probe.diagnostics.newton_iterations;
+            accumulate_work(probe, false);
         };
-
-
     NurbsElementIntersectionOptions3D local_options;
     local_options.geometry_tolerance = geometry_tolerance_;
     local_options.use_triangle_seed = options_.use_triangle_seeds;
+    local_options.max_subdivision_depth =
+        options_.local_max_subdivision_depth;
     for (const int candidate : candidates) {
-        ++result.diagnostics.candidate_elements;
+        checked_increment_diagnostic(
+            result.diagnostics.candidate_elements,
+            "NURBS candidate-element diagnostic overflow");
         const RationalBezierElement3D& element =
             elements_[static_cast<std::size_t>(candidate)];
+        const NurbsSurfacePatch3D& source_patch =
+            model_.patch(element.patch_index);
         if (cartesian_edge == nullptr) {
             const NurbsElementIntersectionResult3D local =
                 intersect_nurbs_bezier_element_3d(
-                    element, model_.patch(element.patch_index),
+                    element, source_patch,
                     start, end, local_options);
             accumulate_local(local);
             continue;
         }
 
-        if (cartesian_edge != nullptr) {
+        const bool element_is_full_single_span =
+            element.u0() == source_patch.domain_start_u()
+            && element.u1() == source_patch.domain_end_u()
+            && element.v0() == source_patch.domain_start_v()
+            && element.v1() == source_patch.domain_end_v();
+        if (cartesian_edge != nullptr && element_is_full_single_span) {
             if (const auto tangent = certified_complete_cartesian_tangent(
-                    element, model_.patch(element.patch_index), nullptr,
+                    element, source_patch, nullptr,
                     start, end, cartesian_edge->axis,
                     geometry_tolerance_)) {
                 tangential_roots.push_back(*tangent);
@@ -950,14 +1050,16 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
             }
         }
 
-        if (element_touches_non_g1_feature(element, model_)) {
+        if (element_touches_non_g1_feature(element, model_)
+            && options_.local_max_subdivision_depth
+                   > kFeatureProbeSubdivisionDepth) {
             NurbsElementIntersectionOptions3D probe_options = local_options;
             probe_options.max_subdivision_depth =
                 kFeatureProbeSubdivisionDepth;
             try {
                 const NurbsElementIntersectionResult3D local =
                     intersect_nurbs_bezier_element_3d(
-                        element, model_.patch(element.patch_index),
+                        element, source_patch,
                         start, end, probe_options);
                 accumulate_local(local);
                 continue;
@@ -984,7 +1086,7 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
         try {
             const NurbsElementIntersectionResult3D local =
                 intersect_nurbs_bezier_element_3d(
-                    element, model_.patch(element.patch_index),
+                    element, source_patch,
                     start, end, local_options);
             accumulate_local(local);
         } catch (const UnresolvedNurbsIntersectionCandidate3D& error) {
@@ -992,7 +1094,7 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
                 error.partial_result();
             accumulate_local(partial);
             const auto tangent = certified_complete_cartesian_tangent(
-                element, model_.patch(element.patch_index),
+                element, source_patch,
                 &partial, start, end, cartesian_edge->axis,
                 geometry_tolerance_);
             if (tangent)

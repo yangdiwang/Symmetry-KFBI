@@ -184,6 +184,33 @@ void accumulate_intersection_diagnostics(
         total.unresolved_candidates,
         increment.unresolved_candidates,
         "NURBS unresolved-candidate diagnostic overflow");
+    total.maximum_subdivision_depth_reached = std::max(
+        total.maximum_subdivision_depth_reached,
+        increment.maximum_subdivision_depth_reached);
+    checked_accumulate_int(
+        total.terminal_certificate_boxes,
+        increment.terminal_certificate_boxes,
+        "NURBS terminal-certificate diagnostic overflow");
+    total.maximum_terminal_certificate_depth_reached = std::max(
+        total.maximum_terminal_certificate_depth_reached,
+        increment.maximum_terminal_certificate_depth_reached);
+    checked_accumulate_int(
+        total.closest_point_attempts, increment.closest_point_attempts,
+        "NURBS closest-point attempt diagnostic overflow");
+    checked_accumulate_int(
+        total.closest_point_iterations, increment.closest_point_iterations,
+        "NURBS closest-point iteration diagnostic overflow");
+    checked_accumulate_int(
+        total.roots_recovered_by_closest_point,
+        increment.roots_recovered_by_closest_point,
+        "NURBS closest-point recovery diagnostic overflow");
+    checked_accumulate_int(
+        total.terminal_misses_by_closest_point,
+        increment.terminal_misses_by_closest_point,
+        "NURBS closest-point terminal-miss diagnostic overflow");
+    checked_accumulate_int(
+        total.closest_point_failures, increment.closest_point_failures,
+        "NURBS closest-point failure diagnostic overflow");
 }
 
 Eigen::Vector3d as_vector(const std::array<double, 3>& values)
@@ -296,8 +323,18 @@ struct NurbsCartesianDomain3D::Impl {
                 "Cartesian box bounds must be finite");
         }
 
+        const double maximum_spacing =
+            *std::max_element(spacing.begin(), spacing.end());
+        const double maximum_leaf_extent = 2.0 * maximum_spacing;
+        if (!std::isfinite(maximum_leaf_extent)) {
+            throw std::overflow_error(
+                "NURBS acceleration leaf extent must be finite");
+        }
+
         NurbsSurfaceIntersectorOptions3D intersector_options;
         intersector_options.use_triangle_seeds = options.use_triangle_seeds;
+        intersector_options.maximum_element_extent = maximum_leaf_extent;
+        intersector_options.local_max_subdivision_depth = 4;
         NurbsSurfaceIntersector3D intersector(
             std::move(model), intersector_options);
         bounds = intersector.bounds();
@@ -306,6 +343,8 @@ struct NurbsCartesianDomain3D::Impl {
             throw std::overflow_error(
                 "NURBS geometry tolerance must be finite");
         }
+        diagnostics.maximum_query_element_extent =
+            intersector.maximum_query_element_extent();
         diagnostics.nurbs_patch_count = checked_size_to_int(
             intersector.model().patches().size(),
             "NURBS patch diagnostic count overflow");
@@ -356,15 +395,12 @@ struct NurbsCartesianDomain3D::Impl {
         barriers[2].assign(
             z_barrier_size, std::uint8_t{0});
 
-        const double maximum_spacing =
-            *std::max_element(spacing.begin(), spacing.end());
-        const double maximum_leaf_extent = 2.0 * maximum_spacing;
-        if (!std::isfinite(maximum_leaf_extent)) {
-            throw std::overflow_error(
-                "NURBS acceleration leaf extent must be finite");
-        }
         const std::vector<RationalBezierElement3D> leaves =
             intersector.acceleration_leaves(maximum_leaf_extent);
+        if (leaves.size() != intersector.query_element_count()) {
+            throw std::logic_error(
+                "NURBS acceleration leaves differ from BVH query elements");
+        }
         diagnostics.acceleration_leaf_count =
             checked_size_to_int(
                 leaves.size(),

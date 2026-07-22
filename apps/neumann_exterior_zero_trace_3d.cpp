@@ -198,12 +198,21 @@ struct ReadinessResult {
     int nurbs_patches = 0;
     int bezier_elements = 0;
     int acceleration_leaves = 0;
+    double maximum_query_element_extent = 0.0;
     std::size_t candidate_grid_edges = 0;
     int triangle_seed_hits = 0;
     int triangle_seed_misses_recovered = 0;
     int subdivision_boxes = 0;
     int newton_attempts = 0;
     int newton_iterations = 0;
+    int maximum_subdivision_depth = 0;
+    int terminal_certificate_boxes = 0;
+    int maximum_terminal_certificate_depth = 0;
+    int closest_point_attempts = 0;
+    int closest_point_iterations = 0;
+    int closest_point_roots_recovered = 0;
+    int closest_point_terminal_misses = 0;
+    int closest_point_failures = 0;
     int seam_deduplications = 0;
     std::size_t barrier_x = 0;
     std::size_t barrier_y = 0;
@@ -1893,6 +1902,8 @@ ReadinessResult run_readiness_case(GeometryKind kind,
     result.nurbs_patches = native_diagnostics.nurbs_patch_count;
     result.bezier_elements = native_diagnostics.bezier_element_count;
     result.acceleration_leaves = native_diagnostics.acceleration_leaf_count;
+    result.maximum_query_element_extent =
+        native_diagnostics.maximum_query_element_extent;
     result.candidate_grid_edges =
         native_diagnostics.candidate_grid_edge_count;
     result.triangle_seed_hits =
@@ -1905,6 +1916,23 @@ ReadinessResult run_readiness_case(GeometryKind kind,
         native_diagnostics.intersections.newton_attempts;
     result.newton_iterations =
         native_diagnostics.intersections.newton_iterations;
+    result.maximum_subdivision_depth =
+        native_diagnostics.intersections.maximum_subdivision_depth_reached;
+    result.terminal_certificate_boxes =
+        native_diagnostics.intersections.terminal_certificate_boxes;
+    result.maximum_terminal_certificate_depth =
+        native_diagnostics.intersections
+            .maximum_terminal_certificate_depth_reached;
+    result.closest_point_attempts =
+        native_diagnostics.intersections.closest_point_attempts;
+    result.closest_point_iterations =
+        native_diagnostics.intersections.closest_point_iterations;
+    result.closest_point_roots_recovered =
+        native_diagnostics.intersections.roots_recovered_by_closest_point;
+    result.closest_point_terminal_misses =
+        native_diagnostics.intersections.terminal_misses_by_closest_point;
+    result.closest_point_failures =
+        native_diagnostics.intersections.closest_point_failures;
     result.seam_deduplications =
         native_diagnostics.intersections.seam_deduplications;
     result.barrier_x = native_diagnostics.barrier_edge_counts[0];
@@ -2085,6 +2113,18 @@ ReadinessResult run_readiness_case(GeometryKind kind,
               << " gap_crossings=" << result.gap_crossings
               << " triangle_fallback_crossings="
               << result.triangle_fallback_crossings << '\n'
+              << "  NURBS query elements=" << result.acceleration_leaves
+              << " max_extent=" << result.maximum_query_element_extent
+              << " local_depth=" << result.maximum_subdivision_depth
+              << " certificate_boxes/depth="
+              << result.terminal_certificate_boxes << '/'
+              << result.maximum_terminal_certificate_depth
+              << " closest attempts/iterations/recovered/misses/failures="
+              << result.closest_point_attempts << '/'
+              << result.closest_point_iterations << '/'
+              << result.closest_point_roots_recovered << '/'
+              << result.closest_point_terminal_misses << '/'
+              << result.closest_point_failures << '\n'
               << "  panel-center surface patches/dofs="
               << result.surface_patches << '/' << result.surface_dofs
               << " area=" << result.surface_dof_area
@@ -2213,9 +2253,14 @@ void write_summary(const std::filesystem::path& output_dir,
                "cauchy_incident_patches_max,cauchy_value_patch_imbalance_max,"
                "cauchy_derivative_patch_imbalance_max,cauchy_condition_median,"
                "cauchy_condition_p95,cauchy_condition_max,nurbs_patches,"
-               "bezier_elements,acceleration_leaves,candidate_grid_edges,"
+               "bezier_elements,acceleration_leaves,maximum_query_element_extent,"
+               "candidate_grid_edges,"
                "triangle_seed_hits,triangle_seed_misses_recovered,subdivision_boxes,"
-               "newton_attempts,newton_iterations,seam_deduplications,"
+               "newton_attempts,newton_iterations,maximum_subdivision_depth,"
+               "terminal_certificate_boxes,maximum_terminal_certificate_depth,"
+               "closest_point_attempts,closest_point_iterations,"
+               "closest_point_roots_recovered,closest_point_terminal_misses,"
+               "closest_point_failures,seam_deduplications,"
                "barrier_x,barrier_y,barrier_z,grid_components,"
                "box_exterior_components,representative_queries,"
                "nurbs_geometry_tolerance,nurbs_root_residual_max,"
@@ -2263,11 +2308,21 @@ void write_summary(const std::filesystem::path& output_dir,
                 << row.cauchy_condition_max << ','
                 << row.nurbs_patches << ',' << row.bezier_elements << ','
                 << row.acceleration_leaves << ','
+                << row.maximum_query_element_extent << ','
                 << row.candidate_grid_edges << ','
                 << row.triangle_seed_hits << ','
                 << row.triangle_seed_misses_recovered << ','
                 << row.subdivision_boxes << ',' << row.newton_attempts << ','
-                << row.newton_iterations << ',' << row.seam_deduplications << ','
+                << row.newton_iterations << ','
+                << row.maximum_subdivision_depth << ','
+                << row.terminal_certificate_boxes << ','
+                << row.maximum_terminal_certificate_depth << ','
+                << row.closest_point_attempts << ','
+                << row.closest_point_iterations << ','
+                << row.closest_point_roots_recovered << ','
+                << row.closest_point_terminal_misses << ','
+                << row.closest_point_failures << ','
+                << row.seam_deduplications << ','
                 << row.barrier_x << ',' << row.barrier_y << ','
                 << row.barrier_z << ',' << row.grid_components << ','
                 << row.box_exterior_components << ','

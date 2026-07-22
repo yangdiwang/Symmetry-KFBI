@@ -29,6 +29,14 @@ struct NurbsElementIntersectionDiagnostics3D {
     int newton_iterations = 0;
     int roots_recovered_without_triangle_seed = 0;
     int unresolved_boxes = 0;
+    int maximum_subdivision_depth_reached = 0;
+    int terminal_certificate_boxes = 0;
+    int maximum_terminal_certificate_depth_reached = 0;
+    int closest_point_attempts = 0;
+    int closest_point_iterations = 0;
+    int roots_recovered_by_closest_point = 0;
+    int terminal_misses_by_closest_point = 0;
+    int closest_point_failures = 0;
 };
 
 struct NurbsElementIntersectionResult3D {

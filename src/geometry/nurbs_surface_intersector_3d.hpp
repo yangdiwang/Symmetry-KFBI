@@ -5,6 +5,8 @@
 
 #include <Eigen/Dense>
 
+#include <cstddef>
+#include <limits>
 #include <optional>
 #include <vector>
 
@@ -32,6 +34,14 @@ struct NurbsSurfaceIntersectionDiagnostics3D {
     int same_patch_deduplications = 0;
     int seam_deduplications = 0;
     int unresolved_candidates = 0;
+    int maximum_subdivision_depth_reached = 0;
+    int terminal_certificate_boxes = 0;
+    int maximum_terminal_certificate_depth_reached = 0;
+    int closest_point_attempts = 0;
+    int closest_point_iterations = 0;
+    int roots_recovered_by_closest_point = 0;
+    int terminal_misses_by_closest_point = 0;
+    int closest_point_failures = 0;
 };
 
 struct NurbsSurfaceIntersectionResult3D {
@@ -52,6 +62,9 @@ struct NurbsCartesianEdgeQuery3D {
 struct NurbsSurfaceIntersectorOptions3D {
     bool use_triangle_seeds = true;
     int bvh_leaf_size = 8;
+    double maximum_element_extent =
+        std::numeric_limits<double>::infinity();
+    int local_max_subdivision_depth = 36;
 };
 
 class NurbsSurfaceIntersector3D {
@@ -63,6 +76,8 @@ public:
     const NurbsSurfaceModel3D& model() const;
     const NurbsAabb3D& bounds() const;
     double geometry_tolerance() const;
+    std::size_t query_element_count() const noexcept;
+    double maximum_query_element_extent() const noexcept;
 
     NurbsSurfaceIntersectionResult3D intersect_segment(
         const Eigen::Vector3d& start,
@@ -98,6 +113,7 @@ private:
     NurbsSurfaceIntersectorOptions3D options_;
     NurbsAabb3D bounds_;
     double geometry_tolerance_ = 1e-14;
+    double maximum_query_element_extent_ = 0.0;
     std::vector<RationalBezierElement3D> elements_;
     std::vector<int> element_order_;
     std::vector<BvhNode> bvh_nodes_;
