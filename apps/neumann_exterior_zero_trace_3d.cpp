@@ -3394,7 +3394,10 @@ bool normal_restrict_hypothesis_supported(
                 reference.common.iterations - baseline_reference.common.iterations;
             const bool current_inflation =
                 current_physical_excess > 0 && current_common_excess > 0;
-            const bool half_removed =
+            const bool routes_valid =
+                current.physical.converged && current.common.converged
+                && reference.physical.converged && reference.common.converged;
+            const bool half_removed = routes_valid &&
                 static_cast<double>(reference_physical_excess)
                     <= 0.5 * static_cast<double>(current_physical_excess)
                 && static_cast<double>(reference_common_excess)
@@ -3409,9 +3412,6 @@ bool normal_restrict_hypothesis_supported(
                 reference.smooth_grid_norms.linf
                     <= 2.0 * baseline_reference.smooth_grid_norms.linf
                        + 1.0e-12;
-            const bool routes_valid =
-                current.physical.converged && current.common.converged
-                && reference.physical.converged && reference.common.converged;
             const bool pair_supported = baseline_valid && routes_valid
                 && current_inflation && half_removed
                 && exact_grid_isolated && smooth_control_stable;
