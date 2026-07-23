@@ -569,20 +569,6 @@ static std::vector<int> build_p2_nearest_center_domain_labels(
     return labels;
 }
 
-static const geometry3d::NurbsSurfaceCrossing3D& require_native_crossing(
-    const geometry3d::NurbsCartesianDomain3D& domain,
-    int node,
-    int neighbor)
-{
-    try {
-        if (domain.has_barrier_between(node, neighbor))
-            return domain.crossing_between(node, neighbor);
-    } catch (const std::exception&) {
-    }
-    throw std::runtime_error(
-        "label-changing edge has no native NURBS crossing");
-}
-
 static void verify_native_label_crossing_invariant(
     const CartesianGrid3D& grid,
     const std::vector<int>& labels,
@@ -603,10 +589,10 @@ static void verify_native_label_crossing_invariant(
                         neighbor_index[0],
                         neighbor_index[1],
                         neighbor_index[2]);
-                    if ((labels[static_cast<std::size_t>(node)] > 0)
-                        != (labels[static_cast<std::size_t>(neighbor)] > 0)) {
-                        (void)require_native_crossing(
-                            domain, node, neighbor);
+                    if (labels[static_cast<std::size_t>(node)]
+                        != labels[static_cast<std::size_t>(neighbor)]) {
+                        (void)domain.correction_crossing_between(
+                            node, neighbor);
                     }
                 }
             }
@@ -1030,7 +1016,7 @@ P2CrossingOwner3D GridPair3D::p2_crossing_owner_between(int a, int b) const {
         if ((impl_->domain_label_vec[static_cast<std::size_t>(a)] > 0)
             != (impl_->domain_label_vec[static_cast<std::size_t>(b)] > 0)) {
             const geometry3d::NurbsSurfaceCrossing3D& crossing =
-                require_native_crossing(*nurbs_domain_, a, b);
+                nurbs_domain_->correction_crossing_between(a, b);
             owner.nurbs_patch_index = crossing.patch_index;
             owner.nurbs_parameter = {crossing.u, crossing.v};
             owner.crossing_point = crossing.point;

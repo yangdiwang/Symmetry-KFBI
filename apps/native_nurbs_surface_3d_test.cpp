@@ -2233,7 +2233,7 @@ void test_nurbs_cartesian_l_prism_labels()
                             "native crossing owner residual is within tolerance");
 
                     const auto& native =
-                        domain->crossing_between(node, neighbor);
+                        domain->correction_crossing_between(node, neighbor);
                     require(owner.nurbs_patch_index == native.patch_index
                                 && owner.surface_component == native.component,
                             "native crossing owner preserves patch and component");
@@ -2556,9 +2556,10 @@ void test_nurbs_cartesian_multiple_components()
     const kfbim::CartesianGrid3D coarse_grid(
         {-1.04, -1.05, -1.0}, {1.5, 1.0, 1.0},
         {3, 2, 2}, kfbim::DofLayout3D::Node);
+    const auto coarse_model = two_translated_components(
+        cylinder.geometry_model(), Eigen::Vector3d(1.5, 0.0, 0.0));
     const kfbim::geometry3d::NurbsCartesianDomain3D coarse_domain(
-        coarse_grid, two_translated_components(
-            cylinder.geometry_model(), Eigen::Vector3d(1.5, 0.0, 0.0)));
+        coarse_grid, coarse_model);
     const int first_component_node = coarse_grid.index(1, 1, 1);
     const int second_component_node = coarse_grid.index(2, 1, 1);
     const auto component_change_crossings = coarse_domain.crossings_between(
@@ -2599,6 +2600,21 @@ void test_nurbs_cartesian_multiple_components()
         },
         "under-resolved NURBS Cartesian edge",
         "multi-crossing correction lookup fails explicitly");
+    const auto coarse_triangulation =
+        kfbim::geometry3d::triangulate_nurbs_surface_patches_3d(
+            coarse_model.patches(), 1.0);
+    const auto coarse_domain_ptr = std::make_shared<const
+        kfbim::geometry3d::NurbsCartesianDomain3D>(coarse_domain);
+    require_throws_contains(
+        [&] {
+            (void)kfbim::GridPair3D(
+                coarse_grid,
+                coarse_triangulation.interface,
+                coarse_triangulation.geometry_interface,
+                coarse_domain_ptr);
+        },
+        "under-resolved NURBS Cartesian edge",
+        "GridPair rejects an unsafe native correction edge");
 }
 
 void test_bezier_rejects_extreme_degree_control_count()
