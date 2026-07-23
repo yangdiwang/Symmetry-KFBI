@@ -138,6 +138,8 @@ struct GeometryBundle {
     Interface3D crossing_interface;
     std::vector<geometry3d::NurbsParamTriangle3D> correction_triangles;
     std::vector<geometry3d::NurbsParamTriangle3D> geometry_triangles;
+    std::vector<geometry3d::NurbsPatchGeometricEdge3D>
+        feature_edge_segments;
     int feature_edges = 0;
     int feature_vertices = 0;
     std::function<bool(const Eigen::Vector3d&)> exact_inside;
@@ -711,6 +713,7 @@ GeometryBundle make_geometry(
             std::move(triangulation.geometry_interface),
             std::move(triangulation.triangles),
             std::move(triangulation.geometry_triangles),
+            std::move(triangulation.feature_edges),
             feature_edges,
             feature_vertices,
             std::move(exact_inside)};
@@ -755,6 +758,7 @@ struct HarmonicTraceSample3D {
     std::array<int, 64> grid_ids{};
     std::array<double, 64> weights{};
     Eigen::VectorXd correction_evaluation;
+    int wrong_side_node_count = 0;
 };
 
 class PanelCenterHarmonicJetKFBI3D {
@@ -817,6 +821,33 @@ public:
         return fit_.condition_values();
     }
 
+    std::vector<double> exterior_only_restrict_condition_values() const
+    {
+        if (!exterior_only_restrict_)
+            throw std::runtime_error(
+                "exterior-only normal restrict was not initialized");
+        std::vector<double> result;
+        result.reserve(exterior_only_restrict_->stencils().size());
+        for (const auto& stencil : exterior_only_restrict_->stencils())
+            result.push_back(stencil.condition);
+        return result;
+    }
+
+    std::vector<int> joint_trace_wrong_side_node_counts() const
+    {
+        std::vector<int> result(static_cast<std::size_t>(surface_size()), 0);
+        for (int center = 0; center < surface_size(); ++center) {
+            for (int side = 0; side < 2; ++side) {
+                for (int layer = 0; layer < 4; ++layer) {
+                    result[static_cast<std::size_t>(center)] +=
+                        trace_samples_[trace_sample_index(center, side, layer)]
+                            .wrong_side_node_count;
+                }
+            }
+        }
+        return result;
+    }
+
     HarmonicJetField3D evaluate(const Eigen::VectorXd& value_jump,
                                 const Eigen::VectorXd& normal_jump) const
     {
@@ -832,6 +863,20 @@ public:
         // bulk solver accepts the right-hand side of -Delta_h.
         bulk_.solve(-rhs, result.potential);
         return result;
+    }
+
+    HarmonicJetField3D field_from_grid_and_jumps(
+        const Eigen::VectorXd& potential,
+        const Eigen::VectorXd& value_jump,
+        const Eigen::VectorXd& normal_jump) const
+    {
+        if (potential.size() != grid_.num_dofs()
+            || value_jump.size() != surface_size()
+            || normal_jump.size() != surface_size()) {
+            throw std::invalid_argument(
+                "exact-grid field received incompatible sizes");
+        }
+        return {potential, fit_.coefficients(value_jump, normal_jump)};
     }
 
     Eigen::VectorXd exterior_trace(const HarmonicJetField3D& field,
@@ -1123,6 +1168,7 @@ private:
                     result.weights[static_cast<std::size_t>(q)] = weight;
                     const bool node_inside = grid_pair_.domain_label(node) > 0;
                     if (node_inside != desired_inside) {
+                        ++result.wrong_side_node_count;
                         const Eigen::Vector3d xi =
                             local_coordinate(center, grid_point(grid_, node));
                         const double correction_sign = desired_inside ? 1.0 : -1.0;
@@ -1531,7 +1577,10 @@ SolveMetrics3D run_dirichlet_normal_case(
     const GridPair3D& grid_pair,
     const PanelCenterHarmonicJetKFBI3D& pipeline,
     const app3d::RigidTransform3D& transform,
-    int gmres_max_iterations)
+    int gmres_max_iterations,
+    ExteriorNormalRestrictMode3D mode =
+        ExteriorNormalRestrictMode3D::JointTricubicCauchy,
+    std::vector<double>* residual_history = nullptr)
 {
     const int size = pipeline.surface_size();
     Eigen::VectorXd value_data(size);
@@ -1550,8 +1599,7 @@ SolveMetrics3D run_dirichlet_normal_case(
     const ExteriorNormalTraceSolution3D solution =
         solve_exterior_zero_normal_dirichlet_3d(
             pipeline, value_data,
-            ExteriorNormalRestrictMode3D::JointTricubicCauchy,
-            2.0e-10, 0, gmres_max_iterations);
+            mode, 2.0e-10, 0, gmres_max_iterations);
     const double seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - solve_start).count();
 
@@ -1559,7 +1607,7 @@ SolveMetrics3D run_dirichlet_normal_case(
         solution.potential, solution.coefficients};
     const Eigen::VectorXd direct_exterior_normal =
         pipeline.exterior_normal_trace(
-            field, value_data, solution.normal_jump);
+            field, value_data, solution.normal_jump, mode);
     const Eigen::VectorXd exterior_normal_from_jump =
         pipeline.interior_normal_trace(
             field, value_data, solution.normal_jump) - solution.normal_jump;
@@ -1613,6 +1661,8 @@ SolveMetrics3D run_dirichlet_normal_case(
         interior_error_sq / static_cast<double>(interior_count));
     result.exterior_bulk_l2 = std::sqrt(
         exterior_error_sq / static_cast<double>(exterior_count));
+    if (residual_history != nullptr)
+        *residual_history = solution.gmres_residuals;
     return result;
 }
 
@@ -3020,14 +3070,579 @@ int run_dirichlet_rigid_study(
     return 0;
 }
 
+struct NormalRestrictNorms3D {
+    double linf = 0.0;
+    double weighted_rms = 0.0;
+};
+
+struct CommonRhsGmresProbe3D {
+    bool converged = false;
+    int iterations = 0;
+    double final_residual = 0.0;
+    std::vector<double> residuals;
+};
+
+struct NormalRestrictRouteProbe3D {
+    bool complete = false;
+    std::string route;
+    ConditionStatistics3D conditions;
+    Eigen::VectorXd exact_grid_error;
+    Eigen::VectorXd smooth_grid_error;
+    Eigen::VectorXd exact_equation_residual;
+    NormalRestrictNorms3D exact_grid_norms;
+    NormalRestrictNorms3D smooth_grid_norms;
+    NormalRestrictNorms3D exact_equation_norms;
+    SolveMetrics3D physical;
+    std::vector<double> physical_residuals;
+    CommonRhsGmresProbe3D common;
+    double seconds = 0.0;
+};
+
+struct NormalRestrictCaseProbe3D {
+    std::string case_id;
+    int N = 0;
+    double h = 0.0;
+    std::vector<int> patch_ids;
+    std::vector<Eigen::Vector3d> points;
+    std::vector<double> weights;
+    std::vector<double> feature_edge_distance_over_h;
+    std::vector<int> wrong_side_support_count;
+    std::array<NormalRestrictRouteProbe3D, 2> routes;
+};
+
+const char* normal_restrict_route_name(ExteriorNormalRestrictMode3D mode)
+{
+    return mode == ExteriorNormalRestrictMode3D::JointTricubicCauchy
+        ? "joint_tricubic_cauchy"
+        : "exterior_only_harmonic_cubic";
+}
+
+int normal_restrict_route_index(ExteriorNormalRestrictMode3D mode)
+{
+    return mode == ExteriorNormalRestrictMode3D::JointTricubicCauchy ? 0 : 1;
+}
+
+NormalRestrictNorms3D normal_restrict_weighted_norms(
+    const Eigen::VectorXd& values,
+    const std::vector<double>& weights,
+    const std::vector<int>* selected = nullptr)
+{
+    if (values.size() != static_cast<int>(weights.size()))
+        throw std::invalid_argument("normal-restrict norm size mismatch");
+    NormalRestrictNorms3D result;
+    double weighted_sum = 0.0;
+    double weight_sum = 0.0;
+    const auto accumulate = [&](int q) {
+        const double value = values[q];
+        const double weight = weights[static_cast<std::size_t>(q)];
+        if (!std::isfinite(value) || !std::isfinite(weight) || weight <= 0.0)
+            throw std::runtime_error("normal-restrict norm received invalid data");
+        result.linf = std::max(result.linf, std::abs(value));
+        weighted_sum += weight * value * value;
+        weight_sum += weight;
+    };
+    if (selected == nullptr) {
+        for (int q = 0; q < values.size(); ++q)
+            accumulate(q);
+    } else {
+        for (int q : *selected)
+            accumulate(q);
+    }
+    if (weight_sum > 0.0)
+        result.weighted_rms = std::sqrt(weighted_sum / weight_sum);
+    return result;
+}
+
+double point_segment_distance_3d(
+    const Eigen::Vector3d& point,
+    const geometry3d::NurbsPatchGeometricEdge3D& edge)
+{
+    const Eigen::Vector3d direction = edge.end - edge.start;
+    const double length_squared = direction.squaredNorm();
+    if (!(length_squared > 0.0))
+        return (point - edge.start).norm();
+    const double phase = std::max(
+        0.0, std::min(1.0, (point - edge.start).dot(direction) / length_squared));
+    return (point - (edge.start + phase * direction)).norm();
+}
+
+Eigen::VectorXd make_common_normal_restrict_rhs(int size)
+{
+    Eigen::VectorXd rhs(size);
+    for (int q = 0; q < size; ++q) {
+        const double index = static_cast<double>(q + 1);
+        rhs[q] = std::sin(0.73 * index) + 0.25 * std::cos(0.19 * index);
+    }
+    const double norm = rhs.norm();
+    if (!(norm > 0.0) || !std::isfinite(norm))
+        throw std::runtime_error("common normal-restrict RHS is invalid");
+    rhs /= norm;
+    return rhs;
+}
+
+CommonRhsGmresProbe3D run_common_normal_restrict_gmres(
+    const PanelCenterHarmonicJetKFBI3D& pipeline,
+    ExteriorNormalRestrictMode3D mode,
+    const Eigen::VectorXd& rhs)
+{
+    ExteriorNormalTraceOperator3D op(pipeline, mode);
+    Eigen::VectorXd unknown = Eigen::VectorXd::Zero(op.problem_size());
+    GMRES gmres(160, 2.0e-10, 0);
+    CommonRhsGmresProbe3D result;
+    result.iterations = gmres.solve(op, rhs, unknown);
+    result.converged = gmres.converged();
+    result.residuals = gmres.residuals();
+    result.final_residual = result.residuals.empty()
+        ? 0.0 : result.residuals.back();
+    return result;
+}
+
+void write_normal_restrict_probe_outputs(
+    const std::filesystem::path& output_dir,
+    const std::vector<NormalRestrictCaseProbe3D>& cases)
+{
+    std::filesystem::create_directories(output_dir);
+    std::ofstream summary = open_output_file(output_dir / "summary.csv");
+    summary << std::setprecision(17)
+            << "case_id,N,route,restrict_condition_median,"
+               "restrict_condition_p95,restrict_condition_max,"
+               "exact_grid_linf,exact_grid_wrms,smooth_grid_linf,"
+               "smooth_grid_wrms,exact_equation_linf,exact_equation_wrms,"
+               "physical_converged,physical_iterations,"
+               "physical_final_residual,physical_interior_linf,"
+               "common_converged,common_iterations,common_final_residual,"
+               "seconds\n";
+    std::ofstream residuals = open_output_file(
+        output_dir / "gmres_residuals.csv");
+    residuals << std::setprecision(17)
+              << "case_id,N,route,solve_kind,iteration,relative_residual\n";
+    for (const NormalRestrictCaseProbe3D& probe_case : cases) {
+        for (const NormalRestrictRouteProbe3D& route : probe_case.routes) {
+            if (!route.complete)
+                continue;
+            const double physical_final = route.physical_residuals.empty()
+                ? 0.0 : route.physical_residuals.back();
+            summary << probe_case.case_id << ',' << probe_case.N << ','
+                    << route.route << ',' << route.conditions.median << ','
+                    << route.conditions.p95 << ',' << route.conditions.maximum
+                    << ',' << route.exact_grid_norms.linf << ','
+                    << route.exact_grid_norms.weighted_rms << ','
+                    << route.smooth_grid_norms.linf << ','
+                    << route.smooth_grid_norms.weighted_rms << ','
+                    << route.exact_equation_norms.linf << ','
+                    << route.exact_equation_norms.weighted_rms << ','
+                    << route.physical.converged << ','
+                    << route.physical.iterations << ',' << physical_final << ','
+                    << route.physical.interior_linf << ','
+                    << route.common.converged << ',' << route.common.iterations
+                    << ',' << route.common.final_residual << ','
+                    << route.seconds << '\n';
+            for (std::size_t k = 0; k < route.physical_residuals.size(); ++k)
+                residuals << probe_case.case_id << ',' << probe_case.N << ','
+                          << route.route << ",physical," << k << ','
+                          << route.physical_residuals[k] << '\n';
+            for (std::size_t k = 0; k < route.common.residuals.size(); ++k)
+                residuals << probe_case.case_id << ',' << probe_case.N << ','
+                          << route.route << ",common," << k << ','
+                          << route.common.residuals[k] << '\n';
+        }
+    }
+}
+
+void write_normal_restrict_probe_localization(
+    const std::filesystem::path& output_dir,
+    const std::vector<NormalRestrictCaseProbe3D>& cases)
+{
+    std::ofstream dofs = open_output_file(output_dir / "dof_diagnostics.csv");
+    dofs << std::setprecision(17)
+         << "case_id,N,route,dof,patch_id,x,y,z,weight,"
+            "feature_edge_distance_over_h,wrong_side_support_count,"
+            "exact_grid_error,smooth_grid_error,"
+            "exact_equation_residual\n";
+    std::ofstream bins = open_output_file(output_dir / "edge_distance_bins.csv");
+    bins << std::setprecision(17)
+         << "case_id,N,route,distance_bin,count,"
+            "exact_grid_linf,exact_grid_wrms,"
+            "exact_equation_linf,exact_equation_wrms\n";
+    const std::array<double, 5> upper{{
+        1.0, 2.0, 4.0, 8.0,
+        std::numeric_limits<double>::infinity()}};
+    const std::array<const char*, 5> labels{{
+        "0_1", "1_2", "2_4", "4_8", "8_inf"}};
+    for (const NormalRestrictCaseProbe3D& probe_case : cases) {
+        const int size = static_cast<int>(probe_case.weights.size());
+        std::array<std::vector<int>, 5> members;
+        for (int q = 0; q < size; ++q) {
+            const double distance = probe_case.feature_edge_distance_over_h[
+                static_cast<std::size_t>(q)];
+            int bin = 0;
+            while (bin < 4 && !(distance < upper[static_cast<std::size_t>(bin)]))
+                ++bin;
+            members[static_cast<std::size_t>(bin)].push_back(q);
+        }
+        for (const NormalRestrictRouteProbe3D& route : probe_case.routes) {
+            if (!route.complete)
+                continue;
+            for (int q = 0; q < size; ++q) {
+                const Eigen::Vector3d& point =
+                    probe_case.points[static_cast<std::size_t>(q)];
+                dofs << probe_case.case_id << ',' << probe_case.N << ','
+                     << route.route << ',' << q << ','
+                     << probe_case.patch_ids[static_cast<std::size_t>(q)] << ','
+                     << point.x() << ',' << point.y() << ',' << point.z() << ','
+                     << probe_case.weights[static_cast<std::size_t>(q)] << ','
+                     << probe_case.feature_edge_distance_over_h[
+                            static_cast<std::size_t>(q)] << ','
+                     << probe_case.wrong_side_support_count[
+                            static_cast<std::size_t>(q)] << ','
+                     << route.exact_grid_error[q] << ','
+                     << route.smooth_grid_error[q] << ','
+                     << route.exact_equation_residual[q] << '\n';
+            }
+            for (int bin = 0; bin < 5; ++bin) {
+                const std::vector<int>& selected =
+                    members[static_cast<std::size_t>(bin)];
+                const NormalRestrictNorms3D grid_norms =
+                    normal_restrict_weighted_norms(
+                        route.exact_grid_error, probe_case.weights, &selected);
+                const NormalRestrictNorms3D equation_norms =
+                    normal_restrict_weighted_norms(
+                        route.exact_equation_residual,
+                        probe_case.weights, &selected);
+                bins << probe_case.case_id << ',' << probe_case.N << ','
+                     << route.route << ','
+                     << labels[static_cast<std::size_t>(bin)] << ','
+                     << selected.size() << ','
+                     << grid_norms.linf << ',' << grid_norms.weighted_rms << ','
+                     << equation_norms.linf << ','
+                     << equation_norms.weighted_rms << '\n';
+            }
+        }
+    }
+}
+
+void write_all_normal_restrict_probe_outputs(
+    const std::filesystem::path& output_dir,
+    const std::vector<NormalRestrictCaseProbe3D>& cases)
+{
+    write_normal_restrict_probe_outputs(output_dir, cases);
+    write_normal_restrict_probe_localization(output_dir, cases);
+}
+
+const NormalRestrictCaseProbe3D* find_normal_restrict_probe_case(
+    const std::vector<NormalRestrictCaseProbe3D>& cases,
+    const std::string& case_id,
+    int N)
+{
+    for (const NormalRestrictCaseProbe3D& probe_case : cases) {
+        if (probe_case.case_id == case_id && probe_case.N == N)
+            return &probe_case;
+    }
+    return nullptr;
+}
+
+bool normal_restrict_hypothesis_supported(
+    const std::vector<NormalRestrictCaseProbe3D>& cases,
+    const std::vector<int>& levels)
+{
+    const std::array<std::string, 2> rotated_ids{{
+        "rot_axis123_17deg", "rot_axis123_17deg_t_xyz_1"}};
+    bool supported = true;
+    for (int N : levels) {
+        const NormalRestrictCaseProbe3D* baseline =
+            find_normal_restrict_probe_case(cases, "baseline", N);
+        if (baseline == nullptr
+            || !baseline->routes[0].complete
+            || !baseline->routes[1].complete) {
+            supported = false;
+            continue;
+        }
+        const NormalRestrictRouteProbe3D& baseline_current =
+            baseline->routes[0];
+        const NormalRestrictRouteProbe3D& baseline_reference =
+            baseline->routes[1];
+        const bool baseline_valid =
+            baseline_current.physical.converged
+            && baseline_current.common.converged
+            && baseline_reference.physical.converged
+            && baseline_reference.common.converged
+            && baseline_reference.exact_grid_norms.linf <= 1.0e-12
+            && baseline_reference.physical.interior_linf
+               <= 2.0 * std::max(
+                    baseline_current.physical.interior_linf, 1.0e-14);
+        supported = supported && baseline_valid;
+        for (const std::string& rotated_id : rotated_ids) {
+            const NormalRestrictCaseProbe3D* rotated =
+                find_normal_restrict_probe_case(cases, rotated_id, N);
+            if (rotated == nullptr
+                || !rotated->routes[0].complete
+                || !rotated->routes[1].complete) {
+                supported = false;
+                continue;
+            }
+            const NormalRestrictRouteProbe3D& current = rotated->routes[0];
+            const NormalRestrictRouteProbe3D& reference = rotated->routes[1];
+            const int current_physical_excess =
+                current.physical.iterations
+                - baseline_current.physical.iterations;
+            const int reference_physical_excess =
+                reference.physical.iterations
+                - baseline_reference.physical.iterations;
+            const int current_common_excess =
+                current.common.iterations - baseline_current.common.iterations;
+            const int reference_common_excess =
+                reference.common.iterations - baseline_reference.common.iterations;
+            const bool current_inflation =
+                current_physical_excess > 0 && current_common_excess > 0;
+            const bool half_removed =
+                static_cast<double>(reference_physical_excess)
+                    <= 0.5 * static_cast<double>(current_physical_excess)
+                && static_cast<double>(reference_common_excess)
+                    <= 0.5 * static_cast<double>(current_common_excess);
+            const bool exact_grid_isolated =
+                current.exact_grid_norms.linf
+                    >= 1.10 * baseline_current.exact_grid_norms.linf
+                && current.exact_grid_norms.linf
+                    >= baseline_current.exact_grid_norms.linf + 1.0e-8
+                && reference.exact_grid_norms.linf <= 1.0e-12;
+            const bool smooth_control_stable =
+                reference.smooth_grid_norms.linf
+                    <= 2.0 * baseline_reference.smooth_grid_norms.linf
+                       + 1.0e-12;
+            const bool routes_valid =
+                current.physical.converged && current.common.converged
+                && reference.physical.converged && reference.common.converged;
+            const bool pair_supported = baseline_valid && routes_valid
+                && current_inflation && half_removed
+                && exact_grid_isolated && smooth_control_stable;
+            supported = supported && pair_supported;
+            std::cout << "[restrict-decision] case=" << rotated_id
+                      << " N=" << N
+                      << " physical_excess(current/reference)="
+                      << current_physical_excess << '/'
+                      << reference_physical_excess
+                      << " common_excess(current/reference)="
+                      << current_common_excess << '/'
+                      << reference_common_excess
+                      << " exact_grid_isolated=" << exact_grid_isolated
+                      << " smooth_control_stable=" << smooth_control_stable
+                      << " half_removed=" << half_removed << '\n';
+        }
+    }
+    return supported;
+}
+
+int run_normal_restrict_causal_probe(std::vector<int> levels)
+{
+    std::sort(levels.begin(), levels.end());
+    levels.erase(std::unique(levels.begin(), levels.end()), levels.end());
+    for (int N : levels) {
+        if (N < 16 || !is_power_of_two(N))
+            throw std::invalid_argument(
+                "restrict-probe N must be a power of two and at least 16");
+    }
+#ifdef KFBIM_APP_OUTPUT_DIR
+    const std::filesystem::path output_dir =
+        std::filesystem::path(KFBIM_APP_OUTPUT_DIR)
+        / "dirichlet_normal_restrict_causal_probe_3d";
+#else
+    const std::filesystem::path output_dir =
+        "output/dirichlet_normal_restrict_causal_probe_3d";
+#endif
+    const std::array<std::string, 3> selected_ids{{
+        "baseline", "rot_axis123_17deg",
+        "rot_axis123_17deg_t_xyz_1"}};
+    const std::vector<app3d::DirichletRigidStudyCase3D> all_cases =
+        app3d::make_l_prism_dirichlet_rigid_study_cases_3d();
+    std::vector<app3d::DirichletRigidStudyCase3D> study_cases;
+    for (const std::string& id : selected_ids) {
+        const auto found = std::find_if(
+            all_cases.begin(), all_cases.end(),
+            [&](const app3d::DirichletRigidStudyCase3D& item) {
+                return item.id == id;
+            });
+        if (found == all_cases.end())
+            throw std::runtime_error("missing restrict-probe rigid case: " + id);
+        study_cases.push_back(*found);
+    }
+
+    std::vector<NormalRestrictCaseProbe3D> results;
+    write_all_normal_restrict_probe_outputs(output_dir, results);
+    std::cout << "KFBI3D exterior-normal restrict causal probe\n"
+              << "  geometry=l_prism cauchy=g1_nearest/degree3/48/28\n"
+              << "  gmres_tolerance=2e-10 restart=0 cap=160\n";
+    for (int N : levels) {
+        const double h = kBoxSide / static_cast<double>(N);
+        for (const auto& study_case : study_cases) {
+            const auto setup_start = std::chrono::steady_clock::now();
+            CartesianGrid3D grid({kBoxMin, kBoxMin, kBoxMin},
+                                 {h, h, h}, {N, N, N}, DofLayout3D::Node);
+            GeometryBundle geometry = make_geometry(
+                GeometryKind::LPrism, h, study_case.transform);
+            const auto domain = std::make_shared<const
+                geometry3d::NurbsCartesianDomain3D>(
+                    grid, geometry.native_surface.geometry_model());
+            const SurfaceDofCloud surface_dofs =
+                app3d::make_native_surface_dofs_3d(
+                    geometry.native_surface, h);
+            validate_surface_dofs(surface_dofs, h);
+            const CauchyStencilSet cauchy_stencils = build_cauchy_stencils(
+                geometry.native_surface, surface_dofs, h,
+                kCauchyValueNeighborCount,
+                kCauchyDerivativeNeighborCount,
+                CauchyStencilPolicy3D::G1Nearest);
+            GridPair3D grid_pair(grid,
+                                 geometry.correction_interface,
+                                 geometry.crossing_interface,
+                                 domain);
+            for (int node = 0; node < grid.num_dofs(); ++node) {
+                const bool numerical_inside = grid_pair.domain_label(node) > 0;
+                if (numerical_inside
+                    != geometry.exact_inside(grid_point(grid, node))) {
+                    throw std::runtime_error(
+                        "restrict-probe native NURBS label mismatch");
+                }
+            }
+            PanelCenterHarmonicJetKFBI3D pipeline(
+                grid, grid_pair, geometry.native_surface,
+                geometry.correction_triangles,
+                geometry.geometry_triangles,
+                surface_dofs, cauchy_stencils, true);
+
+            NormalRestrictCaseProbe3D probe_case;
+            probe_case.case_id = study_case.id;
+            probe_case.N = N;
+            probe_case.h = h;
+            probe_case.wrong_side_support_count =
+                pipeline.joint_trace_wrong_side_node_counts();
+            const int size = pipeline.surface_size();
+            probe_case.patch_ids.reserve(static_cast<std::size_t>(size));
+            probe_case.points.reserve(static_cast<std::size_t>(size));
+            probe_case.weights.reserve(static_cast<std::size_t>(size));
+            probe_case.feature_edge_distance_over_h.reserve(
+                static_cast<std::size_t>(size));
+            if (geometry.feature_edge_segments.empty())
+                throw std::runtime_error("L-prism has no feature-edge segments");
+            for (const SurfaceDof& dof : pipeline.surface().dofs) {
+                probe_case.patch_ids.push_back(dof.patch_id);
+                probe_case.points.push_back(dof.point);
+                probe_case.weights.push_back(dof.weight);
+                double distance = std::numeric_limits<double>::infinity();
+                for (const auto& edge : geometry.feature_edge_segments) {
+                    distance = std::min(
+                        distance, point_segment_distance_3d(dof.point, edge));
+                }
+                probe_case.feature_edge_distance_over_h.push_back(distance / h);
+            }
+
+            Eigen::VectorXd value_data(size);
+            Eigen::VectorXd exact_normal(size);
+            const Eigen::VectorXd zero_jump = Eigen::VectorXd::Zero(size);
+            for (int q = 0; q < size; ++q) {
+                const SurfaceDof& dof =
+                    pipeline.surface().dofs[static_cast<std::size_t>(q)];
+                value_data[q] =
+                    app3d::transformed_manufactured_harmonic_value_3d(
+                        study_case.transform, dof.point);
+                exact_normal[q] =
+                    app3d::transformed_manufactured_harmonic_gradient_3d(
+                        study_case.transform, dof.point).dot(dof.normal);
+            }
+            Eigen::VectorXd piecewise_exact(grid.num_dofs());
+            Eigen::VectorXd smooth_exact(grid.num_dofs());
+            for (int node = 0; node < grid.num_dofs(); ++node) {
+                const double value =
+                    app3d::transformed_manufactured_harmonic_value_3d(
+                        study_case.transform, grid_point(grid, node));
+                smooth_exact[node] = value;
+                piecewise_exact[node] = grid_pair.domain_label(node) > 0
+                    ? value : 0.0;
+            }
+            const HarmonicJetField3D piecewise_field =
+                pipeline.field_from_grid_and_jumps(
+                    piecewise_exact, value_data, exact_normal);
+            const HarmonicJetField3D smooth_field =
+                pipeline.field_from_grid_and_jumps(
+                    smooth_exact, zero_jump, zero_jump);
+            const Eigen::VectorXd common_rhs =
+                make_common_normal_restrict_rhs(size);
+            results.push_back(std::move(probe_case));
+            NormalRestrictCaseProbe3D& stored = results.back();
+
+            const std::array<ExteriorNormalRestrictMode3D, 2> modes{{
+                ExteriorNormalRestrictMode3D::JointTricubicCauchy,
+                ExteriorNormalRestrictMode3D::ExteriorOnlyHarmonicCubic}};
+            for (ExteriorNormalRestrictMode3D mode : modes) {
+                const auto route_start = std::chrono::steady_clock::now();
+                NormalRestrictRouteProbe3D& route = stored.routes[
+                    static_cast<std::size_t>(normal_restrict_route_index(mode))];
+                route.route = normal_restrict_route_name(mode);
+                route.conditions = summarize_conditions(
+                    mode == ExteriorNormalRestrictMode3D::JointTricubicCauchy
+                        ? pipeline.cauchy_condition_values()
+                        : pipeline.exterior_only_restrict_condition_values());
+                route.exact_grid_error = pipeline.exterior_normal_trace(
+                    piecewise_field, value_data, exact_normal, mode);
+                route.smooth_grid_error = pipeline.exterior_normal_trace(
+                    smooth_field, zero_jump, zero_jump, mode) - exact_normal;
+                ExteriorNormalTraceOperator3D op(pipeline, mode);
+                Eigen::VectorXd applied;
+                op.apply(exact_normal, applied);
+                route.exact_equation_residual =
+                    applied - op.right_hand_side(value_data);
+                route.exact_grid_norms = normal_restrict_weighted_norms(
+                    route.exact_grid_error, stored.weights);
+                route.smooth_grid_norms = normal_restrict_weighted_norms(
+                    route.smooth_grid_error, stored.weights);
+                route.exact_equation_norms = normal_restrict_weighted_norms(
+                    route.exact_equation_residual, stored.weights);
+                route.physical = run_dirichlet_normal_case(
+                    grid, grid_pair, pipeline, study_case.transform, 160,
+                    mode, &route.physical_residuals);
+                route.common = run_common_normal_restrict_gmres(
+                    pipeline, mode, common_rhs);
+                route.seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - route_start).count();
+                route.complete = true;
+                write_all_normal_restrict_probe_outputs(output_dir, results);
+                std::cout << "[restrict-probe] case=" << stored.case_id
+                          << " N=" << N << " route=" << route.route
+                          << " exact_grid_linf="
+                          << route.exact_grid_norms.linf
+                          << " smooth_grid_linf="
+                          << route.smooth_grid_norms.linf
+                          << " equation_linf="
+                          << route.exact_equation_norms.linf
+                          << " physical_iter/error="
+                          << route.physical.iterations << '/'
+                          << route.physical.interior_linf
+                          << " common_iter=" << route.common.iterations
+                          << " seconds=" << route.seconds << '\n';
+            }
+            const double setup_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - setup_start).count();
+            std::cout << "[restrict-probe-case] case=" << stored.case_id
+                      << " N=" << N << " dofs=" << size
+                      << " total_seconds=" << setup_seconds << '\n';
+        }
+    }
+    const bool supported = normal_restrict_hypothesis_supported(results, levels);
+    std::cout << "[restrict-hypothesis] "
+              << (supported ? "supported" : "not_proven") << '\n'
+              << "Restrict probe output: " << output_dir.string() << '\n';
+    return 0;
+}
+
 void print_usage(const char* executable)
 {
     std::cout
         << "usage: " << executable
         << " [torus|cylinder|l_prism|all] [N ...]\n"
         << "       " << executable << " --rigid-study [N ...]\n"
+        << "       " << executable << " --restrict-probe [N ...]\n"
         << "  Each N must be a power of two and at least 16 (default: 32).\n"
         << "  Rigid-study default levels: 32, 64, 128.\n"
+        << "  Restrict-probe default levels: 32, 64.\n"
         << "  This stage builds native NURBS parameter-cell-center surface\n"
         << "  unknowns, topology-filtered 48/28 Cauchy stencils, validates\n"
         << "  fixed transfer routes, and executes the Neumann value-jump and\n"
@@ -3049,11 +3664,14 @@ int main(int argc, char** argv)
         std::cout << std::scientific << std::setprecision(6) << std::unitbuf;
         const bool rigid_study = argc >= 2
                               && std::string(argv[1]) == "--rigid-study";
+        const bool restrict_probe = argc >= 2
+                                  && std::string(argv[1]) == "--restrict-probe";
         std::string selection = "all";
-        std::vector<int> levels =
-            rigid_study ? std::vector<int>{32, 64, 128}
-                        : std::vector<int>{32};
-        if (argc >= 2 && !rigid_study)
+        std::vector<int> levels = rigid_study
+            ? std::vector<int>{32, 64, 128}
+            : restrict_probe ? std::vector<int>{32, 64}
+                             : std::vector<int>{32};
+        if (argc >= 2 && !rigid_study && !restrict_probe)
             selection = argv[1];
         if (selection == "--help" || selection == "-h") {
             print_usage(argv[0]);
@@ -3070,6 +3688,8 @@ int main(int argc, char** argv)
                 levels.push_back(N);
             }
         }
+        if (restrict_probe)
+            return run_normal_restrict_causal_probe(levels);
         const CauchyStencilPolicy3D cauchy_policy = selected_cauchy_policy();
         const int cauchy_value_count = positive_environment_integer(
             "KFBIM_3D_CAUCHY_VALUE_COUNT", kCauchyValueNeighborCount);
