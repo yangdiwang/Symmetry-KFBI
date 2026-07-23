@@ -665,8 +665,10 @@ void test_closest_point_classifies_terminal_intersection_boxes()
                 && high_degree_miss.diagnostics.unresolved_boxes == 0
                 && high_degree_miss.diagnostics.terminal_certificate_boxes > 1
                 && high_degree_miss.diagnostics
-                       .maximum_terminal_certificate_depth_reached <= 6,
-            "high-degree terminal certification has bounded work");
+                       .maximum_terminal_certificate_depth_reached <= 6
+                && high_degree_miss.diagnostics
+                       .high_degree_control_hull_fallbacks > 0,
+            "high-degree terminal certification has bounded recorded work");
 
     const NurbsSurfacePatch3D two_root_graph(
         NurbsBasis1D(2, {0.0, 0.0, 0.0, 1.0, 1.0, 1.0}),

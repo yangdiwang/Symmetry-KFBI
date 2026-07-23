@@ -1342,6 +1342,10 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
             result.diagnostics.maximum_sample_seeds_per_element = std::max(
                 result.diagnostics.maximum_sample_seeds_per_element,
                 work.diagnostics.maximum_supplied_seed_count);
+            checked_accumulate_diagnostic(
+                result.diagnostics.high_degree_fallbacks,
+                work.diagnostics.high_degree_control_hull_fallbacks,
+                "NURBS high-degree fallback diagnostic overflow");
         };
     const auto accumulate_local =
         [&](const NurbsElementIntersectionResult3D& local) {

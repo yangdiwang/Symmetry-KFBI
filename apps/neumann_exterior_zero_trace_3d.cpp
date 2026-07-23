@@ -214,6 +214,27 @@ struct ReadinessResult {
     int closest_point_terminal_misses = 0;
     int closest_point_failures = 0;
     int seam_deduplications = 0;
+    int sample_seed_candidates = 0;
+    int sample_seeds_accepted = 0;
+    int sample_seed_roots_recovered = 0;
+    int maximum_sample_seeds_per_element = 0;
+    int stationary_solve_attempts = 0;
+    int stationary_solve_converged = 0;
+    int stationary_witnesses = 0;
+    int stationary_protected_root_pairs = 0;
+    int ambiguous_root_clusters = 0;
+    int non_g1_topology_merges = 0;
+    int high_degree_fallbacks = 0;
+    std::size_t interface_x = 0;
+    std::size_t interface_y = 0;
+    std::size_t interface_z = 0;
+    std::size_t multi_crossing_edges = 0;
+    std::size_t even_parity_interface_edges = 0;
+    std::size_t odd_parity_interface_edges = 0;
+    std::size_t ambiguous_parity_edges = 0;
+    std::size_t endpoint_parity_fallbacks = 0;
+    std::size_t endpoint_classification_queries = 0;
+    std::size_t component_parity_toggles = 0;
     std::size_t barrier_x = 0;
     std::size_t barrier_y = 0;
     std::size_t barrier_z = 0;
@@ -1935,6 +1956,46 @@ ReadinessResult run_readiness_case(GeometryKind kind,
         native_diagnostics.intersections.closest_point_failures;
     result.seam_deduplications =
         native_diagnostics.intersections.seam_deduplications;
+    result.sample_seed_candidates =
+        native_diagnostics.intersections.sample_seed_candidates;
+    result.sample_seeds_accepted =
+        native_diagnostics.intersections.sample_seeds_accepted;
+    result.sample_seed_roots_recovered =
+        native_diagnostics.intersections.roots_recovered_by_sample_seed;
+    result.maximum_sample_seeds_per_element =
+        native_diagnostics.intersections.maximum_sample_seeds_per_element;
+    result.stationary_solve_attempts =
+        native_diagnostics.intersections.stationary_solve_attempts;
+    result.stationary_solve_converged =
+        native_diagnostics.intersections.stationary_solve_converged;
+    result.stationary_witnesses =
+        native_diagnostics.intersections.stationary_witnesses;
+    result.stationary_protected_root_pairs =
+        native_diagnostics.intersections
+            .root_pairs_protected_by_stationary_witness;
+    result.ambiguous_root_clusters =
+        native_diagnostics.intersections.ambiguous_root_clusters;
+    result.non_g1_topology_merges =
+        native_diagnostics.intersections.non_g1_topology_merges;
+    result.high_degree_fallbacks =
+        native_diagnostics.intersections.high_degree_fallbacks;
+    result.interface_x = native_diagnostics.interface_edge_counts[0];
+    result.interface_y = native_diagnostics.interface_edge_counts[1];
+    result.interface_z = native_diagnostics.interface_edge_counts[2];
+    result.multi_crossing_edges =
+        native_diagnostics.multi_crossing_edge_count;
+    result.even_parity_interface_edges =
+        native_diagnostics.even_parity_interface_edge_count;
+    result.odd_parity_interface_edges =
+        native_diagnostics.odd_parity_interface_edge_count;
+    result.ambiguous_parity_edges =
+        native_diagnostics.ambiguous_parity_edge_count;
+    result.endpoint_parity_fallbacks =
+        native_diagnostics.endpoint_parity_fallback_count;
+    result.endpoint_classification_queries =
+        native_diagnostics.endpoint_classification_query_count;
+    result.component_parity_toggles =
+        native_diagnostics.component_parity_toggle_count;
     result.barrier_x = native_diagnostics.barrier_edge_counts[0];
     result.barrier_y = native_diagnostics.barrier_edge_counts[1];
     result.barrier_z = native_diagnostics.barrier_edge_counts[2];
@@ -2113,6 +2174,18 @@ ReadinessResult run_readiness_case(GeometryKind kind,
               << " gap_crossings=" << result.gap_crossings
               << " triangle_fallback_crossings="
               << result.triangle_fallback_crossings << '\n'
+              << "  interface/barrier="
+              << result.interface_x << '/' << result.interface_y << '/'
+              << result.interface_z << " / "
+              << result.barrier_x << '/' << result.barrier_y << '/'
+              << result.barrier_z
+              << " multi=" << result.multi_crossing_edges
+              << " even/odd=" << result.even_parity_interface_edges << '/'
+              << result.odd_parity_interface_edges
+              << " ambiguous/fallback=" << result.ambiguous_parity_edges
+              << '/' << result.endpoint_parity_fallbacks
+              << " component_toggles=" << result.component_parity_toggles
+              << '\n'
               << "  NURBS query elements=" << result.acceleration_leaves
               << " max_extent=" << result.maximum_query_element_extent
               << " local_depth=" << result.maximum_subdivision_depth
@@ -2125,6 +2198,20 @@ ReadinessResult run_readiness_case(GeometryKind kind,
               << result.closest_point_roots_recovered << '/'
               << result.closest_point_terminal_misses << '/'
               << result.closest_point_failures << '\n'
+              << "  sample seeds candidates/accepted/recovered/max="
+              << result.sample_seed_candidates << '/'
+              << result.sample_seeds_accepted << '/'
+              << result.sample_seed_roots_recovered << '/'
+              << result.maximum_sample_seeds_per_element
+              << " stationary attempts/converged/witnesses/protected="
+              << result.stationary_solve_attempts << '/'
+              << result.stationary_solve_converged << '/'
+              << result.stationary_witnesses << '/'
+              << result.stationary_protected_root_pairs
+              << " clusters/nonG1/high_degree="
+              << result.ambiguous_root_clusters << '/'
+              << result.non_g1_topology_merges << '/'
+              << result.high_degree_fallbacks << '\n'
               << "  panel-center surface patches/dofs="
               << result.surface_patches << '/' << result.surface_dofs
               << " area=" << result.surface_dof_area
@@ -2261,6 +2348,16 @@ void write_summary(const std::filesystem::path& output_dir,
                "closest_point_attempts,closest_point_iterations,"
                "closest_point_roots_recovered,closest_point_terminal_misses,"
                "closest_point_failures,seam_deduplications,"
+               "sample_seed_candidates,sample_seeds_accepted,"
+               "sample_seed_roots_recovered,maximum_sample_seeds_per_element,"
+               "stationary_solve_attempts,stationary_solve_converged,"
+               "stationary_witnesses,stationary_protected_root_pairs,"
+               "ambiguous_root_clusters,non_g1_topology_merges,"
+               "high_degree_fallbacks,interface_x,interface_y,interface_z,"
+               "multi_crossing_edges,even_parity_interface_edges,"
+               "odd_parity_interface_edges,ambiguous_parity_edges,"
+               "endpoint_parity_fallbacks,endpoint_classification_queries,"
+               "component_parity_toggles,"
                "barrier_x,barrier_y,barrier_z,grid_components,"
                "box_exterior_components,representative_queries,"
                "nurbs_geometry_tolerance,nurbs_root_residual_max,"
@@ -2323,6 +2420,25 @@ void write_summary(const std::filesystem::path& output_dir,
                 << row.closest_point_terminal_misses << ','
                 << row.closest_point_failures << ','
                 << row.seam_deduplications << ','
+                << row.sample_seed_candidates << ','
+                << row.sample_seeds_accepted << ','
+                << row.sample_seed_roots_recovered << ','
+                << row.maximum_sample_seeds_per_element << ','
+                << row.stationary_solve_attempts << ','
+                << row.stationary_solve_converged << ','
+                << row.stationary_witnesses << ','
+                << row.stationary_protected_root_pairs << ','
+                << row.ambiguous_root_clusters << ','
+                << row.non_g1_topology_merges << ','
+                << row.high_degree_fallbacks << ','
+                << row.interface_x << ',' << row.interface_y << ','
+                << row.interface_z << ',' << row.multi_crossing_edges << ','
+                << row.even_parity_interface_edges << ','
+                << row.odd_parity_interface_edges << ','
+                << row.ambiguous_parity_edges << ','
+                << row.endpoint_parity_fallbacks << ','
+                << row.endpoint_classification_queries << ','
+                << row.component_parity_toggles << ','
                 << row.barrier_x << ',' << row.barrier_y << ','
                 << row.barrier_z << ',' << row.grid_components << ','
                 << row.box_exterior_components << ','

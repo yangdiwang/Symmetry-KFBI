@@ -219,6 +219,46 @@ void accumulate_intersection_diagnostics(
     checked_accumulate_int(
         total.closest_point_failures, increment.closest_point_failures,
         "NURBS closest-point failure diagnostic overflow");
+    checked_accumulate_int(
+        total.sample_seed_candidates, increment.sample_seed_candidates,
+        "NURBS sample-candidate diagnostic overflow");
+    checked_accumulate_int(
+        total.sample_seeds_accepted, increment.sample_seeds_accepted,
+        "NURBS sample-seed diagnostic overflow");
+    checked_accumulate_int(
+        total.roots_recovered_by_sample_seed,
+        increment.roots_recovered_by_sample_seed,
+        "NURBS sample-seed root diagnostic overflow");
+    total.maximum_sample_seeds_per_element = std::max(
+        total.maximum_sample_seeds_per_element,
+        increment.maximum_sample_seeds_per_element);
+    checked_accumulate_int(
+        total.stationary_solve_attempts,
+        increment.stationary_solve_attempts,
+        "NURBS stationary-solve diagnostic overflow");
+    checked_accumulate_int(
+        total.stationary_solve_converged,
+        increment.stationary_solve_converged,
+        "NURBS stationary-convergence diagnostic overflow");
+    checked_accumulate_int(
+        total.stationary_witnesses, increment.stationary_witnesses,
+        "NURBS stationary-witness diagnostic overflow");
+    checked_accumulate_int(
+        total.root_pairs_protected_by_stationary_witness,
+        increment.root_pairs_protected_by_stationary_witness,
+        "NURBS protected-root diagnostic overflow");
+    checked_accumulate_int(
+        total.ambiguous_root_clusters,
+        increment.ambiguous_root_clusters,
+        "NURBS ambiguous-cluster diagnostic overflow");
+    checked_accumulate_int(
+        total.non_g1_topology_merges,
+        increment.non_g1_topology_merges,
+        "NURBS non-G1 topology-merge diagnostic overflow");
+    checked_accumulate_int(
+        total.high_degree_fallbacks,
+        increment.high_degree_fallbacks,
+        "NURBS high-degree fallback diagnostic overflow");
 }
 
 Eigen::Vector3d as_vector(const std::array<double, 3>& values)

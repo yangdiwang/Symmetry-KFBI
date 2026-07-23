@@ -46,6 +46,7 @@ struct NurbsElementIntersectionDiagnostics3D {
     int supplied_seed_attempts = 0;
     int roots_recovered_by_supplied_seed = 0;
     int maximum_supplied_seed_count = 0;
+    int high_degree_control_hull_fallbacks = 0;
 };
 
 struct NurbsElementIntersectionResult3D {

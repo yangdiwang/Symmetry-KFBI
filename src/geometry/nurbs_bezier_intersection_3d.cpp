@@ -859,7 +859,8 @@ bool control_hull_separates_from_segment(
     const RationalBezierElement3D& box,
     const SegmentFrame& frame,
     const Eigen::Vector3d& preferred_separation,
-    double contact_tolerance)
+    double contact_tolerance,
+    NurbsElementIntersectionDiagnostics3D& diagnostics)
 {
     // Exhaustive edge/triangle support-direction enumeration is cubic in the
     // control count. High-degree generic inputs fail closed instead of
@@ -867,6 +868,9 @@ bool control_hull_separates_from_segment(
     constexpr std::size_t maximum_exhaustive_control_points = 16;
     if (box.homogeneous_controls.size()
         > maximum_exhaustive_control_points) {
+        checked_increment_diagnostic(
+            diagnostics.high_degree_control_hull_fallbacks,
+            "NURBS high-degree fallback diagnostic overflow");
         return false;
     }
     std::vector<Eigen::Vector3d> differences;
@@ -1036,7 +1040,7 @@ bool certifies_terminal_separation(
     }
     const double contact_tolerance = 8.0 * geometry_tolerance;
     if (control_hull_separates_from_segment(
-            box, frame, preferred_separation, contact_tolerance)) {
+            box, frame, preferred_separation, contact_tolerance, diagnostics)) {
         return true;
     }
     if (remaining_depth <= 0)
@@ -1101,7 +1105,7 @@ bool certifies_terminal_single_root(
     }
     const double contact_tolerance = 8.0 * geometry_tolerance;
     if (control_hull_separates_from_segment(
-            box, frame, preferred_separation, contact_tolerance)) {
+            box, frame, preferred_separation, contact_tolerance, diagnostics)) {
         return true;
     }
     if (remaining_depth <= 0)

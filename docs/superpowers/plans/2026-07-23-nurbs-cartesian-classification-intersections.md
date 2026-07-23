@@ -1,6 +1,6 @@
 # NURBS Cartesian Classification Intersections Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use Markdown checkbox syntax for tracking.
 
 **Goal:** Replace the single-crossing Cartesian-edge contract with a bounded, grid-scaled multi-candidate path that preserves confirmed NURBS roots and computes point-classification parity without requiring a complete general-purpose intersection solver.
 
@@ -140,18 +140,18 @@ struct NurbsLineSurfaceStationaryPoint3D {
 };
 ~~~
 
-- [ ] Add a failing close-root test with roots 0.5 +/- 1e-3 and a positive-distance stationary witness at 0.5.
-- [ ] Repeat at leaf extents corresponding to N=32,64,128; always require two roots.
-- [ ] Add a split-boundary duplicate-root control test; require one physical root and no positive witness.
-- [ ] Run RED.
-- [ ] Eliminate t by segment projection and solve [(S-L).Su,(S-L).Sv]=0.
-- [ ] Use projected damped Newton with a finite-difference 2-by-2 Jacobian clipped to the parameter box; do not impose descent of squared distance.
-- [ ] Deduplicate stationary results by fixed parameter/physical tolerances.
-- [ ] Estimate root t uncertainty from residual divided by segment length and guarded transversality.
-- [ ] For overlapping same-smooth-branch root intervals, search from the parameter midpoint. A positive witness between roots prevents merging.
-- [ ] If no proof exists, retain an ambiguous cluster and set root_count_known=false; absence of a witness never forces a merge.
-- [ ] Run GREEN.
-- [ ] Commit: feat: protect close NURBS roots with stationary witnesses.
+- [x] Add a failing close-root test with roots 0.5 +/- 1e-3 and a positive-distance stationary witness at 0.5.
+- [x] Repeat at leaf extents corresponding to N=32,64,128; always require two roots.
+- [x] Add a split-boundary duplicate-root control test; require one physical root and no positive witness.
+- [x] Run RED.
+- [x] Eliminate t by segment projection and solve [(S-L).Su,(S-L).Sv]=0.
+- [x] Use projected damped Newton with a finite-difference 2-by-2 Jacobian clipped to the parameter box; do not impose descent of squared distance.
+- [x] Deduplicate stationary results by fixed parameter/physical tolerances.
+- [x] Estimate root t uncertainty from residual divided by segment length and guarded transversality.
+- [x] For overlapping same-smooth-branch root intervals, search from the parameter midpoint. A positive witness between roots prevents merging.
+- [x] If no proof exists, retain an ambiguous cluster and set root_count_known=false; absence of a witness never forces a merge.
+- [x] Run GREEN.
+- [x] Commit: feat: protect close NURBS roots with stationary witnesses.
 
 ---
 
@@ -161,15 +161,15 @@ struct NurbsLineSurfaceStationaryPoint3D {
 - Modify: src/geometry/nurbs_surface_intersector_3d.hpp/.cpp
 - Test: apps/native_nurbs_surface_3d_test.cpp
 
-- [ ] Add failing tests for a coincident shared-edge root on G1 and non-G1 connections.
-- [ ] Add a wedge test containing two close one-sided roots with no smooth stationary witness.
-- [ ] Run RED; expect FeatureEdgeAlignment or incorrect distance-only behavior.
-- [ ] Merge coincident reports on any declared shared topological edge/vertex within the same component, regardless of G1.
-- [ ] Retain the lowest-residual representative and mark feature_edge_contact for non-G1; never average one-sided normals.
-- [ ] Never use the smooth witness rule across non-G1.
-- [ ] Keep unrelated coincident patches fatal and never merge different components.
-- [ ] Run GREEN.
-- [ ] Commit: fix: canonicalize NURBS roots with patch topology.
+- [x] Add failing tests for a coincident shared-edge root on G1 and non-G1 connections.
+- [x] Add a wedge test containing two close one-sided roots with no smooth stationary witness.
+- [x] Run RED; expect FeatureEdgeAlignment or incorrect distance-only behavior.
+- [x] Merge coincident reports on any declared shared topological edge/vertex within the same component, regardless of G1.
+- [x] Retain the lowest-residual representative and mark feature_edge_contact for non-G1; never average one-sided normals.
+- [x] Never use the smooth witness rule across non-G1.
+- [x] Keep unrelated coincident patches fatal and never merge different components.
+- [x] Run GREEN.
+- [x] Commit: fix: canonicalize NURBS roots with patch topology.
 
 ---
 
@@ -197,18 +197,18 @@ NurbsSurfaceCrossingRange3D crossings_between(
 
 The legacy crossing_between API succeeds only when exactly one crossing exists.
 
-- [ ] Replace the under-resolved torus fail-fast test: construction succeeds, at least one edge has multiple crossings, and analytic torus node labels match.
-- [ ] Add same-component even-parity and two-component membership-change tests.
-- [ ] Run RED.
-- [ ] Replace edge-to-single-index storage with contiguous {begin,count} ranges.
-- [ ] Maintain separate interface-edge and parity-barrier bit arrays.
-- [ ] Toggle sparse component bits for resolved roots; barrier iff any component bit is odd.
-- [ ] When parity_known_from_roots=false, cache containing_components for both endpoint node indices and use their symmetric difference.
-- [ ] Do not infer physical root count from endpoint fallback.
-- [ ] Verify full component label changes, not only binary inside/outside.
-- [ ] Update triangle-seed-independent domain checks to compare crossing ranges.
-- [ ] Run GREEN.
-- [ ] Commit: feat: label NURBS domains from crossing parity.
+- [x] Replace the under-resolved torus fail-fast test: construction succeeds, at least one edge has multiple crossings, and analytic torus node labels match.
+- [x] Add same-component even-parity and two-component membership-change tests.
+- [x] Run RED.
+- [x] Replace edge-to-single-index storage with contiguous {begin,count} ranges.
+- [x] Maintain separate interface-edge and parity-barrier bit arrays.
+- [x] Toggle sparse component bits for resolved roots; barrier iff any component bit is odd.
+- [x] When parity_known_from_roots=false, cache containing_components for both endpoint node indices and use their symmetric difference.
+- [x] Do not infer physical root count from endpoint fallback.
+- [x] Verify full component label changes, not only binary inside/outside.
+- [x] Update triangle-seed-independent domain checks to compare crossing ranges.
+- [x] Run GREEN.
+- [x] Commit: feat: label NURBS domains from crossing parity.
 
 ---
 
@@ -221,15 +221,15 @@ The legacy crossing_between API succeeds only when exactly one crossing exists.
 - Modify: apps/neumann_exterior_zero_trace_3d.cpp
 - Modify: apps/native_nurbs_surface_3d_test.cpp
 
-- [ ] Add checked counters for sample seeds, stationary solves/witnesses, root clusters, multi-crossing edges, component parity, non-G1 merges, high-degree fallbacks, and endpoint fallbacks.
-- [ ] Assert at most four sample seeds, main depth <= 4, fallback depth <= 6, and expected analytic counters.
-- [ ] Update console and CSV output without changing the PDE algorithm.
-- [ ] Build all Release targets with cmake --build build --config Release --parallel 1.
-- [ ] Run .\build\apps\Release\native_nurbs_surface_3d_test.exe and require its pass banner.
-- [ ] Run ctest --test-dir build -C Release --output-on-failure and record if no tests are registered.
-- [ ] Run git diff --check.
-- [ ] Run L-prism and hollow-cylinder at N=32,64,128.
-- [ ] Run the torus case that formerly failed on a two-crossing edge and require successful labels.
-- [ ] Compare triangle seeds enabled/disabled, root residuals, nested common-node labels, and PDE convergence trends.
-- [ ] Request final code review.
-- [ ] Commit: test: verify NURBS classification intersections.
+- [x] Add checked counters for sample seeds, stationary solves/witnesses, root clusters, multi-crossing edges, component parity, non-G1 merges, high-degree fallbacks, and endpoint fallbacks.
+- [x] Assert at most four sample seeds, main depth <= 4, fallback depth <= 6, and expected analytic counters.
+- [x] Update console and CSV output without changing the PDE algorithm.
+- [x] Build all Release targets with cmake --build build --config Release --parallel 1.
+- [x] Run .\build\apps\Release\native_nurbs_surface_3d_test.exe and require its pass banner.
+- [x] Run ctest --test-dir build -C Release --output-on-failure and record if no tests are registered.
+- [x] Run git diff --check.
+- [x] Run L-prism and hollow-cylinder at N=32,64,128.
+- [x] Run the torus case that formerly failed on a two-crossing edge and require successful labels.
+- [x] Compare triangle seeds enabled/disabled, root residuals, nested common-node labels, and PDE convergence trends.
+- [x] Request final code review.
+- [x] Commit: test: verify NURBS classification intersections.

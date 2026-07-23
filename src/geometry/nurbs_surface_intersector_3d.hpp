@@ -53,6 +53,7 @@ struct NurbsSurfaceIntersectionDiagnostics3D {
     int root_pairs_protected_by_stationary_witness = 0;
     int ambiguous_root_clusters = 0;
     int non_g1_topology_merges = 0;
+    int high_degree_fallbacks = 0;
 };
 
 struct NurbsSurfaceIntersectionResult3D {
