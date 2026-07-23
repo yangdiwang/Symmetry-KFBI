@@ -8,6 +8,7 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -22,6 +23,7 @@
 #include <Eigen/Dense>
 #include <Eigen/SVD>
 
+#include "dirichlet_rigid_transform_study_3d.hpp"
 #include "native_nurbs_surface_3d.hpp"
 #include "src/bulk_solvers/laplace_zfft_bulk_solver_3d.hpp"
 #include "src/geometry/grid_pair_3d.hpp"
@@ -59,6 +61,11 @@ enum class CauchyStencilPolicy3D {
     TopologicalNearest,
     SamePatch,
     BalancedPatches
+};
+
+enum class SolveSelection3D {
+    Both,
+    DirichletNormalOnly
 };
 
 std::string cauchy_policy_name(CauchyStencilPolicy3D policy)
@@ -314,27 +321,6 @@ GeometryKind parse_geometry(const std::string& name)
         return GeometryKind::LPrism;
     throw std::invalid_argument(
         "geometry must be torus, cylinder, l_prism, or all");
-}
-
-double manufactured_u_3d(const Eigen::Vector3d& point)
-{
-    const double exponential = std::exp(0.35 * point.x());
-    return exponential * std::cos(0.21 * point.y())
-        * std::cos(0.28 * point.z());
-}
-
-Eigen::Vector3d manufactured_gradient_3d(const Eigen::Vector3d& point)
-{
-    const double exponential = std::exp(0.35 * point.x());
-    const double cos_y = std::cos(0.21 * point.y());
-    const double sin_y = std::sin(0.21 * point.y());
-    const double cos_z = std::cos(0.28 * point.z());
-    const double sin_z = std::sin(0.28 * point.z());
-    return {
-        0.35 * exponential * cos_y * cos_z,
-        -0.21 * exponential * sin_y * cos_z,
-        -0.28 * exponential * cos_y * sin_z
-    };
 }
 
 SurfaceCloudDiagnostics validate_surface_dofs(const SurfaceDofCloud& cloud,
@@ -809,10 +795,27 @@ private:
     std::vector<CauchyFitMap3D> maps_;
 };
 
-GeometryBundle make_geometry(GeometryKind kind, double h)
+GeometryBundle make_geometry(
+    GeometryKind kind,
+    double h,
+    const app3d::RigidTransform3D& transform)
 {
-    NativeNurbsSurface3D native_surface =
+    const NativeNurbsSurface3D original_surface =
         app3d::make_native_nurbs_surface_3d(kind);
+    NativeNurbsSurface3D native_surface =
+        app3d::transform_native_nurbs_surface_3d(original_surface, transform);
+    for (const auto& patch : native_surface.patches) {
+        for (const auto& row : patch.control_net()) {
+            for (const Eigen::Vector3d& point : row) {
+                if (!point.allFinite()
+                    || !(point.array().minCoeff() > kBoxMin)
+                    || !(point.array().maxCoeff() < kBoxMin + kBoxSide)) {
+                    throw std::runtime_error(
+                        "transformed NURBS control point is outside the fixed box");
+                }
+            }
+        }
+    }
     geometry3d::NurbsPatchTriangulatorOptions3D options;
     options.edge_buffer_factor = 0.5;
     options.edge_sample_step_factor = 1.0;
@@ -1526,6 +1529,7 @@ SolveMetrics3D run_neumann_case(
     const CartesianGrid3D& grid,
     const GridPair3D& grid_pair,
     const PanelCenterHarmonicJetKFBI3D& pipeline,
+    const app3d::RigidTransform3D& transform,
     int gmres_max_iterations)
 {
     const int size = pipeline.surface_size();
@@ -1534,8 +1538,11 @@ SolveMetrics3D run_neumann_case(
     for (int q = 0; q < size; ++q) {
         const SurfaceDof& dof =
             pipeline.surface().dofs[static_cast<std::size_t>(q)];
-        exact_trace[q] = manufactured_u_3d(dof.point);
-        normal_data[q] = manufactured_gradient_3d(dof.point).dot(dof.normal);
+        exact_trace[q] = app3d::transformed_manufactured_harmonic_value_3d(
+            transform, dof.point);
+        normal_data[q] =
+            app3d::transformed_manufactured_harmonic_gradient_3d(
+                transform, dof.point).dot(dof.normal);
     }
     // Enforce the discrete compatibility condition.  The exact flux has zero
     // continuous mean; the tiny quadrature defect is otherwise amplified by
@@ -1586,7 +1593,8 @@ SolveMetrics3D run_neumann_case(
     for (int node = 0; node < grid.num_dofs(); ++node) {
         if (grid_pair.domain_label(node) <= 0)
             continue;
-        shift_sum += manufactured_u_3d(grid_point(grid, node))
+        shift_sum += app3d::transformed_manufactured_harmonic_value_3d(
+                         transform, grid_point(grid, node))
                    - solution.potential[node];
         ++interior_count;
     }
@@ -1598,7 +1606,8 @@ SolveMetrics3D run_neumann_case(
         if (grid_pair.domain_label(node) > 0) {
             const double error = solution.potential[node]
                                + result.constant_shift
-                               - manufactured_u_3d(grid_point(grid, node));
+                               - app3d::transformed_manufactured_harmonic_value_3d(
+                                     transform, grid_point(grid, node));
             result.interior_linf = std::max(
                 result.interior_linf, std::abs(error));
             interior_error_sq += error * error;
@@ -1621,6 +1630,7 @@ SolveMetrics3D run_dirichlet_normal_case(
     const CartesianGrid3D& grid,
     const GridPair3D& grid_pair,
     const PanelCenterHarmonicJetKFBI3D& pipeline,
+    const app3d::RigidTransform3D& transform,
     int gmres_max_iterations)
 {
     const int size = pipeline.surface_size();
@@ -1629,8 +1639,11 @@ SolveMetrics3D run_dirichlet_normal_case(
     for (int q = 0; q < size; ++q) {
         const SurfaceDof& dof =
             pipeline.surface().dofs[static_cast<std::size_t>(q)];
-        value_data[q] = manufactured_u_3d(dof.point);
-        exact_normal[q] = manufactured_gradient_3d(dof.point).dot(dof.normal);
+        value_data[q] = app3d::transformed_manufactured_harmonic_value_3d(
+            transform, dof.point);
+        exact_normal[q] =
+            app3d::transformed_manufactured_harmonic_gradient_3d(
+                transform, dof.point).dot(dof.normal);
     }
 
     const auto solve_start = std::chrono::steady_clock::now();
@@ -1680,7 +1693,8 @@ SolveMetrics3D run_dirichlet_normal_case(
     for (int node = 0; node < grid.num_dofs(); ++node) {
         if (grid_pair.domain_label(node) > 0) {
             const double error = solution.potential[node]
-                               - manufactured_u_3d(grid_point(grid, node));
+                               - app3d::transformed_manufactured_harmonic_value_3d(
+                                     transform, grid_point(grid, node));
             result.interior_linf = std::max(
                 result.interior_linf, std::abs(error));
             interior_error_sq += error * error;
@@ -1851,14 +1865,16 @@ ReadinessResult run_readiness_case(GeometryKind kind,
                                    CauchyStencilPolicy3D cauchy_policy,
                                    int cauchy_value_count,
                                    int cauchy_normal_count,
-                                   int gmres_max_iterations)
+                                   int gmres_max_iterations,
+                                   const app3d::RigidTransform3D& transform,
+                                   SolveSelection3D solve_selection)
 {
     const double h = kBoxSide / static_cast<double>(N);
     CartesianGrid3D grid({kBoxMin, kBoxMin, kBoxMin},
                          {h, h, h},
                          {N, N, N},
                          DofLayout3D::Node);
-    GeometryBundle geometry = make_geometry(kind, h);
+    GeometryBundle geometry = make_geometry(kind, h, transform);
     const auto domain = std::make_shared<const
         geometry3d::NurbsCartesianDomain3D>(
             grid, geometry.native_surface.geometry_model());
@@ -1873,9 +1889,11 @@ ReadinessResult run_readiness_case(GeometryKind kind,
         cauchy_value_count,
         cauchy_normal_count,
         cauchy_policy);
-    write_surface_files(output_dir, geometry, N);
-    write_panel_center_files(
-        output_dir, geometry.name, N, surface_dofs, cauchy_stencils);
+    if (solve_selection == SolveSelection3D::Both) {
+        write_surface_files(output_dir, geometry, N);
+        write_panel_center_files(
+            output_dir, geometry.name, N, surface_dofs, cauchy_stencils);
+    }
 
     ReadinessResult result;
     result.geometry = geometry.name;
@@ -2206,10 +2224,14 @@ ReadinessResult run_readiness_case(GeometryKind kind,
         throw std::runtime_error(
             "harmonic-jet constant probe produced NaN/Inf");
     }
-    result.neumann = run_neumann_case(
-        grid, grid_pair, harmonic_pipeline, gmres_max_iterations);
+    if (solve_selection == SolveSelection3D::Both) {
+        result.neumann = run_neumann_case(
+            grid, grid_pair, harmonic_pipeline, transform,
+            gmres_max_iterations);
+    }
     result.dirichlet_normal = run_dirichlet_normal_case(
-        grid, grid_pair, harmonic_pipeline, gmres_max_iterations);
+        grid, grid_pair, harmonic_pipeline, transform,
+        gmres_max_iterations);
 
     std::cout << "[ready] " << geometry.name << " - " << geometry.description << '\n'
               << "domain_label_mode=nurbs_barrier_components barriers="
@@ -2326,8 +2348,9 @@ ReadinessResult run_readiness_case(GeometryKind kind,
               << " exterior/interior normal="
               << result.harmonic_constant_exterior_normal_linf << '/'
               << result.harmonic_constant_interior_normal_linf
-              << " bulk_err=" << result.harmonic_constant_bulk_linf << '\n'
-              << "  [neumann] converged/iterations="
+              << " bulk_err=" << result.harmonic_constant_bulk_linf << '\n';
+    if (solve_selection == SolveSelection3D::Both) {
+        std::cout << "  [neumann] converged/iterations="
               << result.neumann.converged << '/' << result.neumann.iterations
               << " gmres=" << result.neumann.gmres_relative_residual
               << " operator=" << result.neumann.operator_residual_linf
@@ -2341,8 +2364,9 @@ ReadinessResult run_readiness_case(GeometryKind kind,
               << result.neumann.exterior_bulk_linf << '/'
               << result.neumann.exterior_bulk_l2
               << " flux_mean=" << result.neumann.data_weighted_mean
-              << " seconds=" << result.neumann.seconds << '\n'
-              << "  [dirichlet-normal] converged/iterations="
+              << " seconds=" << result.neumann.seconds << '\n';
+    }
+    std::cout << "  [dirichlet-normal] converged/iterations="
               << result.dirichlet_normal.converged << '/'
               << result.dirichlet_normal.iterations
               << " gmres="
@@ -2643,12 +2667,472 @@ void write_solve_summaries(const std::filesystem::path& output_dir,
               });
 }
 
+enum class CriterionStatus3D {
+    Pass,
+    Fail,
+    NotEvaluated
+};
+
+const char* criterion_status_name(CriterionStatus3D status)
+{
+    switch (status) {
+    case CriterionStatus3D::Pass:
+        return "pass";
+    case CriterionStatus3D::Fail:
+        return "fail";
+    case CriterionStatus3D::NotEvaluated:
+        return "not_evaluated";
+    }
+    throw std::runtime_error("unknown rigid-study criterion status");
+}
+
+struct RigidStudyRow3D {
+    app3d::DirichletRigidStudyCase3D study_case;
+    ReadinessResult readiness;
+    double total_seconds = 0.0;
+    double observed_order = std::numeric_limits<double>::quiet_NaN();
+    double baseline_error_ratio = std::numeric_limits<double>::quiet_NaN();
+    double baseline_iteration_ratio = std::numeric_limits<double>::quiet_NaN();
+    CriterionStatus3D gmres_pass = CriterionStatus3D::NotEvaluated;
+    CriterionStatus3D monotone_error_pass = CriterionStatus3D::NotEvaluated;
+    CriterionStatus3D order_64_128_pass = CriterionStatus3D::NotEvaluated;
+    CriterionStatus3D baseline_ratio_pass = CriterionStatus3D::NotEvaluated;
+    CriterionStatus3D geometry_diagnostics_pass =
+        CriterionStatus3D::NotEvaluated;
+    CriterionStatus3D overall_pass = CriterionStatus3D::NotEvaluated;
+};
+
+struct RigidStudyAcceptance3D {
+    std::string case_id;
+    CriterionStatus3D gmres_pass = CriterionStatus3D::NotEvaluated;
+    CriterionStatus3D monotone_error_pass = CriterionStatus3D::NotEvaluated;
+    CriterionStatus3D order_64_128_pass = CriterionStatus3D::NotEvaluated;
+    CriterionStatus3D baseline_ratio_pass = CriterionStatus3D::NotEvaluated;
+    CriterionStatus3D geometry_diagnostics_pass =
+        CriterionStatus3D::NotEvaluated;
+    CriterionStatus3D overall_pass = CriterionStatus3D::NotEvaluated;
+};
+
+bool rigid_geometry_diagnostics_pass(const ReadinessResult& result)
+{
+    return result.label_mismatches == 0
+        && result.unsafe_label_changing_edges == 0
+        && result.gap_crossings == 0
+        && result.endpoint_crossings == 0
+        && result.triangle_fallback_crossings == 0;
+}
+
+bool is_rigid_acceptance_level(int N)
+{
+    return N == 32 || N == 64 || N == 128;
+}
+
+const RigidStudyRow3D* find_rigid_study_row(
+    const std::vector<RigidStudyRow3D>& rows,
+    const std::string& case_id,
+    int N)
+{
+    const auto found = std::find_if(
+        rows.begin(), rows.end(), [&](const RigidStudyRow3D& row) {
+            return row.study_case.id == case_id && row.readiness.N == N;
+        });
+    return found == rows.end() ? nullptr : &*found;
+}
+
+double rigid_observed_order(const RigidStudyRow3D& previous,
+                            const RigidStudyRow3D& current)
+{
+    const double previous_error =
+        previous.readiness.dirichlet_normal.interior_linf;
+    const double current_error =
+        current.readiness.dirichlet_normal.interior_linf;
+    if (!(previous_error > 0.0) || !(current_error > 0.0)
+        || current.readiness.N <= previous.readiness.N) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    return std::log(previous_error / current_error)
+         / std::log(static_cast<double>(current.readiness.N)
+                    / previous.readiness.N);
+}
+
+CriterionStatus3D combine_rigid_criteria(
+    const std::vector<CriterionStatus3D>& criteria,
+    bool has_results)
+{
+    if (std::find(criteria.begin(), criteria.end(),
+                  CriterionStatus3D::Fail) != criteria.end()) {
+        return CriterionStatus3D::Fail;
+    }
+    return has_results ? CriterionStatus3D::Pass
+                       : CriterionStatus3D::NotEvaluated;
+}
+
+std::vector<RigidStudyAcceptance3D> update_rigid_study_criteria(
+    std::vector<RigidStudyRow3D>& rows,
+    const std::vector<app3d::DirichletRigidStudyCase3D>& cases)
+{
+    for (RigidStudyRow3D& row : rows) {
+        const RigidStudyRow3D* previous = nullptr;
+        for (const RigidStudyRow3D& candidate : rows) {
+            if (candidate.study_case.id == row.study_case.id
+                && candidate.readiness.N < row.readiness.N
+                && (previous == nullptr
+                    || candidate.readiness.N > previous->readiness.N)) {
+                previous = &candidate;
+            }
+        }
+        row.observed_order = previous == nullptr
+            ? std::numeric_limits<double>::quiet_NaN()
+            : rigid_observed_order(*previous, row);
+
+        const RigidStudyRow3D* baseline = find_rigid_study_row(
+            rows, "baseline", row.readiness.N);
+        if (baseline != nullptr
+            && baseline->readiness.dirichlet_normal.interior_linf > 0.0) {
+            row.baseline_error_ratio =
+                row.readiness.dirichlet_normal.interior_linf
+                / baseline->readiness.dirichlet_normal.interior_linf;
+        }
+        if (baseline != nullptr
+            && baseline->readiness.dirichlet_normal.iterations > 0) {
+            row.baseline_iteration_ratio =
+                static_cast<double>(row.readiness.dirichlet_normal.iterations)
+                / baseline->readiness.dirichlet_normal.iterations;
+        }
+        row.gmres_pass = row.readiness.dirichlet_normal.converged
+                      && row.readiness.dirichlet_normal.iterations <= 80
+            ? CriterionStatus3D::Pass : CriterionStatus3D::Fail;
+        if (is_rigid_acceptance_level(row.readiness.N)) {
+            row.baseline_ratio_pass = std::isfinite(row.baseline_error_ratio)
+                                   && row.baseline_error_ratio <= 3.0
+                ? CriterionStatus3D::Pass : CriterionStatus3D::Fail;
+        } else {
+            row.baseline_ratio_pass = CriterionStatus3D::NotEvaluated;
+        }
+        row.geometry_diagnostics_pass =
+            rigid_geometry_diagnostics_pass(row.readiness)
+            ? CriterionStatus3D::Pass : CriterionStatus3D::Fail;
+    }
+
+    std::vector<RigidStudyAcceptance3D> acceptance;
+    acceptance.reserve(cases.size());
+    for (const auto& study_case : cases) {
+        std::vector<RigidStudyRow3D*> case_rows;
+        for (RigidStudyRow3D& row : rows) {
+            if (row.study_case.id == study_case.id)
+                case_rows.push_back(&row);
+        }
+
+        RigidStudyAcceptance3D item;
+        item.case_id = study_case.id;
+        if (!case_rows.empty()) {
+            const bool gmres_pass = std::all_of(
+                case_rows.begin(), case_rows.end(), [](const auto* row) {
+                    return row->gmres_pass == CriterionStatus3D::Pass;
+                });
+            item.gmres_pass = gmres_pass ? CriterionStatus3D::Pass
+                                        : CriterionStatus3D::Fail;
+            std::vector<RigidStudyRow3D*> acceptance_level_rows;
+            std::copy_if(
+                case_rows.begin(), case_rows.end(),
+                std::back_inserter(acceptance_level_rows), [](const auto* row) {
+                    return is_rigid_acceptance_level(row->readiness.N);
+                });
+            if (!acceptance_level_rows.empty()) {
+                const bool baseline_pass = std::all_of(
+                    acceptance_level_rows.begin(), acceptance_level_rows.end(),
+                    [](const auto* row) {
+                        return row->baseline_ratio_pass
+                            == CriterionStatus3D::Pass;
+                    });
+                item.baseline_ratio_pass = baseline_pass
+                    ? CriterionStatus3D::Pass : CriterionStatus3D::Fail;
+            }
+            const bool geometry_pass = std::all_of(
+                case_rows.begin(), case_rows.end(), [](const auto* row) {
+                    return row->geometry_diagnostics_pass
+                        == CriterionStatus3D::Pass;
+                });
+            item.geometry_diagnostics_pass = geometry_pass
+                ? CriterionStatus3D::Pass : CriterionStatus3D::Fail;
+        }
+
+        const RigidStudyRow3D* row32 = find_rigid_study_row(
+            rows, study_case.id, 32);
+        const RigidStudyRow3D* row64 = find_rigid_study_row(
+            rows, study_case.id, 64);
+        const RigidStudyRow3D* row128 = find_rigid_study_row(
+            rows, study_case.id, 128);
+        if (row32 != nullptr && row64 != nullptr && row128 != nullptr) {
+            const double error32 = row32->readiness.dirichlet_normal.interior_linf;
+            const double error64 = row64->readiness.dirichlet_normal.interior_linf;
+            const double error128 = row128->readiness.dirichlet_normal.interior_linf;
+            item.monotone_error_pass = error32 > error64 && error64 > error128
+                ? CriterionStatus3D::Pass : CriterionStatus3D::Fail;
+        }
+        if (row64 != nullptr && row128 != nullptr) {
+            const double order = rigid_observed_order(*row64, *row128);
+            item.order_64_128_pass = std::isfinite(order) && order >= 1.8
+                ? CriterionStatus3D::Pass : CriterionStatus3D::Fail;
+        }
+        item.overall_pass = combine_rigid_criteria(
+            {item.gmres_pass,
+             item.monotone_error_pass,
+             item.order_64_128_pass,
+             item.baseline_ratio_pass,
+             item.geometry_diagnostics_pass},
+            !case_rows.empty());
+
+        for (RigidStudyRow3D* row : case_rows) {
+            row->monotone_error_pass = item.monotone_error_pass;
+            row->order_64_128_pass = item.order_64_128_pass;
+            row->overall_pass = item.overall_pass;
+        }
+        acceptance.push_back(std::move(item));
+    }
+    return acceptance;
+}
+
+void write_rigid_study_results(
+    const std::filesystem::path& output_dir,
+    const std::vector<RigidStudyRow3D>& rows)
+{
+    std::filesystem::create_directories(output_dir);
+    std::ofstream csv = open_output_file(
+        output_dir / "rigid_transform_results.csv");
+    csv << std::setprecision(17) << std::boolalpha;
+    csv << "case_id,geometry,cauchy_policy,N,h,"
+           "rotation_axis_x,rotation_axis_y,rotation_axis_z,"
+           "rotation_angle_degrees,rotation_center_x,rotation_center_y,"
+           "rotation_center_z,translation_x,translation_y,translation_z,"
+           "rotation_00,rotation_01,rotation_02,rotation_10,rotation_11,"
+           "rotation_12,rotation_20,rotation_21,rotation_22,surface_dofs,"
+           "interior_linf,interior_l2,observed_order,gmres_converged,"
+           "gmres_iterations,gmres_relative_residual,solve_seconds,"
+           "total_seconds,operator_residual_linf,exterior_condition_linf,"
+           "boundary_residual_linf,route_mismatch_linf,density_linf,"
+           "density_l2,exterior_bulk_linf,exterior_bulk_l2,"
+           "cauchy_value_neighbors,cauchy_derivative_neighbors,"
+           "cauchy_condition_median,cauchy_condition_p95,"
+           "cauchy_condition_max,label_mismatches,"
+           "unsafe_label_changing_edges,gap_crossings,endpoint_crossings,"
+           "triangle_fallback_crossings,targeted_retries_unsafe,"
+           "ambiguous_parity_edges,ambiguous_label_changing_edges,"
+           "endpoint_parity_fallbacks,baseline_error_ratio,"
+           "baseline_iteration_ratio,gmres_pass,monotone_error_pass,"
+           "order_64_128_pass,baseline_ratio_pass,"
+           "geometry_diagnostics_pass,overall_pass\n";
+    for (const RigidStudyRow3D& row : rows) {
+        const auto& transform = row.study_case.transform;
+        const auto& result = row.readiness;
+        const auto& metric = result.dirichlet_normal;
+        const Eigen::Matrix3d& rotation = transform.rotation();
+        csv << row.study_case.id << ',' << result.geometry << ','
+            << result.cauchy_policy << ',' << result.N << ',' << result.h
+            << ',' << row.study_case.rotation_axis.x()
+            << ',' << row.study_case.rotation_axis.y()
+            << ',' << row.study_case.rotation_axis.z()
+            << ',' << row.study_case.rotation_angle_degrees
+            << ',' << transform.center().x()
+            << ',' << transform.center().y()
+            << ',' << transform.center().z()
+            << ',' << transform.translation().x()
+            << ',' << transform.translation().y()
+            << ',' << transform.translation().z();
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j)
+                csv << ',' << rotation(i, j);
+        }
+        csv << ',' << result.surface_dofs
+            << ',' << metric.interior_linf
+            << ',' << metric.interior_l2
+            << ',' << row.observed_order
+            << ',' << metric.converged
+            << ',' << metric.iterations
+            << ',' << metric.gmres_relative_residual
+            << ',' << metric.seconds
+            << ',' << row.total_seconds
+            << ',' << metric.operator_residual_linf
+            << ',' << metric.exterior_condition_linf
+            << ',' << metric.boundary_residual_linf
+            << ',' << metric.route_mismatch_linf
+            << ',' << metric.density_linf
+            << ',' << metric.density_l2
+            << ',' << metric.exterior_bulk_linf
+            << ',' << metric.exterior_bulk_l2
+            << ',' << result.cauchy_value_neighbors
+            << ',' << result.cauchy_derivative_neighbors
+            << ',' << result.cauchy_condition_median
+            << ',' << result.cauchy_condition_p95
+            << ',' << result.cauchy_condition_max
+            << ',' << result.label_mismatches
+            << ',' << result.unsafe_label_changing_edges
+            << ',' << result.gap_crossings
+            << ',' << result.endpoint_crossings
+            << ',' << result.triangle_fallback_crossings
+            << ',' << result.targeted_retries_unsafe
+            << ',' << result.ambiguous_parity_edges
+            << ',' << result.ambiguous_label_changing_edges
+            << ',' << result.endpoint_parity_fallbacks
+            << ',' << row.baseline_error_ratio
+            << ',' << row.baseline_iteration_ratio
+            << ',' << criterion_status_name(row.gmres_pass)
+            << ',' << criterion_status_name(row.monotone_error_pass)
+            << ',' << criterion_status_name(row.order_64_128_pass)
+            << ',' << criterion_status_name(row.baseline_ratio_pass)
+            << ',' << criterion_status_name(row.geometry_diagnostics_pass)
+            << ',' << criterion_status_name(row.overall_pass) << '\n';
+    }
+}
+
+void write_rigid_study_acceptance(
+    const std::filesystem::path& output_dir,
+    const std::vector<RigidStudyAcceptance3D>& acceptance)
+{
+    std::filesystem::create_directories(output_dir);
+    std::ofstream csv = open_output_file(
+        output_dir / "rigid_transform_acceptance.csv");
+    csv << "case_id,gmres_pass,monotone_error_pass,order_64_128_pass,"
+           "baseline_ratio_pass,geometry_diagnostics_pass,overall_pass\n";
+    for (const RigidStudyAcceptance3D& item : acceptance) {
+        csv << item.case_id
+            << ',' << criterion_status_name(item.gmres_pass)
+            << ',' << criterion_status_name(item.monotone_error_pass)
+            << ',' << criterion_status_name(item.order_64_128_pass)
+            << ',' << criterion_status_name(item.baseline_ratio_pass)
+            << ',' << criterion_status_name(item.geometry_diagnostics_pass)
+            << ',' << criterion_status_name(item.overall_pass) << '\n';
+    }
+}
+
+int run_dirichlet_rigid_study(
+    std::vector<int> levels,
+    CauchyStencilPolicy3D cauchy_policy,
+    int cauchy_value_count,
+    int cauchy_normal_count,
+    int gmres_max_iterations)
+{
+    if (cauchy_policy != CauchyStencilPolicy3D::G1Nearest
+        || cauchy_value_count != kCauchyValueNeighborCount
+        || cauchy_normal_count != kCauchyDerivativeNeighborCount) {
+        throw std::invalid_argument(
+            "--rigid-study requires KFBIM_3D_CAUCHY_POLICY=g1_nearest, "
+            "KFBIM_3D_CAUCHY_VALUE_COUNT=48, and "
+            "KFBIM_3D_CAUCHY_NORMAL_COUNT=28");
+    }
+    std::sort(levels.begin(), levels.end());
+    levels.erase(std::unique(levels.begin(), levels.end()), levels.end());
+
+#ifdef KFBIM_APP_OUTPUT_DIR
+    const std::filesystem::path output_dir =
+        std::filesystem::path(KFBIM_APP_OUTPUT_DIR)
+        / "dirichlet_rigid_transform_stability_3d";
+#else
+    const std::filesystem::path output_dir =
+        "output/dirichlet_rigid_transform_stability_3d";
+#endif
+    const std::vector<app3d::DirichletRigidStudyCase3D> cases =
+        app3d::make_l_prism_dirichlet_rigid_study_cases_3d();
+    std::vector<RigidStudyRow3D> rows;
+    rows.reserve(levels.size() * cases.size());
+
+    std::cout << "KFBI3D Dirichlet rigid-transform stability study\n"
+              << "  geometry=l_prism formulation=dirichlet_normal_only\n"
+              << "  cauchy_policy=" << cauchy_policy_name(cauchy_policy)
+              << " cauchy_counts=" << cauchy_value_count << '/'
+              << cauchy_normal_count << '\n'
+              << "  gmres_max_iterations=" << gmres_max_iterations << '\n'
+              << "  levels=";
+    for (std::size_t index = 0; index < levels.size(); ++index) {
+        if (index != 0)
+            std::cout << ',';
+        std::cout << levels[index];
+    }
+    std::cout << " cases=" << cases.size() << '\n';
+
+    for (int N : levels) {
+        for (const auto& study_case : cases) {
+            const auto case_start = std::chrono::steady_clock::now();
+            ReadinessResult result = run_readiness_case(
+                GeometryKind::LPrism,
+                N,
+                output_dir,
+                cauchy_policy,
+                cauchy_value_count,
+                cauchy_normal_count,
+                gmres_max_iterations,
+                study_case.transform,
+                SolveSelection3D::DirichletNormalOnly);
+            const double total_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - case_start).count();
+            rows.push_back({study_case, std::move(result), total_seconds});
+            const std::vector<RigidStudyAcceptance3D> acceptance =
+                update_rigid_study_criteria(rows, cases);
+            write_rigid_study_results(output_dir, rows);
+            write_rigid_study_acceptance(output_dir, acceptance);
+
+            const RigidStudyRow3D& row = rows.back();
+            const SolveMetrics3D& metric = row.readiness.dirichlet_normal;
+            std::cout << "[rigid-study] case=" << row.study_case.id
+                      << " N=" << row.readiness.N
+                      << " dirichlet_converged/iterations="
+                      << metric.converged << '/' << metric.iterations
+                      << " interior_linf=" << metric.interior_linf
+                      << " order=" << row.observed_order
+                      << " baseline_error_ratio="
+                      << row.baseline_error_ratio
+                      << " solve_seconds=" << metric.seconds
+                      << " total_seconds=" << row.total_seconds << '\n';
+            if (!metric.converged) {
+                std::cerr << "error: 3D rigid-study GMRES did not converge: "
+                          << "case=" << row.study_case.id
+                          << " N=" << row.readiness.N
+                          << " iterations=" << metric.iterations
+                          << " final_relative_residual="
+                          << std::scientific << std::setprecision(17)
+                          << metric.gmres_relative_residual << '\n';
+                return 1;
+            }
+        }
+    }
+
+    const std::vector<RigidStudyAcceptance3D> acceptance =
+        update_rigid_study_criteria(rows, cases);
+    write_rigid_study_results(output_dir, rows);
+    write_rigid_study_acceptance(output_dir, acceptance);
+    bool all_pass = true;
+    for (const RigidStudyAcceptance3D& item : acceptance) {
+        std::cout << "[rigid-acceptance] case=" << item.case_id
+                  << " gmres=" << criterion_status_name(item.gmres_pass)
+                  << " monotone="
+                  << criterion_status_name(item.monotone_error_pass)
+                  << " order_64_128="
+                  << criterion_status_name(item.order_64_128_pass)
+                  << " baseline_ratio="
+                  << criterion_status_name(item.baseline_ratio_pass)
+                  << " geometry="
+                  << criterion_status_name(item.geometry_diagnostics_pass)
+                  << " overall=" << criterion_status_name(item.overall_pass)
+                  << '\n';
+        all_pass = all_pass && item.overall_pass == CriterionStatus3D::Pass;
+    }
+    std::cout << "Rigid-transform study output: " << output_dir.string()
+              << '\n';
+    if (!all_pass) {
+        std::cerr << "error: one or more rigid-study acceptance criteria failed\n";
+        return 1;
+    }
+    return 0;
+}
+
 void print_usage(const char* executable)
 {
     std::cout
         << "usage: " << executable
         << " [torus|cylinder|l_prism|all] [N ...]\n"
+        << "       " << executable << " --rigid-study [N ...]\n"
         << "  Each N must be a power of two and at least 16 (default: 32).\n"
+        << "  Rigid-study default levels: 32, 64, 128.\n"
         << "  This stage builds native NURBS parameter-cell-center surface\n"
         << "  unknowns, topology-filtered 48/28 Cauchy stencils, validates\n"
         << "  fixed transfer routes, and executes the Neumann value-jump and\n"
@@ -2668,9 +3152,13 @@ int main(int argc, char** argv)
 {
     try {
         std::cout << std::scientific << std::setprecision(6) << std::unitbuf;
+        const bool rigid_study = argc >= 2
+                              && std::string(argv[1]) == "--rigid-study";
         std::string selection = "all";
-        std::vector<int> levels = {32};
-        if (argc >= 2)
+        std::vector<int> levels =
+            rigid_study ? std::vector<int>{32, 64, 128}
+                        : std::vector<int>{32};
+        if (argc >= 2 && !rigid_study)
             selection = argv[1];
         if (selection == "--help" || selection == "-h") {
             print_usage(argv[0]);
@@ -2698,6 +3186,14 @@ int main(int argc, char** argv)
             throw std::invalid_argument(
                 "KFBIM_3D_CAUCHY_NORMAL_COUNT may not exceed "
                 "KFBIM_3D_CAUCHY_VALUE_COUNT");
+        }
+        if (rigid_study) {
+            return run_dirichlet_rigid_study(
+                levels,
+                cauchy_policy,
+                cauchy_value_count,
+                cauchy_normal_count,
+                gmres_max_iterations);
         }
 
         std::vector<GeometryKind> geometries;
@@ -2748,6 +3244,7 @@ int main(int argc, char** argv)
         std::cout << '\n';
 
         std::vector<ReadinessResult> results;
+        const app3d::RigidTransform3D identity_transform;
         for (int N : levels) {
             for (GeometryKind geometry : geometries) {
                 results.push_back(run_readiness_case(
@@ -2757,7 +3254,9 @@ int main(int argc, char** argv)
                     cauchy_policy,
                     cauchy_value_count,
                     cauchy_normal_count,
-                    gmres_max_iterations));
+                    gmres_max_iterations,
+                    identity_transform,
+                    SolveSelection3D::Both));
                 write_summary(output_dir, results);
                 write_solve_summaries(output_dir, results);
 
