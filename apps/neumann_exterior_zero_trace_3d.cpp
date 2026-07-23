@@ -24,6 +24,7 @@
 #include <Eigen/SVD>
 
 #include "dirichlet_rigid_transform_study_3d.hpp"
+#include "exterior_only_cubic_normal_restrict_3d.hpp"
 #include "harmonic_polynomial_space_3d.hpp"
 #include "native_nurbs_surface_3d.hpp"
 #include "src/bulk_solvers/laplace_zfft_bulk_solver_3d.hpp"
@@ -67,6 +68,11 @@ enum class CauchyStencilPolicy3D {
 enum class SolveSelection3D {
     Both,
     DirichletNormalOnly
+};
+
+enum class ExteriorNormalRestrictMode3D {
+    JointTricubicCauchy,
+    ExteriorOnlyHarmonicCubic
 };
 
 std::string cauchy_policy_name(CauchyStencilPolicy3D policy)
@@ -761,7 +767,8 @@ public:
                                  const std::vector<geometry3d::NurbsParamTriangle3D>&
                                      geometry_triangles,
                                  const SurfaceDofCloud& cloud,
-                                 const CauchyStencilSet& stencils)
+                                 const CauchyStencilSet& stencils,
+                                 bool build_exterior_only_restrict = false)
         : grid_(grid)
         , grid_pair_(grid_pair)
         , native_surface_(native_surface)
@@ -779,6 +786,11 @@ public:
             || std::abs(spacing[0] - spacing[2]) > 1.0e-13) {
             throw std::invalid_argument(
                 "harmonic-jet KFBI3D requires an isotropic Cartesian grid");
+        }
+        if (build_exterior_only_restrict) {
+            exterior_only_restrict_ =
+                std::make_unique<app3d::ExteriorOnlyCubicNormalRestrict3D>(
+                    grid_, grid_pair_, cloud_);
         }
         build_crossing_rows();
         build_trace_templates();
@@ -845,6 +857,24 @@ public:
         const Eigen::VectorXd& value_jump,
         const Eigen::VectorXd& normal_jump) const
     {
+        return exterior_normal_trace(
+            field, value_jump, normal_jump,
+            ExteriorNormalRestrictMode3D::JointTricubicCauchy);
+    }
+
+    Eigen::VectorXd exterior_normal_trace(
+        const HarmonicJetField3D& field,
+        const Eigen::VectorXd& value_jump,
+        const Eigen::VectorXd& normal_jump,
+        ExteriorNormalRestrictMode3D mode) const
+    {
+        if (mode == ExteriorNormalRestrictMode3D::ExteriorOnlyHarmonicCubic) {
+            if (!exterior_only_restrict_) {
+                throw std::runtime_error(
+                    "exterior-only normal restrict was not initialized");
+            }
+            return exterior_only_restrict_->apply(field.potential);
+        }
         return recover_trace(
             continued_samples(field, value_jump, normal_jump, false),
             c1_weights_, 1.0 / h_);
@@ -1151,6 +1181,8 @@ private:
     const SurfaceDofCloud& cloud_;
     double h_ = 0.0;
     PanelCenterCauchyFit3D fit_;
+    std::unique_ptr<app3d::ExteriorOnlyCubicNormalRestrict3D>
+        exterior_only_restrict_;
     LaplaceFftBulkSolverZfft3D bulk_;
     LaplaceCorrectionSupport3D correction_support_;
     std::vector<HarmonicCrossingRow3D> crossing_rows_;
@@ -1255,9 +1287,11 @@ ExteriorZeroTraceSolution3D solve_exterior_zero_trace_neumann_3d(
 
 class ExteriorNormalTraceOperator3D final : public IKFBIOperator {
 public:
-    explicit ExteriorNormalTraceOperator3D(
-        const PanelCenterHarmonicJetKFBI3D& pipeline)
+    ExteriorNormalTraceOperator3D(
+        const PanelCenterHarmonicJetKFBI3D& pipeline,
+        ExteriorNormalRestrictMode3D mode)
         : pipeline_(pipeline)
+        , mode_(mode)
     {}
 
     int problem_size() const override
@@ -1277,7 +1311,7 @@ public:
         const HarmonicJetField3D field =
             pipeline_.evaluate(zero_value, normal_jump);
         result = pipeline_.exterior_normal_trace(
-            field, zero_value, normal_jump);
+            field, zero_value, normal_jump, mode_);
     }
 
     Eigen::VectorXd right_hand_side(
@@ -1292,11 +1326,12 @@ public:
         const HarmonicJetField3D field =
             pipeline_.evaluate(prescribed_value_jump, zero_normal);
         return -pipeline_.exterior_normal_trace(
-            field, prescribed_value_jump, zero_normal);
+            field, prescribed_value_jump, zero_normal, mode_);
     }
 
 private:
     const PanelCenterHarmonicJetKFBI3D& pipeline_;
+    ExteriorNormalRestrictMode3D mode_;
 };
 
 struct ExteriorNormalTraceSolution3D {
@@ -1312,11 +1347,12 @@ struct ExteriorNormalTraceSolution3D {
 ExteriorNormalTraceSolution3D solve_exterior_zero_normal_dirichlet_3d(
     const PanelCenterHarmonicJetKFBI3D& pipeline,
     const Eigen::VectorXd& prescribed_value_jump,
+    ExteriorNormalRestrictMode3D mode,
     double tolerance,
     int restart,
     int max_iterations)
 {
-    ExteriorNormalTraceOperator3D op(pipeline);
+    ExteriorNormalTraceOperator3D op(pipeline, mode);
     const Eigen::VectorXd rhs = op.right_hand_side(prescribed_value_jump);
     Eigen::VectorXd normal_jump = Eigen::VectorXd::Zero(op.problem_size());
     GMRES gmres(max_iterations, tolerance, restart);
@@ -1513,7 +1549,9 @@ SolveMetrics3D run_dirichlet_normal_case(
     const auto solve_start = std::chrono::steady_clock::now();
     const ExteriorNormalTraceSolution3D solution =
         solve_exterior_zero_normal_dirichlet_3d(
-            pipeline, value_data, 2.0e-10, 0, gmres_max_iterations);
+            pipeline, value_data,
+            ExteriorNormalRestrictMode3D::JointTricubicCauchy,
+            2.0e-10, 0, gmres_max_iterations);
     const double seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - solve_start).count();
 
