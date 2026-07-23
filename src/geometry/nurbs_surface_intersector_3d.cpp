@@ -15,6 +15,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -70,6 +71,121 @@ NurbsAabb3D segment_bounds(const Eigen::Vector3d& start,
     return {start.cwiseMin(end), start.cwiseMax(end)};
 }
 
+std::array<NurbsQueryElementSample3D, 16> make_query_element_samples(
+    const RationalBezierElement3D& element)
+{
+    std::array<NurbsQueryElementSample3D, 16> samples{};
+    for (int i = 0; i < 4; ++i) {
+        const double u = element.u0()
+            + static_cast<double>(i) * (element.u1() - element.u0()) / 3.0;
+        for (int j = 0; j < 4; ++j) {
+            const double v = element.v0()
+                + static_cast<double>(j) * (element.v1() - element.v0()) / 3.0;
+            NurbsQueryElementSample3D& sample =
+                samples[static_cast<std::size_t>(4 * i + j)];
+            sample.u = u;
+            sample.v = v;
+            sample.point = element.evaluate(u, v);
+            if (!sample.point.allFinite()) {
+                throw std::runtime_error(
+                    "NURBS query-element sample must be finite");
+            }
+        }
+    }
+    return samples;
+}
+
+std::vector<NurbsElementParameterSeed3D> select_sample_seeds(
+    const std::array<NurbsQueryElementSample3D, 16>& samples,
+    const Eigen::Vector3d& start,
+    const Eigen::Vector3d& end)
+{
+    struct RankedSample {
+        int index = -1;
+        double t = 0.0;
+        double squared_distance = std::numeric_limits<double>::infinity();
+    };
+    const Eigen::Vector3d delta = end - start;
+    const double denominator = delta.squaredNorm();
+    std::array<RankedSample, 16> ranked{};
+    for (int index = 0; index < 16; ++index) {
+        const NurbsQueryElementSample3D& sample =
+            samples[static_cast<std::size_t>(index)];
+        const double t = std::clamp(
+            (sample.point - start).dot(delta) / denominator, 0.0, 1.0);
+        ranked[static_cast<std::size_t>(index)] = {
+            index, t,
+            (sample.point - (start + t * delta)).squaredNorm()};
+    }
+
+    std::vector<RankedSample> extrema;
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            const int index = 4 * i + j;
+            const double value =
+                ranked[static_cast<std::size_t>(index)].squared_distance;
+            bool local_minimum = true;
+            for (int di = -1; di <= 1 && local_minimum; ++di) {
+                for (int dj = -1; dj <= 1; ++dj) {
+                    const int ni = i + di;
+                    const int nj = j + dj;
+                    if ((di == 0 && dj == 0)
+                        || ni < 0 || ni >= 4 || nj < 0 || nj >= 4) {
+                        continue;
+                    }
+                    if (ranked[static_cast<std::size_t>(4 * ni + nj)]
+                            .squared_distance < value) {
+                        local_minimum = false;
+                        break;
+                    }
+                }
+            }
+            if (local_minimum)
+                extrema.push_back(ranked[static_cast<std::size_t>(index)]);
+        }
+    }
+    if (extrema.empty()) {
+        extrema.push_back(*std::min_element(
+            ranked.begin(), ranked.end(),
+            [](const RankedSample& first, const RankedSample& second) {
+                return std::tie(first.squared_distance, first.index)
+                    < std::tie(second.squared_distance, second.index);
+            }));
+    }
+    std::sort(
+        extrema.begin(), extrema.end(),
+        [](const RankedSample& first, const RankedSample& second) {
+            return std::tie(first.squared_distance, first.index)
+                < std::tie(second.squared_distance, second.index);
+        });
+
+    std::vector<RankedSample> retained;
+    for (const RankedSample& candidate : extrema) {
+        const int candidate_i = candidate.index / 4;
+        const int candidate_j = candidate.index % 4;
+        const bool too_close = std::any_of(
+            retained.begin(), retained.end(), [&](const RankedSample& existing) {
+                const double normalized_distance = std::max(
+                    std::abs(candidate_i - existing.index / 4) / 3.0,
+                    std::abs(candidate_j - existing.index % 4) / 3.0);
+                return normalized_distance < 1.0 / 3.0;
+            });
+        if (!too_close)
+            retained.push_back(candidate);
+        if (retained.size() == 4)
+            break;
+    }
+
+    std::vector<NurbsElementParameterSeed3D> seeds;
+    seeds.reserve(retained.size());
+    for (const RankedSample& retained_sample : retained) {
+        const NurbsQueryElementSample3D& sample =
+            samples[static_cast<std::size_t>(retained_sample.index)];
+        seeds.push_back({sample.u, sample.v, retained_sample.t});
+    }
+    return seeds;
+}
+
 double parameter_tolerance(const NurbsSurfacePatch3D& patch)
 {
     const double scale = std::max({
@@ -96,8 +212,8 @@ bool same_patch_root(const NurbsSurfaceCrossing3D& first,
         return false;
     const double uv_tolerance = parameter_tolerance(
         model.patch(first.patch_index));
-    return std::abs(first.u - second.u) <= uv_tolerance
-        && std::abs(first.v - second.v) <= uv_tolerance
+    return std::abs(first.u - second.u) <= 8.0 * uv_tolerance
+        && std::abs(first.v - second.v) <= 8.0 * uv_tolerance
         && std::abs(first.edge_parameter - second.edge_parameter)
             <= segment_parameter_tolerance(
                 geometry_tolerance, segment_length)
@@ -798,9 +914,11 @@ NurbsSurfaceIntersector3D::NurbsSurfaceIntersector3D(
     } else {
         elements_ = std::move(base_elements);
     }
+    element_samples_.reserve(elements_.size());
     for (const RationalBezierElement3D& element : elements_) {
         maximum_query_element_extent_ = std::max(
             maximum_query_element_extent_, element.bounds().max_extent());
+        element_samples_.push_back(make_query_element_samples(element));
     }
     element_order_.resize(elements_.size());
     std::iota(element_order_.begin(), element_order_.end(), 0);
@@ -835,6 +953,16 @@ double NurbsSurfaceIntersector3D::
 maximum_query_element_extent() const noexcept
 {
     return maximum_query_element_extent_;
+}
+
+const std::array<NurbsQueryElementSample3D, 16>&
+NurbsSurfaceIntersector3D::query_element_samples(std::size_t element) const
+{
+    if (element >= element_samples_.size()) {
+        throw std::out_of_range(
+            "NURBS query-element sample index is outside storage");
+    }
+    return element_samples_[element];
 }
 
 int NurbsSurfaceIntersector3D::build_bvh_node(int begin, int end)
@@ -1001,6 +1129,17 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
                 result.diagnostics.closest_point_failures,
                 work.diagnostics.closest_point_failures,
                 "NURBS closest-point failure diagnostic overflow");
+            checked_accumulate_diagnostic(
+                result.diagnostics.sample_seeds_accepted,
+                work.diagnostics.supplied_seed_attempts,
+                "NURBS sample-seed diagnostic overflow");
+            checked_accumulate_diagnostic(
+                result.diagnostics.roots_recovered_by_sample_seed,
+                work.diagnostics.roots_recovered_by_supplied_seed,
+                "NURBS sample-seed root diagnostic overflow");
+            result.diagnostics.maximum_sample_seeds_per_element = std::max(
+                result.diagnostics.maximum_sample_seeds_per_element,
+                work.diagnostics.maximum_supplied_seed_count);
         };
     const auto accumulate_local =
         [&](const NurbsElementIntersectionResult3D& local) {
@@ -1027,11 +1166,17 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
             elements_[static_cast<std::size_t>(candidate)];
         const NurbsSurfacePatch3D& source_patch =
             model_.patch(element.patch_index);
+        NurbsElementIntersectionOptions3D candidate_options = local_options;
+        candidate_options.parameter_seeds = select_sample_seeds(
+            element_samples_[static_cast<std::size_t>(candidate)], start, end);
+        checked_accumulate_diagnostic(
+            result.diagnostics.sample_seed_candidates,
+            16, "NURBS sample-candidate diagnostic overflow");
         if (cartesian_edge == nullptr) {
             const NurbsElementIntersectionResult3D local =
                 intersect_nurbs_bezier_element_3d(
                     element, source_patch,
-                    start, end, local_options);
+                    start, end, candidate_options);
             accumulate_local(local);
             continue;
         }
@@ -1054,7 +1199,7 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
         if (element_touches_non_g1_feature(element, model_)
             && options_.local_max_subdivision_depth
                    > kFeatureProbeSubdivisionDepth) {
-            NurbsElementIntersectionOptions3D probe_options = local_options;
+            NurbsElementIntersectionOptions3D probe_options = candidate_options;
             probe_options.max_subdivision_depth =
                 kFeatureProbeSubdivisionDepth;
             try {
@@ -1088,7 +1233,7 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
             const NurbsElementIntersectionResult3D local =
                 intersect_nurbs_bezier_element_3d(
                     element, source_patch,
-                    start, end, local_options);
+                    start, end, candidate_options);
             accumulate_local(local);
         } catch (const UnresolvedNurbsIntersectionCandidate3D& error) {
             const NurbsElementIntersectionResult3D& partial =

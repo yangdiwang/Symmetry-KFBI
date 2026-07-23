@@ -149,6 +149,23 @@ void validate_inputs(const RationalBezierElement3D& element,
         throw std::invalid_argument(
             "Bezier element parameter span lies outside the source patch");
     }
+    if (options.parameter_seeds.size() > 4) {
+        throw std::invalid_argument(
+            "NURBS intersection accepts at most four supplied seeds");
+    }
+    for (const NurbsElementParameterSeed3D& seed : options.parameter_seeds) {
+        if (!std::isfinite(seed.u) || !std::isfinite(seed.v)
+            || !std::isfinite(seed.t)
+            || seed.u < element.u0() - options.parameter_tolerance
+            || seed.u > element.u1() + options.parameter_tolerance
+            || seed.v < element.v0() - options.parameter_tolerance
+            || seed.v > element.v1() + options.parameter_tolerance
+            || seed.t < -options.parameter_tolerance
+            || seed.t > 1.0 + options.parameter_tolerance) {
+            throw std::invalid_argument(
+                "NURBS supplied seed lies outside the query element");
+        }
+    }
     (void)element.bounds();
     for (int i = 0; i <= element.degree_u; ++i) {
         for (int j = 0; j <= element.degree_v; ++j)
@@ -1687,6 +1704,24 @@ NurbsElementIntersectionResult3D intersect_nurbs_bezier_element_3d(
                 element, patch, frame, seed, options, result.diagnostics);
             if (outcome.root)
                 (void)append_root(result.roots, *outcome.root, options);
+        }
+    }
+
+    result.diagnostics.maximum_supplied_seed_count =
+        static_cast<int>(options.parameter_seeds.size());
+    for (const NurbsElementParameterSeed3D& supplied :
+         options.parameter_seeds) {
+        checked_increment_diagnostic(
+            result.diagnostics.supplied_seed_attempts,
+            "NURBS supplied-seed diagnostic overflow");
+        const TriangleSeed seed{supplied.u, supplied.v, supplied.t};
+        const NativeNewtonOutcome outcome = native_newton(
+            element, patch, frame, seed, options, result.diagnostics);
+        if (outcome.root
+            && append_root(result.roots, *outcome.root, options)) {
+            checked_increment_diagnostic(
+                result.diagnostics.roots_recovered_by_supplied_seed,
+                "NURBS supplied-seed root diagnostic overflow");
         }
     }
 

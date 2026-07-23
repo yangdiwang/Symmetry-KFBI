@@ -534,8 +534,19 @@ struct NurbsCartesianDomain3D::Impl {
             if (edge_result.crossings.empty())
                 continue;
             if (edge_result.crossings.size() > 1) {
-                throw std::runtime_error(
-                    "multiple crossings on Cartesian edge");
+                std::ostringstream message;
+                message << std::setprecision(17)
+                        << "multiple crossings on Cartesian edge axis="
+                        << axis << " (" << ijk[0] << ',' << ijk[1] << ','
+                        << ijk[2] << ')';
+                for (const NurbsSurfaceCrossing3D& root :
+                     edge_result.crossings) {
+                    message << " root=(patch=" << root.patch_index
+                            << ",u=" << root.u << ",v=" << root.v
+                            << ",t=" << root.edge_parameter
+                            << ",residual=" << root.residual << ')';
+                }
+                throw std::runtime_error(message.str());
             }
             const NurbsSurfaceCrossing3D& crossing =
                 edge_result.crossings.front();

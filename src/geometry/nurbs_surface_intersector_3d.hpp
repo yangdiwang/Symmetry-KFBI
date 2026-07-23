@@ -5,6 +5,7 @@
 
 #include <Eigen/Dense>
 
+#include <array>
 #include <cstddef>
 #include <limits>
 #include <vector>
@@ -41,6 +42,10 @@ struct NurbsSurfaceIntersectionDiagnostics3D {
     int roots_recovered_by_closest_point = 0;
     int terminal_misses_by_closest_point = 0;
     int closest_point_failures = 0;
+    int sample_seed_candidates = 0;
+    int sample_seeds_accepted = 0;
+    int roots_recovered_by_sample_seed = 0;
+    int maximum_sample_seeds_per_element = 0;
 };
 
 struct NurbsSurfaceIntersectionResult3D {
@@ -67,6 +72,12 @@ struct NurbsCartesianEdgeIntersections3D {
     bool has_near_tangent_candidate = false;
 };
 
+struct NurbsQueryElementSample3D {
+    double u = 0.0;
+    double v = 0.0;
+    Eigen::Vector3d point = Eigen::Vector3d::Zero();
+};
+
 struct NurbsSurfaceIntersectorOptions3D {
     bool use_triangle_seeds = true;
     int bvh_leaf_size = 8;
@@ -86,6 +97,8 @@ public:
     double geometry_tolerance() const;
     std::size_t query_element_count() const noexcept;
     double maximum_query_element_extent() const noexcept;
+    const std::array<NurbsQueryElementSample3D, 16>&
+    query_element_samples(std::size_t element) const;
 
     NurbsSurfaceIntersectionResult3D intersect_segment(
         const Eigen::Vector3d& start,
@@ -123,6 +136,7 @@ private:
     double geometry_tolerance_ = 1e-14;
     double maximum_query_element_extent_ = 0.0;
     std::vector<RationalBezierElement3D> elements_;
+    std::vector<std::array<NurbsQueryElementSample3D, 16>> element_samples_;
     std::vector<int> element_order_;
     std::vector<BvhNode> bvh_nodes_;
     int bvh_root_ = -1;

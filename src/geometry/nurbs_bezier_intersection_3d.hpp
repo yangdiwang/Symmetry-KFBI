@@ -21,6 +21,12 @@ struct NurbsElementRoot3D {
     double transversality = 0.0;
 };
 
+struct NurbsElementParameterSeed3D {
+    double u = 0.0;
+    double v = 0.0;
+    double t = 0.0;
+};
+
 struct NurbsElementIntersectionDiagnostics3D {
     int subdivision_boxes = 0;
     int conservative_rejections = 0;
@@ -37,6 +43,9 @@ struct NurbsElementIntersectionDiagnostics3D {
     int roots_recovered_by_closest_point = 0;
     int terminal_misses_by_closest_point = 0;
     int closest_point_failures = 0;
+    int supplied_seed_attempts = 0;
+    int roots_recovered_by_supplied_seed = 0;
+    int maximum_supplied_seed_count = 0;
 };
 
 struct NurbsElementIntersectionResult3D {
@@ -62,6 +71,7 @@ struct NurbsElementIntersectionOptions3D {
     int max_subdivision_depth = 36;
     int max_newton_iterations = 24;
     bool use_triangle_seed = true;
+    std::vector<NurbsElementParameterSeed3D> parameter_seeds;
 };
 
 NurbsElementIntersectionResult3D intersect_nurbs_bezier_element_3d(

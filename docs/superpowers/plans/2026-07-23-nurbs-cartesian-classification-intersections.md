@@ -100,16 +100,16 @@ struct NurbsQueryElementSample3D {
 
 NurbsElementIntersectionOptions3D gains a vector of parameter seeds.
 
-- [ ] Add failing tests for 16 finite samples per query leaf, at most four accepted seeds, and triangle-seed independence.
-- [ ] Run RED.
-- [ ] Precompute normalized coordinates {0,1/3,2/3,1} squared for every BVH leaf.
-- [ ] Project the 16 points to each finite edge.
-- [ ] Select discrete local extrema by distance, sort them, and reject retained seeds closer than 1/3 in normalized parameter Chebyshev distance.
-- [ ] Always retain the best sample if no extremum survives; triangle seeds keep first priority.
-- [ ] Run supplied seeds before midpoint recursion and deduplicate with fixed geometry/parameter tolerances.
-- [ ] Assert main depth <= 4 and accepted seeds <= 4.
-- [ ] Run GREEN.
-- [ ] Commit: feat: seed NURBS intersections from leaf samples.
+- [x] Add failing tests for 16 finite samples per query leaf, at most four accepted seeds, and triangle-seed independence.
+- [x] Run RED.
+- [x] Precompute normalized coordinates {0,1/3,2/3,1} squared for every BVH leaf.
+- [x] Project the 16 points to each finite edge.
+- [x] Select discrete local extrema by distance, sort them, and reject retained seeds closer than 1/3 in normalized parameter Chebyshev distance.
+- [x] Always retain the best sample if no extremum survives; triangle seeds keep first priority.
+- [x] Run supplied seeds before midpoint recursion and deduplicate with fixed geometry/parameter tolerances.
+- [x] Assert main depth <= 4 and accepted seeds <= 4.
+- [x] Run GREEN.
+- [x] Commit: feat: seed NURBS intersections from leaf samples.
 
 ---
 

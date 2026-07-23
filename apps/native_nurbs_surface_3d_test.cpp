@@ -1344,6 +1344,19 @@ void test_native_nurbs_surface_intersector()
                 && grid_scaled_intersector.query_element_count()
                        > torus_intersector.query_element_count(),
             "extent-limited Bezier leaves are the actual BVH query elements");
+    for (std::size_t element = 0;
+         element < grid_scaled_intersector.query_element_count(); ++element) {
+        const auto& samples =
+            grid_scaled_intersector.query_element_samples(element);
+        require(samples.size() == 16
+                    && std::all_of(
+                        samples.begin(), samples.end(), [](const auto& sample) {
+                            return std::isfinite(sample.u)
+                                && std::isfinite(sample.v)
+                                && sample.point.allFinite();
+                        }),
+                "each query leaf owns sixteen finite parameter samples");
+    }
     const auto grid_scaled_hit =
         grid_scaled_intersector.intersect_cartesian_edge(
             NurbsCartesianEdgeQuery3D{
@@ -1352,6 +1365,8 @@ void test_native_nurbs_surface_intersector()
     const auto& grid_scaled_diagnostics = grid_scaled_hit.diagnostics;
     require(grid_scaled_hit.crossings.size() == 1
                 && grid_scaled_diagnostics.maximum_subdivision_depth_reached <= 4
+                && grid_scaled_diagnostics.maximum_sample_seeds_per_element <= 4
+                && grid_scaled_diagnostics.sample_seeds_accepted > 0
                 && grid_scaled_diagnostics.unresolved_candidates == 0,
             "grid-scaled Cartesian query obeys the local depth-four budget");
 
