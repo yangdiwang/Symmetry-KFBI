@@ -1524,7 +1524,8 @@ double surface_weighted_mean(const SurfaceDofCloud& surface,
 SolveMetrics3D run_neumann_case(
     const CartesianGrid3D& grid,
     const GridPair3D& grid_pair,
-    const PanelCenterHarmonicJetKFBI3D& pipeline)
+    const PanelCenterHarmonicJetKFBI3D& pipeline,
+    int gmres_max_iterations)
 {
     const int size = pipeline.surface_size();
     Eigen::VectorXd exact_trace(size);
@@ -1544,7 +1545,7 @@ SolveMetrics3D run_neumann_case(
     const auto solve_start = std::chrono::steady_clock::now();
     const ExteriorZeroTraceSolution3D solution =
         solve_exterior_zero_trace_neumann_3d(
-            pipeline, normal_data, 2.0e-10, 80, 200);
+            pipeline, normal_data, 2.0e-10, 80, gmres_max_iterations);
     const double seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - solve_start).count();
 
@@ -1618,7 +1619,8 @@ SolveMetrics3D run_neumann_case(
 SolveMetrics3D run_dirichlet_normal_case(
     const CartesianGrid3D& grid,
     const GridPair3D& grid_pair,
-    const PanelCenterHarmonicJetKFBI3D& pipeline)
+    const PanelCenterHarmonicJetKFBI3D& pipeline,
+    int gmres_max_iterations)
 {
     const int size = pipeline.surface_size();
     Eigen::VectorXd value_data(size);
@@ -1633,7 +1635,7 @@ SolveMetrics3D run_dirichlet_normal_case(
     const auto solve_start = std::chrono::steady_clock::now();
     const ExteriorNormalTraceSolution3D solution =
         solve_exterior_zero_normal_dirichlet_3d(
-            pipeline, value_data, 2.0e-10, 0, 400);
+            pipeline, value_data, 2.0e-10, 0, gmres_max_iterations);
     const double seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - solve_start).count();
 
@@ -1847,7 +1849,8 @@ ReadinessResult run_readiness_case(GeometryKind kind,
                                    const std::filesystem::path& output_dir,
                                    CauchyStencilPolicy3D cauchy_policy,
                                    int cauchy_value_count,
-                                   int cauchy_normal_count)
+                                   int cauchy_normal_count,
+                                   int gmres_max_iterations)
 {
     const double h = kBoxSide / static_cast<double>(N);
     CartesianGrid3D grid({kBoxMin, kBoxMin, kBoxMin},
@@ -2202,9 +2205,10 @@ ReadinessResult run_readiness_case(GeometryKind kind,
         throw std::runtime_error(
             "harmonic-jet constant probe produced NaN/Inf");
     }
-    result.neumann = run_neumann_case(grid, grid_pair, harmonic_pipeline);
+    result.neumann = run_neumann_case(
+        grid, grid_pair, harmonic_pipeline, gmres_max_iterations);
     result.dirichlet_normal = run_dirichlet_normal_case(
-        grid, grid_pair, harmonic_pipeline);
+        grid, grid_pair, harmonic_pipeline, gmres_max_iterations);
 
     std::cout << "[ready] " << geometry.name << " - " << geometry.description << '\n'
               << "domain_label_mode=nurbs_barrier_components barriers="
@@ -2652,7 +2656,9 @@ void print_usage(const char* executable)
         << "  same_patch, topological_nearest, or balanced_patches.\n"
         << "  KFBIM_3D_CAUCHY_VALUE_COUNT and\n"
         << "  KFBIM_3D_CAUCHY_NORMAL_COUNT select positive stencil counts\n"
-        << "  (defaults: 48 and 28; normal count may not exceed value count).\n";
+        << "  (defaults: 48 and 28; normal count may not exceed value count).\n"
+        << "  KFBIM_3D_GMRES_MAX_ITERATIONS selects a positive GMRES cap\n"
+        << "  for both formulations (default: 80).\n";
 }
 
 } // namespace
@@ -2685,6 +2691,8 @@ int main(int argc, char** argv)
             "KFBIM_3D_CAUCHY_VALUE_COUNT", kCauchyValueNeighborCount);
         const int cauchy_normal_count = positive_environment_integer(
             "KFBIM_3D_CAUCHY_NORMAL_COUNT", kCauchyDerivativeNeighborCount);
+        const int gmres_max_iterations = positive_environment_integer(
+            "KFBIM_3D_GMRES_MAX_ITERATIONS", 80);
         if (cauchy_normal_count > cauchy_value_count) {
             throw std::invalid_argument(
                 "KFBIM_3D_CAUCHY_NORMAL_COUNT may not exceed "
@@ -2729,6 +2737,7 @@ int main(int argc, char** argv)
                   << '\n'
                   << "  cauchy_counts=" << cauchy_value_count << '/'
                   << cauchy_normal_count << '\n'
+                  << "  gmres_max_iterations=" << gmres_max_iterations << '\n'
                   << "  levels=";
         for (std::size_t index = 0; index < levels.size(); ++index) {
             if (index != 0)
@@ -2739,22 +2748,36 @@ int main(int argc, char** argv)
 
         std::vector<ReadinessResult> results;
         for (int N : levels) {
-            for (GeometryKind geometry : geometries)
+            for (GeometryKind geometry : geometries) {
                 results.push_back(run_readiness_case(
                     geometry,
                     N,
                     output_dir,
                     cauchy_policy,
                     cauchy_value_count,
-                    cauchy_normal_count));
-        }
-        write_summary(output_dir, results);
-        write_solve_summaries(output_dir, results);
-        for (const ReadinessResult& result : results) {
-            if (!result.neumann.converged
-                || !result.dirichlet_normal.converged) {
-                throw std::runtime_error(
-                    "at least one requested 3D GMRES solve did not converge");
+                    cauchy_normal_count,
+                    gmres_max_iterations));
+                write_summary(output_dir, results);
+                write_solve_summaries(output_dir, results);
+
+                const ReadinessResult& result = results.back();
+                const SolveMetrics3D* failed_solve = nullptr;
+                if (!result.neumann.converged)
+                    failed_solve = &result.neumann;
+                else if (!result.dirichlet_normal.converged)
+                    failed_solve = &result.dirichlet_normal;
+                if (failed_solve != nullptr) {
+                    throw std::runtime_error(
+                        "3D GMRES did not converge: geometry="
+                        + result.geometry
+                        + " N=" + std::to_string(result.N)
+                        + " formulation=" + failed_solve->formulation
+                        + " iterations="
+                        + std::to_string(failed_solve->iterations)
+                        + " final_relative_residual="
+                        + std::to_string(
+                            failed_solve->gmres_relative_residual));
+                }
             }
         }
 

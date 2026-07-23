@@ -66,6 +66,33 @@ jobs:
             'cauchy_degree=3 restrict_grid_degree=3 restrict_normal_degree=3'
           printf '%s\n' "$three_d_output" | grep -Fq \
             'cauchy_counts=48/28'
+          printf '%s\n' "$three_d_output" | grep -Fq \
+            'gmres_max_iterations=80'
+          if capped_output="$(
+            KFBIM_3D_GMRES_MAX_ITERATIONS=1 \
+              ./build/apps/neumann_exterior_zero_trace_3d l_prism 16 32 2>&1
+          )"; then
+            echo 'capped 3D GMRES run unexpectedly succeeded' >&2
+            exit 1
+          fi
+          printf '%s\n' "$capped_output" | grep -Fq \
+            'geometry=l_prism N=16 formulation='
+          printf '%s\n' "$capped_output" | grep -Fq \
+            'iterations='
+          printf '%s\n' "$capped_output" | grep -Fq \
+            'final_relative_residual='
+          test "$(printf '%s\n' "$capped_output" | grep -c '^\[ready\]')" -eq 1
+          for invalid_gmres_maximum in 0 -1 abc; do
+            if invalid_output="$(
+              KFBIM_3D_GMRES_MAX_ITERATIONS="$invalid_gmres_maximum" \
+                ./build/apps/neumann_exterior_zero_trace_3d l_prism 16 2>&1
+            )"; then
+              echo "invalid 3D GMRES maximum unexpectedly succeeded: $invalid_gmres_maximum" >&2
+              exit 1
+            fi
+            printf '%s\n' "$invalid_output" | grep -Fq \
+              'KFBIM_3D_GMRES_MAX_ITERATIONS must be a positive integer'
+          done
           three_d_override_output="$(
             KFBIM_3D_CAUCHY_POLICY=topological_nearest \
             KFBIM_3D_CAUCHY_VALUE_COUNT=32 \
