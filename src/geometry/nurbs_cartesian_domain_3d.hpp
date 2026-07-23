@@ -33,6 +33,19 @@ private:
 struct NurbsCartesianDomainOptions3D {
     bool use_triangle_seeds = true;
 };
+struct NurbsCartesianEdgeClassification3D {
+    bool queried = false;
+    bool has_confirmed_interface = false;
+    bool changes_component_membership = false;
+    bool root_count_known = true;
+    bool parity_known_from_roots = true;
+    bool has_near_tangent_candidate = false;
+    bool used_targeted_retry = false;
+    bool correction_safe = false;
+    std::size_t confirmed_crossing_count = 0;
+    std::size_t ambiguous_cluster_count = 0;
+    int confirmed_transverse_count = 0;
+};
 
 struct NurbsCartesianDomainDiagnostics3D {
     int nurbs_patch_count = 0;
@@ -70,6 +83,10 @@ public:
     NurbsSurfaceCrossingRange3D crossings_between(
         int node_a, int node_b) const;
     const NurbsSurfaceCrossing3D& crossing_between(
+        int node_a, int node_b) const;
+    NurbsCartesianEdgeClassification3D edge_classification_between(
+        int node_a, int node_b) const;
+    const NurbsSurfaceCrossing3D& correction_crossing_between(
         int node_a, int node_b) const;
     const std::vector<int>& labels() const;
     const NurbsCartesianDomainDiagnostics3D& diagnostics() const;

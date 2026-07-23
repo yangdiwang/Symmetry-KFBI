@@ -2110,6 +2110,25 @@ void test_nurbs_cartesian_l_prism_labels()
                     }
 
                     ++crossing_edges;
+                    const auto classification =
+                        domain->edge_classification_between(node, neighbor);
+                    require(classification.queried
+                                && classification.has_confirmed_interface
+                                && classification.changes_component_membership
+                                && classification.root_count_known
+                                && classification.parity_known_from_roots
+                                && classification.confirmed_crossing_count == 1
+                                && classification.confirmed_transverse_count == 1
+                                && classification.ambiguous_cluster_count == 0
+                                && !classification.has_near_tangent_candidate
+                                && classification.correction_safe,
+                            "L-prism label-changing edge is correction-safe");
+                    const auto& strict_crossing =
+                        domain->correction_crossing_between(node, neighbor);
+                    require(&strict_crossing
+                                == &domain->correction_crossing_between(
+                                    neighbor, node),
+                            "strict crossing reverse lookup has identity");
                     const kfbim::P2CrossingOwner3D owner =
                         pair.p2_crossing_owner_between(node, neighbor);
                     require(owner.status
@@ -2418,7 +2437,25 @@ void test_nurbs_cartesian_multiple_components()
                 first_component_node, second_component_node);
         },
         "requires exactly one crossing",
-        "legacy crossing lookup rejects a four-root component-change edge");
+        "legacy crossing lookup rejects a four-root component-change edge");    const auto coarse_classification =
+        coarse_domain.edge_classification_between(
+            first_component_node, second_component_node);
+    require(coarse_classification.queried
+                && coarse_classification.has_confirmed_interface
+                && coarse_classification.changes_component_membership
+                && coarse_classification.root_count_known
+                && coarse_classification.parity_known_from_roots
+                && coarse_classification.confirmed_crossing_count == 4
+                && coarse_classification.confirmed_transverse_count == 4
+                && !coarse_classification.correction_safe,
+            "multi-crossing component change is not correction-safe");
+    require_throws_contains(
+        [&] {
+            (void)coarse_domain.correction_crossing_between(
+                first_component_node, second_component_node);
+        },
+        "under-resolved NURBS Cartesian edge",
+        "multi-crossing correction lookup fails explicitly");
 }
 
 void test_bezier_rejects_extreme_degree_control_count()
