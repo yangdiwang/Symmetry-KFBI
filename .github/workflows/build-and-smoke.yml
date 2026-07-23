@@ -68,6 +68,8 @@ jobs:
             'cauchy_counts=48/28'
           printf '%s\n' "$three_d_output" | grep -Fq \
             'gmres_max_iterations=80'
+          printf '%s\n' "$three_d_output" | grep -Fq \
+            'levels=32'
           if capped_output="$(
             KFBIM_3D_GMRES_MAX_ITERATIONS=1 \
               ./build/apps/neumann_exterior_zero_trace_3d l_prism 16 32 2>&1
@@ -81,7 +83,20 @@ jobs:
             'iterations='
           printf '%s\n' "$capped_output" | grep -Fq \
             'final_relative_residual='
+          printf '%s\n' "$capped_output" | grep -Fq \
+            '[neumann] converged/iterations=0/1'
+          printf '%s\n' "$capped_output" | grep -Fq \
+            '[dirichlet-normal] converged/iterations=0/1'
           test "$(printf '%s\n' "$capped_output" | grep -c '^\[ready\]')" -eq 1
+          summary_dir=output/neumann_exterior_zero_trace_3d/g1_nearest
+          for summary_csv in \
+              geometry_readiness.csv \
+              neumann_results.csv \
+              dirichlet_normal_results.csv; do
+            test "$(wc -l < "$summary_dir/$summary_csv")" -eq 2
+            tail -n 1 "$summary_dir/$summary_csv" | grep -Eq \
+              '^l_prism,g1_nearest,16,'
+          done
           for invalid_gmres_maximum in 0 -1 abc; do
             if invalid_output="$(
               KFBIM_3D_GMRES_MAX_ITERATIONS="$invalid_gmres_maximum" \

@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -2767,16 +2768,17 @@ int main(int argc, char** argv)
                 else if (!result.dirichlet_normal.converged)
                     failed_solve = &result.dirichlet_normal;
                 if (failed_solve != nullptr) {
-                    throw std::runtime_error(
-                        "3D GMRES did not converge: geometry="
-                        + result.geometry
-                        + " N=" + std::to_string(result.N)
-                        + " formulation=" + failed_solve->formulation
-                        + " iterations="
-                        + std::to_string(failed_solve->iterations)
-                        + " final_relative_residual="
-                        + std::to_string(
-                            failed_solve->gmres_relative_residual));
+                    std::ostringstream message;
+                    message
+                        << "3D GMRES did not converge: geometry="
+                        << result.geometry
+                        << " N=" << result.N
+                        << " formulation=" << failed_solve->formulation
+                        << " iterations=" << failed_solve->iterations
+                        << " final_relative_residual="
+                        << std::scientific << std::setprecision(17)
+                        << failed_solve->gmres_relative_residual;
+                    throw std::runtime_error(message.str());
                 }
             }
         }
