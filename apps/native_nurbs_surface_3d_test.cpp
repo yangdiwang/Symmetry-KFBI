@@ -1805,6 +1805,71 @@ kfbim::geometry3d::NurbsSurfaceModel3D two_translated_components(
         std::move(connections));
 }
 
+void test_direct_nurbs_point_classification()
+{
+    using kfbim::geometry3d::NurbsSurfaceIntersector3D;
+    using kfbim::geometry3d::NurbsSurfaceIntersectorOptions3D;
+    struct Case { Eigen::Vector3d point; std::vector<int> expected; const char* name; };
+    const auto verify = [](const NativeNurbsSurface3D& surface,
+                           const std::vector<Case>& cases) {
+        NurbsSurfaceIntersectorOptions3D no_seeds;
+        no_seeds.use_triangle_seeds = false;
+        const NurbsSurfaceIntersector3D seeded(surface.geometry_model());
+        const NurbsSurfaceIntersector3D unseeded(
+            surface.geometry_model(), no_seeds);
+        for (const auto& item : cases) {
+            require(seeded.containing_components(item.point) == item.expected,
+                    std::string(item.name) + " with triangle seeds");
+            require(unseeded.containing_components(item.point) == item.expected,
+                    std::string(item.name) + " without triangle seeds");
+        }
+    };
+
+    const NativeNurbsSurface3D torus =
+        make_native_nurbs_surface_3d(GeometryKind3D::Torus);
+    verify(torus, {
+        {{0.62, -0.04, 0.03}, {0}, "torus material"},
+        {{0.07, -0.04, 0.03}, {}, "torus hole/two-crossing ray"},
+        {{1.20, 0.80, 0.80}, {}, "torus far exterior"}});
+    verify(make_native_nurbs_surface_3d(GeometryKind3D::HollowCylinder), {
+        {{0.46, -0.05, 0.0}, {0}, "cylinder wall"},
+        {{0.06, -0.05, 0.0}, {}, "cylinder bore"},
+        {{0.70, -0.05, 0.0}, {}, "cylinder radial exterior"},
+        {{0.46, -0.05, 0.80}, {}, "cylinder above cap"},
+        {{0.46, -0.05, 0.669}, {0}, "cylinder inside cap"},
+        {{0.46, -0.05, 0.671}, {}, "cylinder outside cap"}});
+    verify(make_native_nurbs_surface_3d(GeometryKind3D::LPrism), {
+        {{0.40, -0.30, 0.0}, {0}, "L-prism lower arm"},
+        {{-0.20, 0.20, 0.0}, {0}, "L-prism upper arm"},
+        {{0.30, 0.20, 0.0}, {}, "L-prism missing quadrant"},
+        {{0.0, -0.30, 0.80}, {}, "L-prism outside height"},
+        {{0.02, -0.12, 0.0}, {0}, "L-prism corner southwest"},
+        {{0.12, -0.12, 0.0}, {0}, "L-prism corner southeast"},
+        {{0.02, -0.02, 0.0}, {0}, "L-prism corner northwest"},
+        {{0.12, -0.02, 0.0}, {}, "L-prism corner northeast"}});
+
+    const auto translated_model = two_translated_components(
+        torus.geometry_model(), Eigen::Vector3d(2.0, 0.0, 0.0));
+    for (bool use_seeds : {true, false}) {
+        NurbsSurfaceIntersectorOptions3D options;
+        options.use_triangle_seeds = use_seeds;
+        const NurbsSurfaceIntersector3D translated(translated_model, options);
+        require(translated.containing_components({0.62, -0.04, 0.03})
+                    == std::vector<int>{0}
+                && translated.containing_components({2.62, -0.04, 0.03})
+                    == std::vector<int>{1}
+                && translated.containing_components({1.07, -0.04, 0.03})
+                    .empty(),
+                "translated components classify independently");
+    }
+
+    const NurbsSurfaceIntersector3D torus_intersector(torus.geometry_model());
+    require_throws_contains(
+        [&] { (void)torus_intersector.containing_components(
+                  {0.82, -0.04, 0.03}); },
+        "point lies on NURBS surface",
+        "direct classification rejects an exact surface point");
+}
 void require_triangle_seed_independent_domain(
     const kfbim::CartesianGrid3D& grid,
     const kfbim::geometry3d::NurbsSurfaceModel3D& model,
@@ -2822,6 +2887,7 @@ int main()
         test_single_patch_periodic_seam_canonicalization();
         test_tangent_witness_does_not_swallow_unresolved_candidate();
         test_native_nurbs_surface_intersector();
+        test_direct_nurbs_point_classification();
         test_nurbs_cartesian_l_prism_labels();
         test_nurbs_cartesian_under_resolved_torus_uses_parity();
         test_nurbs_cartesian_input_contracts();

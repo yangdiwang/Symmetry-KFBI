@@ -1602,9 +1602,17 @@ std::vector<int> NurbsSurfaceIntersector3D::containing_components(
             if (std::any_of(
                     result.crossings.begin(), result.crossings.end(),
                     [&](const auto& root) {
-                        return root.edge_parameter <= endpoint_tolerance
-                            || root.edge_parameter
-                                >= 1.0 - endpoint_tolerance;
+                        return root.edge_parameter <= endpoint_tolerance;
+                    })) {
+                throw std::runtime_error(cartesian_edge_diagnostic(
+                    "point lies on NURBS surface", ray,
+                    result.crossings));
+            }
+            if (std::any_of(
+                    result.crossings.begin(), result.crossings.end(),
+                    [&](const auto& root) {
+                        return root.edge_parameter
+                            >= 1.0 - endpoint_tolerance;
                     })) {
                 throw std::runtime_error(cartesian_edge_diagnostic(
                     "surface intersects Cartesian node", ray,
