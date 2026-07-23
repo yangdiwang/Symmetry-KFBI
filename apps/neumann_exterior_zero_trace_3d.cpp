@@ -54,6 +54,7 @@ using SurfaceDofCloud = app3d::SurfaceDofCloud3D;
 using SurfacePatchInfo = app3d::SurfaceDofPatch3D;
 
 enum class CauchyStencilPolicy3D {
+    G1Nearest,
     TopologicalNearest,
     SamePatch,
     BalancedPatches
@@ -62,6 +63,8 @@ enum class CauchyStencilPolicy3D {
 std::string cauchy_policy_name(CauchyStencilPolicy3D policy)
 {
     switch (policy) {
+    case CauchyStencilPolicy3D::G1Nearest:
+        return "g1_nearest";
     case CauchyStencilPolicy3D::TopologicalNearest:
         return "topological_nearest";
     case CauchyStencilPolicy3D::SamePatch:
@@ -76,15 +79,18 @@ CauchyStencilPolicy3D selected_cauchy_policy()
 {
     const char* raw = std::getenv("KFBIM_3D_CAUCHY_POLICY");
     if (raw == nullptr || std::string(raw).empty()
-        || std::string(raw) == "topological_nearest") {
-        return CauchyStencilPolicy3D::TopologicalNearest;
+        || std::string(raw) == "g1_nearest") {
+        return CauchyStencilPolicy3D::G1Nearest;
     }
     if (std::string(raw) == "same_patch")
         return CauchyStencilPolicy3D::SamePatch;
+    if (std::string(raw) == "topological_nearest")
+        return CauchyStencilPolicy3D::TopologicalNearest;
     if (std::string(raw) == "balanced_patches")
         return CauchyStencilPolicy3D::BalancedPatches;
     throw std::invalid_argument(
-        "KFBIM_3D_CAUCHY_POLICY must be topological_nearest, same_patch, or balanced_patches");
+        "KFBIM_3D_CAUCHY_POLICY must be g1_nearest, same_patch, "
+        "topological_nearest, or balanced_patches");
 }
 
 int positive_environment_integer(const char* name, int default_value)
@@ -141,7 +147,7 @@ struct CauchyStencil {
 };
 
 struct CauchyStencilSet {
-    CauchyStencilPolicy3D policy = CauchyStencilPolicy3D::TopologicalNearest;
+    CauchyStencilPolicy3D policy = CauchyStencilPolicy3D::G1Nearest;
     int value_count = 0;
     int derivative_count = 0;
     int value_count_min = 0;
@@ -399,6 +405,9 @@ std::vector<int> select_cauchy_dofs(CauchyStencilPolicy3D policy,
                                     int count)
 {
     switch (policy) {
+    case CauchyStencilPolicy3D::G1Nearest:
+        return app3d::nearest_g1_cauchy_dofs(
+            surface, cloud, center, count);
     case CauchyStencilPolicy3D::TopologicalNearest:
         return app3d::nearest_topological_cauchy_dofs(
             surface, cloud, center, count);
@@ -2634,13 +2643,13 @@ void print_usage(const char* executable)
     std::cout
         << "usage: " << executable
         << " [torus|cylinder|l_prism|all] [N ...]\n"
-        << "  Each N must be a power of two and at least 16 (default: 16).\n"
+        << "  Each N must be a power of two and at least 16 (default: 32).\n"
         << "  This stage builds native NURBS parameter-cell-center surface\n"
         << "  unknowns, topology-filtered 48/28 Cauchy stencils, validates\n"
         << "  fixed transfer routes, and executes the Neumann value-jump and\n"
         << "  Dirichlet normal-jump harmonic-jet GMRES formulations.\n"
-        << "  KFBIM_3D_CAUCHY_POLICY selects topological_nearest (default),\n"
-        << "  same_patch, or balanced_patches.\n"
+        << "  KFBIM_3D_CAUCHY_POLICY selects g1_nearest (default),\n"
+        << "  same_patch, topological_nearest, or balanced_patches.\n"
         << "  KFBIM_3D_CAUCHY_VALUE_COUNT and\n"
         << "  KFBIM_3D_CAUCHY_NORMAL_COUNT select positive stencil counts\n"
         << "  (defaults: 48 and 28; normal count may not exceed value count).\n";
@@ -2653,7 +2662,7 @@ int main(int argc, char** argv)
     try {
         std::cout << std::scientific << std::setprecision(6) << std::unitbuf;
         std::string selection = "all";
-        std::vector<int> levels = {16};
+        std::vector<int> levels = {32};
         if (argc >= 2)
             selection = argv[1];
         if (selection == "--help" || selection == "-h") {
@@ -2711,7 +2720,7 @@ int main(int argc, char** argv)
                   << "  Neumann target: exterior value trace = 0\n"
                   << "  Dirichlet target: exterior normal trace = 0\n"
                   << "  current stage: native NURBS surface DOFs + "
-                     "topological Cauchy neighborhoods + G1 parameter-owned routes\n"
+                     "selected Cauchy neighborhoods + G1 parameter-owned routes\n"
                   << "  cauchy_policy=" << cauchy_policy_name(cauchy_policy)
                   << '\n'
                   << "  cauchy_degree=" << kCauchyPolynomialDegree

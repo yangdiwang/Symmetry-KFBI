@@ -94,6 +94,12 @@ struct SurfaceDofCloud3D {
     int center_dof,
     int count);
 
+[[nodiscard]] std::vector<int> nearest_g1_cauchy_dofs(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud3D& cloud,
+    int center_dof,
+    int count);
+
 [[nodiscard]] std::vector<int> nearest_same_patch_cauchy_dofs(
     const SurfaceDofCloud3D& cloud,
     int center_dof,

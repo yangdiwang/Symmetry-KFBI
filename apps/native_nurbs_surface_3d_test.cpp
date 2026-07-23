@@ -35,6 +35,7 @@ using kfbim::app3d::balanced_topological_cauchy_dofs;
 using kfbim::app3d::interpolate_triangle_parameter;
 using kfbim::app3d::make_native_nurbs_surface_3d;
 using kfbim::app3d::make_native_surface_dofs_3d;
+using kfbim::app3d::nearest_g1_cauchy_dofs;
 using kfbim::app3d::nearest_same_patch_cauchy_dofs;
 using kfbim::app3d::nearest_topological_cauchy_dofs;
 using kfbim::app3d::parameter_dof_candidates_2x2;
@@ -2762,6 +2763,17 @@ bool contains_patch(const std::array<int, 4>& ids,
     return false;
 }
 
+bool contains_patch(const std::vector<int>& ids,
+                    const SurfaceDofCloud3D& cloud,
+                    int patch_id)
+{
+    for (int id : ids) {
+        if (cloud.dofs[static_cast<std::size_t>(id)].patch_id == patch_id)
+            return true;
+    }
+    return false;
+}
+
 bool all_on_patch(const std::array<int, 4>& ids,
                   const SurfaceDofCloud3D& cloud,
                   int patch_id)
@@ -2825,6 +2837,11 @@ void test_parameter_candidates()
             torus, torus_cloud, torus_cauchy_center, 48);
     require(contains_non_source_patch(torus_cauchy, torus_cloud, 0),
             "fine-grid Cauchy selector includes a topological seam neighbor");
+    const std::vector<int> torus_g1_cauchy =
+        nearest_g1_cauchy_dofs(
+            torus, torus_cloud, torus_cauchy_center, 48);
+    require(contains_patch(torus_g1_cauchy, torus_cloud, 12),
+            "G1 Cauchy selector crosses the torus periodic seam");
 
     const NativeNurbsSurface3D lprism =
         make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
@@ -2845,6 +2862,12 @@ void test_parameter_candidates()
             "smooth L-cap seam must retain four candidates");
     require(contains_patch(smooth, lcloud, 4),
             "smooth L-cap seam reaches its neighboring patch");
+    const int lcap_center = top_left.dof_index(
+        top_left.nu - 1, top_left.nv / 2);
+    const std::vector<int> lcap_g1_cauchy =
+        nearest_g1_cauchy_dofs(lprism, lcloud, lcap_center, 48);
+    require(contains_patch(lcap_g1_cauchy, lcloud, 4),
+            "G1 Cauchy selector crosses a smooth L-cap seam");
 
     NativeNurbsSurface3D reversed;
     reversed.name = "reversed_test";
@@ -2939,6 +2962,16 @@ void test_parameter_candidates()
         require(coarse_lcloud.dofs[static_cast<std::size_t>(q)].patch_id == 7,
                 "same-patch Cauchy selector cannot cross a patch edge");
     }
+    const std::vector<int> coarse_l_g1 =
+        nearest_g1_cauchy_dofs(
+            lprism, coarse_lcloud, lcenter, 48);
+    require(coarse_l_g1.size()
+                == static_cast<std::size_t>(lside.dof_count()),
+            "G1 Cauchy selector cannot cross a sharp edge to fill its budget");
+    for (int q : coarse_l_g1) {
+        require(coarse_lcloud.dofs[static_cast<std::size_t>(q)].patch_id == 7,
+                "G1 Cauchy selector remains on an isolated L side");
+    }
 
     const SurfaceDofCloud3D fine_lcloud =
         make_native_surface_dofs_3d(lprism, 3.0 / 32.0);
@@ -2995,6 +3028,37 @@ void test_parameter_candidates()
     require(no_patch_in_range(
                 cylinder_cauchy, coarse_cylinder_cloud, 4, 8),
             "outer-wall Cauchy selector does not jump to the inner wall");
+    const int cylinder_seam_center =
+        outer_wall.dof_index(0, 0);
+    const std::vector<int> cylinder_g1_cauchy =
+        nearest_g1_cauchy_dofs(
+            cylinder, coarse_cylinder_cloud, cylinder_seam_center, 48);
+    require(contains_non_source_patch(
+                cylinder_g1_cauchy, coarse_cylinder_cloud, 0),
+            "G1 Cauchy selector crosses a smooth cylinder quarter seam");
+    for (int q : cylinder_g1_cauchy) {
+        const int patch =
+            coarse_cylinder_cloud.dofs[static_cast<std::size_t>(q)].patch_id;
+        require(patch >= 0 && patch < 4,
+                "G1 Cauchy selector stays on the outer cylinder sheet");
+    }
+    const int second_ring_count = 3 * outer_wall.dof_count() + 1;
+    const std::vector<int> cylinder_second_ring =
+        nearest_g1_cauchy_dofs(cylinder,
+                               coarse_cylinder_cloud,
+                               cylinder_seam_center,
+                               second_ring_count);
+    require(cylinder_second_ring.size()
+                == static_cast<std::size_t>(second_ring_count),
+            "G1 Cauchy selector fills its request through a second G1 ring");
+    require(contains_patch(cylinder_second_ring, coarse_cylinder_cloud, 2),
+            "G1 Cauchy selector reaches the opposite outer-wall quarter");
+    for (int q : cylinder_second_ring) {
+        const int patch =
+            coarse_cylinder_cloud.dofs[static_cast<std::size_t>(q)].patch_id;
+        require(patch >= 0 && patch < 4,
+                "second-ring G1 selection stays on the outer cylinder sheet");
+    }
 }
 
 void test_grid_edge_triangle_owners()

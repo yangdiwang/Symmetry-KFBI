@@ -1004,6 +1004,98 @@ std::vector<int> nearest_topological_cauchy_dofs(
     return result;
 }
 
+std::vector<int> nearest_g1_cauchy_dofs(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud3D& cloud,
+    int center_dof,
+    int count)
+{
+    if (center_dof < 0
+        || center_dof >= static_cast<int>(cloud.dofs.size())) {
+        throw std::out_of_range("Cauchy center DOF is outside the surface cloud");
+    }
+    if (count <= 0)
+        throw std::invalid_argument("Cauchy sample count must be positive");
+    if (surface.patches.size() != cloud.patches.size()
+        || surface.smooth_neighbors.size() != surface.patches.size()) {
+        throw std::invalid_argument(
+            "G1 Cauchy selection requires complete smooth topology");
+    }
+
+    const int center_patch =
+        cloud.dofs[static_cast<std::size_t>(center_dof)].patch_id;
+    if (center_patch < 0
+        || center_patch >= static_cast<int>(cloud.patches.size())) {
+        throw std::runtime_error("Cauchy center DOF has invalid patch ownership");
+    }
+
+    std::vector<bool> visited(surface.patches.size(), false);
+    visited[static_cast<std::size_t>(center_patch)] = true;
+    std::vector<int> included{center_patch};
+    std::vector<int> frontier{center_patch};
+    int candidate_count =
+        cloud.patches[static_cast<std::size_t>(center_patch)].dof_count();
+    bool expanded_one_ring = false;
+    while ((!expanded_one_ring || candidate_count < count)
+           && !frontier.empty()) {
+        std::vector<int> next;
+        for (int patch : frontier) {
+            for (const auto& connection :
+                 surface.smooth_neighbors[static_cast<std::size_t>(patch)]) {
+                if (!connection)
+                    continue;
+                const int neighbor = connection->patch;
+                if (neighbor < 0
+                    || neighbor >= static_cast<int>(surface.patches.size())) {
+                    throw std::runtime_error(
+                        "G1 Cauchy topology contains an invalid patch");
+                }
+                if (!visited[static_cast<std::size_t>(neighbor)]) {
+                    visited[static_cast<std::size_t>(neighbor)] = true;
+                    next.push_back(neighbor);
+                }
+            }
+        }
+        std::sort(next.begin(), next.end());
+        for (int patch : next) {
+            included.push_back(patch);
+            candidate_count +=
+                cloud.patches[static_cast<std::size_t>(patch)].dof_count();
+        }
+        frontier = std::move(next);
+        expanded_one_ring = true;
+    }
+
+    const Eigen::Vector3d& center_point =
+        cloud.dofs[static_cast<std::size_t>(center_dof)].point;
+    std::vector<DistanceDofPair> candidates;
+    candidates.reserve(static_cast<std::size_t>(candidate_count));
+    for (int patch : included) {
+        const SurfaceDofPatch3D& tensor =
+            cloud.patches[static_cast<std::size_t>(patch)];
+        for (int local = 0; local < tensor.dof_count(); ++local) {
+            const int q = tensor.first_dof + local;
+            if (q < 0 || q >= static_cast<int>(cloud.dofs.size())) {
+                throw std::runtime_error(
+                    "G1 Cauchy patch has invalid contiguous DOF range");
+            }
+            candidates.emplace_back(
+                (cloud.dofs[static_cast<std::size_t>(q)].point - center_point)
+                    .squaredNorm(),
+                q);
+        }
+    }
+    std::sort(candidates.begin(), candidates.end(), distance_dof_less);
+    const int selected = std::min(count, static_cast<int>(candidates.size()));
+    std::vector<int> result;
+    result.reserve(static_cast<std::size_t>(selected));
+    for (int k = 0; k < selected; ++k)
+        result.push_back(candidates[static_cast<std::size_t>(k)].second);
+    if (std::find(result.begin(), result.end(), center_dof) == result.end())
+        throw std::runtime_error("G1 Cauchy selection lost its center DOF");
+    return result;
+}
+
 std::vector<int> nearest_same_patch_cauchy_dofs(
     const SurfaceDofCloud3D& cloud,
     int center_dof,

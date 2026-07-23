@@ -43,7 +43,10 @@ jobs:
           ./build/apps/neumann_exterior_trace_lshape_2d 24
           ./build/apps/neumann_harmonic_jet_case_2d ellipse 24
           ./build/apps/neumann_harmonic_jet_python_compatible_2d ellipse 24
-          three_d_output="$(./build/apps/neumann_exterior_zero_trace_3d l_prism 16)"
+          three_d_output="$(
+            env -u KFBIM_3D_CAUCHY_POLICY \
+              ./build/apps/neumann_exterior_zero_trace_3d l_prism
+          )"
           printf '%s\n' "$three_d_output"
           printf '%s\n' "$three_d_output" | grep -Fq \
             'domain_label_mode=nurbs_barrier_components'
@@ -58,12 +61,13 @@ jobs:
           printf '%s\n' "$three_d_output" | grep -Fq \
             'targeted_retries='
           printf '%s\n' "$three_d_output" | grep -Fq \
-            'cauchy_policy=topological_nearest'
+            'cauchy_policy=g1_nearest'
           printf '%s\n' "$three_d_output" | grep -Fq \
             'cauchy_degree=3 restrict_grid_degree=3 restrict_normal_degree=3'
           printf '%s\n' "$three_d_output" | grep -Fq \
             'cauchy_counts=48/28'
           three_d_override_output="$(
+            KFBIM_3D_CAUCHY_POLICY=topological_nearest \
             KFBIM_3D_CAUCHY_VALUE_COUNT=32 \
             KFBIM_3D_CAUCHY_NORMAL_COUNT=20 \
               ./build/apps/neumann_exterior_zero_trace_3d l_prism 16
@@ -71,6 +75,8 @@ jobs:
           printf '%s\n' "$three_d_override_output"
           printf '%s\n' "$three_d_override_output" | grep -Fq \
             'cauchy_counts=32/20'
+          printf '%s\n' "$three_d_override_output" | grep -Fq \
+            'cauchy_policy=topological_nearest'
           printf '%s\n' "$three_d_override_output" | grep -Fq \
             '[neumann] converged/iterations=1/'
           printf '%s\n' "$three_d_override_output" | grep -Fq \
