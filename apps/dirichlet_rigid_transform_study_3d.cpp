@@ -5,6 +5,27 @@
 
 namespace kfbim::app3d {
 
+RigidStudyCriterionStatus3D combine_rigid_study_criteria_3d(
+    const std::vector<RigidStudyCriterionStatus3D>& criteria,
+    bool has_results,
+    bool require_all_evaluated)
+{
+    for (RigidStudyCriterionStatus3D criterion : criteria) {
+        if (criterion == RigidStudyCriterionStatus3D::Fail)
+            return RigidStudyCriterionStatus3D::Fail;
+    }
+    if (!has_results)
+        return RigidStudyCriterionStatus3D::NotEvaluated;
+    if (require_all_evaluated) {
+        for (RigidStudyCriterionStatus3D criterion : criteria) {
+            if (criterion == RigidStudyCriterionStatus3D::NotEvaluated)
+                return RigidStudyCriterionStatus3D::NotEvaluated;
+        }
+    }
+    return RigidStudyCriterionStatus3D::Pass;
+
+}
+
 namespace {
 
 constexpr double kDegreesToRadians =

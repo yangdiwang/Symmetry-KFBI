@@ -2667,11 +2667,7 @@ void write_solve_summaries(const std::filesystem::path& output_dir,
               });
 }
 
-enum class CriterionStatus3D {
-    Pass,
-    Fail,
-    NotEvaluated
-};
+using CriterionStatus3D = app3d::RigidStudyCriterionStatus3D;
 
 const char* criterion_status_name(CriterionStatus3D status)
 {
@@ -2755,21 +2751,10 @@ double rigid_observed_order(const RigidStudyRow3D& previous,
                     / previous.readiness.N);
 }
 
-CriterionStatus3D combine_rigid_criteria(
-    const std::vector<CriterionStatus3D>& criteria,
-    bool has_results)
-{
-    if (std::find(criteria.begin(), criteria.end(),
-                  CriterionStatus3D::Fail) != criteria.end()) {
-        return CriterionStatus3D::Fail;
-    }
-    return has_results ? CriterionStatus3D::Pass
-                       : CriterionStatus3D::NotEvaluated;
-}
-
 std::vector<RigidStudyAcceptance3D> update_rigid_study_criteria(
     std::vector<RigidStudyRow3D>& rows,
-    const std::vector<app3d::DirichletRigidStudyCase3D>& cases)
+    const std::vector<app3d::DirichletRigidStudyCase3D>& cases,
+    bool require_complete_acceptance)
 {
     for (RigidStudyRow3D& row : rows) {
         const RigidStudyRow3D* previous = nullptr;
@@ -2875,13 +2860,14 @@ std::vector<RigidStudyAcceptance3D> update_rigid_study_criteria(
             item.order_64_128_pass = std::isfinite(order) && order >= 1.8
                 ? CriterionStatus3D::Pass : CriterionStatus3D::Fail;
         }
-        item.overall_pass = combine_rigid_criteria(
+        item.overall_pass = app3d::combine_rigid_study_criteria_3d(
             {item.gmres_pass,
              item.monotone_error_pass,
              item.order_64_128_pass,
              item.baseline_ratio_pass,
              item.geometry_diagnostics_pass},
-            !case_rows.empty());
+            !case_rows.empty(),
+            require_complete_acceptance);
 
         for (RigidStudyRow3D* row : case_rows) {
             row->monotone_error_pass = item.monotone_error_pass;
@@ -3023,6 +3009,11 @@ int run_dirichlet_rigid_study(
     std::sort(levels.begin(), levels.end());
     levels.erase(std::unique(levels.begin(), levels.end()), levels.end());
 
+    const bool require_complete_acceptance =
+        std::binary_search(levels.begin(), levels.end(), 32)
+        && std::binary_search(levels.begin(), levels.end(), 64)
+        && std::binary_search(levels.begin(), levels.end(), 128);
+
 #ifdef KFBIM_APP_OUTPUT_DIR
     const std::filesystem::path output_dir =
         std::filesystem::path(KFBIM_APP_OUTPUT_DIR)
@@ -3067,7 +3058,8 @@ int run_dirichlet_rigid_study(
                 std::chrono::steady_clock::now() - case_start).count();
             rows.push_back({study_case, std::move(result), total_seconds});
             const std::vector<RigidStudyAcceptance3D> acceptance =
-                update_rigid_study_criteria(rows, cases);
+                update_rigid_study_criteria(
+                    rows, cases, require_complete_acceptance);
             write_rigid_study_results(output_dir, rows);
             write_rigid_study_acceptance(output_dir, acceptance);
 
@@ -3097,7 +3089,8 @@ int run_dirichlet_rigid_study(
     }
 
     const std::vector<RigidStudyAcceptance3D> acceptance =
-        update_rigid_study_criteria(rows, cases);
+        update_rigid_study_criteria(
+            rows, cases, require_complete_acceptance);
     write_rigid_study_results(output_dir, rows);
     write_rigid_study_acceptance(output_dir, acceptance);
     bool all_pass = true;

@@ -6,6 +6,16 @@
 #include <vector>
 
 namespace kfbim::app3d {
+enum class RigidStudyCriterionStatus3D {
+    Pass,
+    Fail,
+    NotEvaluated
+};
+
+RigidStudyCriterionStatus3D combine_rigid_study_criteria_3d(
+    const std::vector<RigidStudyCriterionStatus3D>& criteria,
+    bool has_results,
+    bool require_all_evaluated);
 
 struct DirichletRigidStudyCase3D {
     std::string id;

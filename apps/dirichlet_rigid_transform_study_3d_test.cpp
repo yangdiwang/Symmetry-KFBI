@@ -9,6 +9,8 @@
 namespace {
 
 using kfbim::app3d::DirichletRigidStudyCase3D;
+using kfbim::app3d::RigidStudyCriterionStatus3D;
+using kfbim::app3d::combine_rigid_study_criteria_3d;
 using kfbim::app3d::make_l_prism_dirichlet_rigid_study_cases_3d;
 using kfbim::app3d::manufactured_harmonic_gradient_3d;
 using kfbim::app3d::manufactured_harmonic_value_3d;
@@ -91,14 +93,41 @@ void test_transformed_harmonic_data_are_covariant()
                          manufactured_harmonic_gradient_3d(point))).norm() < 2.0e-14,
                     "transformed harmonic gradient is not covariant");
         }
+
     }
 }
+void test_acceptance_criterion_combination()
+{
+    using Status = RigidStudyCriterionStatus3D;
+    require(combine_rigid_study_criteria_3d(
+                {Status::Pass, Status::Fail, Status::NotEvaluated},
+                true, true) == Status::Fail,
+            "failure dominates rigid-study criteria");
+    require(combine_rigid_study_criteria_3d(
+                {Status::Pass, Status::NotEvaluated},
+                false, true) == Status::NotEvaluated,
+            "empty rigid-study result is not evaluated");
+    require(combine_rigid_study_criteria_3d(
+                {Status::Pass, Status::Pass}, true, true) == Status::Pass,
+            "complete passing rigid-study criteria pass");
+    require(combine_rigid_study_criteria_3d(
+                {Status::Pass, Status::NotEvaluated},
+                true, true) == Status::NotEvaluated,
+            "incomplete acceptance remains not evaluated");
+    require(combine_rigid_study_criteria_3d(
+                {Status::Pass, Status::NotEvaluated},
+                true, false) == Status::Pass,
+            "smoke-study unavailable criteria are neutral");
+}
+
+
 
 } // namespace
 
 int main()
 {
     try {
+        test_acceptance_criterion_combination();
         test_catalog_metadata();
         test_transformed_harmonic_data_are_covariant();
         std::cout << "3D Dirichlet rigid-transform study tests passed\n";
