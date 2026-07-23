@@ -10,6 +10,26 @@
 
 namespace kfbim::geometry3d {
 
+class NurbsCartesianDomain3D;
+
+class NurbsSurfaceCrossingRange3D {
+public:
+    NurbsSurfaceCrossingRange3D() noexcept = default;
+
+    const NurbsSurfaceCrossing3D* begin() const noexcept;
+    const NurbsSurfaceCrossing3D* end() const noexcept;
+    std::size_t size() const noexcept;
+    const NurbsSurfaceCrossing3D& operator[](std::size_t index) const;
+
+private:
+    friend class NurbsCartesianDomain3D;
+    NurbsSurfaceCrossingRange3D(
+        const NurbsSurfaceCrossing3D* data, std::size_t size) noexcept;
+
+    const NurbsSurfaceCrossing3D* data_ = nullptr;
+    std::size_t size_ = 0;
+};
+
 struct NurbsCartesianDomainOptions3D {
     bool use_triangle_seeds = true;
 };
@@ -21,6 +41,14 @@ struct NurbsCartesianDomainDiagnostics3D {
     std::size_t candidate_grid_edge_count = 0;
     double maximum_query_element_extent = 0.0;
     std::array<std::size_t, 3> barrier_edge_counts{{0, 0, 0}};
+    std::array<std::size_t, 3> interface_edge_counts{{0, 0, 0}};
+    std::size_t multi_crossing_edge_count = 0;
+    std::size_t even_parity_interface_edge_count = 0;
+    std::size_t odd_parity_interface_edge_count = 0;
+    std::size_t ambiguous_parity_edge_count = 0;
+    std::size_t endpoint_parity_fallback_count = 0;
+    std::size_t endpoint_classification_query_count = 0;
+    std::size_t component_parity_toggle_count = 0;
     int grid_component_count = 0;
     int box_exterior_component_count = 0;
     int representative_query_count = 0;
@@ -38,6 +66,9 @@ public:
 
     int label(int node) const;
     bool has_barrier_between(int node_a, int node_b) const;
+    bool has_interface_between(int node_a, int node_b) const;
+    NurbsSurfaceCrossingRange3D crossings_between(
+        int node_a, int node_b) const;
     const NurbsSurfaceCrossing3D& crossing_between(
         int node_a, int node_b) const;
     const std::vector<int>& labels() const;

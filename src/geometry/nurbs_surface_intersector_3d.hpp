@@ -86,6 +86,8 @@ struct NurbsCartesianEdgeIntersections3D {
     bool root_count_known = true;
     bool parity_known_from_roots = true;
     bool has_near_tangent_candidate = false;
+    bool changes_inside_outside = false;
+    bool changes_component_membership = false;
 };
 
 struct NurbsQueryElementSample3D {

@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -26,6 +27,13 @@ struct ClosedIntInterval {
     {
         return lower > upper;
     }
+};
+struct EdgeCrossingRange3D {
+    int begin = 0;
+    int count = 0;
+    int confirmed_transverse_count = 0;
+    bool changes_inside_outside = false;
+    bool changes_component_membership = false;
 };
 
 std::size_t checked_size_product(std::size_t first,
@@ -247,8 +255,10 @@ struct NurbsCartesianDomain3D::Impl {
     int plane_stride = 0;
     int node_count = 0;
     std::array<std::vector<std::uint8_t>, 3> barriers;
+    std::array<std::vector<std::uint8_t>, 3> interface_edges;
     std::vector<NurbsSurfaceCrossing3D> crossings;
-    std::unordered_map<std::uint64_t, int> crossing_by_edge;
+    std::unordered_map<std::uint64_t, EdgeCrossingRange3D>
+        crossing_ranges_by_edge;
     std::vector<int> node_labels;
     NurbsCartesianDomainDiagnostics3D diagnostics;
     NurbsAabb3D bounds;
@@ -394,6 +404,12 @@ struct NurbsCartesianDomain3D::Impl {
             y_barrier_size, std::uint8_t{0});
         barriers[2].assign(
             z_barrier_size, std::uint8_t{0});
+        interface_edges[0].assign(
+            x_barrier_size, std::uint8_t{0});
+        interface_edges[1].assign(
+            y_barrier_size, std::uint8_t{0});
+        interface_edges[2].assign(
+            z_barrier_size, std::uint8_t{0});
 
         const std::vector<RationalBezierElement3D> leaves =
             intersector.acceleration_leaves(maximum_leaf_extent);
@@ -496,6 +512,22 @@ struct NurbsCartesianDomain3D::Impl {
             candidate_keys.end());
         diagnostics.candidate_grid_edge_count = candidate_keys.size();
 
+        std::unordered_map<int, std::vector<int>> endpoint_membership_cache;
+        const auto endpoint_membership = [&](int node) {
+            const auto found = endpoint_membership_cache.find(node);
+            if (found != endpoint_membership_cache.end())
+                return found->second;
+            std::vector<int> containing = intersector.containing_components(
+                as_vector(grid.coord(node)));
+            std::sort(containing.begin(), containing.end());
+            endpoint_membership_cache.emplace(node, containing);
+            diagnostics.endpoint_classification_query_count = checked_size_add(
+                diagnostics.endpoint_classification_query_count,
+                std::size_t{1},
+                "NURBS endpoint-classification diagnostic overflow");
+            return containing;
+        };
+
         for (const std::uint64_t key : candidate_keys) {
             const std::uint64_t axis_bits = key >> 62;
             if (axis_bits > 2)
@@ -526,46 +558,104 @@ struct NurbsCartesianDomain3D::Impl {
                         axis, ijk[0], ijk[1], ijk[2], start, end});
             accumulate_intersection_diagnostics(
                 diagnostics.intersections, edge_result.diagnostics);
-            if (!edge_result.root_count_known
-                || !edge_result.parity_known_from_roots) {
-                throw std::runtime_error(
-                    "ambiguous intersection on Cartesian edge");
+            std::vector<int> toggled_components;
+            bool changes_inside_outside = false;
+            bool changes_component_membership = false;
+            if (edge_result.parity_known_from_roots) {
+                toggled_components = edge_result.toggled_components;
+                changes_inside_outside =
+                    edge_result.changes_inside_outside;
+                changes_component_membership =
+                    edge_result.changes_component_membership;
+            } else {
+                diagnostics.ambiguous_parity_edge_count = checked_size_add(
+                    diagnostics.ambiguous_parity_edge_count,
+                    std::size_t{1},
+                    "NURBS ambiguous-parity diagnostic overflow");
+                diagnostics.endpoint_parity_fallback_count = checked_size_add(
+                    diagnostics.endpoint_parity_fallback_count,
+                    std::size_t{1},
+                    "NURBS endpoint-fallback diagnostic overflow");
+                const std::vector<int> start_membership =
+                    endpoint_membership(start_node);
+                const std::vector<int> end_membership =
+                    endpoint_membership(end_node);
+                changes_inside_outside =
+                    start_membership.empty() != end_membership.empty();
+                changes_component_membership =
+                    start_membership != end_membership;
+                std::set_symmetric_difference(
+                    start_membership.begin(), start_membership.end(),
+                    end_membership.begin(), end_membership.end(),
+                    std::back_inserter(toggled_components));
             }
-            if (edge_result.crossings.empty())
-                continue;
-            if (edge_result.crossings.size() > 1) {
-                std::ostringstream message;
-                message << std::setprecision(17)
-                        << "multiple crossings on Cartesian edge axis="
-                        << axis << " (" << ijk[0] << ',' << ijk[1] << ','
-                        << ijk[2] << ')';
-                for (const NurbsSurfaceCrossing3D& root :
-                     edge_result.crossings) {
-                    message << " root=(patch=" << root.patch_index
-                            << ",u=" << root.u << ",v=" << root.v
-                            << ",t=" << root.edge_parameter
-                            << ",residual=" << root.residual << ')';
-                }
-                throw std::runtime_error(message.str());
-            }
-            const NurbsSurfaceCrossing3D& crossing =
-                edge_result.crossings.front();
+            diagnostics.component_parity_toggle_count = checked_size_add(
+                diagnostics.component_parity_toggle_count,
+                toggled_components.size(),
+                "NURBS component-parity diagnostic overflow");
 
-            barriers[static_cast<std::size_t>(axis)]
-                    [barrier_index(axis, ijk[0], ijk[1], ijk[2])] =
-                std::uint8_t{1};
-            std::size_t& barrier_count =
-                diagnostics.barrier_edge_counts[
-                    static_cast<std::size_t>(axis)];
-            barrier_count = checked_size_add(
-                barrier_count, std::size_t{1},
-                "NURBS barrier diagnostic count overflow");
-            diagnostics.maximum_root_residual = std::max(
-                diagnostics.maximum_root_residual, crossing.residual);
-            const int crossing_index = checked_size_to_int(
-                crossings.size(), "NURBS crossing index exceeds int range");
-            crossings.push_back(crossing);
-            crossing_by_edge.emplace(key, crossing_index);
+            const std::size_t storage_index =
+                barrier_index(axis, ijk[0], ijk[1], ijk[2]);
+            if (!edge_result.crossings.empty()) {
+                interface_edges[static_cast<std::size_t>(axis)]
+                               [storage_index] = std::uint8_t{1};
+                std::size_t& interface_count =
+                    diagnostics.interface_edge_counts[
+                        static_cast<std::size_t>(axis)];
+                interface_count = checked_size_add(
+                    interface_count, std::size_t{1},
+                    "NURBS interface diagnostic count overflow");
+                if (edge_result.crossings.size() > 1) {
+                    diagnostics.multi_crossing_edge_count = checked_size_add(
+                        diagnostics.multi_crossing_edge_count,
+                        std::size_t{1},
+                        "NURBS multi-crossing diagnostic overflow");
+                }
+                if (edge_result.parity_known_from_roots) {
+                    std::size_t& parity_count =
+                        edge_result.confirmed_transverse_count % 2 == 0
+                        ? diagnostics.even_parity_interface_edge_count
+                        : diagnostics.odd_parity_interface_edge_count;
+                    parity_count = checked_size_add(
+                        parity_count, std::size_t{1},
+                        "NURBS interface-parity diagnostic overflow");
+                }
+
+                EdgeCrossingRange3D range;
+                range.begin = checked_size_to_int(
+                    crossings.size(),
+                    "NURBS crossing range begin exceeds int range");
+                range.count = checked_size_to_int(
+                    edge_result.crossings.size(),
+                    "NURBS crossing range count exceeds int range");
+                range.confirmed_transverse_count =
+                    edge_result.confirmed_transverse_count;
+                range.changes_inside_outside = changes_inside_outside;
+                range.changes_component_membership =
+                    changes_component_membership;
+                for (const NurbsSurfaceCrossing3D& crossing :
+                     edge_result.crossings) {
+                    diagnostics.maximum_root_residual = std::max(
+                        diagnostics.maximum_root_residual,
+                        crossing.residual);
+                    crossings.push_back(crossing);
+                }
+                if (!crossing_ranges_by_edge.emplace(key, range).second) {
+                    throw std::logic_error(
+                        "duplicate NURBS Cartesian crossing range");
+                }
+            }
+
+            if (changes_component_membership) {
+                barriers[static_cast<std::size_t>(axis)][storage_index] =
+                    std::uint8_t{1};
+                std::size_t& barrier_count =
+                    diagnostics.barrier_edge_counts[
+                        static_cast<std::size_t>(axis)];
+                barrier_count = checked_size_add(
+                    barrier_count, std::size_t{1},
+                    "NURBS barrier diagnostic count overflow");
+            }
         }
 
         flood_and_label(grid, intersector);
@@ -639,6 +729,11 @@ struct NurbsCartesianDomain3D::Impl {
         return barriers[static_cast<std::size_t>(axis)]
                     [barrier_index(axis, i, j, k)] != 0;
     }
+    bool interface_at(int axis, int i, int j, int k) const
+    {
+        return interface_edges[static_cast<std::size_t>(axis)]
+                              [barrier_index(axis, i, j, k)] != 0;
+    }
 
     std::pair<int, int> adjacent_edge(int node_a, int node_b) const
     {
@@ -672,6 +767,12 @@ struct NurbsCartesianDomain3D::Impl {
         const auto edge = adjacent_edge(node_a, node_b);
         const auto ijk = node_coordinates(edge.second);
         return barrier_at(edge.first, ijk[0], ijk[1], ijk[2]);
+    }
+    bool has_interface(int node_a, int node_b) const
+    {
+        const auto edge = adjacent_edge(node_a, node_b);
+        const auto ijk = node_coordinates(edge.second);
+        return interface_at(edge.first, ijk[0], ijk[1], ijk[2]);
     }
 
     void flood_and_label(const CartesianGrid3D& grid,
@@ -785,25 +886,44 @@ struct NurbsCartesianDomain3D::Impl {
                      int first, int second) const
     {
         const bool barrier = barrier_at(axis, i, j, k);
-        const bool binary_change =
-            (node_labels[static_cast<std::size_t>(first)] > 0)
-            != (node_labels[static_cast<std::size_t>(second)] > 0);
+        const bool interface_edge = interface_at(axis, i, j, k);
+        const int first_label =
+            node_labels[static_cast<std::size_t>(first)];
+        const int second_label =
+            node_labels[static_cast<std::size_t>(second)];
+        const bool component_label_change = first_label != second_label;
+        const bool binary_change = (first_label > 0) != (second_label > 0);
+        if (component_label_change != barrier) {
+            throw std::runtime_error(
+                "NURBS component label change disagrees with Cartesian barrier");
+        }
+
         const std::uint64_t key = edge_key(axis, first);
-        if (binary_change && !barrier) {
+        const auto found = crossing_ranges_by_edge.find(key);
+        const bool has_range = found != crossing_ranges_by_edge.end();
+        if (interface_edge != has_range) {
             throw std::runtime_error(
-                "NURBS binary label change lacks Cartesian barrier");
+                "NURBS interface edge disagrees with crossing range");
         }
-        if (barrier && crossing_by_edge.find(key)
-                == crossing_by_edge.end()) {
+        if (!has_range)
+            return;
+
+        const EdgeCrossingRange3D& range = found->second;
+        if (range.begin < 0 || range.count <= 0
+            || static_cast<std::size_t>(range.begin)
+                   > crossings.size()
+            || static_cast<std::size_t>(range.count)
+                   > crossings.size()
+                       - static_cast<std::size_t>(range.begin)) {
             throw std::runtime_error(
-                "NURBS Cartesian barrier lacks crossing record");
+                "NURBS Cartesian crossing range is invalid");
         }
-        if (barrier && !binary_change) {
+        if (range.changes_component_membership != barrier
+            || range.changes_inside_outside != binary_change) {
             throw std::runtime_error(
-                "NURBS barrier does not separate opposite sides");
+                "NURBS crossing parity disagrees with endpoint labels");
         }
     }
-
     void verify_barriers() const
     {
         const int nx = dims[0];
@@ -825,6 +945,37 @@ struct NurbsCartesianDomain3D::Impl {
         }
     }
 };
+
+NurbsSurfaceCrossingRange3D::NurbsSurfaceCrossingRange3D(
+    const NurbsSurfaceCrossing3D* data, std::size_t size) noexcept
+    : data_(data)
+    , size_(size)
+{}
+
+const NurbsSurfaceCrossing3D*
+NurbsSurfaceCrossingRange3D::begin() const noexcept
+{
+    return data_;
+}
+
+const NurbsSurfaceCrossing3D*
+NurbsSurfaceCrossingRange3D::end() const noexcept
+{
+    return data_ == nullptr ? nullptr : data_ + size_;
+}
+
+std::size_t NurbsSurfaceCrossingRange3D::size() const noexcept
+{
+    return size_;
+}
+
+const NurbsSurfaceCrossing3D&
+NurbsSurfaceCrossingRange3D::operator[](std::size_t index) const
+{
+    if (index >= size_)
+        throw std::out_of_range("NURBS crossing range index is out of bounds");
+    return data_[index];
+}
 
 NurbsCartesianDomain3D::NurbsCartesianDomain3D(
     const CartesianGrid3D& grid,
@@ -850,19 +1001,41 @@ bool NurbsCartesianDomain3D::has_barrier_between(
     return impl_->has_barrier(node_a, node_b);
 }
 
-const NurbsSurfaceCrossing3D& NurbsCartesianDomain3D::crossing_between(
+bool NurbsCartesianDomain3D::has_interface_between(
+    int node_a, int node_b) const
+{
+    return impl_->has_interface(node_a, node_b);
+}
+
+NurbsSurfaceCrossingRange3D NurbsCartesianDomain3D::crossings_between(
     int node_a, int node_b) const
 {
     const auto edge = impl_->adjacent_edge(node_a, node_b);
-    const auto found = impl_->crossing_by_edge.find(
+    const auto found = impl_->crossing_ranges_by_edge.find(
         edge_key(edge.first, edge.second));
-    if (found == impl_->crossing_by_edge.end()) {
+    if (found == impl_->crossing_ranges_by_edge.end())
+        return {};
+    const EdgeCrossingRange3D& range = found->second;
+    return NurbsSurfaceCrossingRange3D(
+        impl_->crossings.data() + range.begin,
+        static_cast<std::size_t>(range.count));
+}
+
+const NurbsSurfaceCrossing3D& NurbsCartesianDomain3D::crossing_between(
+    int node_a, int node_b) const
+{
+    const NurbsSurfaceCrossingRange3D range =
+        crossings_between(node_a, node_b);
+    if (range.size() == 0) {
         throw std::runtime_error(
             "no NURBS crossing between Cartesian nodes");
     }
-    return impl_->crossings[static_cast<std::size_t>(found->second)];
+    if (range.size() != 1) {
+        throw std::runtime_error(
+            "NURBS crossing lookup requires exactly one crossing");
+    }
+    return range[0];
 }
-
 const std::vector<int>& NurbsCartesianDomain3D::labels() const
 {
     return impl_->node_labels;

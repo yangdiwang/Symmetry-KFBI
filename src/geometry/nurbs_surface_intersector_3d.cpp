@@ -1074,6 +1074,9 @@ bool is_retryable_ray_degeneracy(const std::string& message)
                 != std::string::npos
 
         || message.find("tangential Cartesian edge contact")
+                != std::string::npos
+        || message.find(
+               "unresolved conservative NURBS intersection candidate")
                 != std::string::npos;
 }
 
@@ -1544,6 +1547,10 @@ NurbsSurfaceIntersector3D::intersect_cartesian_edge(
             if (odd[static_cast<std::size_t>(component)])
                 edge_result.toggled_components.push_back(component);
         }
+        edge_result.changes_component_membership =
+            !edge_result.toggled_components.empty();
+        edge_result.changes_inside_outside =
+            edge_result.toggled_components.size() % 2 != 0;
     }
     return edge_result;
 }

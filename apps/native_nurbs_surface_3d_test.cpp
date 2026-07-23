@@ -1828,11 +1828,14 @@ void require_triangle_seed_independent_domain(
     require(seeded.diagnostics().barrier_edge_counts
                 == unseeded.diagnostics().barrier_edge_counts,
             name + " barrier counts do not depend on triangle seeds");
+    require(seeded.diagnostics().interface_edge_counts
+                == unseeded.diagnostics().interface_edge_counts,
+            name + " interface counts do not depend on triangle seeds");
 
     const auto dims = grid.dof_dims();
     const double crossing_tolerance = 8.0 * std::max(
         seeded.geometry_tolerance(), unseeded.geometry_tolerance());
-    bool checked_reverse_crossing = false;
+    bool checked_reverse_crossings = false;
     bool checked_missing_crossing = false;
     for (int k = 0; k < dims[2]; ++k) {
         for (int j = 0; j < dims[1]; ++j) {
@@ -1845,13 +1848,33 @@ void require_triangle_seed_independent_domain(
                 for (const int neighbor : positive_neighbors) {
                     if (neighbor < 0)
                         continue;
-                    const bool seeded_barrier =
-                        seeded.has_barrier_between(node, neighbor);
-                    require(seeded_barrier
+                    require(seeded.has_barrier_between(node, neighbor)
                                 == unseeded.has_barrier_between(
                                     node, neighbor),
                             name + " barrier locations do not depend on triangle seeds");
-                    if (!seeded_barrier) {
+                    const bool seeded_interface =
+                        seeded.has_interface_between(node, neighbor);
+                    require(seeded_interface
+                                == unseeded.has_interface_between(
+                                    node, neighbor),
+                            name + " interface locations do not depend on triangle seeds");
+                    const auto seeded_crossings =
+                        seeded.crossings_between(node, neighbor);
+                    const auto unseeded_crossings =
+                        unseeded.crossings_between(node, neighbor);
+                    require(seeded_interface
+                                == (seeded_crossings.size() > 0)
+                                && seeded_crossings.size()
+                                    == unseeded_crossings.size(),
+                            name + " crossing ranges do not depend on triangle seeds");
+                    for (std::size_t root = 0;
+                         root < seeded_crossings.size(); ++root) {
+                        require((seeded_crossings[root].point
+                                    - unseeded_crossings[root].point).norm()
+                                    <= crossing_tolerance,
+                                name + " crossing points do not depend on triangle seeds");
+                    }
+                    if (seeded_crossings.size() == 0) {
                         if (!checked_missing_crossing) {
                             require_throws_contains(
                                 [&] {
@@ -1859,35 +1882,39 @@ void require_triangle_seed_independent_domain(
                                         node, neighbor);
                                 },
                                 "no NURBS crossing between Cartesian nodes",
-                                name + " unblocked edge has no crossing record");
+                                name + " empty range has no single crossing");
                             checked_missing_crossing = true;
                         }
                         continue;
                     }
-                    const auto& seeded_crossing =
-                        seeded.crossing_between(node, neighbor);
-                    const auto& unseeded_crossing =
-                        unseeded.crossing_between(node, neighbor);
-                    require((seeded_crossing.point
-                                - unseeded_crossing.point).norm()
-                                <= crossing_tolerance,
-                            name + " crossing points do not depend on triangle seeds");
-                    if (!checked_reverse_crossing) {
-                        require(&seeded.crossing_between(neighbor, node)
-                                    == &seeded_crossing,
-                                name + " reverse endpoint lookup returns the same crossing");
-                        checked_reverse_crossing = true;
+                    const auto reverse =
+                        seeded.crossings_between(neighbor, node);
+                    require(reverse.begin() == seeded_crossings.begin()
+                                && reverse.size() == seeded_crossings.size(),
+                            name + " reverse endpoint lookup returns the same range");
+                    checked_reverse_crossings = true;
+                    if (seeded_crossings.size() == 1) {
+                        require(&seeded.crossing_between(node, neighbor)
+                                    == &seeded_crossings[0],
+                                name + " legacy lookup returns the sole crossing");
+                    } else {
+                        require_throws_contains(
+                            [&] {
+                                (void)seeded.crossing_between(
+                                    node, neighbor);
+                            },
+                            "requires exactly one crossing",
+                            name + " legacy lookup rejects a crossing range");
                     }
                 }
             }
         }
     }
-    require(checked_reverse_crossing,
-            name + " has a barrier for reverse crossing lookup");
+    require(checked_reverse_crossings,
+            name + " has an interface for reverse range lookup");
     require(checked_missing_crossing,
-            name + " has an unblocked edge for missing crossing lookup");
+            name + " has an edge with an empty crossing range");
 }
-
 void test_nurbs_cartesian_l_prism_labels()
 {
     constexpr double h = 3.0 / 128.0;
@@ -2138,22 +2165,66 @@ void test_cartesian_edge_collects_multiple_crossings()
             "two transverse torus roots determine parity");
 }
 
-void test_nurbs_cartesian_under_resolved_torus_fails_fast()
+void test_nurbs_cartesian_under_resolved_torus_uses_parity()
 {
     const kfbim::CartesianGrid3D grid(
         {-0.781, -0.841, -0.721}, {0.05, 0.05, 0.05},
         {34, 33, 31}, kfbim::DofLayout3D::Node);
     const NativeNurbsSurface3D torus =
         make_native_nurbs_surface_3d(GeometryKind3D::Torus);
-    require_throws_contains(
-        [&] {
-            (void)kfbim::geometry3d::NurbsCartesianDomain3D(
-                grid, torus.geometry_model());
-        },
-        "multiple crossings on Cartesian edge",
-        "under-resolved torus Cartesian grid fails closed before labeling");
-}
+    const kfbim::geometry3d::NurbsCartesianDomain3D domain(
+        grid, torus.geometry_model());
 
+    int label_mismatches = 0;
+    for (int node = 0; node < grid.num_dofs(); ++node) {
+        const auto x = grid.coord(node);
+        label_mismatches +=
+            (domain.label(node) > 0)
+                    != torus.exact_inside({x[0], x[1], x[2]})
+                ? 1 : 0;
+    }
+    require(label_mismatches == 0,
+            "under-resolved torus labels match the analytic solid");
+
+    const auto dims = grid.dof_dims();
+    int multiple_crossing_edges = 0;
+    int same_component_even_edges = 0;
+    for (int k = 0; k < dims[2]; ++k) {
+        for (int j = 0; j < dims[1]; ++j) {
+            for (int i = 0; i < dims[0]; ++i) {
+                const int node = grid.index(i, j, k);
+                const std::array<int, 3> neighbors{{
+                    i + 1 < dims[0] ? grid.index(i + 1, j, k) : -1,
+                    j + 1 < dims[1] ? grid.index(i, j + 1, k) : -1,
+                    k + 1 < dims[2] ? grid.index(i, j, k + 1) : -1}};
+                for (const int neighbor : neighbors) {
+                    if (neighbor < 0)
+                        continue;
+                    const auto crossings =
+                        domain.crossings_between(node, neighbor);
+                    if (crossings.size() <= 1)
+                        continue;
+                    ++multiple_crossing_edges;
+                    const int component = crossings[0].component;
+                    const bool same_component = std::all_of(
+                        crossings.begin(), crossings.end(),
+                        [&](const auto& root) {
+                            return root.component == component;
+                        });
+                    if (same_component && crossings.size() % 2 == 0
+                        && !domain.has_barrier_between(node, neighbor)) {
+                        ++same_component_even_edges;
+                    }
+                }
+            }
+        }
+    }
+    require(multiple_crossing_edges > 0
+                && same_component_even_edges > 0
+                && domain.diagnostics().multi_crossing_edge_count > 0
+                && domain.diagnostics().even_parity_interface_edge_count > 0,
+            "under-resolved torus keeps even multi-crossing interface edges");
+}
 void test_nurbs_cartesian_input_contracts()
 {
     const NativeNurbsSurface3D torus =
@@ -2251,6 +2322,36 @@ void test_nurbs_cartesian_multiple_components()
             "translated L-prism component has label two");
     require(domain.label(grid.index(30, 10, 14)) == 0,
             "space between L-prism components is exterior");
+
+    const NativeNurbsSurface3D cylinder =
+        make_native_nurbs_surface_3d(GeometryKind3D::HollowCylinder);
+    const kfbim::CartesianGrid3D coarse_grid(
+        {-1.04, -1.05, -1.0}, {1.5, 1.0, 1.0},
+        {3, 2, 2}, kfbim::DofLayout3D::Node);
+    const kfbim::geometry3d::NurbsCartesianDomain3D coarse_domain(
+        coarse_grid, two_translated_components(
+            cylinder.geometry_model(), Eigen::Vector3d(1.5, 0.0, 0.0)));
+    const int first_component_node = coarse_grid.index(1, 1, 1);
+    const int second_component_node = coarse_grid.index(2, 1, 1);
+    const auto component_change_crossings = coarse_domain.crossings_between(
+        first_component_node, second_component_node);
+    require(coarse_domain.label(first_component_node) == 1
+                && coarse_domain.label(second_component_node) == 2
+                && component_change_crossings.size() == 4
+                && coarse_domain.has_interface_between(
+                    first_component_node, second_component_node)
+                && coarse_domain.has_barrier_between(
+                    first_component_node, second_component_node)
+                && coarse_domain.diagnostics()
+                       .component_parity_toggle_count >= 2,
+            "component membership change is a barrier despite even total parity");
+    require_throws_contains(
+        [&] {
+            (void)coarse_domain.crossing_between(
+                first_component_node, second_component_node);
+        },
+        "requires exactly one crossing",
+        "legacy crossing lookup rejects a four-root component-change edge");
 }
 
 void test_bezier_rejects_extreme_degree_control_count()
@@ -2720,7 +2821,7 @@ int main()
         test_tangent_witness_does_not_swallow_unresolved_candidate();
         test_native_nurbs_surface_intersector();
         test_nurbs_cartesian_l_prism_labels();
-        test_nurbs_cartesian_under_resolved_torus_fails_fast();
+        test_nurbs_cartesian_under_resolved_torus_uses_parity();
         test_nurbs_cartesian_input_contracts();
         test_nurbs_cartesian_multiple_components();
         test_nurbs_cartesian_curved_targets_and_triangle_independence();
