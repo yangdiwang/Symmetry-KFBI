@@ -2,6 +2,7 @@
 
 #include "nurbs_bezier_extraction_3d.hpp"
 #include "nurbs_bezier_intersection_3d.hpp"
+#include "nurbs_bezier_segment_stationary_points_3d.hpp"
 #include "rational_bezier_subdivision_3d.hpp"
 
 #include <CGAL/Exact_predicates_exact_constructions_kernel.h>
@@ -653,23 +654,6 @@ certified_complete_cartesian_tangent(
     return tangent;
 }
 
-class FeatureEdgeAlignment : public std::runtime_error {
-public:
-    explicit FeatureEdgeAlignment(
-        std::vector<NurbsSurfaceCrossing3D> roots)
-        : std::runtime_error("non-G1 feature-edge alignment")
-        , roots_(std::move(roots))
-    {
-    }
-
-    const std::vector<NurbsSurfaceCrossing3D>& roots() const
-    {
-        return roots_;
-    }
-
-private:
-    std::vector<NurbsSurfaceCrossing3D> roots_;
-};
 
 class UnrelatedPatchCoincidence : public std::runtime_error {
 public:
@@ -762,37 +746,44 @@ std::vector<NurbsSurfaceCrossing3D> canonicalize_roots(
         }
     }
 
-    for (const auto& root : patch_unique) {
-        for (const auto& connection : model.connections()) {
-            if (!connection.g1
-                && (root_on_interval(root, connection.first, model)
-                    || root_on_interval(root, connection.second, model))) {
-                throw FeatureEdgeAlignment(patch_unique);
-            }
-        }
+    for (auto& root : patch_unique) {
+        root.feature_edge_contact = root.feature_edge_contact
+            || root_on_non_g1_feature(root, model);
     }
 
     DisjointSets seams(static_cast<int>(patch_unique.size()));
     for (int first = 0; first < static_cast<int>(patch_unique.size()); ++first) {
         for (int second = first + 1;
              second < static_cast<int>(patch_unique.size()); ++second) {
-            if (!coincident_root(
-                    patch_unique[static_cast<std::size_t>(first)],
-                    patch_unique[static_cast<std::size_t>(second)],
-                    geometry_tolerance, segment_length)) {
+            NurbsSurfaceCrossing3D& first_root =
+                patch_unique[static_cast<std::size_t>(first)];
+            NurbsSurfaceCrossing3D& second_root =
+                patch_unique[static_cast<std::size_t>(second)];
+            if (first_root.component != second_root.component
+                || !coincident_root(first_root, second_root,
+                                    geometry_tolerance, segment_length)) {
                 continue;
             }
-            const bool declared_smooth_seam = std::any_of(
-                model.connections().begin(), model.connections().end(),
-                [&](const auto& connection) {
-                    return connection.g1
-                        && roots_match_connection(
-                            patch_unique[static_cast<std::size_t>(first)],
-                            patch_unique[static_cast<std::size_t>(second)],
-                            connection, model);
-                });
-            if (declared_smooth_seam)
-                seams.unite(first, second);
+            const NurbsPatchEdgeConnection3D* declared_connection = nullptr;
+            for (const auto& connection : model.connections()) {
+                if (roots_match_connection(
+                        first_root, second_root, connection, model)) {
+                    declared_connection = &connection;
+                    break;
+                }
+            }
+            if (declared_connection == nullptr)
+                continue;
+            if (!declared_connection->g1) {
+                first_root.feature_edge_contact = true;
+                second_root.feature_edge_contact = true;
+                if (seams.find(first) != seams.find(second)) {
+                    checked_increment_diagnostic(
+                        diagnostics.non_g1_topology_merges,
+                        "NURBS non-G1 topology-merge diagnostic overflow");
+                }
+            }
+            seams.unite(first, second);
         }
     }
 
@@ -812,16 +803,29 @@ std::vector<NurbsSurfaceCrossing3D> canonicalize_roots(
         }
     }
 
+    std::vector<bool> group_feature(patch_unique.size(), false);
+    for (int root_index = 0;
+         root_index < static_cast<int>(patch_unique.size()); ++root_index) {
+        if (patch_unique[static_cast<std::size_t>(root_index)]
+                .feature_edge_contact) {
+            group_feature[static_cast<std::size_t>(seams.find(root_index))] =
+                true;
+        }
+    }
+
     std::vector<NurbsSurfaceCrossing3D> canonical;
     std::vector<int> representative(patch_unique.size(), -1);
     for (int root_index = 0;
          root_index < static_cast<int>(patch_unique.size()); ++root_index) {
         const int group = seams.find(root_index);
+        const bool feature_contact =
+            group_feature[static_cast<std::size_t>(group)];
         int& output = representative[static_cast<std::size_t>(group)];
         if (output < 0) {
             output = static_cast<int>(canonical.size());
             canonical.push_back(
                 patch_unique[static_cast<std::size_t>(root_index)]);
+            canonical.back().feature_edge_contact = feature_contact;
         } else {
             checked_increment_diagnostic(
                 diagnostics.seam_deduplications,
@@ -834,10 +838,11 @@ std::vector<NurbsSurfaceCrossing3D> canonicalize_roots(
                 current.transversality, candidate.transversality);
             if (candidate.residual < current.residual)
                 current = candidate;
-            current.transversality = minimum_transversality;
+            current.feature_edge_contact = feature_contact;
+            if (!feature_contact)
+                current.transversality = minimum_transversality;
         }
     }
-
     std::sort(canonical.begin(), canonical.end(),
               [](const auto& first, const auto& second) {
                   if (first.edge_parameter != second.edge_parameter) {
@@ -852,6 +857,196 @@ std::vector<NurbsSurfaceCrossing3D> canonicalize_roots(
     return canonical;
 }
 
+struct CloseRootAnalysis3D {
+    std::vector<AmbiguousRootCluster3D> ambiguous_clusters;
+    std::vector<bool> ambiguous_roots;
+};
+
+double root_edge_parameter_uncertainty(
+    const NurbsSurfaceCrossing3D& root,
+    double geometry_tolerance,
+    double segment_length)
+{
+    const double transversality_floor = std::sqrt(
+        geometry_tolerance / std::max(1.0, segment_length));
+    const double guarded_transversality = std::max(
+        root.transversality, transversality_floor);
+    const double residual = std::max(root.residual, geometry_tolerance);
+    return segment_parameter_tolerance(
+               geometry_tolerance, segment_length)
+        + residual / (segment_length * guarded_transversality);
+}
+
+CloseRootAnalysis3D analyze_close_root_pairs(
+    const std::vector<NurbsSurfaceCrossing3D>& roots,
+    const NurbsSurfaceModel3D& model,
+    const std::vector<RationalBezierElement3D>& elements,
+    const Eigen::Vector3d& start,
+    const Eigen::Vector3d& end,
+    double geometry_tolerance,
+    NurbsSurfaceIntersectionDiagnostics3D& diagnostics)
+{
+    CloseRootAnalysis3D analysis;
+    analysis.ambiguous_roots.assign(roots.size(), false);
+    if (roots.size() < 2)
+        return analysis;
+
+    const double segment_length = (end - start).norm();
+    const double edge_tolerance = segment_parameter_tolerance(
+        geometry_tolerance, segment_length);
+    DisjointSets ambiguous_sets(static_cast<int>(roots.size()));
+    std::vector<bool> participates(roots.size(), false);
+
+    for (std::size_t index = 1; index < roots.size(); ++index) {
+        const NurbsSurfaceCrossing3D& first = roots[index - 1];
+        const NurbsSurfaceCrossing3D& second = roots[index];
+        if (first.component != second.component
+            || !(first.edge_parameter < second.edge_parameter)) {
+            continue;
+        }
+        const double first_uncertainty = root_edge_parameter_uncertainty(
+            first, geometry_tolerance, segment_length);
+        const double second_uncertainty = root_edge_parameter_uncertainty(
+            second, geometry_tolerance, segment_length);
+        const bool intervals_overlap =
+            first.edge_parameter + first_uncertainty
+            >= second.edge_parameter - second_uncertainty;
+        const bool close_pair = intervals_overlap
+            || second.edge_parameter - first.edge_parameter <= 0.01;
+        if (!close_pair)
+            continue;
+
+        bool positive_witness = false;
+        const bool smooth_same_patch =
+            first.patch_index == second.patch_index
+            && !first.feature_edge_contact
+            && !second.feature_edge_contact;
+        if (smooth_same_patch) {
+            const double uv_tolerance = parameter_tolerance(
+                model.patch(first.patch_index));
+            const auto element = std::find_if(
+                elements.begin(), elements.end(), [&](const auto& candidate) {
+                    return candidate.patch_index == first.patch_index
+                        && first.u >= candidate.u0() - uv_tolerance
+                        && first.u <= candidate.u1() + uv_tolerance
+                        && second.u >= candidate.u0() - uv_tolerance
+                        && second.u <= candidate.u1() + uv_tolerance
+                        && first.v >= candidate.v0() - uv_tolerance
+                        && first.v <= candidate.v1() + uv_tolerance
+                        && second.v >= candidate.v0() - uv_tolerance
+                        && second.v <= candidate.v1() + uv_tolerance;
+                });
+            if (element != elements.end()) {
+                const double u_padding = std::max(
+                    uv_tolerance,
+                    1.0e-6 * (element->u1() - element->u0()));
+                const double v_padding = std::max(
+                    uv_tolerance,
+                    1.0e-6 * (element->v1() - element->v0()));
+                const NurbsParameterBox2D box{
+                    std::max(element->u0(),
+                             std::min(first.u, second.u) - u_padding),
+                    std::min(element->u1(),
+                             std::max(first.u, second.u) + u_padding),
+                    std::max(element->v0(),
+                             std::min(first.v, second.v) - v_padding),
+                    std::min(element->v1(),
+                             std::max(first.v, second.v) + v_padding)};
+                if (box.u0 < box.u1 && box.v0 < box.v1) {
+                    checked_increment_diagnostic(
+                        diagnostics.stationary_solve_attempts,
+                        "NURBS stationary-solve diagnostic overflow");
+                    try {
+                        NurbsLineSurfaceStationaryPointOptions3D options;
+                        options.geometry_tolerance = geometry_tolerance;
+                        options.parameter_tolerance = uv_tolerance;
+                        const Eigen::Vector2d first_parameter(
+                            first.u, first.v);
+                        const Eigen::Vector2d second_parameter(
+                            second.u, second.v);
+                        const std::vector<Eigen::Vector2d> seeds{
+                            0.5 * (first_parameter + second_parameter),
+                            0.75 * first_parameter
+                                + 0.25 * second_parameter,
+                            0.25 * first_parameter
+                                + 0.75 * second_parameter,
+                            Eigen::Vector2d(
+                                0.5 * (box.u0 + box.u1),
+                                0.5 * (box.v0 + box.v1))};
+                        const auto stationary_points =
+                            find_nurbs_bezier_segment_stationary_points_3d(
+                                *element, model.patch(first.patch_index),
+                                start, end, box, seeds, options);
+                        if (!stationary_points.empty()) {
+                            checked_increment_diagnostic(
+                                diagnostics.stationary_solve_converged,
+                                "NURBS stationary-convergence diagnostic overflow");
+                        }
+                        for (const auto& stationary : stationary_points) {
+                            if (stationary.t
+                                    <= first.edge_parameter + edge_tolerance
+                                || stationary.t
+                                    >= second.edge_parameter - edge_tolerance
+                                || stationary.distance
+                                    <= 8.0 * geometry_tolerance
+                                || stationary.tangent_measure >= 1.0e-6) {
+                                continue;
+                            }
+                            positive_witness = true;
+                            checked_increment_diagnostic(
+                                diagnostics.stationary_witnesses,
+                                "NURBS stationary-witness diagnostic overflow");
+                        }
+                        if (positive_witness) {
+                            checked_increment_diagnostic(
+                                diagnostics
+                                    .root_pairs_protected_by_stationary_witness,
+                                "NURBS protected-root diagnostic overflow");
+                        }
+                    } catch (const std::exception&) {
+                    }
+                }
+            }
+        }
+
+        if (intervals_overlap && !positive_witness) {
+            participates[index - 1] = true;
+            participates[index] = true;
+            ambiguous_sets.unite(
+                static_cast<int>(index - 1), static_cast<int>(index));
+        }
+    }
+
+    std::vector<int> cluster_index(roots.size(), -1);
+    for (std::size_t root_index = 0;
+         root_index < roots.size(); ++root_index) {
+        if (!participates[root_index])
+            continue;
+        const int group = ambiguous_sets.find(
+            static_cast<int>(root_index));
+        int& output = cluster_index[static_cast<std::size_t>(group)];
+        if (output < 0) {
+            output = static_cast<int>(analysis.ambiguous_clusters.size());
+            AmbiguousRootCluster3D cluster;
+            cluster.component = roots[root_index].component;
+            cluster.edge_parameter_begin = roots[root_index].edge_parameter;
+            cluster.edge_parameter_end = roots[root_index].edge_parameter;
+            analysis.ambiguous_clusters.push_back(std::move(cluster));
+            checked_increment_diagnostic(
+                diagnostics.ambiguous_root_clusters,
+                "NURBS ambiguous-cluster diagnostic overflow");
+        }
+        AmbiguousRootCluster3D& cluster =
+            analysis.ambiguous_clusters[static_cast<std::size_t>(output)];
+        cluster.candidates.push_back(roots[root_index]);
+        cluster.edge_parameter_begin = std::min(
+            cluster.edge_parameter_begin, roots[root_index].edge_parameter);
+        cluster.edge_parameter_end = std::max(
+            cluster.edge_parameter_end, roots[root_index].edge_parameter);
+        analysis.ambiguous_roots[root_index] = true;
+    }
+    return analysis;
+}
 std::string cartesian_edge_diagnostic(
     const char* prefix,
     const NurbsCartesianEdgeQuery3D& edge,
@@ -877,8 +1072,7 @@ bool is_retryable_ray_degeneracy(const std::string& message)
                 != std::string::npos
         || message.find("surface overlaps Cartesian edge")
                 != std::string::npos
-        || message.find("non-G1 feature-edge alignment")
-                != std::string::npos
+
         || message.find("tangential Cartesian edge contact")
                 != std::string::npos;
 }
@@ -1041,7 +1235,12 @@ NurbsSurfaceIntersector3D::intersect_segment(
     const Eigen::Vector3d& start,
     const Eigen::Vector3d& end) const
 {
-    return intersect_segment_impl(start, end, nullptr);
+    NurbsSurfaceIntersectionResult3D result =
+        intersect_segment_impl(start, end, nullptr);
+    (void)analyze_close_root_pairs(
+        result.crossings, model_, elements_, start, end,
+        geometry_tolerance_, result.diagnostics);
+    return result;
 }
 
 NurbsSurfaceIntersectionResult3D
@@ -1271,15 +1470,12 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
             "surface intersects Cartesian node", *cartesian_edge,
             all_roots));
     }
-    if (std::any_of(all_roots.begin(), all_roots.end(), [&](const auto& root) {
-            return root_on_non_g1_feature(root, model_);
-        })) {
-        throw FeatureEdgeAlignment(std::move(all_roots));
-    }
+
     result.crossings = canonicalize_roots(
         std::move(all_roots), model_, geometry_tolerance_, segment_length,
         result.diagnostics,
         result.diagnostics.unresolved_candidates == 0);
+
     return result;
 }
 
@@ -1291,21 +1487,43 @@ NurbsSurfaceIntersector3D::intersect_cartesian_edge(
     try {
         result = intersect_segment_impl(
             edge.start, edge.end, &edge);
-    } catch (const FeatureEdgeAlignment& alignment) {
-        throw std::runtime_error(cartesian_edge_diagnostic(
-            "non-G1 feature-edge alignment", edge, alignment.roots()));
     } catch (const UnrelatedPatchCoincidence& coincidence) {
         throw std::runtime_error(cartesian_edge_diagnostic(
             "coincident roots on unrelated NURBS patches", edge,
             coincidence.roots()));
     }
 
-    NurbsCartesianEdgeIntersections3D edge_result;
-    edge_result.crossings = std::move(result.crossings);
-    edge_result.diagnostics = result.diagnostics;
-    edge_result.root_count_known =
-        edge_result.diagnostics.unresolved_candidates == 0;
+    const CloseRootAnalysis3D close_root_analysis =
+        analyze_close_root_pairs(
+            result.crossings, model_, elements_, edge.start, edge.end,
+            geometry_tolerance_, result.diagnostics);
 
+    NurbsCartesianEdgeIntersections3D edge_result;
+    edge_result.ambiguous_clusters =
+        close_root_analysis.ambiguous_clusters;
+    edge_result.crossings.reserve(result.crossings.size());
+    for (std::size_t index = 0; index < result.crossings.size(); ++index) {
+        if (!close_root_analysis.ambiguous_roots[index])
+            edge_result.crossings.push_back(result.crossings[index]);
+    }
+    if (result.diagnostics.unresolved_candidates > 0) {
+        edge_result.ambiguous_clusters.push_back(AmbiguousRootCluster3D{});
+        checked_increment_diagnostic(
+            result.diagnostics.ambiguous_root_clusters,
+            "NURBS ambiguous-cluster diagnostic overflow");
+    }
+    edge_result.diagnostics = result.diagnostics;
+    edge_result.root_count_known = edge_result.ambiguous_clusters.empty();
+    for (const AmbiguousRootCluster3D& cluster :
+         edge_result.ambiguous_clusters) {
+        if (std::any_of(
+                cluster.candidates.begin(), cluster.candidates.end(),
+                [](const auto& candidate) {
+                    return candidate.transversality <= 1.0e-10;
+                })) {
+            edge_result.has_near_tangent_candidate = true;
+        }
+    }
     std::vector<bool> odd(
         static_cast<std::size_t>(model_.num_components()), false);
     for (const NurbsSurfaceCrossing3D& root : edge_result.crossings) {
@@ -1313,6 +1531,7 @@ NurbsSurfaceIntersector3D::intersect_cartesian_edge(
             edge_result.has_near_tangent_candidate = true;
             continue;
         }
+        edge_result.confirmed_transverse_count += 1;
         odd[static_cast<std::size_t>(root.component)] =
             !odd[static_cast<std::size_t>(root.component)];
     }

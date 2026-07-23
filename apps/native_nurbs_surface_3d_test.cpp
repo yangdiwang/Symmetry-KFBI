@@ -4,6 +4,7 @@
 #include "src/geometry/nurbs_bezier_extraction_3d.hpp"
 #include "src/geometry/nurbs_bezier_intersection_3d.hpp"
 #include "src/geometry/nurbs_bezier_segment_closest_point_3d.hpp"
+#include "src/geometry/nurbs_bezier_segment_stationary_points_3d.hpp"
 #include "src/geometry/nurbs_cartesian_domain_3d.hpp"
 #include "src/geometry/rational_bezier_element_3d.hpp"
 #include "src/geometry/rational_bezier_subdivision_3d.hpp"
@@ -859,6 +860,102 @@ void test_analytic_ruled_graph_root_cases()
             "zero-derivative odd crossing remains an unresolved candidate");
 }
 
+void test_close_roots_have_stationary_witness()
+{
+    using kfbim::geometry::NurbsBasis1D;
+    using kfbim::geometry3d::NurbsParameterBox2D;
+    using kfbim::geometry3d::NurbsSurfaceModel3D;
+    using kfbim::geometry3d::NurbsSurfacePatch3D;
+
+    constexpr double separation = 1.0e-3;
+    constexpr double endpoint_value = 0.25 - separation * separation;
+    const NurbsSurfacePatch3D graph(
+        NurbsBasis1D(2, {0.0, 0.0, 0.0, 1.0, 1.0, 1.0}),
+        NurbsBasis1D(1, {0.0, 0.0, 1.0, 1.0}),
+        {{{0.0, 0.0, endpoint_value}, {0.0, 1.0, endpoint_value}},
+         {{0.5, 0.0, -0.25 - separation * separation},
+          {0.5, 1.0, -0.25 - separation * separation}},
+         {{1.0, 0.0, endpoint_value}, {1.0, 1.0, endpoint_value}}},
+        {{1.0, 1.0}, {1.0, 1.0}, {1.0, 1.0}});
+    const NurbsSurfaceModel3D model({graph}, {0}, {});
+    const auto element =
+        kfbim::geometry3d::extract_rational_bezier_elements_3d(model).front();
+    const Eigen::Vector3d start(0.0, 0.5, 0.0);
+    const Eigen::Vector3d end(1.0, 0.5, 0.0);
+
+    kfbim::geometry3d::NurbsElementIntersectionOptions3D intersection_options;
+    intersection_options.geometry_tolerance = 1.0e-12;
+    intersection_options.max_subdivision_depth = 4;
+    intersection_options.parameter_seeds = {
+        {0.5 - separation, 0.5, 0.5 - separation},
+        {0.5 + separation, 0.5, 0.5 + separation}};
+    kfbim::geometry3d::NurbsElementIntersectionResult3D roots;
+    try {
+        roots = kfbim::geometry3d::intersect_nurbs_bezier_element_3d(
+            element, model.patch(0), start, end, intersection_options);
+    } catch (const kfbim::geometry3d::
+                 UnresolvedNurbsIntersectionCandidate3D& error) {
+        roots = error.partial_result();
+    }
+    require(roots.roots.size() == 2,
+            "close ruled-graph roots remain distinct");
+
+    for (int N : {32, 64, 128}) {
+        const double half_width = 2.0 / static_cast<double>(N);
+        const auto stationary =
+            kfbim::geometry3d::
+                solve_nurbs_bezier_segment_stationary_point_3d(
+                    element, model.patch(0), start, end,
+                    NurbsParameterBox2D{
+                        0.5 - half_width, 0.5 + half_width, 0.25, 0.75},
+                    Eigen::Vector2d(0.5, 0.5));
+        require(stationary.converged
+                    && std::abs(stationary.u - 0.5) < 2.0e-10
+                    && std::abs(stationary.t - 0.5) < 2.0e-10
+                    && stationary.distance > 0.5e-6
+                    && stationary.distance < 2.0e-6
+                    && stationary.tangent_measure < 1.0e-10,
+                "close roots retain a positive stationary witness at N="
+                    + std::to_string(N));
+        const auto stationary_points =
+            kfbim::geometry3d::
+                find_nurbs_bezier_segment_stationary_points_3d(
+                    element, model.patch(0), start, end,
+                    NurbsParameterBox2D{
+                        0.5 - half_width, 0.5 + half_width, 0.25, 0.75},
+                    {Eigen::Vector2d(0.5, 0.5),
+                     Eigen::Vector2d(0.5 - 1.0e-5, 0.5),
+                     Eigen::Vector2d(0.5 + 1.0e-5, 0.5)});
+        require(stationary_points.size() == 1
+                    && stationary_points.front().distance > 0.5e-6,
+                "stationary seeds deduplicate to one witness at N="
+                    + std::to_string(N));
+    }
+}
+void test_split_boundary_root_is_not_ambiguous()
+{
+    using kfbim::geometry3d::NurbsCartesianEdgeQuery3D;
+    using kfbim::geometry3d::NurbsSurfaceIntersector3D;
+    using kfbim::geometry3d::NurbsSurfaceIntersectorOptions3D;
+
+    const NativeNurbsSurface3D lprism =
+        make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
+    NurbsSurfaceIntersectorOptions3D options;
+    options.maximum_element_extent = 0.7;
+    options.local_max_subdivision_depth = 4;
+    const NurbsSurfaceIntersector3D intersector(
+        lprism.geometry_model(), options);
+    const auto edge = intersector.intersect_cartesian_edge(
+        NurbsCartesianEdgeQuery3D{
+            0, 70, 71, 72,
+            {-0.60, -0.30, 0.02}, {-0.46, -0.30, 0.02}});
+    require(edge.crossings.size() == 1
+                && edge.ambiguous_clusters.empty()
+                && edge.root_count_known
+                && edge.diagnostics.same_patch_deduplications >= 1
+                && edge.diagnostics.stationary_witnesses == 0,
+            "a root on a query-leaf split is one unambiguous root");
+}
 void test_ruled_overlap_certificate_is_physical_and_fail_safe()
 {
     using kfbim::geometry::NurbsBasis1D;
@@ -1598,16 +1695,44 @@ void test_native_nurbs_surface_intersector()
         {"surface overlaps Cartesian edge", "axis=0", "(30,31,32)",
          "root=(patch="},
         "cylinder top-rim query gives overlap priority over feature contact");
-    require_throws_contains_all(
-        [&] {
-            (void)cylinder_intersector.intersect_cartesian_edge(
-                NurbsCartesianEdgeQuery3D{
-                    1, 33, 34, 35,
-                    {0.61, -0.07, 0.67}, {0.61, -0.03, 0.67}});
-        },
-        {"non-G1 feature-edge alignment", "axis=1", "(33,34,35)",
-         "root=(patch="},
-        "cylinder top rim reports a feature-only Cartesian contact");
+    const auto cylinder_feature_contact =
+        cylinder_intersector.intersect_cartesian_edge(
+            NurbsCartesianEdgeQuery3D{
+                1, 33, 34, 35,
+                {0.61, -0.07, 0.67}, {0.61, -0.03, 0.67}});
+    const auto populated_feature_clusters = std::count_if(
+        cylinder_feature_contact.ambiguous_clusters.begin(),
+        cylinder_feature_contact.ambiguous_clusters.end(),
+        [](const auto& cluster) { return !cluster.candidates.empty(); });
+    const auto feature_cluster = std::find_if(
+        cylinder_feature_contact.ambiguous_clusters.begin(),
+        cylinder_feature_contact.ambiguous_clusters.end(),
+        [](const auto& cluster) { return !cluster.candidates.empty(); });
+    require(cylinder_feature_contact.crossings.empty()
+                && populated_feature_clusters == 1
+                && !cylinder_feature_contact.root_count_known
+                && cylinder_feature_contact.has_near_tangent_candidate
+                && feature_cluster
+                       != cylinder_feature_contact.ambiguous_clusters.end()
+                && std::all_of(
+                    feature_cluster->candidates.begin(),
+                    feature_cluster->candidates.end(),
+                    [](const auto& root) {
+                        return root.feature_edge_contact;
+                    })
+                && cylinder_feature_contact.diagnostics
+                       .non_g1_topology_merges >= 1,
+            "cylinder top-rim candidates form one feature-edge cluster");
+
+    const auto transverse_feature_hit =
+        cylinder_intersector.intersect_segment(
+            {0.63, -0.05, 0.69}, {0.59, -0.05, 0.65});
+    require(transverse_feature_hit.crossings.size() == 1
+                && transverse_feature_hit.crossings.front()
+                       .feature_edge_contact
+                && transverse_feature_hit.diagnostics
+                       .non_g1_topology_merges >= 1,
+            "declared non-G1 topology merges a transverse rim root once");
 
     const NativeNurbsSurface3D lprism =
         make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
@@ -2582,6 +2707,8 @@ int main()
         test_rational_bezier_element_intersection();
         test_bezier_element_intersection_isolates_all_roots_and_fails_safe();
         test_analytic_ruled_graph_root_cases();
+        test_close_roots_have_stationary_witness();
+        test_split_boundary_root_is_not_ambiguous();
         test_ruled_overlap_certificate_is_physical_and_fail_safe();
         test_exact_predicate_triangle_seed_on_thin_element();
         test_reweighted_ruled_overlap_certificate();

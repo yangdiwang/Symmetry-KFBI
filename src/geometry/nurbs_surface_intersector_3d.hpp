@@ -22,6 +22,7 @@ struct NurbsSurfaceCrossing3D {
     Eigen::Vector3d normal = Eigen::Vector3d::Zero();
     double residual = 0.0;
     double transversality = 0.0;
+    bool feature_edge_contact = false;
 };
 
 struct NurbsSurfaceIntersectionDiagnostics3D {
@@ -46,6 +47,12 @@ struct NurbsSurfaceIntersectionDiagnostics3D {
     int sample_seeds_accepted = 0;
     int roots_recovered_by_sample_seed = 0;
     int maximum_sample_seeds_per_element = 0;
+    int stationary_solve_attempts = 0;
+    int stationary_solve_converged = 0;
+    int stationary_witnesses = 0;
+    int root_pairs_protected_by_stationary_witness = 0;
+    int ambiguous_root_clusters = 0;
+    int non_g1_topology_merges = 0;
 };
 
 struct NurbsSurfaceIntersectionResult3D {
@@ -63,10 +70,19 @@ struct NurbsCartesianEdgeQuery3D {
     Eigen::Vector3d end = Eigen::Vector3d::Zero();
 };
 
+struct AmbiguousRootCluster3D {
+    int component = -1;
+    double edge_parameter_begin = 0.0;
+    double edge_parameter_end = 1.0;
+    std::vector<NurbsSurfaceCrossing3D> candidates;
+};
+
 struct NurbsCartesianEdgeIntersections3D {
     std::vector<NurbsSurfaceCrossing3D> crossings;
+    std::vector<AmbiguousRootCluster3D> ambiguous_clusters;
     std::vector<int> toggled_components;
     NurbsSurfaceIntersectionDiagnostics3D diagnostics;
+    int confirmed_transverse_count = 0;
     bool root_count_known = true;
     bool parity_known_from_roots = true;
     bool has_near_tangent_candidate = false;
