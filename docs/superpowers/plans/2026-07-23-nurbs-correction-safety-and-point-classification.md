@@ -1,6 +1,6 @@
 # NURBS Correction Safety and Point Classification Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Separate point-classification sufficiency from KFBI correction safety, certify difficult label-changing edges with bounded extra work, and directly test analytic NURBS point containment.
 
@@ -32,7 +32,7 @@
 - Consumes: `NurbsSurfaceIntersector3D::containing_components(point)`.
 - Produces: a geometry-independent regression table for torus, hollow-cylinder, L-prism, and two translated components.
 
-- [ ] **Step 1: Add the analytic point table**
+- [x] **Step 1: Add the analytic point table**
 
 Add `test_direct_nurbs_point_classification()` and call it before Cartesian
 domain tests. Use robust points at least `1e-3` from the analytic boundary.
@@ -69,7 +69,7 @@ Add an exact surface point and require the final message to contain:
 point lies on NURBS surface
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run:
 
@@ -81,7 +81,7 @@ cmake --build build --config Release --target native_nurbs_surface_3d_test --par
 The boundary-point assertion must fail because the current three-ray retry
 replaces endpoint contact by the generic `unable to classify` message.
 
-- [ ] **Step 3: Preserve an endpoint-contact verdict across ray retries**
+- [x] **Step 3: Preserve an endpoint-contact verdict across ray retries**
 
 In `containing_components`, distinguish:
 
@@ -92,7 +92,7 @@ In `containing_components`, distinguish:
 
 Do not change the parity calculation for successful rays.
 
-- [ ] **Step 4: Run GREEN and commit**
+- [x] **Step 4: Run GREEN and commit**
 
 Run the focused executable and `git diff --check`, then commit:
 
@@ -134,7 +134,7 @@ const NurbsSurfaceCrossing3D& correction_crossing_between(
     int node_a, int node_b) const;
 ```
 
-- [ ] **Step 1: Add failing domain API tests**
+- [x] **Step 1: Add failing domain API tests**
 
 Extend the existing multi-component coarse-edge test:
 
@@ -158,12 +158,12 @@ require_throws_contains(
 For an ordinary L-prism label-changing edge require `correction_safe`, one
 confirmed root, and reverse-order lookup identity.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Build the native test. Expected: compilation fails because the new record and
 methods are absent.
 
-- [ ] **Step 3: Replace the range-only map by an edge record**
+- [x] **Step 3: Replace the range-only map by an edge record**
 
 Store one internal record for every queried candidate key:
 
@@ -183,7 +183,7 @@ neighbor edge. `correction_crossing_between` requires `correction_safe` and
 otherwise formats the edge axis, node coordinates, flags, counts, and every
 confirmed root.
 
-- [ ] **Step 4: Run GREEN and commit**
+- [x] **Step 4: Run GREEN and commit**
 
 Run the native test and `git diff --check`, then commit:
 
@@ -206,7 +206,7 @@ feat: expose NURBS correction-safe edge records
 - Extends close-root proof across same-patch element splits and declared G1
   connections; no public witness API is added.
 
-- [ ] **Step 1: Add failing bounded-default and split-root tests**
+- [x] **Step 1: Add failing bounded-default and split-root tests**
 
 Require:
 
@@ -224,12 +224,12 @@ diagnostic. Repeat with the graph represented by two G1-connected patches.
 Change the connection to non-G1 and require that smooth witness protection is
 not used.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run the focused test. The default-depth assertions and cross-element/G1
 protected-pair assertions must fail.
 
-- [ ] **Step 3: Implement smooth-branch candidate collection**
+- [x] **Step 3: Implement smooth-branch candidate collection**
 
 Replace the single-element condition in close-root analysis with:
 
@@ -247,12 +247,12 @@ parameter lies strictly between the roots, its distance exceeds
 Do not traverse non-G1 connections. Preserve fixed-tolerance stationary
 deduplication.
 
-- [ ] **Step 4: Set bounded defaults**
+- [x] **Step 4: Set bounded defaults**
 
 Set both public default depths to four. Keep explicit targeted depth six and
 terminal certificate depth six unchanged.
 
-- [ ] **Step 5: Run GREEN and commit**
+- [x] **Step 5: Run GREEN and commit**
 
 Run the focused test and `git diff --check`, then commit:
 
@@ -281,7 +281,7 @@ std::size_t correction_safe_edge_count = 0;
 std::size_t unsafe_label_changing_edge_count = 0;
 ```
 
-- [ ] **Step 1: Add a failing retry regression**
+- [x] **Step 1: Add a failing retry regression**
 
 Build the production torus domain on the `[-1.5,1.5]^3`, `N=128` node grid.
 This is the existing case that reports five depth-four endpoint fallbacks.
@@ -297,12 +297,12 @@ For records with `used_targeted_retry=true`, additionally require
 four-crossing two-component coarse fixture and require it to remain unsafe
 without being collapsed to one root.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run the focused test and confirm that no retry diagnostics or retry state
 exist.
 
-- [ ] **Step 3: Add the bounded retry intersector**
+- [x] **Step 3: Add the bounded retry intersector**
 
 Construct the normal depth-four intersector as today. Lazily construct a
 second intersector over the same model and leaf extent with local depth six
@@ -319,7 +319,7 @@ For an unknown-parity edge:
 Count resolved and unsafe retries with checked arithmetic. Do not retry an
 ambiguous edge whose endpoint membership is unchanged.
 
-- [ ] **Step 4: Run GREEN and commit**
+- [x] **Step 4: Run GREEN and commit**
 
 Run the focused test and `git diff --check`, then commit:
 
@@ -339,7 +339,7 @@ feat: retry difficult NURBS barrier intersections
 - Consumes: `NurbsCartesianDomain3D::correction_crossing_between`.
 - Preserves: the legacy triangle route when no native domain is present.
 
-- [ ] **Step 1: Add failing GridPair unsafe-edge tests**
+- [x] **Step 1: Add failing GridPair unsafe-edge tests**
 
 Construct a native-domain `GridPair3D` around the existing coarse
 multi-component fixture. Require construction to fail with:
@@ -351,19 +351,19 @@ under-resolved NURBS Cartesian edge
 For L-prism, require every binary label-changing edge to have
 `correction_safe=true` and every P2 owner to remain an exact native owner.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 The coarse multi-component GridPair currently catches the domain error and
 reports only `label-changing edge has no native NURBS crossing`; require the
 new detailed assertion to fail.
 
-- [ ] **Step 3: Replace permissive native lookup**
+- [x] **Step 3: Replace permissive native lookup**
 
 Delete the catch-all wrapper around native crossing lookup. Call
 `correction_crossing_between` directly in both the constructor invariant and
 `p2_crossing_owner_between`. Preserve the domain's detailed exception.
 
-- [ ] **Step 4: Run GREEN and commit**
+- [x] **Step 4: Run GREEN and commit**
 
 Run the focused test and `git diff --check`, then commit:
 
@@ -384,7 +384,7 @@ fix: reject unsafe NURBS corrections in GridPair3D
 - Extends console and `geometry_readiness.csv` with the six retry/safety
   counters from Task 4.
 
-- [ ] **Step 1: Add failing output assertions**
+- [x] **Step 1: Add failing output assertions**
 
 Require the stable readiness output to include:
 
@@ -396,13 +396,13 @@ targeted_retries=
 
 Update CI grep assertions for `unsafe_label_changing_edges=0`.
 
-- [ ] **Step 2: Wire checked diagnostics**
+- [x] **Step 2: Wire checked diagnostics**
 
 Populate `ReadinessResult`, console output, per-level readiness CSV, and
 combined CSV directly from `NurbsCartesianDomainDiagnostics3D`. Do not
 recompute edge queries in the app.
 
-- [ ] **Step 3: Run focused and full verification**
+- [x] **Step 3: Run focused and full verification**
 
 Run:
 
@@ -427,7 +427,7 @@ For all nine geometry levels require:
 
 Do not enforce L-prism error orders or iteration counts.
 
-- [ ] **Step 4: Record and commit results**
+- [x] **Step 4: Record and commit results**
 
 The result document reports direct point cases, retry counts, safety counts,
 root residuals, solver convergence, and explicitly repeats that L-prism

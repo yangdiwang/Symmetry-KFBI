@@ -232,6 +232,13 @@ struct ReadinessResult {
     std::size_t even_parity_interface_edges = 0;
     std::size_t odd_parity_interface_edges = 0;
     std::size_t ambiguous_parity_edges = 0;
+    std::size_t ambiguous_label_changing_edges = 0;
+    std::size_t targeted_retries = 0;
+    std::size_t targeted_retries_resolved = 0;
+    std::size_t targeted_retries_unsafe = 0;
+    std::size_t correction_safe_edges = 0;
+    std::size_t unsafe_label_changing_edges = 0;
+    int maximum_targeted_retry_subdivision_depth = 0;
     std::size_t endpoint_parity_fallbacks = 0;
     std::size_t endpoint_classification_queries = 0;
     std::size_t component_parity_toggles = 0;
@@ -1990,6 +1997,21 @@ ReadinessResult run_readiness_case(GeometryKind kind,
         native_diagnostics.odd_parity_interface_edge_count;
     result.ambiguous_parity_edges =
         native_diagnostics.ambiguous_parity_edge_count;
+    result.ambiguous_label_changing_edges =
+        native_diagnostics.ambiguous_label_changing_edge_count;
+    result.targeted_retries =
+        native_diagnostics.targeted_retry_count;
+    result.targeted_retries_resolved =
+        native_diagnostics.targeted_retry_resolved_count;
+    result.targeted_retries_unsafe =
+        native_diagnostics.targeted_retry_unsafe_count;
+    result.correction_safe_edges =
+        native_diagnostics.correction_safe_edge_count;
+    result.unsafe_label_changing_edges =
+        native_diagnostics.unsafe_label_changing_edge_count;
+    result.maximum_targeted_retry_subdivision_depth =
+        native_diagnostics.targeted_retry_intersections
+            .maximum_subdivision_depth_reached;
     result.endpoint_parity_fallbacks =
         native_diagnostics.endpoint_parity_fallback_count;
     result.endpoint_classification_queries =
@@ -2007,6 +2029,17 @@ ReadinessResult run_readiness_case(GeometryKind kind,
     result.nurbs_geometry_tolerance = domain->geometry_tolerance();
     result.nurbs_root_residual_max =
         native_diagnostics.maximum_root_residual;
+    if (result.unsafe_label_changing_edges != 0)
+        throw std::runtime_error("unsafe native label-changing edge remains");
+    if (result.maximum_subdivision_depth > 4)
+        throw std::runtime_error("primary NURBS query exceeded depth four");
+    if (result.maximum_targeted_retry_subdivision_depth > 6)
+        throw std::runtime_error("targeted NURBS retry exceeded depth six");
+    if (result.nurbs_root_residual_max
+        > result.nurbs_geometry_tolerance) {
+        throw std::runtime_error(
+            "native NURBS root residual exceeds geometry tolerance");
+    }
     for (int n = 0; n < grid.num_dofs(); ++n) {
         const bool numerical_inside = grid_pair.domain_label(n) > 0;
         const auto coordinate = grid.coord(n);
@@ -2029,8 +2062,8 @@ ReadinessResult run_readiness_case(GeometryKind kind,
     }
     if (result.interior_nodes == 0 || result.exterior_nodes == 0)
         throw std::runtime_error("domain labeling did not produce both sides");
-    if (result.label_mismatches > std::max(2, grid.num_dofs() / 100))
-        throw std::runtime_error("more than one percent of grid labels are incorrect");
+    if (result.label_mismatches != 0)
+        throw std::runtime_error("native NURBS grid labels are not exact");
 
     const LaplaceCorrectionSupport3D support =
         build_laplace_correction_support_3d(
@@ -2173,7 +2206,15 @@ ReadinessResult run_readiness_case(GeometryKind kind,
               << " root_residual=" << result.nurbs_root_residual_max
               << " gap_crossings=" << result.gap_crossings
               << " triangle_fallback_crossings="
-              << result.triangle_fallback_crossings << '\n'
+              << result.triangle_fallback_crossings
+              << " correction_safe_edges=" << result.correction_safe_edges
+              << " unsafe_label_changing_edges="
+              << result.unsafe_label_changing_edges
+              << " targeted_retries=" << result.targeted_retries << '/'
+              << result.targeted_retries_resolved << '/'
+              << result.targeted_retries_unsafe
+              << " targeted_retry_depth="
+              << result.maximum_targeted_retry_subdivision_depth << '\n'
               << "  interface/barrier="
               << result.interface_x << '/' << result.interface_y << '/'
               << result.interface_z << " / "
@@ -2182,8 +2223,10 @@ ReadinessResult run_readiness_case(GeometryKind kind,
               << " multi=" << result.multi_crossing_edges
               << " even/odd=" << result.even_parity_interface_edges << '/'
               << result.odd_parity_interface_edges
-              << " ambiguous/fallback=" << result.ambiguous_parity_edges
-              << '/' << result.endpoint_parity_fallbacks
+              << " ambiguous/label-changing/fallback="
+              << result.ambiguous_parity_edges << '/'
+              << result.ambiguous_label_changing_edges << '/'
+              << result.endpoint_parity_fallbacks
               << " component_toggles=" << result.component_parity_toggles
               << '\n'
               << "  NURBS query elements=" << result.acceleration_leaves
@@ -2356,6 +2399,10 @@ void write_summary(const std::filesystem::path& output_dir,
                "high_degree_fallbacks,interface_x,interface_y,interface_z,"
                "multi_crossing_edges,even_parity_interface_edges,"
                "odd_parity_interface_edges,ambiguous_parity_edges,"
+               "ambiguous_label_changing_edges,targeted_retries,"
+               "targeted_retries_resolved,targeted_retries_unsafe,"
+               "correction_safe_edges,unsafe_label_changing_edges,"
+               "maximum_targeted_retry_subdivision_depth,"
                "endpoint_parity_fallbacks,endpoint_classification_queries,"
                "component_parity_toggles,"
                "barrier_x,barrier_y,barrier_z,grid_components,"
@@ -2436,6 +2483,13 @@ void write_summary(const std::filesystem::path& output_dir,
                 << row.even_parity_interface_edges << ','
                 << row.odd_parity_interface_edges << ','
                 << row.ambiguous_parity_edges << ','
+                << row.ambiguous_label_changing_edges << ','
+                << row.targeted_retries << ','
+                << row.targeted_retries_resolved << ','
+                << row.targeted_retries_unsafe << ','
+                << row.correction_safe_edges << ','
+                << row.unsafe_label_changing_edges << ','
+                << row.maximum_targeted_retry_subdivision_depth << ','
                 << row.endpoint_parity_fallbacks << ','
                 << row.endpoint_classification_queries << ','
                 << row.component_parity_toggles << ','

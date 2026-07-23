@@ -52,6 +52,12 @@ jobs:
           printf '%s\n' "$three_d_output" | grep -Fq \
             'triangle_fallback_crossings=0'
           printf '%s\n' "$three_d_output" | grep -Fq \
+            'correction_safe_edges='
+          printf '%s\n' "$three_d_output" | grep -Fq \
+            'unsafe_label_changing_edges=0'
+          printf '%s\n' "$three_d_output" | grep -Fq \
+            'targeted_retries='
+          printf '%s\n' "$three_d_output" | grep -Fq \
             'cauchy_policy=topological_nearest'
           printf '%s\n' "$three_d_output" | grep -Fq \
             'cauchy_degree=3 restrict_grid_degree=3 restrict_normal_degree=3'

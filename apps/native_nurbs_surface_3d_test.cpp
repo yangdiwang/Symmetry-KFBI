@@ -2580,7 +2580,8 @@ void test_nurbs_cartesian_multiple_components()
                 first_component_node, second_component_node);
         },
         "requires exactly one crossing",
-        "legacy crossing lookup rejects a four-root component-change edge");    const auto coarse_classification =
+        "legacy crossing lookup rejects a four-root component-change edge");
+    const auto coarse_classification =
         coarse_domain.edge_classification_between(
             first_component_node, second_component_node);
     require(coarse_classification.queried
