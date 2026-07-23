@@ -2392,6 +2392,67 @@ void test_nurbs_cartesian_under_resolved_torus_uses_parity()
                 && domain.diagnostics().even_parity_interface_edge_count > 0,
             "under-resolved torus keeps even multi-crossing interface edges");
 }
+void test_nurbs_cartesian_targeted_retry()
+{
+    constexpr int N = 128;
+    constexpr double h = 3.0 / static_cast<double>(N);
+    const kfbim::CartesianGrid3D grid(
+        {-1.5, -1.5, -1.5}, {h, h, h}, {N, N, N},
+        kfbim::DofLayout3D::Node);
+    const NativeNurbsSurface3D torus =
+        make_native_nurbs_surface_3d(GeometryKind3D::Torus);
+    const kfbim::geometry3d::NurbsCartesianDomain3D domain(
+        grid, torus.geometry_model());
+    const auto& diagnostics = domain.diagnostics();
+    require(diagnostics.targeted_retry_count > 0
+                && diagnostics.ambiguous_label_changing_edge_count
+                       == diagnostics.targeted_retry_count
+                && diagnostics.targeted_retry_resolved_count
+                       == diagnostics.targeted_retry_count
+                && diagnostics.targeted_retry_unsafe_count == 0
+                && diagnostics.unsafe_label_changing_edge_count == 0
+                && diagnostics.intersections
+                       .maximum_subdivision_depth_reached <= 4
+                && diagnostics.targeted_retry_intersections
+                       .maximum_subdivision_depth_reached <= 6,
+            "N=128 torus resolves every ambiguous label-changing edge");
+
+    const auto dims = grid.dof_dims();
+    std::size_t correction_safe_barriers = 0;
+    std::size_t retried_edges = 0;
+    for (int k = 0; k < dims[2]; ++k) {
+        for (int j = 0; j < dims[1]; ++j) {
+            for (int i = 0; i < dims[0]; ++i) {
+                const int node = grid.index(i, j, k);
+                const std::array<int, 3> neighbors{{
+                    i + 1 < dims[0] ? grid.index(i + 1, j, k) : -1,
+                    j + 1 < dims[1] ? grid.index(i, j + 1, k) : -1,
+                    k + 1 < dims[2] ? grid.index(i, j, k + 1) : -1}};
+                for (const int neighbor : neighbors) {
+                    if (neighbor < 0)
+                        continue;
+                    const auto info =
+                        domain.edge_classification_between(node, neighbor);
+                    if (info.used_targeted_retry) {
+                        ++retried_edges;
+                        require(info.root_count_known
+                                    && info.parity_known_from_roots,
+                                "targeted retry resolves root parity");
+                    }
+                    if (!domain.has_barrier_between(node, neighbor))
+                        continue;
+                    require(info.queried && info.correction_safe,
+                            "every torus barrier is correction-safe");
+                    ++correction_safe_barriers;
+                }
+            }
+        }
+    }
+    require(retried_edges == diagnostics.targeted_retry_count
+                && correction_safe_barriers
+                       == diagnostics.correction_safe_edge_count,
+            "retry and correction-safe diagnostics match edge records");
+}
 void test_nurbs_cartesian_input_contracts()
 {
     const NativeNurbsSurface3D torus =
@@ -2528,6 +2589,7 @@ void test_nurbs_cartesian_multiple_components()
                 && coarse_classification.parity_known_from_roots
                 && coarse_classification.confirmed_crossing_count == 4
                 && coarse_classification.confirmed_transverse_count == 4
+                && !coarse_classification.used_targeted_retry
                 && !coarse_classification.correction_safe,
             "multi-crossing component change is not correction-safe");
     require_throws_contains(
@@ -3008,6 +3070,7 @@ int main()
         test_direct_nurbs_point_classification();
         test_nurbs_cartesian_l_prism_labels();
         test_nurbs_cartesian_under_resolved_torus_uses_parity();
+        test_nurbs_cartesian_targeted_retry();
         test_nurbs_cartesian_input_contracts();
         test_nurbs_cartesian_multiple_components();
         test_nurbs_cartesian_curved_targets_and_triangle_independence();

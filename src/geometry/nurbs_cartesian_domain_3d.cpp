@@ -572,6 +572,19 @@ struct NurbsCartesianDomain3D::Impl {
             return containing;
         };
 
+        std::unique_ptr<NurbsSurfaceIntersector3D> retry_intersector;
+        const auto targeted_retry = [&](const NurbsCartesianEdgeQuery3D& query) {
+            if (!retry_intersector) {
+                NurbsSurfaceIntersectorOptions3D retry_options =
+                    intersector_options;
+                retry_options.local_max_subdivision_depth = 6;
+                retry_intersector =
+                    std::make_unique<NurbsSurfaceIntersector3D>(
+                        intersector.model(), retry_options);
+            }
+            return retry_intersector->intersect_cartesian_edge(query);
+        };
+
         for (const std::uint64_t key : candidate_keys) {
             const std::uint64_t axis_bits = key >> 62;
             if (axis_bits > 2)
@@ -596,15 +609,51 @@ struct NurbsCartesianDomain3D::Impl {
             }
             const Eigen::Vector3d start = as_vector(grid.coord(start_node));
             const Eigen::Vector3d end = as_vector(grid.coord(end_node));
-            const NurbsCartesianEdgeIntersections3D edge_result =
-                intersector.intersect_cartesian_edge(
-                    NurbsCartesianEdgeQuery3D{
-                        axis, ijk[0], ijk[1], ijk[2], start, end});
+            const NurbsCartesianEdgeQuery3D query{
+                axis, ijk[0], ijk[1], ijk[2], start, end};
+            NurbsCartesianEdgeIntersections3D edge_result =
+                intersector.intersect_cartesian_edge(query);
             accumulate_intersection_diagnostics(
                 diagnostics.intersections, edge_result.diagnostics);
             std::vector<int> toggled_components;
             bool changes_inside_outside = false;
             bool changes_component_membership = false;
+            bool used_targeted_retry = false;
+            std::vector<int> start_membership;
+            std::vector<int> end_membership;
+            bool endpoint_membership_loaded = false;
+            const auto load_endpoint_membership = [&] {
+                if (endpoint_membership_loaded)
+                    return;
+                start_membership = endpoint_membership(start_node);
+                end_membership = endpoint_membership(end_node);
+                endpoint_membership_loaded = true;
+            };
+
+            if (!edge_result.parity_known_from_roots) {
+                diagnostics.ambiguous_parity_edge_count = checked_size_add(
+                    diagnostics.ambiguous_parity_edge_count,
+                    std::size_t{1},
+                    "NURBS ambiguous-parity diagnostic overflow");
+                load_endpoint_membership();
+                if (start_membership != end_membership) {
+                    diagnostics.ambiguous_label_changing_edge_count =
+                        checked_size_add(
+                            diagnostics.ambiguous_label_changing_edge_count,
+                            std::size_t{1},
+                            "NURBS ambiguous label-changing diagnostic overflow");
+                    diagnostics.targeted_retry_count = checked_size_add(
+                        diagnostics.targeted_retry_count,
+                        std::size_t{1},
+                        "NURBS targeted-retry diagnostic overflow");
+                    edge_result = targeted_retry(query);
+                    used_targeted_retry = true;
+                    accumulate_intersection_diagnostics(
+                        diagnostics.targeted_retry_intersections,
+                        edge_result.diagnostics);
+                }
+            }
+
             if (edge_result.parity_known_from_roots) {
                 toggled_components = edge_result.toggled_components;
                 changes_inside_outside =
@@ -612,18 +661,11 @@ struct NurbsCartesianDomain3D::Impl {
                 changes_component_membership =
                     edge_result.changes_component_membership;
             } else {
-                diagnostics.ambiguous_parity_edge_count = checked_size_add(
-                    diagnostics.ambiguous_parity_edge_count,
-                    std::size_t{1},
-                    "NURBS ambiguous-parity diagnostic overflow");
                 diagnostics.endpoint_parity_fallback_count = checked_size_add(
                     diagnostics.endpoint_parity_fallback_count,
                     std::size_t{1},
                     "NURBS endpoint-fallback diagnostic overflow");
-                const std::vector<int> start_membership =
-                    endpoint_membership(start_node);
-                const std::vector<int> end_membership =
-                    endpoint_membership(end_node);
+                load_endpoint_membership();
                 changes_inside_outside =
                     start_membership.empty() != end_membership.empty();
                 changes_component_membership =
@@ -663,6 +705,8 @@ struct NurbsCartesianDomain3D::Impl {
                 edge_result.parity_known_from_roots;
             record.classification.has_near_tangent_candidate =
                 edge_result.has_near_tangent_candidate;
+            record.classification.used_targeted_retry =
+                used_targeted_retry;
             record.classification.confirmed_crossing_count =
                 edge_result.crossings.size();
             record.classification.ambiguous_cluster_count =
@@ -677,6 +721,27 @@ struct NurbsCartesianDomain3D::Impl {
                 && edge_result.confirmed_transverse_count == 1
                 && edge_result.ambiguous_clusters.empty()
                 && !edge_result.has_near_tangent_candidate;
+            if (record.classification.correction_safe) {
+                diagnostics.correction_safe_edge_count = checked_size_add(
+                    diagnostics.correction_safe_edge_count,
+                    std::size_t{1},
+                    "NURBS correction-safe diagnostic overflow");
+            } else if (changes_component_membership) {
+                diagnostics.unsafe_label_changing_edge_count =
+                    checked_size_add(
+                        diagnostics.unsafe_label_changing_edge_count,
+                        std::size_t{1},
+                        "NURBS unsafe label-changing diagnostic overflow");
+            }
+            if (used_targeted_retry) {
+                std::size_t& retry_result_count =
+                    record.classification.correction_safe
+                    ? diagnostics.targeted_retry_resolved_count
+                    : diagnostics.targeted_retry_unsafe_count;
+                retry_result_count = checked_size_add(
+                    retry_result_count, std::size_t{1},
+                    "NURBS targeted-retry result diagnostic overflow");
+            }
 
             if (!edge_result.crossings.empty()) {
                 interface_edges[static_cast<std::size_t>(axis)]

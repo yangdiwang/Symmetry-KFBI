@@ -59,6 +59,12 @@ struct NurbsCartesianDomainDiagnostics3D {
     std::size_t even_parity_interface_edge_count = 0;
     std::size_t odd_parity_interface_edge_count = 0;
     std::size_t ambiguous_parity_edge_count = 0;
+    std::size_t ambiguous_label_changing_edge_count = 0;
+    std::size_t targeted_retry_count = 0;
+    std::size_t targeted_retry_resolved_count = 0;
+    std::size_t targeted_retry_unsafe_count = 0;
+    std::size_t correction_safe_edge_count = 0;
+    std::size_t unsafe_label_changing_edge_count = 0;
     std::size_t endpoint_parity_fallback_count = 0;
     std::size_t endpoint_classification_query_count = 0;
     std::size_t component_parity_toggle_count = 0;
@@ -67,6 +73,7 @@ struct NurbsCartesianDomainDiagnostics3D {
     int representative_query_count = 0;
     std::vector<std::size_t> component_sizes;
     NurbsSurfaceIntersectionDiagnostics3D intersections;
+    NurbsSurfaceIntersectionDiagnostics3D targeted_retry_intersections;
     double maximum_root_residual = 0.0;
 };
 
