@@ -917,98 +917,210 @@ CloseRootAnalysis3D analyze_close_root_pairs(
             continue;
 
         bool positive_witness = false;
-        const bool smooth_same_patch =
-            first.patch_index == second.patch_index
-            && !first.feature_edge_contact
-            && !second.feature_edge_contact;
-        if (smooth_same_patch) {
-            const double uv_tolerance = parameter_tolerance(
-                model.patch(first.patch_index));
-            const auto element = std::find_if(
-                elements.begin(), elements.end(), [&](const auto& candidate) {
-                    return candidate.patch_index == first.patch_index
-                        && first.u >= candidate.u0() - uv_tolerance
-                        && first.u <= candidate.u1() + uv_tolerance
-                        && second.u >= candidate.u0() - uv_tolerance
-                        && second.u <= candidate.u1() + uv_tolerance
-                        && first.v >= candidate.v0() - uv_tolerance
-                        && first.v <= candidate.v1() + uv_tolerance
-                        && second.v >= candidate.v0() - uv_tolerance
-                        && second.v <= candidate.v1() + uv_tolerance;
-                });
-            if (element != elements.end()) {
-                const double u_padding = std::max(
-                    uv_tolerance,
-                    1.0e-6 * (element->u1() - element->u0()));
-                const double v_padding = std::max(
-                    uv_tolerance,
-                    1.0e-6 * (element->v1() - element->v0()));
-                const NurbsParameterBox2D box{
-                    std::max(element->u0(),
-                             std::min(first.u, second.u) - u_padding),
-                    std::min(element->u1(),
-                             std::max(first.u, second.u) + u_padding),
-                    std::max(element->v0(),
-                             std::min(first.v, second.v) - v_padding),
-                    std::min(element->v1(),
-                             std::max(first.v, second.v) + v_padding)};
-                if (box.u0 < box.u1 && box.v0 < box.v1) {
-                    checked_increment_diagnostic(
-                        diagnostics.stationary_solve_attempts,
-                        "NURBS stationary-solve diagnostic overflow");
-                    try {
-                        NurbsLineSurfaceStationaryPointOptions3D options;
-                        options.geometry_tolerance = geometry_tolerance;
-                        options.parameter_tolerance = uv_tolerance;
-                        const Eigen::Vector2d first_parameter(
-                            first.u, first.v);
-                        const Eigen::Vector2d second_parameter(
-                            second.u, second.v);
-                        const std::vector<Eigen::Vector2d> seeds{
-                            0.5 * (first_parameter + second_parameter),
-                            0.75 * first_parameter
-                                + 0.25 * second_parameter,
-                            0.25 * first_parameter
-                                + 0.75 * second_parameter,
-                            Eigen::Vector2d(
-                                0.5 * (box.u0 + box.u1),
-                                0.5 * (box.v0 + box.v1))};
-                        const auto stationary_points =
-                            find_nurbs_bezier_segment_stationary_points_3d(
-                                *element, model.patch(first.patch_index),
-                                start, end, box, seeds, options);
-                        if (!stationary_points.empty()) {
-                            checked_increment_diagnostic(
-                                diagnostics.stationary_solve_converged,
-                                "NURBS stationary-convergence diagnostic overflow");
-                        }
-                        for (const auto& stationary : stationary_points) {
-                            if (stationary.t
-                                    <= first.edge_parameter + edge_tolerance
-                                || stationary.t
-                                    >= second.edge_parameter - edge_tolerance
-                                || stationary.distance
-                                    <= 8.0 * geometry_tolerance
-                                || stationary.tangent_measure >= 1.0e-6) {
-                                continue;
-                            }
-                            positive_witness = true;
-                            checked_increment_diagnostic(
-                                diagnostics.stationary_witnesses,
-                                "NURBS stationary-witness diagnostic overflow");
-                        }
-                        if (positive_witness) {
-                            checked_increment_diagnostic(
-                                diagnostics
-                                    .root_pairs_protected_by_stationary_witness,
-                                "NURBS protected-root diagnostic overflow");
-                        }
-                    } catch (const std::exception&) {
-                    }
-                }
+        std::vector<const NurbsPatchEdgeConnection3D*> smooth_connections;
+        if (!first.feature_edge_contact && !second.feature_edge_contact) {
+            for (const auto& connection : model.connections()) {
+                if (!connection.g1)
+                    continue;
+                const bool same_patch_connection =
+                    first.patch_index == second.patch_index
+                    && connection.first.patch == first.patch_index
+                    && connection.second.patch == first.patch_index;
+                const bool direct_connection =
+                    (connection.first.patch == first.patch_index
+                     && connection.second.patch == second.patch_index)
+                    || (connection.first.patch == second.patch_index
+                        && connection.second.patch == first.patch_index);
+                if (same_patch_connection || direct_connection)
+                    smooth_connections.push_back(&connection);
             }
         }
+        const bool smooth_branch =
+            !first.feature_edge_contact
+            && !second.feature_edge_contact
+            && (first.patch_index == second.patch_index
+                || !smooth_connections.empty());
+        if (smooth_branch) {
+            const auto contains_root = [&](const RationalBezierElement3D& element,
+                                           const NurbsSurfaceCrossing3D& root) {
+                if (element.patch_index != root.patch_index)
+                    return false;
+                const double tolerance = parameter_tolerance(
+                    model.patch(root.patch_index));
+                return root.u >= element.u0() - tolerance
+                    && root.u <= element.u1() + tolerance
+                    && root.v >= element.v0() - tolerance
+                    && root.v <= element.v1() + tolerance;
+            };
+            std::vector<const RationalBezierElement3D*> candidates;
+            for (const RationalBezierElement3D& element : elements) {
+                bool candidate = contains_root(element, first)
+                    || contains_root(element, second);
+                for (const auto* connection : smooth_connections) {
+                    candidate = candidate
+                        || element_touches_interval(
+                            element, connection->first, model)
+                        || element_touches_interval(
+                            element, connection->second, model);
+                }
+                if (candidate)
+                    candidates.push_back(&element);
+            }
 
+            const auto edge_parameter = [](
+                const NurbsSurfaceCrossing3D& root,
+                NurbsPatchEdge3D edge) {
+                return edge == NurbsPatchEdge3D::UMin
+                        || edge == NurbsPatchEdge3D::UMax
+                    ? root.v : root.u;
+            };
+            const auto boundary_seed = [&](const RationalBezierElement3D& element,
+                                            const NurbsPatchEdgeInterval3D& side,
+                                            double along) {
+                const NurbsSurfacePatch3D& patch =
+                    model.patch(element.patch_index);
+                Eigen::Vector2d seed;
+                switch (side.edge) {
+                case NurbsPatchEdge3D::UMin:
+                    seed = {patch.domain_start_u(), along};
+                    break;
+                case NurbsPatchEdge3D::UMax:
+                    seed = {patch.domain_end_u(), along};
+                    break;
+                case NurbsPatchEdge3D::VMin:
+                    seed = {along, patch.domain_start_v()};
+                    break;
+                case NurbsPatchEdge3D::VMax:
+                    seed = {along, patch.domain_end_v()};
+                    break;
+                }
+                seed.x() = std::clamp(seed.x(), element.u0(), element.u1());
+                seed.y() = std::clamp(seed.y(), element.v0(), element.v1());
+                return seed;
+            };
+            const auto mapped_along = [&](const NurbsSurfaceCrossing3D& root,
+                                          const NurbsPatchEdgeConnection3D& connection,
+                                          const NurbsPatchEdgeInterval3D& target) {
+                const NurbsPatchEdgeInterval3D* source = nullptr;
+                if (root.patch_index == connection.first.patch)
+                    source = &connection.first;
+                else if (root.patch_index == connection.second.patch)
+                    source = &connection.second;
+                if (source == nullptr)
+                    return 0.5 * (target.begin + target.end);
+                const double source_length = source->end - source->begin;
+                if (!(source_length > 0.0))
+                    return 0.5 * (target.begin + target.end);
+                double fraction = (edge_parameter(root, source->edge)
+                                   - source->begin) / source_length;
+                fraction = std::clamp(fraction, 0.0, 1.0);
+                if (source != &target && connection.reversed)
+                    fraction = 1.0 - fraction;
+                return target.begin
+                    + fraction * (target.end - target.begin);
+            };
+
+            for (const RationalBezierElement3D* element : candidates) {
+                const NurbsSurfacePatch3D& patch =
+                    model.patch(element->patch_index);
+                const double uv_tolerance = parameter_tolerance(patch);
+                const NurbsParameterBox2D box{
+                    element->u0(), element->u1(),
+                    element->v0(), element->v1()};
+                if (!(box.u0 < box.u1 && box.v0 < box.v1))
+                    continue;
+
+                std::vector<Eigen::Vector2d> seeds;
+                seeds.push_back({0.5 * (box.u0 + box.u1),
+                                 0.5 * (box.v0 + box.v1)});
+                for (const NurbsSurfaceCrossing3D* root : {&first, &second}) {
+                    if (root->patch_index == element->patch_index) {
+                        seeds.push_back({
+                            std::clamp(root->u, box.u0, box.u1),
+                            std::clamp(root->v, box.v0, box.v1)});
+                    }
+                }
+                if (first.patch_index == second.patch_index
+                    && first.patch_index == element->patch_index) {
+                    seeds.push_back({
+                        std::clamp(0.5 * (first.u + second.u),
+                                   box.u0, box.u1),
+                        std::clamp(0.5 * (first.v + second.v),
+                                   box.v0, box.v1)});
+                }
+                for (const auto* connection : smooth_connections) {
+                    for (const NurbsPatchEdgeInterval3D* side :
+                         {&connection->first, &connection->second}) {
+                        if (side->patch != element->patch_index
+                            || !element_touches_interval(
+                                *element, *side, model)) {
+                            continue;
+                        }
+                        seeds.push_back(boundary_seed(
+                            *element, *side,
+                            mapped_along(first, *connection, *side)));
+                        seeds.push_back(boundary_seed(
+                            *element, *side,
+                            mapped_along(second, *connection, *side)));
+                    }
+                }
+                std::sort(seeds.begin(), seeds.end(),
+                          [](const Eigen::Vector2d& a,
+                             const Eigen::Vector2d& b) {
+                              return std::tie(a.x(), a.y())
+                                  < std::tie(b.x(), b.y());
+                          });
+                seeds.erase(
+                    std::unique(
+                        seeds.begin(), seeds.end(),
+                        [&](const Eigen::Vector2d& a,
+                            const Eigen::Vector2d& b) {
+                            return (a - b).norm() <= uv_tolerance;
+                        }),
+                    seeds.end());
+
+                checked_increment_diagnostic(
+                    diagnostics.stationary_solve_attempts,
+                    "NURBS stationary-solve diagnostic overflow");
+                try {
+                    NurbsLineSurfaceStationaryPointOptions3D options;
+                    options.geometry_tolerance = geometry_tolerance;
+                    options.parameter_tolerance = uv_tolerance;
+                    const auto stationary_points =
+                        find_nurbs_bezier_segment_stationary_points_3d(
+                            *element, patch, start, end, box, seeds, options);
+                    if (!stationary_points.empty()) {
+                        checked_increment_diagnostic(
+                            diagnostics.stationary_solve_converged,
+                            "NURBS stationary-convergence diagnostic overflow");
+                    }
+                    for (const auto& stationary : stationary_points) {
+                        if (stationary.t
+                                <= first.edge_parameter + edge_tolerance
+                            || stationary.t
+                                >= second.edge_parameter - edge_tolerance
+                            || stationary.distance
+                                <= 8.0 * geometry_tolerance
+                            || stationary.tangent_measure >= 1.0e-6) {
+                            continue;
+                        }
+                        positive_witness = true;
+                        checked_increment_diagnostic(
+                            diagnostics.stationary_witnesses,
+                            "NURBS stationary-witness diagnostic overflow");
+                        break;
+                    }
+                } catch (const std::exception&) {
+                }
+                if (positive_witness)
+                    break;
+            }
+            if (positive_witness) {
+                checked_increment_diagnostic(
+                    diagnostics.root_pairs_protected_by_stationary_witness,
+                    "NURBS protected-root diagnostic overflow");
+            }
+        }
         if (intervals_overlap && !positive_witness) {
             participates[index - 1] = true;
             participates[index] = true;

@@ -102,7 +102,7 @@ struct NurbsSurfaceIntersectorOptions3D {
     int bvh_leaf_size = 8;
     double maximum_element_extent =
         std::numeric_limits<double>::infinity();
-    int local_max_subdivision_depth = 36;
+    int local_max_subdivision_depth = 4;
 };
 
 class NurbsSurfaceIntersector3D {

@@ -69,7 +69,7 @@ private:
 struct NurbsElementIntersectionOptions3D {
     double geometry_tolerance = 1e-12;
     double parameter_tolerance = 1e-12;
-    int max_subdivision_depth = 36;
+    int max_subdivision_depth = 4;
     int max_newton_iterations = 24;
     bool use_triangle_seed = true;
     std::vector<NurbsElementParameterSeed3D> parameter_seeds;

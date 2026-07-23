@@ -862,8 +862,17 @@ void test_analytic_ruled_graph_root_cases()
             "zero-derivative odd crossing remains an unresolved candidate");
 }
 
+kfbim::geometry3d::NurbsSurfaceModel3D
+make_single_patch_periodic_torus();
+
 void test_close_roots_have_stationary_witness()
 {
+    require(kfbim::geometry3d::NurbsElementIntersectionOptions3D{}
+                    .max_subdivision_depth == 4,
+            "element intersection default depth is bounded");
+    require(kfbim::geometry3d::NurbsSurfaceIntersectorOptions3D{}
+                    .local_max_subdivision_depth == 4,
+            "surface intersection default depth is bounded");
     using kfbim::geometry::NurbsBasis1D;
     using kfbim::geometry3d::NurbsParameterBox2D;
     using kfbim::geometry3d::NurbsSurfaceModel3D;
@@ -933,7 +942,89 @@ void test_close_roots_have_stationary_witness()
                 "stationary seeds deduplicate to one witness at N="
                     + std::to_string(N));
     }
+
+    constexpr double cross_section_offset = 0.10;
+    kfbim::geometry3d::NurbsSurfaceIntersectorOptions3D surface_options;
+    surface_options.local_max_subdivision_depth = 4;
+
+    const kfbim::geometry3d::NurbsSurfaceIntersector3D periodic_intersector(
+        make_single_patch_periodic_torus(), surface_options);
+    const auto periodic_edge = periodic_intersector.intersect_cartesian_edge(
+        kfbim::geometry3d::NurbsCartesianEdgeQuery3D{
+            2, 80, 81, 82,
+            {1.0 + cross_section_offset, 0.0, -20.0},
+            {1.0 + cross_section_offset, 0.0, 20.0}});
+    require(periodic_edge.crossings.size() == 2
+                && periodic_edge.crossings[0].patch_index
+                       == periodic_edge.crossings[1].patch_index
+                && periodic_edge.ambiguous_clusters.empty()
+                && periodic_edge.root_count_known
+                && periodic_edge.diagnostics
+                       .root_pairs_protected_by_stationary_witness >= 1,
+            "close roots across same-patch elements retain a witness");
+
+    const NativeNurbsSurface3D torus =
+        make_native_nurbs_surface_3d(GeometryKind3D::Torus);
+    constexpr double inverse_sqrt_two =
+        0.707106781186547524400844362104849039;
+    const Eigen::Vector3d radial(
+        inverse_sqrt_two, inverse_sqrt_two, 0.0);
+
+    const Eigen::Vector3d g1_start =
+        Eigen::Vector3d(0.07, -0.04, 0.03)
+        + cross_section_offset * Eigen::Vector3d::UnitZ()
+        + 0.10 * radial;
+    const Eigen::Vector3d g1_end =
+        Eigen::Vector3d(0.07, -0.04, 0.03)
+        + cross_section_offset * Eigen::Vector3d::UnitZ()
+        + 40.0 * radial;
+    const kfbim::geometry3d::NurbsSurfaceIntersector3D g1_intersector(
+        torus.geometry_model(), surface_options);
+    const auto g1_edge = g1_intersector.intersect_cartesian_edge(
+        kfbim::geometry3d::NurbsCartesianEdgeQuery3D{
+            0, 83, 84, 85, g1_start, g1_end});
+    require(g1_edge.crossings.size() == 2
+                && g1_edge.crossings[0].patch_index
+                       != g1_edge.crossings[1].patch_index
+                && g1_edge.ambiguous_clusters.empty()
+                && g1_edge.root_count_known
+                && g1_edge.diagnostics
+                       .root_pairs_protected_by_stationary_witness >= 1,
+            "close roots across a G1 patch edge retain a witness");
+
+    auto non_g1_connections = torus.geometry_model().connections();
+    bool changed_connection = false;
+    for (auto& connection : non_g1_connections) {
+        const int first = connection.first.patch;
+        const int second = connection.second.patch;
+        if (connection.g1
+            && ((first == 0 && second == 1)
+                || (first == 1 && second == 0))) {
+            connection.g1 = false;
+            changed_connection = true;
+        }
+    }
+    require(changed_connection, "torus fixture contains the selected G1 edge");
+    std::vector<int> torus_components;
+    for (int patch = 0;
+         patch < torus.geometry_model().num_patches(); ++patch) {
+        torus_components.push_back(
+            torus.geometry_model().patch_component(patch));
+    }
+    const kfbim::geometry3d::NurbsSurfaceIntersector3D non_g1_intersector(
+        kfbim::geometry3d::NurbsSurfaceModel3D(
+            torus.geometry_model().patches(), std::move(torus_components),
+            std::move(non_g1_connections)),
+        surface_options);
+    const auto non_g1_edge = non_g1_intersector.intersect_cartesian_edge(
+        kfbim::geometry3d::NurbsCartesianEdgeQuery3D{
+            0, 86, 87, 88, g1_start, g1_end});
+    require(non_g1_edge.crossings.size() == 2
+                && non_g1_edge.diagnostics
+                       .root_pairs_protected_by_stationary_witness == 0,
+            "close-root witness does not cross a non-G1 patch edge");
 }
+
 void test_split_boundary_root_is_not_ambiguous()
 {
     using kfbim::geometry3d::NurbsCartesianEdgeQuery3D;
@@ -1702,29 +1793,19 @@ void test_native_nurbs_surface_intersector()
             NurbsCartesianEdgeQuery3D{
                 1, 33, 34, 35,
                 {0.61, -0.07, 0.67}, {0.61, -0.03, 0.67}});
-    const auto populated_feature_clusters = std::count_if(
-        cylinder_feature_contact.ambiguous_clusters.begin(),
-        cylinder_feature_contact.ambiguous_clusters.end(),
-        [](const auto& cluster) { return !cluster.candidates.empty(); });
-    const auto feature_cluster = std::find_if(
-        cylinder_feature_contact.ambiguous_clusters.begin(),
-        cylinder_feature_contact.ambiguous_clusters.end(),
-        [](const auto& cluster) { return !cluster.candidates.empty(); });
-    require(cylinder_feature_contact.crossings.empty()
-                && populated_feature_clusters == 1
+    require(cylinder_feature_contact.crossings.size() == 1
+                && cylinder_feature_contact.crossings.front()
+                       .feature_edge_contact
+                && cylinder_feature_contact.ambiguous_clusters.size() == 1
+                && cylinder_feature_contact.ambiguous_clusters.front()
+                       .candidates.empty()
                 && !cylinder_feature_contact.root_count_known
                 && cylinder_feature_contact.has_near_tangent_candidate
-                && feature_cluster
-                       != cylinder_feature_contact.ambiguous_clusters.end()
-                && std::all_of(
-                    feature_cluster->candidates.begin(),
-                    feature_cluster->candidates.end(),
-                    [](const auto& root) {
-                        return root.feature_edge_contact;
-                    })
+                && cylinder_feature_contact.diagnostics
+                       .unresolved_candidates > 0
                 && cylinder_feature_contact.diagnostics
                        .non_g1_topology_merges >= 1,
-            "cylinder top-rim candidates form one feature-edge cluster");
+            "bounded-depth cylinder rim contact remains explicitly unresolved");
 
     const auto transverse_feature_hit =
         cylinder_intersector.intersect_segment(
