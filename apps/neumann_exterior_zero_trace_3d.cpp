@@ -24,6 +24,7 @@
 #include <Eigen/SVD>
 
 #include "dirichlet_rigid_transform_study_3d.hpp"
+#include "harmonic_polynomial_space_3d.hpp"
 #include "native_nurbs_surface_3d.hpp"
 #include "src/bulk_solvers/laplace_zfft_bulk_solver_3d.hpp"
 #include "src/geometry/grid_pair_3d.hpp"
@@ -515,145 +516,8 @@ CauchyStencilSet build_cauchy_stencils(const NativeNurbsSurface3D& surface,
     return result;
 }
 
-struct PolynomialPower3D {
-    int x = 0;
-    int y = 0;
-    int z = 0;
-};
-
-double integer_power(double value, int power)
-{
-    double result = 1.0;
-    for (int i = 0; i < power; ++i)
-        result *= value;
-    return result;
-}
-
-class HarmonicPolynomialSpace3D {
-public:
-    explicit HarmonicPolynomialSpace3D(int degree = 4)
-        : degree_(degree)
-    {
-        if (degree_ < 1)
-            throw std::invalid_argument("harmonic polynomial degree must be positive");
-        powers_ = powers_through_degree(degree_);
-        const std::vector<PolynomialPower3D> lower =
-            powers_through_degree(degree_ - 2);
-        std::map<std::array<int, 3>, int> lower_index;
-        for (int i = 0; i < static_cast<int>(lower.size()); ++i) {
-            lower_index[{lower[static_cast<std::size_t>(i)].x,
-                         lower[static_cast<std::size_t>(i)].y,
-                         lower[static_cast<std::size_t>(i)].z}] = i;
-        }
-
-        Eigen::MatrixXd laplacian = Eigen::MatrixXd::Zero(
-            static_cast<int>(lower.size()), static_cast<int>(powers_.size()));
-        for (int col = 0; col < static_cast<int>(powers_.size()); ++col) {
-            const PolynomialPower3D p = powers_[static_cast<std::size_t>(col)];
-            if (p.x >= 2) {
-                laplacian(lower_index.at({p.x - 2, p.y, p.z}), col)
-                    += static_cast<double>(p.x * (p.x - 1));
-            }
-            if (p.y >= 2) {
-                laplacian(lower_index.at({p.x, p.y - 2, p.z}), col)
-                    += static_cast<double>(p.y * (p.y - 1));
-            }
-            if (p.z >= 2) {
-                laplacian(lower_index.at({p.x, p.y, p.z - 2}), col)
-                    += static_cast<double>(p.z * (p.z - 1));
-            }
-        }
-        Eigen::JacobiSVD<Eigen::MatrixXd> svd(
-            laplacian, Eigen::ComputeFullV);
-        const int expected_dimension = (degree_ + 1) * (degree_ + 1);
-        if (static_cast<int>(powers_.size()) - laplacian.rows()
-            != expected_dimension) {
-            throw std::runtime_error("unexpected 3D harmonic-space dimension");
-        }
-        transform_ = svd.matrixV().rightCols(expected_dimension);
-        if ((laplacian * transform_).norm() > 1.0e-10)
-            throw std::runtime_error("failed to construct a harmonic polynomial basis");
-    }
-
-    int dimension() const
-    {
-        return static_cast<int>(transform_.cols());
-    }
-
-    Eigen::VectorXd basis(double x, double y, double z) const
-    {
-        Eigen::VectorXd monomials(static_cast<int>(powers_.size()));
-        for (int i = 0; i < monomials.size(); ++i) {
-            const PolynomialPower3D p = powers_[static_cast<std::size_t>(i)];
-            monomials[i] = integer_power(x, p.x)
-                         * integer_power(y, p.y)
-                         * integer_power(z, p.z);
-        }
-        return transform_.transpose() * monomials;
-    }
-
-    Eigen::MatrixXd gradient(double x, double y, double z) const
-    {
-        Eigen::MatrixXd monomial_gradient = Eigen::MatrixXd::Zero(
-            3, static_cast<int>(powers_.size()));
-        for (int i = 0; i < static_cast<int>(powers_.size()); ++i) {
-            const PolynomialPower3D p = powers_[static_cast<std::size_t>(i)];
-            if (p.x > 0) {
-                monomial_gradient(0, i) = static_cast<double>(p.x)
-                    * integer_power(x, p.x - 1)
-                    * integer_power(y, p.y)
-                    * integer_power(z, p.z);
-            }
-            if (p.y > 0) {
-                monomial_gradient(1, i) = static_cast<double>(p.y)
-                    * integer_power(x, p.x)
-                    * integer_power(y, p.y - 1)
-                    * integer_power(z, p.z);
-            }
-            if (p.z > 0) {
-                monomial_gradient(2, i) = static_cast<double>(p.z)
-                    * integer_power(x, p.x)
-                    * integer_power(y, p.y)
-                    * integer_power(z, p.z - 1);
-            }
-        }
-        return monomial_gradient * transform_;
-    }
-
-private:
-    static std::vector<PolynomialPower3D> powers_through_degree(int degree)
-    {
-        std::vector<PolynomialPower3D> result;
-        if (degree < 0)
-            return result;
-        for (int total = 0; total <= degree; ++total) {
-            for (int px = 0; px <= total; ++px) {
-                for (int py = 0; py <= total - px; ++py)
-                    result.push_back({px, py, total - px - py});
-            }
-        }
-        return result;
-    }
-
-    int degree_ = 4;
-    std::vector<PolynomialPower3D> powers_;
-    Eigen::MatrixXd transform_;
-};
-
-Eigen::MatrixXd svd_pseudoinverse(const Eigen::MatrixXd& matrix,
-                                  double relative_cutoff)
-{
-    Eigen::JacobiSVD<Eigen::MatrixXd> svd(
-        matrix, Eigen::ComputeThinU | Eigen::ComputeThinV);
-    const Eigen::VectorXd singular = svd.singularValues();
-    if (singular.size() == 0 || !(singular[0] > 0.0))
-        throw std::runtime_error("cannot invert an empty Cauchy design matrix");
-    Eigen::VectorXd inverse = singular;
-    const double cutoff = relative_cutoff * singular[0];
-    for (int i = 0; i < inverse.size(); ++i)
-        inverse[i] = singular[i] > cutoff ? 1.0 / singular[i] : 0.0;
-    return svd.matrixV() * inverse.asDiagonal() * svd.matrixU().transpose();
-}
+using app3d::HarmonicPolynomialSpace3D;
+using app3d::svd_pseudoinverse_3d;
 
 struct CauchyFitMap3D {
     Eigen::MatrixXd value_map;
@@ -776,7 +640,7 @@ private:
         }
         CauchyFitMap3D result;
         result.condition = singular[0] / singular[singular.size() - 1];
-        const Eigen::MatrixXd pinv = svd_pseudoinverse(weighted, 3.0e-12);
+        const Eigen::MatrixXd pinv = svd_pseudoinverse_3d(weighted, 3.0e-12);
         result.value_map.resize(dimension(), value_count);
         result.normal_map.resize(dimension(), normal_count);
         for (int k = 0; k < value_count; ++k)
@@ -1272,7 +1136,7 @@ private:
             design(4 + q, 4) = xp * xp;
             design(4 + q, 5) = xp * xp * xp;
         }
-        const Eigen::MatrixXd pinv = svd_pseudoinverse(design, 1.0e-13);
+        const Eigen::MatrixXd pinv = svd_pseudoinverse_3d(design, 1.0e-13);
         for (int q = 0; q < 8; ++q) {
             c0_weights_[static_cast<std::size_t>(q)] = pinv(0, q);
             c1_weights_[static_cast<std::size_t>(q)] = pinv(1, q);
