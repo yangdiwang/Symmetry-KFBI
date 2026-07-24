@@ -47,6 +47,237 @@ void require(bool condition, const std::string& message)
         throw std::runtime_error(message);
 }
 
+void require_same_surface_crossing(
+    const kfbim::geometry3d::NurbsSurfaceCrossing3D& first,
+    const kfbim::geometry3d::NurbsSurfaceCrossing3D& second,
+    const std::string& message)
+{
+    require(first.patch_index == second.patch_index
+                && first.component == second.component
+                && first.u == second.u
+                && first.v == second.v
+                && first.edge_parameter == second.edge_parameter
+                && (first.point - second.point).norm() == 0.0
+                && (first.normal - second.normal).norm() == 0.0
+                && first.residual == second.residual
+                && first.transversality == second.transversality
+                && first.feature_edge_contact == second.feature_edge_contact
+                && first.reliable_transversality_tolerance
+                    == second.reliable_transversality_tolerance,
+            message);
+}
+
+void require_same_route_neutral_intersection_diagnostics(
+    const kfbim::geometry3d::NurbsSurfaceIntersectionDiagnostics3D& first,
+    const kfbim::geometry3d::NurbsSurfaceIntersectionDiagnostics3D& second,
+    const std::string& message)
+{
+    require(first.candidate_elements == second.candidate_elements
+                && first.maximum_candidate_elements_per_edge
+                    == second.maximum_candidate_elements_per_edge
+                && first.triangle_seed_hits == second.triangle_seed_hits
+                && first.triangle_seed_misses_recovered
+                    == second.triangle_seed_misses_recovered
+                && first.subdivision_boxes == second.subdivision_boxes
+                && first.newton_attempts == second.newton_attempts
+                && first.newton_iterations == second.newton_iterations
+                && first.same_patch_deduplications
+                    == second.same_patch_deduplications
+                && first.seam_deduplications
+                    == second.seam_deduplications
+                && first.unresolved_candidates
+                    == second.unresolved_candidates
+                && first.maximum_subdivision_depth_reached
+                    == second.maximum_subdivision_depth_reached
+                && first.terminal_certificate_boxes
+                    == second.terminal_certificate_boxes
+                && first.maximum_terminal_certificate_depth_reached
+                    == second.maximum_terminal_certificate_depth_reached
+                && first.closest_point_attempts
+                    == second.closest_point_attempts
+                && first.closest_point_iterations
+                    == second.closest_point_iterations
+                && first.roots_recovered_by_closest_point
+                    == second.roots_recovered_by_closest_point
+                && first.terminal_misses_by_closest_point
+                    == second.terminal_misses_by_closest_point
+                && first.closest_point_failures
+                    == second.closest_point_failures
+                && first.sample_seed_candidates
+                    == second.sample_seed_candidates
+                && first.sample_seeds_accepted
+                    == second.sample_seeds_accepted
+                && first.roots_recovered_by_sample_seed
+                    == second.roots_recovered_by_sample_seed
+                && first.maximum_sample_seeds_per_element
+                    == second.maximum_sample_seeds_per_element
+                && first.stationary_solve_attempts
+                    == second.stationary_solve_attempts
+                && first.stationary_solve_converged
+                    == second.stationary_solve_converged
+                && first.stationary_witnesses == second.stationary_witnesses
+                && first.root_pairs_protected_by_stationary_witness
+                    == second.root_pairs_protected_by_stationary_witness
+                && first.ambiguous_root_clusters
+                    == second.ambiguous_root_clusters
+                && first.non_g1_topology_merges
+                    == second.non_g1_topology_merges
+                && first.high_degree_fallbacks
+                    == second.high_degree_fallbacks,
+            message);
+}
+
+void require_same_cartesian_edge_result(
+    const kfbim::geometry3d::NurbsCartesianEdgeIntersections3D& first,
+    const kfbim::geometry3d::NurbsCartesianEdgeIntersections3D& second,
+    const std::string& message)
+{
+    require(first.crossings.size() == second.crossings.size()
+                && first.ambiguous_clusters.size()
+                    == second.ambiguous_clusters.size()
+                && first.toggled_components == second.toggled_components
+                && first.confirmed_transverse_count
+                    == second.confirmed_transverse_count
+                && first.root_count_known == second.root_count_known
+                && first.parity_known_from_roots
+                    == second.parity_known_from_roots
+                && first.has_near_tangent_candidate
+                    == second.has_near_tangent_candidate
+                && first.changes_inside_outside
+                    == second.changes_inside_outside
+                && first.changes_component_membership
+                    == second.changes_component_membership,
+            message + " classification");
+    require_same_route_neutral_intersection_diagnostics(
+        first.diagnostics, second.diagnostics, message + " diagnostics");
+    for (std::size_t root = 0; root < first.crossings.size(); ++root) {
+        require_same_surface_crossing(
+            first.crossings[root], second.crossings[root],
+            message + " crossing");
+    }
+    for (std::size_t cluster = 0;
+         cluster < first.ambiguous_clusters.size(); ++cluster) {
+        const auto& first_cluster = first.ambiguous_clusters[cluster];
+        const auto& second_cluster = second.ambiguous_clusters[cluster];
+        require(first_cluster.component == second_cluster.component
+                    && first_cluster.edge_parameter_begin
+                        == second_cluster.edge_parameter_begin
+                    && first_cluster.edge_parameter_end
+                        == second_cluster.edge_parameter_end
+                    && first_cluster.candidates.size()
+                        == second_cluster.candidates.size(),
+                message + " ambiguous cluster");
+        for (std::size_t candidate = 0;
+             candidate < first_cluster.candidates.size(); ++candidate) {
+            require_same_surface_crossing(
+                first_cluster.candidates[candidate],
+                second_cluster.candidates[candidate],
+                message + " ambiguous candidate");
+        }
+    }
+}
+
+void require_same_edge_classification(
+    const kfbim::geometry3d::NurbsCartesianEdgeClassification3D& first,
+    const kfbim::geometry3d::NurbsCartesianEdgeClassification3D& second,
+    const std::string& message)
+{
+    require(first.queried == second.queried
+                && first.has_confirmed_interface
+                    == second.has_confirmed_interface
+                && first.changes_component_membership
+                    == second.changes_component_membership
+                && first.root_count_known == second.root_count_known
+                && first.parity_known_from_roots
+                    == second.parity_known_from_roots
+                && first.has_near_tangent_candidate
+                    == second.has_near_tangent_candidate
+                && first.used_targeted_retry == second.used_targeted_retry
+                && first.correction_safe == second.correction_safe
+                && first.confirmed_crossing_count
+                    == second.confirmed_crossing_count
+                && first.ambiguous_cluster_count
+                    == second.ambiguous_cluster_count
+                && first.confirmed_transverse_count
+                    == second.confirmed_transverse_count,
+            message);
+}
+
+void require_same_domain_outputs(
+    const kfbim::CartesianGrid3D& grid,
+    const kfbim::geometry3d::NurbsCartesianDomain3D& baseline,
+    const kfbim::geometry3d::NurbsCartesianDomain3D& candidate,
+    const std::string& message)
+{
+    require(baseline.labels() == candidate.labels(), message + " labels");
+    require(baseline.geometry_tolerance() == candidate.geometry_tolerance()
+                && (baseline.surface_bounds().lower
+                        - candidate.surface_bounds().lower).norm() == 0.0
+                && (baseline.surface_bounds().upper
+                        - candidate.surface_bounds().upper).norm() == 0.0,
+            message + " geometry metadata");
+
+    const auto dims = grid.dof_dims();
+    for (int k = 0; k < dims[2]; ++k) {
+        for (int j = 0; j < dims[1]; ++j) {
+            for (int i = 0; i < dims[0]; ++i) {
+                const int node = grid.index(i, j, k);
+                const std::array<int, 3> neighbors{{
+                    i + 1 < dims[0] ? grid.index(i + 1, j, k) : -1,
+                    j + 1 < dims[1] ? grid.index(i, j + 1, k) : -1,
+                    k + 1 < dims[2] ? grid.index(i, j, k + 1) : -1}};
+                for (const int neighbor : neighbors) {
+                    if (neighbor < 0)
+                        continue;
+                    require(baseline.has_barrier_between(node, neighbor)
+                                == candidate.has_barrier_between(
+                                    node, neighbor)
+                                && baseline.has_interface_between(
+                                    node, neighbor)
+                                == candidate.has_interface_between(
+                                    node, neighbor),
+                            message + " edge flags");
+                    const auto baseline_info =
+                        baseline.edge_classification_between(node, neighbor);
+                    const auto candidate_info =
+                        candidate.edge_classification_between(node, neighbor);
+                    require_same_edge_classification(
+                        baseline_info, candidate_info,
+                        message + " edge classification");
+                    const auto baseline_crossings =
+                        baseline.crossings_between(node, neighbor);
+                    const auto candidate_crossings =
+                        candidate.crossings_between(node, neighbor);
+                    require(baseline_crossings.size()
+                                == candidate_crossings.size(),
+                            message + " crossing count");
+                    for (std::size_t root = 0;
+                         root < baseline_crossings.size(); ++root) {
+                        require_same_surface_crossing(
+                            baseline_crossings[root],
+                            candidate_crossings[root],
+                            message + " crossing");
+                    }
+                    if (baseline_crossings.size() == 1) {
+                        require_same_surface_crossing(
+                            baseline.crossing_between(node, neighbor),
+                            candidate.crossing_between(node, neighbor),
+                            message + " single crossing lookup");
+                    }
+                    if (baseline_info.correction_safe) {
+                        require_same_surface_crossing(
+                            baseline.correction_crossing_between(
+                                node, neighbor),
+                            candidate.correction_crossing_between(
+                                node, neighbor),
+                            message + " strict correction crossing");
+                    }
+                }
+            }
+        }
+    }
+}
+
 template <class Function>
 void require_throws_contains(Function&& function,
                              const std::string& needle,
@@ -1995,9 +2226,6 @@ void require_triangle_seed_independent_domain(
     const NurbsCartesianDomain3D seeded(grid, model);
     NurbsCartesianDomainOptions3D no_seed_options;
     no_seed_options.use_triangle_seeds = false;
-    no_seed_options.strategy =
-        kfbim::geometry3d::NurbsCartesianPreprocessStrategy3D::
-            OptimizedIntersection;
     const NurbsCartesianDomain3D unseeded(
         grid, model, no_seed_options);
 
@@ -2013,15 +2241,6 @@ void require_triangle_seed_independent_domain(
     require(seeded.diagnostics().interface_edge_counts
                 == unseeded.diagnostics().interface_edge_counts,
             name + " interface counts do not depend on triangle seeds");
-    require(unseeded.diagnostics().candidate_element_incidence_count > 0
-                && unseeded.diagnostics().intersections
-                       .mapped_candidate_elements
-                    == unseeded.diagnostics().intersections
-                           .candidate_elements
-                && unseeded.diagnostics().intersections
-                       .bvh_candidate_elements == 0,
-            name + " optimized domain uses stable mapped candidates");
-
     const auto dims = grid.dof_dims();
     const double crossing_tolerance = 8.0 * std::max(
         seeded.geometry_tolerance(), unseeded.geometry_tolerance());
@@ -2104,6 +2323,35 @@ void require_triangle_seed_independent_domain(
             name + " has an interface for reverse range lookup");
     require(checked_missing_crossing,
             name + " has an edge with an empty crossing range");
+
+    const auto require_strategy_equivalence =
+        [&](kfbim::geometry3d::NurbsCartesianPreprocessStrategy3D strategy,
+            const std::string& strategy_name) {
+            NurbsCartesianDomainOptions3D strategy_options;
+            strategy_options.strategy = strategy;
+            const NurbsCartesianDomain3D candidate(
+                grid, model, strategy_options);
+            require_same_domain_outputs(
+                grid, seeded, candidate,
+                name + " " + strategy_name);
+            require(
+                candidate.diagnostics().candidate_element_incidence_count > 0
+                    && candidate.diagnostics().intersections
+                           .mapped_candidate_elements
+                        == candidate.diagnostics().intersections
+                               .candidate_elements
+                    && candidate.diagnostics().intersections
+                           .bvh_candidate_elements == 0,
+                name + " " + strategy_name
+                    + " uses stable mapped candidates");
+        };
+    require_strategy_equivalence(
+        kfbim::geometry3d::NurbsCartesianPreprocessStrategy3D::
+            OptimizedIntersection,
+        "optimized strategy");
+    require_strategy_equivalence(
+        kfbim::geometry3d::NurbsCartesianPreprocessStrategy3D::Hybrid,
+        "hybrid strategy");
 }
 void test_nurbs_cartesian_l_prism_labels()
 {
@@ -2404,44 +2652,38 @@ void test_selectable_preprocess_candidate_workload()
     const auto& descriptors = intersector.query_elements();
     require(descriptors.size() == intersector.query_element_count(),
             "stable descriptors cover every query element");
-    std::vector<std::size_t> ids;
-    for (const auto& descriptor : descriptors)
-        ids.push_back(descriptor.id);
     const NurbsCartesianEdgeQuery3D query{
         0, 6, 11, 8, {0.0, -0.04, 0.03}, {1.0, -0.04, 0.03}};
+    const NurbsAabb3D query_bounds{
+        query.start.cwiseMin(query.end),
+        query.start.cwiseMax(query.end)};
+    std::vector<std::size_t> ids;
+    for (const auto& descriptor : descriptors) {
+        if (descriptor.bounds.overlaps(
+                query_bounds, intersector.geometry_tolerance())) {
+            ids.push_back(descriptor.id);
+        }
+    }
+    require(ids.size() > 1,
+            "candidate-equivalence edge overlaps multiple query elements");
+    std::reverse(ids.begin(), ids.end());
     const auto bvh = intersector.intersect_cartesian_edge(query);
     const auto mapped = intersector.intersect_cartesian_edge(query, ids);
-    require(bvh.crossings.size() == mapped.crossings.size(),
-            "mapped candidates preserve crossing count");
-    require(bvh.toggled_components == mapped.toggled_components,
-            "mapped candidates preserve component parity");
-    require(bvh.root_count_known == mapped.root_count_known,
-            "mapped candidates preserve root-count status");
-    require(bvh.changes_component_membership
-                == mapped.changes_component_membership,
-            "mapped candidates preserve membership changes");
-    require(bvh.diagnostics.bvh_candidate_elements
-                == bvh.diagnostics.candidate_elements,
-            "baseline diagnostics count BVH candidates");
-    require(mapped.diagnostics.mapped_candidate_elements
-                == mapped.diagnostics.candidate_elements,
-            "mapped diagnostics count supplied candidates");
-    require(bvh.diagnostics.maximum_candidate_elements_per_edge
-                    == bvh.diagnostics.candidate_elements
-                && mapped.diagnostics.maximum_candidate_elements_per_edge
+    require(ids.size()
+                == static_cast<std::size_t>(
+                    bvh.diagnostics.candidate_elements)
+                && bvh.diagnostics.candidate_elements
                     == mapped.diagnostics.candidate_elements,
-            "candidate diagnostics record the maximum edge workload");
-    for (std::size_t root = 0; root < bvh.crossings.size(); ++root) {
-        require(bvh.crossings[root].patch_index
-                    == mapped.crossings[root].patch_index,
-                "mapped candidates preserve crossing patch");
-        require(bvh.crossings[root].edge_parameter
-                    == mapped.crossings[root].edge_parameter,
-                "mapped candidates preserve crossing parameter");
-        require((bvh.crossings[root].point
-                    - mapped.crossings[root].point).norm() == 0.0,
-                "mapped candidates preserve crossing point");
-    }
+            "mapped AABB workload equals the BVH candidate workload");
+    require_same_cartesian_edge_result(
+        bvh, mapped, "mapped candidates reproduce the full BVH result");
+    require(bvh.diagnostics.bvh_candidate_elements
+                    == bvh.diagnostics.candidate_elements
+                && bvh.diagnostics.mapped_candidate_elements == 0
+                && mapped.diagnostics.mapped_candidate_elements
+                    == mapped.diagnostics.candidate_elements
+                && mapped.diagnostics.bvh_candidate_elements == 0,
+            "candidate diagnostics distinguish BVH and mapped routes");
     require_throws_contains(
         [&] { (void)intersector.intersect_cartesian_edge(
             query, {ids.front(), ids.front()}); },
