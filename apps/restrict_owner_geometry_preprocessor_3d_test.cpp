@@ -1004,6 +1004,167 @@ void test_hybrid_segment_closest_miss_and_root_paths()
                     root_results.hybrid.owner_class)));
 }
 
+bool certificate_has_safe_root(
+    const kfbim::geometry3d::NurbsSurfaceCandidateCertificate3D& certificate)
+{
+    return certificate.kind
+               == CertificateKind::CertifiedUniqueTransverseRoot
+        && certificate.crossing.has_value()
+        && certificate.segment_parameter_strictly_interior
+        && certificate.element_parameter_strictly_interior
+        && certificate.patch_parameter_strictly_interior
+        && !certificate.crossing->feature_edge_contact
+        && certificate.crossing->transversality
+               > certificate.crossing
+                     ->reliable_transversality_tolerance;
+}
+
+struct DangerousCompatibleRootFixture {
+    int target_patch = -1;
+    Eigen::Vector3d start = Eigen::Vector3d::Zero();
+    Eigen::Vector3d end = Eigen::Vector3d::Zero();
+};
+
+DangerousCompatibleRootFixture find_dangerous_compatible_root_fixture(
+    const NativeNurbsSurface3D& surface,
+    SurfaceDofCloud3D& cloud,
+    double spacing)
+{
+    kfbim::geometry3d::NurbsSurfaceIntersectorOptions3D options;
+    options.maximum_element_extent = 2.0 * spacing;
+    options.local_max_subdivision_depth = 4;
+    const kfbim::geometry3d::NurbsSurfaceIntersector3D intersector(
+        surface.geometry_model(), options);
+    const std::array<std::pair<double, double>, 5> parameters{{
+        {0.0, 0.37}, {1.0, 0.43}, {0.37, 0.0},
+        {0.43, 1.0}, {0.5, 0.5}}};
+
+    for (int patch_index = 0;
+         patch_index < static_cast<int>(surface.patches.size());
+         ++patch_index) {
+        const auto& patch = surface.patches[
+            static_cast<std::size_t>(patch_index)];
+        for (const auto& parameter : parameters) {
+            const double u = patch.domain_start_u()
+                + parameter.first
+                    * (patch.domain_end_u() - patch.domain_start_u());
+            const double v = patch.domain_start_v()
+                + parameter.second
+                    * (patch.domain_end_v() - patch.domain_start_v());
+            const auto data = patch.evaluate_with_derivatives(u, v);
+            const Eigen::Vector3d normal =
+                data.du.cross(data.dv).normalized();
+            const std::array<
+                std::pair<Eigen::Vector3d, Eigen::Vector3d>, 2>
+                segments{{
+                    {data.point, data.point + 0.40 * normal},
+                    {data.point - 0.20 * normal,
+                     data.point + 0.40 * normal}}};
+            for (const auto& segment : segments) {
+                const auto candidates =
+                    intersector.conservative_segment_candidates(
+                        segment.first, segment.second);
+                std::vector<int> root_patches;
+                bool unsafe_root = false;
+                bool unresolved = false;
+                for (const auto& candidate : candidates) {
+                    const auto certificate =
+                        intersector.certify_candidate_segment(
+                            candidate, segment.first, segment.second);
+                    if (certificate.kind == CertificateKind::Unresolved) {
+                        unresolved = true;
+                        break;
+                    }
+                    if (certificate.kind
+                        == CertificateKind::CertifiedUniqueTransverseRoot) {
+                        root_patches.push_back(candidate.patch_index());
+                        unsafe_root = unsafe_root
+                            || !certificate_has_safe_root(certificate);
+                    }
+                }
+                if (unresolved || root_patches.empty() || !unsafe_root)
+                    continue;
+                std::sort(root_patches.begin(), root_patches.end());
+                root_patches.erase(
+                    std::unique(root_patches.begin(), root_patches.end()),
+                    root_patches.end());
+                const bool has_foreign_miss = std::any_of(
+                    candidates.begin(), candidates.end(),
+                    [&](const auto& candidate) {
+                        return std::find(
+                                   root_patches.begin(), root_patches.end(),
+                                   candidate.patch_index())
+                            == root_patches.end();
+                    });
+                if (!has_foreign_miss)
+                    continue;
+                const int target_patch = root_patches.front();
+                cloud.patches[static_cast<std::size_t>(target_patch)]
+                    .smooth_patch_ids = root_patches;
+                return {
+                    target_patch, segment.first, segment.second};
+            }
+        }
+    }
+    throw std::runtime_error(
+        "failed to find compatible unsafe-root plus foreign-miss fixture");
+}
+
+void test_hybrid_compatible_unsafe_root_uses_optimized_fallback()
+{
+    const NativeNurbsSurface3D surface =
+        make_native_nurbs_surface_3d(GeometryKind3D::Torus);
+    const double spacing = 3.0 / 16.0;
+    SurfaceDofCloud3D cloud =
+        make_native_surface_dofs_3d(surface, spacing);
+    const DangerousCompatibleRootFixture fixture =
+        find_dangerous_compatible_root_fixture(surface, cloud, spacing);
+
+    kfbim::geometry3d::NurbsSurfaceIntersectorOptions3D options;
+    options.maximum_element_extent = 2.0 * spacing;
+    options.local_max_subdivision_depth = 4;
+    const kfbim::geometry3d::NurbsSurfaceIntersector3D intersector(
+        surface.geometry_model(), options);
+    const auto candidates = intersector.conservative_segment_candidates(
+        fixture.start, fixture.end);
+    bool saw_compatible_unsafe_root = false;
+    bool saw_foreign_miss = false;
+    const auto& compatible = cloud.patches[
+        static_cast<std::size_t>(fixture.target_patch)].smooth_patch_ids;
+    for (const auto& candidate : candidates) {
+        const auto certificate = intersector.certify_candidate_segment(
+            candidate, fixture.start, fixture.end);
+        const bool local = candidate.patch_index() == fixture.target_patch
+            || std::find(
+                   compatible.begin(), compatible.end(),
+                   candidate.patch_index()) != compatible.end();
+        if (local) {
+            saw_compatible_unsafe_root = saw_compatible_unsafe_root
+                || (certificate.kind
+                        == CertificateKind::CertifiedUniqueTransverseRoot
+                    && !certificate_has_safe_root(certificate));
+        } else {
+            require(certificate.kind == CertificateKind::CertifiedMiss,
+                    "dangerous-root fixture has only certified foreign misses");
+            saw_foreign_miss = true;
+        }
+    }
+    require(saw_compatible_unsafe_root && saw_foreign_miss,
+            "dangerous-root fixture validates both certificate partitions");
+
+    const auto results = evaluate_three_modes(
+        surface, cloud, spacing,
+        one_wrong_side_sample(
+            center_dof(cloud, fixture.target_patch),
+            fixture.start, fixture.end));
+    require(results.hybrid.query_path == results.optimized.query_path
+                && results.hybrid.query_path
+                       != QueryPath::ClosestCertifiedMiss
+                && results.hybrid.query_path
+                       != QueryPath::SegmentTargetOnly,
+            "compatible unsafe root delegates to optimized intersection");
+}
+
 void test_hybrid_unsafe_geometry_uses_optimized_fallback()
 {
     const NativeNurbsSurface3D cylinder =
@@ -1062,10 +1223,66 @@ void test_hybrid_unresolved_boundary_seam_and_multi_fallbacks()
         center + radius - 0.2 * direction;
     const Eigen::Vector3d unresolved_end =
         unresolved_start + direction;
-    const int unresolved_target = foreign_target_dof_for_segment(
-        cylinder, cylinder_cloud, unresolved_start, unresolved_end);
+    const NativeNurbsSurface3D unresolved_surface =
+        duplicate_surface(cylinder);
+    const SurfaceDofCloud3D unresolved_cloud =
+        make_native_surface_dofs_3d(unresolved_surface, spacing);
+
+    kfbim::geometry3d::NurbsSurfaceIntersectorOptions3D unresolved_options;
+    unresolved_options.maximum_element_extent = 2.0 * spacing;
+    unresolved_options.local_max_subdivision_depth = 4;
+    const kfbim::geometry3d::NurbsSurfaceIntersector3D
+        unresolved_intersector(
+            unresolved_surface.geometry_model(), unresolved_options);
+    const auto unresolved_candidates =
+        unresolved_intersector.conservative_segment_candidates(
+            unresolved_start, unresolved_end);
+    std::vector<std::pair<int, CertificateKind>>
+        unresolved_certificates;
+    unresolved_certificates.reserve(unresolved_candidates.size());
+    for (const auto& candidate : unresolved_candidates) {
+        const auto certificate =
+            unresolved_intersector.certify_candidate_segment(
+                candidate, unresolved_start, unresolved_end);
+        unresolved_certificates.push_back(
+            {candidate.patch_index(), certificate.kind});
+    }
+    int unresolved_target_patch = -1;
+    int foreign_unresolved_count = -1;
+    for (int patch = 0;
+         patch < static_cast<int>(unresolved_cloud.patches.size()); ++patch) {
+        const auto& compatible = unresolved_cloud.patches[
+            static_cast<std::size_t>(patch)].smooth_patch_ids;
+        const int count = static_cast<int>(std::count_if(
+            unresolved_certificates.begin(),
+            unresolved_certificates.end(),
+            [&](const auto& certificate) {
+                const bool local = certificate.first == patch
+                    || std::find(
+                           compatible.begin(), compatible.end(),
+                           certificate.first) != compatible.end();
+                return !local
+                    && certificate.second == CertificateKind::Unresolved;
+            }));
+        if (count > foreign_unresolved_count) {
+            unresolved_target_patch = patch;
+            foreign_unresolved_count = count;
+        }
+    }
+    require(unresolved_target_patch >= 0 && foreign_unresolved_count >= 2,
+            "unresolved fixture has at least two foreign unresolved leaves: "
+                + std::to_string(foreign_unresolved_count)
+                + " foreign, " + std::to_string(static_cast<int>(
+                    std::count_if(
+                        unresolved_certificates.begin(),
+                        unresolved_certificates.end(), [](const auto& c) {
+                            return c.second == CertificateKind::Unresolved;
+                        }))) + " total");
+    const int unresolved_target =
+        center_dof(unresolved_cloud, unresolved_target_patch);
+
     const auto unresolved = evaluate_three_modes(
-        cylinder, cylinder_cloud, spacing,
+        unresolved_surface, unresolved_cloud, spacing,
         one_wrong_side_sample(
             unresolved_target, unresolved_start, unresolved_end));
     require(unresolved.hybrid.query_path
@@ -1292,6 +1509,7 @@ int main()
         test_hybrid_segment_closest_miss_and_root_paths();
         test_hybrid_unsafe_geometry_uses_optimized_fallback();
         test_hybrid_unresolved_boundary_seam_and_multi_fallbacks();
+        test_hybrid_compatible_unsafe_root_uses_optimized_fallback();
         test_hybrid_partial_connection_and_stage_timing();
         test_validation_slots_and_diagnostics();
         std::cout

@@ -660,14 +660,32 @@ RestrictOwnerGeometryPreprocessor3D::preprocess_sample(
                     || work.certificate.kind
                            == CertificateKind::CertifiedMiss;
             });
-        const bool no_compatible_unresolved = std::none_of(
+        std::size_t compatible_safe_root_count = 0;
+        const bool compatible_all_safe_or_miss = std::all_of(
             certificates.begin(), certificates.end(),
-            [](const CandidateCertificate& work) {
-                return !work.foreign
-                    && work.certificate.kind
-                           == CertificateKind::Unresolved;
+            [&compatible_safe_root_count](
+                const CandidateCertificate& work) {
+                if (work.foreign
+                    || work.certificate.kind
+                           == CertificateKind::CertifiedMiss) {
+                    return true;
+                }
+                const auto& certificate = work.certificate;
+                const bool safe_root = certificate.kind
+                           == CertificateKind::CertifiedUniqueTransverseRoot
+                    && certificate.crossing.has_value()
+                    && certificate.segment_parameter_strictly_interior
+                    && certificate.element_parameter_strictly_interior
+                    && certificate.patch_parameter_strictly_interior
+                    && !certificate.crossing->feature_edge_contact
+                    && certificate.crossing->transversality
+                           > certificate.crossing
+                                 ->reliable_transversality_tolerance;
+                if (!safe_root)
+                    return false;
+                return ++compatible_safe_root_count == 1;
             });
-        if (foreign_all_miss && no_compatible_unresolved) {
+        if (foreign_all_miss && compatible_all_safe_or_miss) {
             const bool used_closest = std::any_of(
                 certificates.begin(), certificates.end(),
                 [](const CandidateCertificate& work) {
