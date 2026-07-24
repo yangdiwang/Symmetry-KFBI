@@ -135,4 +135,3 @@ Check that the summary has exactly three owner rows, all physical/common solves
 converged, and owner classification/audit counts are conserved.  Run
 `git diff --check` and report any remaining untracked files without adding
 them.
-

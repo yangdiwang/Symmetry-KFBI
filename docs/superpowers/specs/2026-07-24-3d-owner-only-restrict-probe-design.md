@@ -40,4 +40,3 @@ reference route.
 4. Run `--restrict-probe-owner 256`, then compute
    `log2(error_128 / error_256)` from the archived `N=128` results and report
    physical GMRES iterations.
-
