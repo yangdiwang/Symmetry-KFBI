@@ -36,6 +36,10 @@ if(KFBIM_BUILD_3D)
         dirichlet_rigid_transform_study_3d.cpp
     )
 
+    add_library(kfbim_phase_profile_3d STATIC
+        kfbi_phase_profile_3d.cpp
+    )
+
     add_executable(native_nurbs_surface_3d_test
         native_nurbs_surface_3d_test.cpp
     )
@@ -58,6 +62,10 @@ if(KFBIM_BUILD_3D)
 
     add_executable(crossing_owner_restrict_3d_test
         crossing_owner_restrict_3d_test.cpp
+    )
+
+    add_executable(kfbim_phase_profile_3d_test
+        kfbi_phase_profile_3d_test.cpp
     )
 
     add_executable(neumann_exterior_zero_trace_3d
@@ -122,9 +130,14 @@ if(KFBIM_BUILD_3D)
         kfbim_3d_app_geometry
     )
 
+    target_link_libraries(kfbim_phase_profile_3d_test PRIVATE
+        kfbim_phase_profile_3d
+    )
+
     target_link_libraries(neumann_exterior_zero_trace_3d PRIVATE
         kfbim_3d_app_geometry
         kfbim_core
+        kfbim_phase_profile_3d
     )
 endif()
 
@@ -172,11 +185,13 @@ target_compile_features(neumann_harmonic_jet_python_compatible_2d PRIVATE cxx_st
 target_compile_features(dirichlet_harmonic_jet_python_compatible_2d PRIVATE cxx_std_17)
 if(KFBIM_BUILD_3D)
     target_compile_features(kfbim_3d_app_geometry PUBLIC cxx_std_17)
+    target_compile_features(kfbim_phase_profile_3d PUBLIC cxx_std_17)
     target_compile_features(native_nurbs_surface_3d_test PRIVATE cxx_std_17)
     target_compile_features(native_nurbs_surface_transform_3d_test PRIVATE cxx_std_17)
     target_compile_features(dirichlet_rigid_transform_study_3d_test PRIVATE cxx_std_17)
     target_compile_features(harmonic_polynomial_space_3d_test PRIVATE cxx_std_17)
     target_compile_features(exterior_only_cubic_normal_restrict_3d_test PRIVATE cxx_std_17)
     target_compile_features(crossing_owner_restrict_3d_test PRIVATE cxx_std_17)
+    target_compile_features(kfbim_phase_profile_3d_test PRIVATE cxx_std_17)
     target_compile_features(neumann_exterior_zero_trace_3d PRIVATE cxx_std_17)
 endif()
