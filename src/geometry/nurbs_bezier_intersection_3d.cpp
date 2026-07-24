@@ -1051,6 +1051,11 @@ AffinePlanarResult3D classify_affine_planar_intersection(
         256.0 * machine_epsilon * absolute_coordinate_scale
         / (frame.length
            * std::max(measured_transversality, machine_epsilon));
+    const double physical_segment_parameter_uncertainty =
+        (contact_tolerance + maximum_correspondence_residual
+         + roundoff_tolerance)
+        / (frame.length
+           * std::max(measured_transversality, machine_epsilon));
     const double parameter_margin = std::max({
         8.0 * options.parameter_tolerance,
         64.0 * machine_epsilon,
@@ -1064,8 +1069,10 @@ AffinePlanarResult3D classify_affine_planar_intersection(
         64.0 * machine_epsilon,
         256.0 * machine_epsilon
             / std::max(measured_transversality, machine_epsilon),
-        segment_parameter_uncertainty});
-    if (!std::isfinite(parameter_margin)
+        segment_parameter_uncertainty,
+        physical_segment_parameter_uncertainty});
+    if (!std::isfinite(physical_segment_parameter_uncertainty)
+        || !std::isfinite(parameter_margin)
         || !std::isfinite(segment_margin)) {
         return result;
     }

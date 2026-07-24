@@ -1017,6 +1017,38 @@ void test_affine_planar_fast_path()
                 && thin_near_miss.diagnostics.certified_fallback_elements == 1,
             "physical u-boundary tolerance band does not certify an affine miss");
 
+    constexpr double accepted_source_offset = 7.0e-12;
+    constexpr double shallow_delta_z = 1.0e-3;
+    const auto solve_shifted_source =
+        [&](double source_z, double element_plane_t) {
+            const double start_z = -shallow_delta_z * element_plane_t;
+            try {
+                return intersect_nurbs_bezier_element_3d(
+                    elements.front(), make_plane(source_z),
+                    {-0.25, 0.5, start_z},
+                    {0.75, 0.5, start_z + shallow_delta_z},
+                    options);
+            } catch (const UnresolvedNurbsIntersectionCandidate3D& error) {
+                return error.partial_result();
+            }
+        };
+    const NurbsElementIntersectionResult3D shallow_near_hit =
+        solve_shifted_source(
+            accepted_source_offset, 1.0 - 4.0e-9);
+    require(shallow_near_hit.diagnostics.planar_analytic_hits == 0
+                && shallow_near_hit.diagnostics.planar_analytic_misses == 0
+                && shallow_near_hit.diagnostics.planar_analytic_fallbacks == 1
+                && shallow_near_hit.diagnostics.certified_fallback_elements == 1,
+            "accepted source offset cannot certify a shallow endpoint hit");
+    const NurbsElementIntersectionResult3D shallow_near_miss =
+        solve_shifted_source(
+            -accepted_source_offset, 1.0 + 4.0e-9);
+    require(shallow_near_miss.diagnostics.planar_analytic_hits == 0
+                && shallow_near_miss.diagnostics.planar_analytic_misses == 0
+                && shallow_near_miss.diagnostics.planar_analytic_fallbacks == 1
+                && shallow_near_miss.diagnostics.certified_fallback_elements == 1,
+            "accepted source offset cannot certify a shallow endpoint miss");
+
     const NurbsElementIntersectionResult3D reversed =
         solve(0, {0.25, 0.75, 1.0}, {0.25, 0.75, -1.0});
     require(reversed.roots.size() == 1
