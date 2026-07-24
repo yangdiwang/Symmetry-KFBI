@@ -178,6 +178,55 @@ void test_cli_statistics_and_csv_support()
     require(singleton.coefficient_of_variation == 0.0,
             "single-sample CV is zero");
 
+    kfbim::geometry3d::NurbsSurfaceCrossing3D baseline_root;
+    baseline_root.residual = 1.312240036803182e-12;
+    baseline_root.transversality = 0.046379355124585922;
+    baseline_root.reliable_transversality_tolerance =
+        1.5316046881873814e-05;
+    kfbim::geometry3d::NurbsSurfaceCrossing3D candidate_root = baseline_root;
+    candidate_root.residual = 3.5217424465803382e-18;
+    candidate_root.transversality = 0.046379355050207342;
+    constexpr double fixed_tolerance = 1.7269626515938326e-11;
+    const ConditionedCrossingPositionTolerance3D conditioned_tolerance =
+        conditioned_crossing_position_tolerance_3d(
+            baseline_root, candidate_root, 3.0 / 64.0, fixed_tolerance);
+    require(conditioned_tolerance.edge > 2.6085019561028489e-11
+                && conditioned_tolerance.point > 2.6529886640680597e-11
+                && conditioned_tolerance.edge
+                    < conditioned_tolerance.point
+                && conditioned_tolerance.point < 5.0e-11,
+            "shallow transverse roots include residual-over-angle uncertainty");
+    baseline_root.transversality =
+        baseline_root.reliable_transversality_tolerance;
+    const auto unreliable_tolerance =
+        conditioned_crossing_position_tolerance_3d(
+            baseline_root, candidate_root,
+            3.0 / 64.0, fixed_tolerance);
+    require(unreliable_tolerance.edge == fixed_tolerance
+                && unreliable_tolerance.point == fixed_tolerance,
+            "unreliable roots cannot relax crossing comparison tolerance");
+    baseline_root.feature_edge_contact = true;
+    const auto feature_tolerance =
+        conditioned_crossing_position_tolerance_3d(
+            baseline_root, candidate_root,
+            3.0 / 64.0, fixed_tolerance);
+    require(feature_tolerance.edge == fixed_tolerance
+                && feature_tolerance.point == fixed_tolerance,
+            "feature roots retain fixed crossing comparison tolerance");
+    baseline_root.feature_edge_contact = false;
+    baseline_root.residual = 1.0;
+    candidate_root.residual = 1.0;
+    baseline_root.transversality = 1.0;
+    candidate_root.transversality = 1.0;
+    baseline_root.reliable_transversality_tolerance = 1.0e-5;
+    candidate_root.reliable_transversality_tolerance = 1.0e-5;
+    const auto capped_tolerance =
+        conditioned_crossing_position_tolerance_3d(
+            baseline_root, candidate_root, 0.04, fixed_tolerance);
+    require(capped_tolerance.edge == 0.01
+                && capped_tolerance.point == 0.01,
+            "conditioned crossing tolerance is capped at one quarter edge");
+
     const std::vector<std::string> raw_header = raw_csv_header_3d();
     const std::vector<std::string> raw_row =
         raw_csv_row_3d(RawBenchmarkRecord3D{});

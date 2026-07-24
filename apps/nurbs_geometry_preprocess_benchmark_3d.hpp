@@ -116,6 +116,18 @@ void validate_benchmark_options_3d(const BenchmarkOptions3D& options);
     const std::vector<double>& samples,
     double matching_baseline_median);
 
+struct ConditionedCrossingPositionTolerance3D {
+    double edge = 0.0;
+    double point = 0.0;
+};
+
+[[nodiscard]] ConditionedCrossingPositionTolerance3D
+conditioned_crossing_position_tolerance_3d(
+    const geometry3d::NurbsSurfaceCrossing3D& baseline,
+    const geometry3d::NurbsSurfaceCrossing3D& candidate,
+    double edge_length,
+    double fixed_physical_tolerance);
+
 [[nodiscard]] std::vector<std::string> raw_csv_header_3d();
 [[nodiscard]] std::vector<std::string> raw_csv_row_3d(
     const RawBenchmarkRecord3D& record);

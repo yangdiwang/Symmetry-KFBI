@@ -404,8 +404,15 @@ std::string crossing_comparison_detail(
     const NurbsSurfaceCrossing3D& baseline,
     const NurbsSurfaceCrossing3D& candidate,
     double edge_length,
-    const CrossingTolerance& tolerance)
+    const CrossingTolerance& tolerance,
+    bool condition_position_tolerance)
 {
+    ConditionedCrossingPositionTolerance3D position_tolerance{
+        tolerance.physical, tolerance.physical};
+    if (condition_position_tolerance) {
+        position_tolerance = conditioned_crossing_position_tolerance_3d(
+            baseline, candidate, edge_length, tolerance.physical);
+    }
     double uv_error = std::numeric_limits<double>::infinity();
     double baseline_normal_error = std::numeric_limits<double>::infinity();
     double candidate_normal_error = std::numeric_limits<double>::infinity();
@@ -452,10 +459,15 @@ std::string crossing_comparison_detail(
                 baseline.reliable_transversality_tolerance
                 - candidate.reliable_transversality_tolerance)) << '}';
     const std::string thresholds =
-        "{physical=" + format_double(tolerance.physical)
+        "{base_physical=" + format_double(tolerance.physical)
+        + ";edge_position=" + format_double(position_tolerance.edge)
+        + ";point_position=" + format_double(position_tolerance.point)
         + ";dimensionless=" + format_double(tolerance.dimensionless)
-        + ";uv_point=physical;edge_parameter=physical;point=physical"
-        + ";normal_to_patch=dimensionless;residual_delta=physical"
+        + ";uv_point=point_position"
+        + ";edge_parameter=edge_position"
+        + ";point=point_position"
+        + ";normal_to_patch=dimensionless"
+        + ";residual_delta=base_physical"
         + ";absolute_residual=" + format_double(tolerance.physical / 8.0)
         + ";transversality=normal_delta+dimensionless"
         + ";reliability_tolerance=dimensionless}";
@@ -470,8 +482,15 @@ bool equivalent_crossing(
     const NurbsSurfaceCrossing3D& candidate,
     double edge_length,
     const CrossingTolerance& tolerance,
+    bool condition_position_tolerance,
     BackendMaterialization3D& result)
 {
+    ConditionedCrossingPositionTolerance3D position_tolerance{
+        tolerance.physical, tolerance.physical};
+    if (condition_position_tolerance) {
+        position_tolerance = conditioned_crossing_position_tolerance_3d(
+            baseline, candidate, edge_length, tolerance.physical);
+    }
     bool equivalent = baseline.patch_index == candidate.patch_index
         && baseline.component == candidate.component
         && baseline.feature_edge_contact == candidate.feature_edge_contact;
@@ -520,9 +539,9 @@ bool equivalent_crossing(
     const Eigen::Vector3d candidate_patch_normal =
         candidate_patch.normal(candidate.u, candidate.v);
     equivalent = equivalent
-        && uv_error <= tolerance.physical
-        && parameter_error <= tolerance.physical
-        && point_error <= tolerance.physical
+        && uv_error <= position_tolerance.point
+        && parameter_error <= position_tolerance.edge
+        && point_error <= position_tolerance.point
         && (baseline.normal - baseline_patch_normal).norm()
             <= tolerance.dimensionless
         && (candidate.normal - candidate_patch_normal).norm()
@@ -673,6 +692,7 @@ bool equivalent_owner(
     const P2CrossingOwner3D& candidate,
     double edge_length,
     const CrossingTolerance& tolerance,
+    const ConditionedCrossingPositionTolerance3D& position_tolerance,
     BackendMaterialization3D& result)
 {
     bool equivalent = baseline.center_index == candidate.center_index
@@ -729,11 +749,11 @@ bool equivalent_owner(
                   geometry_barycentric_error, point_error, normal_error,
                   residual_error, uv_error}));
     return equivalent
-        && parameter_error <= tolerance.physical
+        && parameter_error <= position_tolerance.edge
         && barycentric_error <= tolerance.dimensionless
         && geometry_barycentric_error <= tolerance.dimensionless
-        && uv_error <= tolerance.physical
-        && point_error <= tolerance.physical
+        && uv_error <= position_tolerance.point
+        && point_error <= position_tolerance.point
         && residual_error <= tolerance.physical;
 }
 
@@ -898,18 +918,24 @@ std::string owner_comparison_detail(
     const P2CrossingOwner3D& candidate,
     const NurbsSurfaceCrossing3D& strict_crossing,
     double edge_length,
-    const CrossingTolerance& tolerance)
+    const CrossingTolerance& tolerance,
+    const ConditionedCrossingPositionTolerance3D& position_tolerance)
 {
     const OwnerComparisonErrors errors = measure_owner_comparison(
         prepared, baseline, candidate, strict_crossing, edge_length);
     const std::string thresholds =
-        "{physical=" + format_double(tolerance.physical)
+        "{base_physical=" + format_double(tolerance.physical)
+        + ";edge_position=" + format_double(position_tolerance.edge)
+        + ";point_position=" + format_double(position_tolerance.point)
         + ";dimensionless=" + format_double(tolerance.dimensionless)
-        + ";discrete=exact;edge_parameter=physical"
+        + ";discrete=exact;edge_parameter=edge_position"
         + ";barycentric=dimensionless"
-        + ";geometry_barycentric=dimensionless;uv_point=physical"
-        + ";normal_to_patch=dimensionless;crossing_point=physical"
-        + ";crossing_residual=physical;strict_normal_delta=dimensionless}";
+        + ";geometry_barycentric=dimensionless"
+        + ";uv_point=point_position"
+        + ";normal_to_patch=dimensionless"
+        + ";crossing_point=point_position"
+        + ";crossing_residual=base_physical"
+        + ";strict_crossing_fields=base_physical/dimensionless}";
     return compose_mismatch_detail_3d(
         serialize_crossing_owner_3d(baseline),
         serialize_crossing_owner_3d(candidate),
@@ -1045,7 +1071,7 @@ void scan_crossings(ScanContext& context,
         if (!equivalent_crossing(
                 context.prepared,
                 baseline_crossings[root], candidate_crossings[root],
-                edge_length, context.tolerance, context.result)) {
+                edge_length, context.tolerance, true, context.result)) {
             ++context.result.crossing_field_mismatch_count;
             record_mismatch(
                 context.mismatches, context.prepared, context.backend,
@@ -1054,7 +1080,7 @@ void scan_crossings(ScanContext& context,
                     + crossing_comparison_detail(
                         context.prepared, baseline_crossings[root],
                         candidate_crossings[root], edge_length,
-                        context.tolerance));
+                        context.tolerance, true));
         }
     }
     if (candidate_crossings.size() == 1) {
@@ -1062,7 +1088,7 @@ void scan_crossings(ScanContext& context,
             context.candidate.crossing_between(node, neighbor);
         if (!equivalent_crossing(
                 context.prepared, candidate_crossings[0], single,
-                edge_length, context.tolerance, context.result)) {
+                edge_length, context.tolerance, false, context.result)) {
             ++context.result.crossing_field_mismatch_count;
             record_mismatch(
                 context.mismatches, context.prepared, context.backend,
@@ -1071,7 +1097,7 @@ void scan_crossings(ScanContext& context,
                     "crossing_between;"
                     + crossing_comparison_detail(
                         context.prepared, candidate_crossings[0], single,
-                        edge_length, context.tolerance));
+                        edge_length, context.tolerance, false));
         }
     }
 }
@@ -1084,6 +1110,8 @@ void scan_owner(ScanContext& context,
                 int node,
                 int neighbor,
                 double edge_length,
+                const ConditionedCrossingPositionTolerance3D&
+                    backend_position_tolerance,
                 const NurbsSurfaceCrossing3D& candidate_crossing)
 {
     ++context.result.correction_owner_count;
@@ -1123,7 +1151,8 @@ void scan_owner(ScanContext& context,
             owner_matches = owner_matches
                 && equivalent_owner(
                     context.prepared, baseline_owner, candidate_owner,
-                    edge_length, context.tolerance, context.result);
+                    edge_length, context.tolerance,
+                    backend_position_tolerance, context.result);
         }
         if (!owner_matches) {
             ++context.result.correction_owner_mismatch_count;
@@ -1135,7 +1164,8 @@ void scan_owner(ScanContext& context,
                     + (baseline_owner_available
                         ? owner_comparison_detail(
                             context.prepared, baseline_owner, candidate_owner,
-                            candidate_crossing, edge_length, context.tolerance)
+                            candidate_crossing, edge_length, context.tolerance,
+                            backend_position_tolerance)
                         : "baseline={owner=unavailable};candidate="
                             + serialize_crossing_owner_3d(candidate_owner)
                             + ";strict_crossing="
@@ -1204,14 +1234,20 @@ void scan_label_changing_edge(
             candidate_crossing, edge_length, context.tolerance);
         bool crossing_matches = false;
         const NurbsSurfaceCrossing3D* baseline_crossing_ptr = nullptr;
+        ConditionedCrossingPositionTolerance3D position_tolerance{
+            context.tolerance.physical, context.tolerance.physical};
         if ((baseline_label_a > 0) != (baseline_label_b > 0)
             && baseline_info.correction_safe) {
             const NurbsSurfaceCrossing3D& baseline_crossing =
                 context.baseline.correction_crossing_between(node, neighbor);
             baseline_crossing_ptr = &baseline_crossing;
+            position_tolerance =
+                conditioned_crossing_position_tolerance_3d(
+                    baseline_crossing, candidate_crossing,
+                    edge_length, context.tolerance.physical);
             crossing_matches = equivalent_crossing(
                 context.prepared, baseline_crossing, candidate_crossing,
-                edge_length, context.tolerance, context.result);
+                edge_length, context.tolerance, true, context.result);
         }
         if (!crossing_matches) {
             ++context.result.correction_crossing_mismatch_count;
@@ -1224,7 +1260,7 @@ void scan_label_changing_edge(
                         ? crossing_comparison_detail(
                             context.prepared, *baseline_crossing_ptr,
                             candidate_crossing, edge_length,
-                            context.tolerance)
+                            context.tolerance, true)
                         : "baseline={crossing=unavailable};candidate="
                             + serialize_surface_crossing_3d(candidate_crossing)
                             + ";errors={baseline_correction_unavailable=1};"
@@ -1232,7 +1268,7 @@ void scan_label_changing_edge(
         }
         scan_owner(
             context, axis, i, j, k, node, neighbor,
-            edge_length, candidate_crossing);
+            edge_length, position_tolerance, candidate_crossing);
     } catch (const std::exception& error) {
         ++context.result.correction_crossing_mismatch_count;
         ++context.result.correction_owner_mismatch_count;
@@ -1810,6 +1846,58 @@ void write_benchmark_outputs(
 }
 
 } // namespace
+
+ConditionedCrossingPositionTolerance3D
+conditioned_crossing_position_tolerance_3d(
+    const geometry3d::NurbsSurfaceCrossing3D& baseline,
+    const geometry3d::NurbsSurfaceCrossing3D& candidate,
+    double edge_length,
+    double fixed_physical_tolerance)
+{
+    if (!std::isfinite(edge_length) || edge_length <= 0.0)
+        throw std::invalid_argument("crossing edge length must be positive");
+    if (!std::isfinite(fixed_physical_tolerance)
+        || fixed_physical_tolerance < 0.0) {
+        throw std::invalid_argument(
+            "fixed crossing tolerance must be finite and nonnegative");
+    }
+    const ConditionedCrossingPositionTolerance3D fixed{
+        fixed_physical_tolerance, fixed_physical_tolerance};
+    if (baseline.feature_edge_contact || candidate.feature_edge_contact)
+        return fixed;
+    const auto uncertainty = [](const auto& root, double& value) {
+        constexpr double minimum_reliable_transversality = 1.0e-10;
+        const double residual = std::abs(root.residual);
+        const double transversality = std::abs(root.transversality);
+        const double reliability = std::max(
+            std::abs(root.reliable_transversality_tolerance),
+            minimum_reliable_transversality);
+        if (!std::isfinite(residual) || !std::isfinite(transversality)
+            || !std::isfinite(reliability)
+            || transversality < 2.0 * reliability) {
+            return false;
+        }
+        value = residual / (transversality - reliability);
+        return std::isfinite(value);
+    };
+    double baseline_uncertainty = 0.0;
+    double candidate_uncertainty = 0.0;
+    if (!uncertainty(baseline, baseline_uncertainty)
+        || !uncertainty(candidate, candidate_uncertainty)) {
+        return fixed;
+    }
+    const double residual_sum =
+        std::abs(baseline.residual) + std::abs(candidate.residual);
+    const double edge_tolerance = fixed_physical_tolerance
+        + baseline_uncertainty + candidate_uncertainty;
+    const double point_tolerance = edge_tolerance + residual_sum;
+    if (!std::isfinite(edge_tolerance) || !std::isfinite(point_tolerance))
+        return fixed;
+    const double cap = 0.25 * edge_length;
+    return {
+        std::max(fixed_physical_tolerance, std::min(edge_tolerance, cap)),
+        std::max(fixed_physical_tolerance, std::min(point_tolerance, cap))};
+}
 
 const char* backend_name_3d(Backend3D backend) noexcept
 {
