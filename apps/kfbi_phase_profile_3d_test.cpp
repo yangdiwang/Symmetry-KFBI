@@ -33,13 +33,14 @@ int run_tests()
 {
     using namespace kfbim::app3d;
 
-    const std::array<const char*, 16> expected_names{{
+    const std::array<const char*, 17> expected_names{{
         "geometry_and_domain",
         "surface_dofs_and_stencils",
         "grid_pair_and_label_validation",
         "pipeline_fixed_initialization",
         "crossing_rows",
         "nurbs_segment_intersections",
+        "restrict_owner_geometry_preprocessing",
         "trace_owner_template_assembly",
         "exact_fields_and_other_setup",
         "cauchy_coefficients",
@@ -57,33 +58,45 @@ int run_tests()
         const auto kind = static_cast<PhaseProfileKind3D>(q);
         require(std::string(phase_profile_name_3d(kind)) == expected_names[q],
                 "phase name is wrong");
-        require(phase_profile_is_algorithm_3d(kind) == (q < 14),
+        require(phase_profile_is_algorithm_3d(kind) == (q < 15),
                 "algorithm phase classification is wrong");
     }
 
     PhaseProfile3D profile;
     profile.add(PhaseProfileKind3D::GeometryAndDomain, 2.0, 4);
+    profile.add(
+        PhaseProfileKind3D::RestrictOwnerGeometryPreprocessing, 0.25, 1);
+    profile.add(
+        PhaseProfileKind3D::TraceOwnerTemplateAssembly, 0.5, 1);
     profile.add(PhaseProfileKind3D::FftBulkSolve, 1.0, 2);
     profile.add(PhaseProfileKind3D::DiagnosticOutput, 0.5, 1);
     profile.note_timer_reads(20);
     profile.set_seconds_per_clock_read(1.0e-7);
-    profile.finalize(4.0);
+    profile.finalize(4.5);
 
-    require(std::abs(profile.algorithm_seconds() - 3.0) < 1.0e-14,
+    require(std::abs(profile.algorithm_seconds() - 3.75) < 1.0e-14,
             "algorithm denominator is wrong");
-    require(std::abs(profile.measured_seconds_without_wall_overhead() - 3.5)
+    require(std::abs(profile.measured_seconds_without_wall_overhead() - 4.25)
                 < 1.0e-14,
             "measured denominator is wrong");
     require(std::abs(profile.record(
-                PhaseProfileKind3D::WallOverhead).seconds - 0.5) < 1.0e-14,
+                PhaseProfileKind3D::WallOverhead).seconds - 0.25) < 1.0e-14,
             "wall remainder is wrong");
+    require(profile.record(
+                PhaseProfileKind3D::RestrictOwnerGeometryPreprocessing).calls
+                == 1
+            && profile.record(
+                PhaseProfileKind3D::TraceOwnerTemplateAssembly).calls == 1
+            && profile.record(
+                PhaseProfileKind3D::GmresAndOtherRoute).calls == 0,
+            "fixed preprocessing leaves are not disjoint from GMRES");
     require(profile.record(
                 PhaseProfileKind3D::GeometryAndDomain).calls == 4,
             "call count is wrong");
     require(std::abs(profile.estimated_timer_overhead_seconds() - 2.0e-6)
                 < 1.0e-14,
             "timer overhead estimate is wrong");
-    require(std::abs(profile.wall_seconds() - 4.0) < 1.0e-14,
+    require(std::abs(profile.wall_seconds() - 4.5) < 1.0e-14,
             "wall time is wrong");
 
     require_invalid_argument(

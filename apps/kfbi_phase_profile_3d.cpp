@@ -20,6 +20,7 @@ constexpr std::array<const char*, phase_profile_kind_count_3d()>
         "pipeline_fixed_initialization",
         "crossing_rows",
         "nurbs_segment_intersections",
+        "restrict_owner_geometry_preprocessing",
         "trace_owner_template_assembly",
         "exact_fields_and_other_setup",
         "cauchy_coefficients",

@@ -16,6 +16,7 @@ enum class PhaseProfileKind3D {
     PipelineFixedInitialization,
     CrossingRows,
     NurbsSegmentIntersections,
+    RestrictOwnerGeometryPreprocessing,
     TraceOwnerTemplateAssembly,
     ExactFieldsAndOtherSetup,
     CauchyCoefficients,
