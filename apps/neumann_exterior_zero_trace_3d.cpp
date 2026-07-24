@@ -119,6 +119,51 @@ auto profile_phase_3d(app3d::PhaseProfile3D* profile,
     }
 }
 
+ProfileClock3D::time_point profile_timer_start_3d(
+    app3d::PhaseProfile3D* profile)
+{
+    if (profile == nullptr)
+        return {};
+    profile->note_timer_reads(1);
+    return ProfileClock3D::now();
+}
+
+double profile_timer_elapsed_3d(
+    app3d::PhaseProfile3D* profile,
+    ProfileClock3D::time_point start)
+{
+    if (profile == nullptr)
+        return 0.0;
+    profile->note_timer_reads(1);
+    return std::chrono::duration<double>(
+        ProfileClock3D::now() - start).count();
+}
+
+void profile_add_elapsed_3d(
+    app3d::PhaseProfile3D* profile,
+    PhaseProfileKind3D kind,
+    ProfileClock3D::time_point start,
+    std::uint64_t calls = 1)
+{
+    if (profile != nullptr) {
+        profile->add(
+            kind, profile_timer_elapsed_3d(profile, start), calls);
+    }
+}
+
+double nonnegative_profile_remainder_3d(
+    double parent_seconds,
+    double child_seconds,
+    const char* context)
+{
+    const double remainder = parent_seconds - child_seconds;
+    const double tolerance =
+        std::max(1.0e-9, 1.0e-8 * parent_seconds);
+    if (remainder < -tolerance)
+        throw std::logic_error(std::string(context) + " child timers overlap");
+    return std::max(0.0, remainder);
+}
+
 std::string cauchy_policy_name(CauchyStencilPolicy3D policy)
 {
     switch (policy) {
@@ -4031,7 +4076,9 @@ bool normal_restrict_hypothesis_supported(
     return supported;
 }
 
-int run_normal_restrict_causal_probe(std::vector<int> levels, bool owner_only)
+int run_normal_restrict_causal_probe(std::vector<int> levels,
+                                     bool owner_only,
+                                     bool phase_profile = false)
 {
     std::sort(levels.begin(), levels.end());
     levels.erase(std::unique(levels.begin(), levels.end()), levels.end());
@@ -4040,19 +4087,31 @@ int run_normal_restrict_causal_probe(std::vector<int> levels, bool owner_only)
             throw std::invalid_argument(
                 "restrict-probe N must be a power of two and at least 16");
     }
+    if (phase_profile && !owner_only)
+        throw std::invalid_argument(
+            "phase profiling requires the crossing-owner-only route");
+    if (phase_profile && levels.size() != 1)
+        throw std::invalid_argument(
+            "phase profiling accepts exactly one grid level");
+
+    const std::string output_leaf = phase_profile
+        ? "dirichlet_normal_restrict_crossing_owner_profile_3d"
+        : owner_only
+            ? "dirichlet_normal_restrict_crossing_owner_3d"
+            : "dirichlet_normal_restrict_causal_probe_3d";
 #ifdef KFBIM_APP_OUTPUT_DIR
     const std::filesystem::path output_dir =
         std::filesystem::path(KFBIM_APP_OUTPUT_DIR)
-        / (owner_only ? "dirichlet_normal_restrict_crossing_owner_3d"
-                      : "dirichlet_normal_restrict_causal_probe_3d");
+        / output_leaf;
 #else
     const std::filesystem::path output_dir =
-        owner_only ? "output/dirichlet_normal_restrict_crossing_owner_3d"
-                   : "output/dirichlet_normal_restrict_causal_probe_3d";
+        std::filesystem::path("output") / output_leaf;
 #endif
-    const std::array<std::string, 3> selected_ids{{
-        "baseline", "rot_axis123_17deg",
-        "rot_axis123_17deg_t_xyz_1"}};
+    const std::vector<std::string> selected_ids = phase_profile
+        ? std::vector<std::string>{"rot_axis123_17deg"}
+        : std::vector<std::string>{
+            "baseline", "rot_axis123_17deg",
+            "rot_axis123_17deg_t_xyz_1"};
     const std::vector<app3d::DirichletRigidStudyCase3D> all_cases =
         app3d::make_l_prism_dirichlet_rigid_study_cases_3d();
     std::vector<app3d::DirichletRigidStudyCase3D> study_cases;
@@ -4068,15 +4127,47 @@ int run_normal_restrict_causal_probe(std::vector<int> levels, bool owner_only)
     }
 
     std::vector<NormalRestrictCaseProbe3D> results;
-    write_all_normal_restrict_probe_outputs(output_dir, results);
-    write_restrict_owner_probe_outputs(output_dir, results);
+    if (!phase_profile) {
+        write_all_normal_restrict_probe_outputs(output_dir, results);
+        write_restrict_owner_probe_outputs(output_dir, results);
+    }
+    const double seconds_per_clock_read = phase_profile
+        ? app3d::calibrate_steady_clock_read_seconds_3d() : 0.0;
     std::cout << "KFBI3D exterior-normal restrict causal probe\n"
               << "  geometry=l_prism cauchy=g1_nearest/degree3/48/28\n"
               << "  gmres_tolerance=2e-10 restart=0 cap=160\n";
     for (int N : levels) {
         const double h = kBoxSide / static_cast<double>(N);
         for (const auto& study_case : study_cases) {
+            app3d::PhaseProfile3D profile_storage;
+            app3d::PhaseProfile3D* profile =
+                phase_profile ? &profile_storage : nullptr;
+            const ProfileClock3D::time_point profile_wall_start =
+                profile_timer_start_3d(profile);
+            if (profile != nullptr) {
+                profile_phase_3d(
+                    profile, PhaseProfileKind3D::DiagnosticOutput, 1,
+                    [&] {
+                        std::filesystem::remove(
+                            output_dir / "phase_profile.csv");
+                    });
+                profile_phase_3d(
+                    profile, PhaseProfileKind3D::DiagnosticOutput, 1,
+                    [&] {
+                        write_all_normal_restrict_probe_outputs(
+                            output_dir, results);
+                    });
+                profile_phase_3d(
+                    profile, PhaseProfileKind3D::DiagnosticOutput, 1,
+                    [&] {
+                        write_restrict_owner_probe_outputs(
+                            output_dir, results);
+                    });
+            }
+
             const auto setup_start = std::chrono::steady_clock::now();
+            const ProfileClock3D::time_point geometry_start =
+                profile_timer_start_3d(profile);
             CartesianGrid3D grid({kBoxMin, kBoxMin, kBoxMin},
                                  {h, h, h}, {N, N, N}, DofLayout3D::Node);
             GeometryBundle geometry = make_geometry(
@@ -4084,6 +4175,12 @@ int run_normal_restrict_causal_probe(std::vector<int> levels, bool owner_only)
             const auto domain = std::make_shared<const
                 geometry3d::NurbsCartesianDomain3D>(
                     grid, geometry.native_surface.geometry_model());
+            profile_add_elapsed_3d(
+                profile, PhaseProfileKind3D::GeometryAndDomain,
+                geometry_start);
+
+            const ProfileClock3D::time_point surface_start =
+                profile_timer_start_3d(profile);
             const SurfaceDofCloud surface_dofs =
                 app3d::make_native_surface_dofs_3d(
                     geometry.native_surface, h);
@@ -4093,6 +4190,12 @@ int run_normal_restrict_causal_probe(std::vector<int> levels, bool owner_only)
                 kCauchyValueNeighborCount,
                 kCauchyDerivativeNeighborCount,
                 CauchyStencilPolicy3D::G1Nearest);
+            profile_add_elapsed_3d(
+                profile, PhaseProfileKind3D::SurfaceDofsAndStencils,
+                surface_start);
+
+            const ProfileClock3D::time_point grid_pair_start =
+                profile_timer_start_3d(profile);
             GridPair3D grid_pair(grid,
                                  geometry.correction_interface,
                                  geometry.crossing_interface,
@@ -4105,16 +4208,59 @@ int run_normal_restrict_causal_probe(std::vector<int> levels, bool owner_only)
                         "restrict-probe native NURBS label mismatch");
                 }
             }
+            profile_add_elapsed_3d(
+                profile, PhaseProfileKind3D::GridPairAndLabelValidation,
+                grid_pair_start);
+
+            const double crossing_rows_before = profile != nullptr
+                ? profile->record(
+                    PhaseProfileKind3D::CrossingRows).seconds : 0.0;
+            const double intersections_before = profile != nullptr
+                ? profile->record(
+                    PhaseProfileKind3D::NurbsSegmentIntersections).seconds
+                : 0.0;
+            const double trace_assembly_before = profile != nullptr
+                ? profile->record(
+                    PhaseProfileKind3D::TraceOwnerTemplateAssembly).seconds
+                : 0.0;
+            if (profile != nullptr)
+                profile->note_timer_reads(1);
             const auto pipeline_start = std::chrono::steady_clock::now();
             PanelCenterHarmonicJetKFBI3D pipeline(
                 grid, grid_pair, geometry.native_surface,
                 geometry.correction_triangles,
                 geometry.geometry_triangles,
-                surface_dofs, cauchy_stencils, !owner_only, true);
+                surface_dofs, cauchy_stencils, !owner_only, true, profile);
+            if (profile != nullptr)
+                profile->note_timer_reads(1);
+            const auto pipeline_end = std::chrono::steady_clock::now();
             const double pipeline_setup_seconds =
                 std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - pipeline_start).count();
+                    pipeline_end - pipeline_start).count();
+            if (profile != nullptr) {
+                const double child_seconds =
+                    profile->record(
+                        PhaseProfileKind3D::CrossingRows).seconds
+                    - crossing_rows_before
+                    + profile->record(
+                        PhaseProfileKind3D::NurbsSegmentIntersections).seconds
+                    - intersections_before
+                    + profile->record(
+                        PhaseProfileKind3D::TraceOwnerTemplateAssembly).seconds
+                    - trace_assembly_before;
+                profile->add(
+                    PhaseProfileKind3D::PipelineFixedInitialization,
+                    nonnegative_profile_remainder_3d(
+                        pipeline_setup_seconds, child_seconds,
+                        "pipeline setup"),
+                    1);
+            }
 
+            const ProfileClock3D::time_point other_setup_start =
+                profile_timer_start_3d(profile);
+            const double setup_coefficients_before = profile != nullptr
+                ? profile->record(
+                    PhaseProfileKind3D::CauchyCoefficients).seconds : 0.0;
             NormalRestrictCaseProbe3D probe_case;
             probe_case.case_id = study_case.id;
             probe_case.N = N;
@@ -4193,10 +4339,28 @@ int run_normal_restrict_causal_probe(std::vector<int> levels, bool owner_only)
                     smooth_exact, zero_jump, zero_jump);
             const Eigen::VectorXd common_rhs =
                 make_common_normal_restrict_rhs(size);
+            if (profile != nullptr) {
+                const double other_setup_seconds =
+                    profile_timer_elapsed_3d(profile, other_setup_start);
+                const double coefficient_seconds =
+                    profile->record(
+                        PhaseProfileKind3D::CauchyCoefficients).seconds
+                    - setup_coefficients_before;
+                profile->add(
+                    PhaseProfileKind3D::ExactFieldsAndOtherSetup,
+                    nonnegative_profile_remainder_3d(
+                        other_setup_seconds, coefficient_seconds,
+                        "remaining setup"),
+                    1);
+            }
             probe_case.setup_seconds = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - setup_start).count();
             results.push_back(std::move(probe_case));
-            write_restrict_owner_probe_outputs(output_dir, results);
+            profile_phase_3d(
+                profile, PhaseProfileKind3D::DiagnosticOutput, 1,
+                [&] {
+                    write_restrict_owner_probe_outputs(output_dir, results);
+                });
             NormalRestrictCaseProbe3D& stored = results.back();
 
             const std::vector<ExteriorNormalRestrictMode3D> modes = owner_only
@@ -4207,6 +4371,21 @@ int run_normal_restrict_causal_probe(std::vector<int> levels, bool owner_only)
                     ExteriorNormalRestrictMode3D::JointTricubicCrossingOwner,
                     ExteriorNormalRestrictMode3D::ExteriorOnlyHarmonicCubic};
             for (ExteriorNormalRestrictMode3D mode : modes) {
+                const std::array<PhaseProfileKind3D, 5> route_kinds{{
+                    PhaseProfileKind3D::CauchyCoefficients,
+                    PhaseProfileKind3D::SpreadRhsAssembly,
+                    PhaseProfileKind3D::FftBulkSolve,
+                    PhaseProfileKind3D::RestrictContinuedSamples,
+                    PhaseProfileKind3D::RestrictRecovery,
+                }};
+                std::array<double, 5> route_children_before{};
+                if (profile != nullptr) {
+                    for (std::size_t q = 0; q < route_kinds.size(); ++q) {
+                        route_children_before[q] =
+                            profile->record(route_kinds[q]).seconds;
+                    }
+                    profile->note_timer_reads(1);
+                }
                 const auto route_start = std::chrono::steady_clock::now();
                 NormalRestrictRouteProbe3D& route = stored.routes[
                     static_cast<std::size_t>(normal_restrict_route_index(mode))];
@@ -4248,10 +4427,32 @@ int run_normal_restrict_causal_probe(std::vector<int> levels, bool owner_only)
                     throw std::runtime_error(
                         "GMRES apply performed a crossing-owner geometry query");
                 }
+                if (profile != nullptr)
+                    profile->note_timer_reads(1);
+                const auto route_end = std::chrono::steady_clock::now();
                 route.seconds = std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - route_start).count();
+                    route_end - route_start).count();
+                if (profile != nullptr) {
+                    double child_seconds = 0.0;
+                    for (std::size_t q = 0; q < route_kinds.size(); ++q) {
+                        child_seconds +=
+                            profile->record(route_kinds[q]).seconds
+                            - route_children_before[q];
+                    }
+                    profile->add(
+                        PhaseProfileKind3D::GmresAndOtherRoute,
+                        nonnegative_profile_remainder_3d(
+                            route.seconds, child_seconds,
+                            "normal-restrict route"),
+                        1);
+                }
                 route.complete = true;
-                write_all_normal_restrict_probe_outputs(output_dir, results);
+                profile_phase_3d(
+                    profile, PhaseProfileKind3D::DiagnosticOutput, 1,
+                    [&] {
+                        write_all_normal_restrict_probe_outputs(
+                            output_dir, results);
+                    });
                 std::cout << "[restrict-probe] case=" << stored.case_id
                           << " N=" << N << " route=" << route.route
                           << " exact_grid_linf="
@@ -4274,6 +4475,42 @@ int run_normal_restrict_causal_probe(std::vector<int> levels, bool owner_only)
                       << " pipeline_setup_seconds="
                       << stored.pipeline_setup_seconds
                       << " total_seconds=" << total_seconds << '\n';
+
+            if (profile != nullptr) {
+                profile->set_seconds_per_clock_read(
+                    seconds_per_clock_read);
+                const double profile_wall_seconds =
+                    profile_timer_elapsed_3d(profile, profile_wall_start);
+                profile->finalize(profile_wall_seconds);
+                double recorded_wall_seconds = 0.0;
+                for (std::size_t q = 0;
+                     q < app3d::phase_profile_kind_count_3d(); ++q) {
+                    recorded_wall_seconds += profile->record(
+                        static_cast<PhaseProfileKind3D>(q)).seconds;
+                }
+                const double exhaustive_tolerance =
+                    std::max(1.0e-6, 1.0e-8 * profile_wall_seconds);
+                if (std::abs(
+                        recorded_wall_seconds - profile_wall_seconds)
+                    > exhaustive_tolerance) {
+                    throw std::logic_error(
+                        "phase-profile leaves are not exhaustive");
+                }
+                app3d::write_phase_profile_csv_3d(
+                    output_dir / "phase_profile.csv",
+                    stored.case_id, N, *profile);
+                const double overhead_percent =
+                    profile_wall_seconds > 0.0
+                    ? 100.0
+                        * profile->estimated_timer_overhead_seconds()
+                        / profile_wall_seconds
+                    : 0.0;
+                std::cout << "[phase-profile] algorithm_seconds="
+                          << profile->algorithm_seconds()
+                          << " wall_seconds=" << profile_wall_seconds
+                          << " estimated_timer_overhead_percent="
+                          << overhead_percent << '\n';
+            }
         }
     }
     if (!owner_only) {
@@ -4294,9 +4531,11 @@ void print_usage(const char* executable)
         << "       " << executable << " --rigid-study [N ...]\n"
         << "       " << executable << " --restrict-probe [N ...]\n"
         << "       " << executable << " --restrict-probe-owner [N ...]\n"
+        << "       " << executable << " --restrict-profile-owner [N]\n"
         << "  Each N must be a power of two and at least 16 (default: 32).\n"
         << "  Rigid-study default levels: 32, 64, 128.\n"
         << "  Restrict-probe default levels: 32, 64.\n"
+        << "  Restrict-profile default level: 128 (one level only).\n"
         << "  This stage builds native NURBS parameter-cell-center surface\n"
         << "  unknowns, topology-filtered 48/28 Cauchy stencils, validates\n"
         << "  fixed transfer routes, and executes the Neumann value-jump and\n"
@@ -4322,14 +4561,18 @@ int main(int argc, char** argv)
                                   && std::string(argv[1]) == "--restrict-probe";
         const bool restrict_probe_owner = argc >= 2
             && std::string(argv[1]) == "--restrict-probe-owner";
+        const bool restrict_profile_owner = argc >= 2
+            && std::string(argv[1]) == "--restrict-profile-owner";
         std::string selection = "all";
         std::vector<int> levels = rigid_study
             ? std::vector<int>{32, 64, 128}
-            : (restrict_probe || restrict_probe_owner)
+            : restrict_profile_owner
+                ? std::vector<int>{128}
+                : (restrict_probe || restrict_probe_owner)
                 ? std::vector<int>{32, 64}
                 : std::vector<int>{32};
         if (argc >= 2 && !rigid_study && !restrict_probe
-            && !restrict_probe_owner)
+            && !restrict_probe_owner && !restrict_profile_owner)
             selection = argv[1];
         if (selection == "--help" || selection == "-h") {
             print_usage(argv[0]);
@@ -4346,9 +4589,12 @@ int main(int argc, char** argv)
                 levels.push_back(N);
             }
         }
-        if (restrict_probe || restrict_probe_owner)
+        if (restrict_probe || restrict_probe_owner
+            || restrict_profile_owner) {
             return run_normal_restrict_causal_probe(levels,
-                                                     restrict_probe_owner);
+                restrict_probe_owner || restrict_profile_owner,
+                restrict_profile_owner);
+        }
         const CauchyStencilPolicy3D cauchy_policy = selected_cauchy_policy();
         const int cauchy_value_count = positive_environment_integer(
             "KFBIM_3D_CAUCHY_VALUE_COUNT", kCauchyValueNeighborCount);
