@@ -23,12 +23,14 @@
 #include <Eigen/Dense>
 #include <Eigen/SVD>
 
+#include "crossing_owner_restrict_3d.hpp"
 #include "dirichlet_rigid_transform_study_3d.hpp"
 #include "exterior_only_cubic_normal_restrict_3d.hpp"
 #include "harmonic_polynomial_space_3d.hpp"
 #include "native_nurbs_surface_3d.hpp"
 #include "src/bulk_solvers/laplace_zfft_bulk_solver_3d.hpp"
 #include "src/geometry/grid_pair_3d.hpp"
+#include "src/geometry/nurbs_bezier_intersection_3d.hpp"
 #include "src/geometry/nurbs_cartesian_domain_3d.hpp"
 #include "src/geometry/nurbs_patch_triangulator_3d.hpp"
 #include "src/geometry/p2_surface_3d.hpp"
@@ -72,6 +74,7 @@ enum class SolveSelection3D {
 
 enum class ExteriorNormalRestrictMode3D {
     JointTricubicCauchy,
+    JointTricubicCrossingOwner,
     ExteriorOnlyHarmonicCubic
 };
 
@@ -754,11 +757,25 @@ struct HarmonicCrossingRow3D {
     Eigen::VectorXd evaluation;
 };
 
+struct HarmonicTraceCorrectionTerm3D {
+    int owner_dof = -1;
+    Eigen::VectorXd evaluation;
+};
+
+constexpr std::size_t kRestrictOwnerDecisionKindCount =
+    static_cast<std::size_t>(
+        app3d::RestrictOwnerDecisionKind3D::AmbiguousEdgeFallback)
+    + std::size_t{1};
+
 struct HarmonicTraceSample3D {
     std::array<int, 64> grid_ids{};
     std::array<double, 64> weights{};
-    Eigen::VectorXd correction_evaluation;
+    Eigen::VectorXd legacy_correction_evaluation;
+    std::vector<HarmonicTraceCorrectionTerm3D> owner_corrections;
     int wrong_side_node_count = 0;
+    std::array<int, kRestrictOwnerDecisionKindCount> owner_decision_counts{};
+    int owner_unresolved_fallback_count = 0;
+    int owner_unrelated_coincidence_fallback_count = 0;
 };
 
 class PanelCenterHarmonicJetKFBI3D {
@@ -772,7 +789,8 @@ public:
                                      geometry_triangles,
                                  const SurfaceDofCloud& cloud,
                                  const CauchyStencilSet& stencils,
-                                 bool build_exterior_only_restrict = false)
+                                 bool build_exterior_only_restrict = false,
+                                 bool build_crossing_owner_restrict = false)
         : grid_(grid)
         , grid_pair_(grid_pair)
         , native_surface_(native_surface)
@@ -797,7 +815,17 @@ public:
                     grid_, grid_pair_, cloud_);
         }
         build_crossing_rows();
-        build_trace_templates();
+        if (build_crossing_owner_restrict) {
+            geometry3d::NurbsSurfaceIntersectorOptions3D options;
+            options.maximum_element_extent = 2.0 * h_;
+            options.local_max_subdivision_depth = 4;
+            const geometry3d::NurbsSurfaceIntersector3D intersector(
+                native_surface_.geometry_model(), options);
+            build_trace_templates(&intersector);
+            crossing_owner_templates_built_ = true;
+        } else {
+            build_trace_templates(nullptr);
+        }
         build_joint_trace_fit();
     }
 
@@ -921,7 +949,7 @@ public:
             return exterior_only_restrict_->apply(field.potential);
         }
         return recover_trace(
-            continued_samples(field, value_jump, normal_jump, false),
+            continued_samples(field, value_jump, normal_jump, false, mode),
             c1_weights_, 1.0 / h_);
     }
 
@@ -939,8 +967,17 @@ private:
     Eigen::MatrixXd continued_samples(const HarmonicJetField3D& field,
                                       const Eigen::VectorXd& value_jump,
                                       const Eigen::VectorXd& normal_jump,
-                                      bool interior_continuation) const
+                                      bool interior_continuation,
+                                      ExteriorNormalRestrictMode3D mode =
+                                          ExteriorNormalRestrictMode3D::
+                                              JointTricubicCauchy) const
     {
+        const bool use_crossing_owner =
+            mode == ExteriorNormalRestrictMode3D::JointTricubicCrossingOwner;
+        if (use_crossing_owner && !crossing_owner_templates_built_) {
+            throw std::runtime_error(
+                "crossing-owner normal restrict was not initialized");
+        }
         const int size = surface_size();
         if (field.potential.size() != grid_.num_dofs()
             || field.coefficients.rows() != size
@@ -962,8 +999,17 @@ private:
                                * field.potential[
                                    sample.grid_ids[static_cast<std::size_t>(q)]];
                     }
-                    value += sample.correction_evaluation.dot(
-                        field.coefficients.row(center).transpose());
+                    if (use_crossing_owner) {
+                        for (const HarmonicTraceCorrectionTerm3D& term
+                             : sample.owner_corrections) {
+                            value += term.evaluation.dot(
+                                field.coefficients.row(
+                                    term.owner_dof).transpose());
+                        }
+                    } else {
+                        value += sample.legacy_correction_evaluation.dot(
+                            field.coefficients.row(center).transpose());
+                    }
                     samples(center, 4 * side + layer) = value;
                 }
             }
@@ -1118,7 +1164,10 @@ private:
 
     HarmonicTraceSample3D build_trace_sample(int center,
                                              bool desired_inside,
-                                             double signed_layer) const
+                                             double signed_layer,
+                                             const geometry3d::
+                                                 NurbsSurfaceIntersector3D*
+                                                 restrict_intersector) const
     {
         const SurfaceDof& dof = cloud_.dofs[static_cast<std::size_t>(center)];
         const Eigen::Vector3d query =
@@ -1152,7 +1201,9 @@ private:
         // polynomial; a final cubic interpolation in the third direction is
         // algebraically the standard 4x4x4 tensor-product tricubic formula.
         HarmonicTraceSample3D result;
-        result.correction_evaluation = Eigen::VectorXd::Zero(fit_.dimension());
+        result.legacy_correction_evaluation =
+            Eigen::VectorXd::Zero(fit_.dimension());
+        std::map<int, Eigen::VectorXd> owner_evaluations;
         int q = 0;
         for (int iz = 0; iz < 4; ++iz) {
             for (int iy = 0; iy < 4; ++iy) {
@@ -1169,20 +1220,77 @@ private:
                     const bool node_inside = grid_pair_.domain_label(node) > 0;
                     if (node_inside != desired_inside) {
                         ++result.wrong_side_node_count;
-                        const Eigen::Vector3d xi =
-                            local_coordinate(center, grid_point(grid_, node));
+                        const Eigen::Vector3d node_point =
+                            grid_point(grid_, node);
+                        const Eigen::Vector3d target_xi =
+                            local_coordinate(center, node_point);
                         const double correction_sign = desired_inside ? 1.0 : -1.0;
-                        result.correction_evaluation += correction_sign * weight
-                            * fit_.space().basis(xi.x(), xi.y(), xi.z());
+                        result.legacy_correction_evaluation +=
+                            correction_sign * weight
+                            * fit_.space().basis(
+                                target_xi.x(), target_xi.y(), target_xi.z());
+
+                        if (restrict_intersector != nullptr) {
+                            int owner = center;
+                            try {
+                                const geometry3d::
+                                    NurbsSurfaceIntersectionResult3D intersection =
+                                        restrict_intersector->intersect_segment(
+                                            query, node_point);
+                                const app3d::RestrictOwnerDecision3D decision =
+                                    app3d::select_restrict_correction_owner_3d(
+                                        center, query, node_point,
+                                        native_surface_, cloud_, intersection);
+                                owner = decision.owner_dof;
+                                const std::size_t kind =
+                                    static_cast<std::size_t>(decision.kind);
+                                if (kind
+                                    >= result.owner_decision_counts.size()) {
+                                    throw std::logic_error(
+                                        "crossing-owner decision kind is invalid");
+                                }
+                                ++result.owner_decision_counts[kind];
+                            } catch (const geometry3d::
+                                         UnresolvedNurbsIntersectionCandidate3D&) {
+                                ++result.owner_unresolved_fallback_count;
+                            } catch (const std::runtime_error& error) {
+                                if (std::string(error.what())
+                                    != "coincident roots on unrelated NURBS patches") {
+                                    throw;
+                                }
+                                ++result.
+                                    owner_unrelated_coincidence_fallback_count;
+                            }
+
+                            const Eigen::Vector3d owner_xi =
+                                local_coordinate(owner, node_point);
+                            Eigen::VectorXd& owner_evaluation =
+                                owner_evaluations[owner];
+                            if (owner_evaluation.size() == 0) {
+                                owner_evaluation =
+                                    Eigen::VectorXd::Zero(fit_.dimension());
+                            }
+                            owner_evaluation += correction_sign * weight
+                                * fit_.space().basis(
+                                    owner_xi.x(), owner_xi.y(), owner_xi.z());
+                        }
                     }
                     ++q;
                 }
             }
         }
+        result.owner_corrections.reserve(owner_evaluations.size());
+        for (auto& owner_evaluation : owner_evaluations) {
+            HarmonicTraceCorrectionTerm3D term;
+            term.owner_dof = owner_evaluation.first;
+            term.evaluation = std::move(owner_evaluation.second);
+            result.owner_corrections.push_back(std::move(term));
+        }
         return result;
     }
 
-    void build_trace_templates()
+    void build_trace_templates(
+        const geometry3d::NurbsSurfaceIntersector3D* restrict_intersector)
     {
         trace_samples_.reserve(
             static_cast<std::size_t>(surface_size() * 2 * 4));
@@ -1192,7 +1300,9 @@ private:
                 const double sign = desired_inside ? -1.0 : 1.0;
                 for (double layer : normal_layers_)
                     trace_samples_.push_back(
-                        build_trace_sample(center, desired_inside, sign * layer));
+                        build_trace_sample(
+                            center, desired_inside, sign * layer,
+                            restrict_intersector));
             }
         }
     }
@@ -1225,6 +1335,7 @@ private:
     const std::vector<geometry3d::NurbsParamTriangle3D>& correction_triangles_;
     const std::vector<geometry3d::NurbsParamTriangle3D>& geometry_triangles_;
     const SurfaceDofCloud& cloud_;
+    bool crossing_owner_templates_built_ = false;
     double h_ = 0.0;
     PanelCenterCauchyFit3D fit_;
     std::unique_ptr<app3d::ExteriorOnlyCubicNormalRestrict3D>
