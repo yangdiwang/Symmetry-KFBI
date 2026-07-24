@@ -139,6 +139,12 @@ void validate_inputs(const RationalBezierElement3D& element,
     }
     if (options.max_subdivision_depth < 0)
         throw std::invalid_argument("NURBS intersection depth must be nonnegative");
+    if (options.terminal_separation_subdivision_depth < 0
+        || options.terminal_separation_subdivision_depth
+               > kMaximumTerminalSeparationSubdivisionDepth3D) {
+        throw std::invalid_argument(
+            "NURBS terminal separation depth is outside the supported range");
+    }
     if (options.max_newton_iterations <= 0
         || options.max_newton_iterations
                > std::numeric_limits<int>::max() / 2) {
@@ -1039,7 +1045,7 @@ bool control_hull_separates_from_segment(
     return false;
 }
 
-constexpr int kTerminalCertificateSubdivisionDepth = 6;
+constexpr int kTerminalSingleRootCertificateSubdivisionDepth = 6;
 
 bool certifies_terminal_separation(
     const RationalBezierElement3D& box,
@@ -1047,7 +1053,7 @@ bool certifies_terminal_separation(
     const Eigen::Vector3d& preferred_separation,
     double geometry_tolerance,
     NurbsElementIntersectionDiagnostics3D& diagnostics,
-    int remaining_depth = kTerminalCertificateSubdivisionDepth,
+    int remaining_depth,
     int certificate_depth = 0)
 {
     checked_increment_diagnostic(
@@ -1104,7 +1110,8 @@ bool certifies_terminal_single_root(
     const Eigen::Vector3d& preferred_separation,
     double geometry_tolerance,
     NurbsElementIntersectionDiagnostics3D& diagnostics,
-    int remaining_depth = kTerminalCertificateSubdivisionDepth,
+    int remaining_depth =
+        kTerminalSingleRootCertificateSubdivisionDepth,
     int certificate_depth = 0)
 {
     checked_increment_diagnostic(
@@ -1743,7 +1750,8 @@ NurbsElementSegmentCertificate3D certify_nurbs_bezier_element_segment_3d(
     if (closest.distance > contact_tolerance) {
         if (certifies_terminal_separation(
                 element, frame, preferred_separation,
-                options.geometry_tolerance, diagnostics)) {
+                options.geometry_tolerance, diagnostics,
+                options.terminal_separation_subdivision_depth)) {
             checked_increment_diagnostic(
                 diagnostics.terminal_misses_by_closest_point,
                 "NURBS terminal-miss diagnostic overflow");
@@ -1953,7 +1961,8 @@ NurbsElementIntersectionResult3D intersect_nurbs_bezier_element_3d(
                         closest_result->surface_point
                             - closest_result->segment_point,
                         options.geometry_tolerance,
-                        result.diagnostics)) {
+                        result.diagnostics,
+                        options.terminal_separation_subdivision_depth)) {
                     checked_increment_diagnostic(
                         result.diagnostics.unresolved_boxes,
                         "NURBS unresolved-box diagnostic overflow");

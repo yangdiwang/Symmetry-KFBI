@@ -1,5 +1,7 @@
 #include "native_nurbs_surface_transform_3d.hpp"
+#include "src/geometry/nurbs_cartesian_domain_3d.hpp"
 
+#include <cmath>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -152,6 +154,150 @@ void test_transformed_l_prism_geometry_and_metadata()
             "transformed exact-inside predicate rejects outside point");
 }
 
+void test_rotated_torus_n64_edge_has_one_certified_root()
+{
+    constexpr double degrees_to_radians =
+        3.141592653589793238462643383279502884 / 180.0;
+    constexpr double h = 3.0 / 64.0;
+    const RigidTransform3D rotation =
+        RigidTransform3D::from_axis_angle(
+            {1.0, 2.0, 3.0}, 17.0 * degrees_to_radians,
+            {0.07, -0.07, 0.02}, Eigen::Vector3d::Zero());
+    const NativeNurbsSurface3D torus =
+        transform_native_nurbs_surface_3d(
+            make_native_nurbs_surface_3d(GeometryKind3D::Torus),
+            rotation);
+
+    const Eigen::Vector3d start(-0.375, 0.0, -0.046875);
+    const Eigen::Vector3d end(-0.375, h, -0.046875);
+    const kfbim::geometry3d::NurbsCartesianEdgeQuery3D query{
+        1, 24, 32, 31, start, end};
+    kfbim::geometry3d::NurbsSurfaceIntersectorOptions3D direct_options;
+    direct_options.maximum_element_extent = 2.0 * h;
+    direct_options.local_max_subdivision_depth = 6;
+    direct_options.terminal_separation_subdivision_depth = 12;
+    const kfbim::geometry3d::NurbsSurfaceIntersector3D direct_intersector(
+        torus.geometry_model(), direct_options);
+    const auto edge = direct_intersector.intersect_cartesian_edge(query);
+
+    std::size_t ambiguous_candidates = 0;
+    for (const auto& cluster : edge.ambiguous_clusters)
+        ambiguous_candidates += cluster.candidates.size();
+    const std::string diagnostics =
+        " unresolved="
+        + std::to_string(edge.diagnostics.unresolved_candidates)
+        + " ambiguous_clusters="
+        + std::to_string(edge.ambiguous_clusters.size())
+        + " ambiguous_candidates="
+        + std::to_string(ambiguous_candidates)
+        + " confirmed="
+        + std::to_string(edge.crossings.size());
+
+    require(
+        torus.exact_inside(start) != torus.exact_inside(end),
+        "rotated torus regression edge changes exact membership");
+    require(
+        edge.diagnostics.unresolved_candidates == 0,
+        "rotated torus regression edge has unresolved candidates"
+            + diagnostics);
+    require(
+        edge.ambiguous_clusters.empty(),
+        "rotated torus regression edge has ambiguous roots"
+            + diagnostics);
+    require(
+        edge.root_count_known && edge.parity_known_from_roots,
+        "rotated torus regression edge has unknown parity"
+            + diagnostics);
+    require(
+        edge.crossings.size() == 1
+            && edge.confirmed_transverse_count == 1
+            && edge.changes_component_membership,
+        "rotated torus regression edge is not one transverse crossing"
+            + diagnostics);
+    require(
+        std::abs(edge.crossings.front().edge_parameter
+                 - 0.2872035643282431) <= 2.0e-10,
+        "rotated torus regression root parameter is inaccurate");
+    require(
+        edge.diagnostics.maximum_terminal_certificate_depth_reached > 6
+            && edge.diagnostics.maximum_terminal_certificate_depth_reached
+                   <= 12,
+        "rotated torus regression did not use the bounded deep "
+        "separation certificate");
+
+    const kfbim::CartesianGrid3D grid(
+        {-1.5, -1.5, -1.5},
+        {0.375, h, 0.484375},
+        {8, 64, 7},
+        kfbim::DofLayout3D::Node);
+    kfbim::geometry3d::NurbsCartesianDomainOptions3D domain_options;
+    domain_options.maximum_element_extent_cap = 2.0 * h;
+    const kfbim::geometry3d::NurbsCartesianDomain3D domain(
+        grid, torus.geometry_model(), domain_options);
+    const int start_node = grid.index(3, 32, 3);
+    const int end_node = grid.index(3, 33, 3);
+    const auto classification =
+        domain.edge_classification_between(start_node, end_node);
+    require(
+        classification.used_targeted_retry
+            && classification.correction_safe
+            && classification.root_count_known
+            && classification.parity_known_from_roots
+            && classification.confirmed_crossing_count == 1
+            && classification.confirmed_transverse_count == 1
+            && classification.ambiguous_cluster_count == 0,
+        "rotated torus N=64 production domain edge is not "
+        "correction-safe after targeted retry");
+    const auto domain_crossings =
+        domain.crossings_between(start_node, end_node);
+    require(
+        domain_crossings.size() == 1
+            && std::abs(domain_crossings[0].edge_parameter
+                        - 0.2872035643282431) <= 2.0e-10,
+        "rotated torus N=64 production domain stores the wrong crossing");
+    const auto& domain_diagnostics = domain.diagnostics();
+    require(
+        domain_diagnostics.targeted_retry_count > 0
+            && domain_diagnostics.targeted_retry_resolved_count > 0
+            && domain_diagnostics.targeted_retry_intersections
+                   .maximum_terminal_certificate_depth_reached > 6
+            && domain_diagnostics.maximum_query_element_extent
+                   <= 2.0 * h,
+        "rotated torus N=64 production domain did not record the "
+        "bounded targeted retry");
+}
+
+void test_terminal_separation_depth_option_is_validated()
+{
+    using kfbim::geometry3d::NurbsSurfaceIntersector3D;
+    using kfbim::geometry3d::NurbsSurfaceIntersectorOptions3D;
+
+    require(
+        NurbsSurfaceIntersectorOptions3D{}
+                .terminal_separation_subdivision_depth
+            == kfbim::geometry3d::
+                kDefaultTerminalSeparationSubdivisionDepth3D,
+        "terminal separation certificate keeps the production default");
+    NurbsSurfaceIntersectorOptions3D options;
+    options.terminal_separation_subdivision_depth = -1;
+    const NativeNurbsSurface3D torus =
+        make_native_nurbs_surface_3d(GeometryKind3D::Torus);
+    require_throws(
+        [&] {
+            (void)NurbsSurfaceIntersector3D(
+                torus.geometry_model(), options);
+        },
+        "negative terminal separation depth is rejected");
+    options.terminal_separation_subdivision_depth =
+        kfbim::geometry3d::kMaximumTerminalSeparationSubdivisionDepth3D + 1;
+    require_throws(
+        [&] {
+            (void)NurbsSurfaceIntersector3D(
+                torus.geometry_model(), options);
+        },
+        "excessive terminal separation depth is rejected");
+}
+
 void test_invalid_transforms_are_rejected()
 {
     const Eigen::Vector3d zero = Eigen::Vector3d::Zero();
@@ -185,6 +331,8 @@ int main()
     try {
         test_transform_points_and_vectors();
         test_transformed_l_prism_geometry_and_metadata();
+        test_rotated_torus_n64_edge_has_one_certified_root();
+        test_terminal_separation_depth_option_is_validated();
         test_invalid_transforms_are_rejected();
         test_empty_predicate_is_rejected();
         std::cout << "native NURBS rigid transform tests passed\n";

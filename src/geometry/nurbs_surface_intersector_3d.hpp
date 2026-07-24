@@ -150,6 +150,8 @@ struct NurbsSurfaceIntersectorOptions3D {
     double maximum_element_extent =
         std::numeric_limits<double>::infinity();
     int local_max_subdivision_depth = 4;
+    int terminal_separation_subdivision_depth =
+        kDefaultTerminalSeparationSubdivisionDepth3D;
 };
 
 class NurbsSurfaceIntersector3D {

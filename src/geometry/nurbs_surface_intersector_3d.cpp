@@ -1253,6 +1253,12 @@ NurbsSurfaceIntersector3D::NurbsSurfaceIntersector3D(
         throw std::invalid_argument(
             "NURBS local intersection depth must be nonnegative");
     }
+    if (options_.terminal_separation_subdivision_depth < 0
+        || options_.terminal_separation_subdivision_depth
+               > kMaximumTerminalSeparationSubdivisionDepth3D) {
+        throw std::invalid_argument(
+            "NURBS terminal separation depth is outside the supported range");
+    }
     if (std::isnan(options_.maximum_element_extent)
         || options_.maximum_element_extent <= 0.0) {
         throw std::invalid_argument(
@@ -1411,6 +1417,8 @@ NurbsSurfaceIntersector3D::certify_candidate_segment(
     options.use_triangle_seed = options_.use_triangle_seeds;
     options.max_subdivision_depth =
         options_.local_max_subdivision_depth;
+    options.terminal_separation_subdivision_depth =
+        options_.terminal_separation_subdivision_depth;
     const std::vector<NurbsElementParameterSeed3D> sample_seeds =
         select_sample_seeds(
             element_samples_[candidate.query_element_], start, end);
@@ -1669,6 +1677,8 @@ NurbsSurfaceIntersector3D::intersect_segment_candidate_indices(
     local_options.use_triangle_seed = options_.use_triangle_seeds;
     local_options.max_subdivision_depth =
         options_.local_max_subdivision_depth;
+    local_options.terminal_separation_subdivision_depth =
+        options_.terminal_separation_subdivision_depth;
     for (const std::size_t candidate : candidates) {
         checked_increment_diagnostic(
             result.diagnostics.candidate_elements,
