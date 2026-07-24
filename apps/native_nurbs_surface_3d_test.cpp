@@ -1995,6 +1995,9 @@ void require_triangle_seed_independent_domain(
     const NurbsCartesianDomain3D seeded(grid, model);
     NurbsCartesianDomainOptions3D no_seed_options;
     no_seed_options.use_triangle_seeds = false;
+    no_seed_options.strategy =
+        kfbim::geometry3d::NurbsCartesianPreprocessStrategy3D::
+            OptimizedIntersection;
     const NurbsCartesianDomain3D unseeded(
         grid, model, no_seed_options);
 
@@ -2010,6 +2013,14 @@ void require_triangle_seed_independent_domain(
     require(seeded.diagnostics().interface_edge_counts
                 == unseeded.diagnostics().interface_edge_counts,
             name + " interface counts do not depend on triangle seeds");
+    require(unseeded.diagnostics().candidate_element_incidence_count > 0
+                && unseeded.diagnostics().intersections
+                       .mapped_candidate_elements
+                    == unseeded.diagnostics().intersections
+                           .candidate_elements
+                && unseeded.diagnostics().intersections
+                       .bvh_candidate_elements == 0,
+            name + " optimized domain uses stable mapped candidates");
 
     const auto dims = grid.dof_dims();
     const double crossing_tolerance = 8.0 * std::max(
@@ -2361,6 +2372,86 @@ void test_cartesian_edge_collects_multiple_crossings()
             "two torus crossings have even component parity");
     require(result.parity_known_from_roots,
             "two transverse torus roots determine parity");
+}
+
+void test_selectable_preprocess_candidate_workload()
+{
+    using namespace kfbim::geometry3d;
+    const auto default_strategy = NurbsCartesianDomainOptions3D{}.strategy;
+    require(
+        default_strategy
+            == NurbsCartesianPreprocessStrategy3D::CertifiedBaseline,
+        "certified baseline is the default preprocessing strategy");
+    const std::array<NurbsCartesianPreprocessStrategy3D, 3> strategies{{
+        NurbsCartesianPreprocessStrategy3D::CertifiedBaseline,
+        NurbsCartesianPreprocessStrategy3D::OptimizedIntersection,
+        NurbsCartesianPreprocessStrategy3D::Hybrid}};
+    NurbsCartesianDomainOptions3D selected_options;
+    for (const auto strategy : strategies) {
+        selected_options.strategy = strategy;
+        require(selected_options.strategy == strategy,
+                "each preprocessing strategy is selectable");
+    }
+    const NurbsCartesianDomainDiagnostics3D neutral;
+    require(neutral.candidate_element_incidence_count == 0,
+            "candidate incidence diagnostic defaults to zero");
+    require(neutral.total_construction_seconds == 0.0,
+            "construction timing diagnostic defaults to zero");
+
+    const NativeNurbsSurface3D torus =
+        make_native_nurbs_surface_3d(GeometryKind3D::Torus);
+    const NurbsSurfaceIntersector3D intersector(torus.geometry_model());
+    const auto& descriptors = intersector.query_elements();
+    require(descriptors.size() == intersector.query_element_count(),
+            "stable descriptors cover every query element");
+    std::vector<std::size_t> ids;
+    for (const auto& descriptor : descriptors)
+        ids.push_back(descriptor.id);
+    const NurbsCartesianEdgeQuery3D query{
+        0, 6, 11, 8, {0.0, -0.04, 0.03}, {1.0, -0.04, 0.03}};
+    const auto bvh = intersector.intersect_cartesian_edge(query);
+    const auto mapped = intersector.intersect_cartesian_edge(query, ids);
+    require(bvh.crossings.size() == mapped.crossings.size(),
+            "mapped candidates preserve crossing count");
+    require(bvh.toggled_components == mapped.toggled_components,
+            "mapped candidates preserve component parity");
+    require(bvh.root_count_known == mapped.root_count_known,
+            "mapped candidates preserve root-count status");
+    require(bvh.changes_component_membership
+                == mapped.changes_component_membership,
+            "mapped candidates preserve membership changes");
+    require(bvh.diagnostics.bvh_candidate_elements
+                == bvh.diagnostics.candidate_elements,
+            "baseline diagnostics count BVH candidates");
+    require(mapped.diagnostics.mapped_candidate_elements
+                == mapped.diagnostics.candidate_elements,
+            "mapped diagnostics count supplied candidates");
+    require(bvh.diagnostics.maximum_candidate_elements_per_edge
+                    == bvh.diagnostics.candidate_elements
+                && mapped.diagnostics.maximum_candidate_elements_per_edge
+                    == mapped.diagnostics.candidate_elements,
+            "candidate diagnostics record the maximum edge workload");
+    for (std::size_t root = 0; root < bvh.crossings.size(); ++root) {
+        require(bvh.crossings[root].patch_index
+                    == mapped.crossings[root].patch_index,
+                "mapped candidates preserve crossing patch");
+        require(bvh.crossings[root].edge_parameter
+                    == mapped.crossings[root].edge_parameter,
+                "mapped candidates preserve crossing parameter");
+        require((bvh.crossings[root].point
+                    - mapped.crossings[root].point).norm() == 0.0,
+                "mapped candidates preserve crossing point");
+    }
+    require_throws_contains(
+        [&] { (void)intersector.intersect_cartesian_edge(
+            query, {ids.front(), ids.front()}); },
+        "duplicate NURBS query-element candidate ID",
+        "mapped query rejects duplicate IDs");
+    require_throws_contains(
+        [&] { (void)intersector.intersect_cartesian_edge(
+            query, {descriptors.size()}); },
+        "NURBS query-element candidate ID is outside storage",
+        "mapped query rejects out-of-range IDs");
 }
 
 void test_nurbs_cartesian_under_resolved_torus_uses_parity()
@@ -3186,6 +3277,7 @@ int main()
         test_nurbs_cartesian_multiple_components();
         test_nurbs_cartesian_curved_targets_and_triangle_independence();
         test_cartesian_edge_collects_multiple_crossings();
+        test_selectable_preprocess_candidate_workload();
         test_uniform_native_dofs();
         test_parameter_candidates();
         test_grid_edge_triangle_owners();

@@ -12,6 +12,12 @@ namespace kfbim::geometry3d {
 
 class NurbsCartesianDomain3D;
 
+enum class NurbsCartesianPreprocessStrategy3D {
+    CertifiedBaseline,
+    OptimizedIntersection,
+    Hybrid
+};
+
 class NurbsSurfaceCrossingRange3D {
 public:
     NurbsSurfaceCrossingRange3D() noexcept = default;
@@ -32,6 +38,8 @@ private:
 
 struct NurbsCartesianDomainOptions3D {
     bool use_triangle_seeds = true;
+    NurbsCartesianPreprocessStrategy3D strategy =
+        NurbsCartesianPreprocessStrategy3D::CertifiedBaseline;
 };
 struct NurbsCartesianEdgeClassification3D {
     bool queried = false;
@@ -52,6 +60,7 @@ struct NurbsCartesianDomainDiagnostics3D {
     int bezier_element_count = 0;
     int acceleration_leaf_count = 0;
     std::size_t candidate_grid_edge_count = 0;
+    std::size_t candidate_element_incidence_count = 0;
     double maximum_query_element_extent = 0.0;
     std::array<std::size_t, 3> barrier_edge_counts{{0, 0, 0}};
     std::array<std::size_t, 3> interface_edge_counts{{0, 0, 0}};
@@ -75,6 +84,14 @@ struct NurbsCartesianDomainDiagnostics3D {
     NurbsSurfaceIntersectionDiagnostics3D intersections;
     NurbsSurfaceIntersectionDiagnostics3D targeted_retry_intersections;
     double maximum_root_residual = 0.0;
+    double intersector_build_seconds = 0.0;
+    double candidate_enumeration_seconds = 0.0;
+    double edge_intersection_seconds = 0.0;
+    double edge_materialization_seconds = 0.0;
+    double flood_labeling_seconds = 0.0;
+    double representative_classification_seconds = 0.0;
+    double invariant_verification_seconds = 0.0;
+    double total_construction_seconds = 0.0;
 };
 
 class NurbsCartesianDomain3D {
