@@ -1208,6 +1208,35 @@ bool is_retryable_ray_degeneracy(const std::string& message)
 
 } // namespace
 
+NurbsSurfaceCandidate3D::NurbsSurfaceCandidate3D(
+    const NurbsSurfaceIntersector3D* source,
+    std::size_t query_element,
+    int patch_index,
+    int component,
+    NurbsAabb3D bounds)
+    : source_(source)
+    , query_element_(query_element)
+    , patch_index_(patch_index)
+    , component_(component)
+    , bounds_(std::move(bounds))
+{
+}
+
+int NurbsSurfaceCandidate3D::patch_index() const noexcept
+{
+    return patch_index_;
+}
+
+int NurbsSurfaceCandidate3D::component() const noexcept
+{
+    return component_;
+}
+
+const NurbsAabb3D& NurbsSurfaceCandidate3D::bounds() const noexcept
+{
+    return bounds_;
+}
+
 NurbsSurfaceIntersector3D::NurbsSurfaceIntersector3D(
     NurbsSurfaceModel3D model,
     NurbsSurfaceIntersectorOptions3D options)
@@ -1286,6 +1315,146 @@ NurbsSurfaceIntersector3D::query_element_samples(std::size_t element) const
             "NURBS query-element sample index is outside storage");
     }
     return element_samples_[element];
+}
+
+void NurbsSurfaceIntersector3D::validate_segment(
+    const Eigen::Vector3d& start,
+    const Eigen::Vector3d& end) const
+{
+    if (!start.allFinite() || !end.allFinite())
+        throw std::invalid_argument("NURBS intersection segment must be finite");
+    const double segment_length = (end - start).norm();
+    if (!std::isfinite(segment_length)
+        || segment_length <= geometry_tolerance_) {
+        throw std::invalid_argument(
+            "NURBS intersection segment endpoints must be distinct");
+    }
+}
+
+void NurbsSurfaceIntersector3D::validate_candidate_owner(
+    const NurbsSurfaceCandidate3D& candidate) const
+{
+    if (candidate.source_ != this) {
+        throw std::invalid_argument(
+            "candidate belongs to a different NURBS surface intersector");
+    }
+    if (candidate.query_element_ >= elements_.size()) {
+        throw std::invalid_argument(
+            "NURBS surface candidate element index is invalid");
+    }
+}
+
+std::vector<NurbsSurfaceCandidate3D>
+NurbsSurfaceIntersector3D::conservative_candidates(
+    const NurbsAabb3D& query_bounds) const
+{
+    if (!query_bounds.lower.allFinite()
+        || !query_bounds.upper.allFinite()
+        || !(query_bounds.lower.array()
+             <= query_bounds.upper.array()).all()) {
+        throw std::invalid_argument(
+            "NURBS candidate query bounds must be finite and ordered");
+    }
+
+    std::vector<int> indices;
+    collect_candidate_elements(bvh_root_, query_bounds, indices);
+    std::sort(
+        indices.begin(), indices.end(), [&](int first, int second) {
+            const RationalBezierElement3D& first_element =
+                elements_[static_cast<std::size_t>(first)];
+            const RationalBezierElement3D& second_element =
+                elements_[static_cast<std::size_t>(second)];
+            return std::make_tuple(
+                       first_element.patch_index,
+                       first_element.component, first)
+                 < std::make_tuple(
+                       second_element.patch_index,
+                       second_element.component, second);
+        });
+    indices.erase(
+        std::unique(indices.begin(), indices.end()), indices.end());
+
+    std::vector<NurbsSurfaceCandidate3D> candidates;
+    candidates.reserve(indices.size());
+    for (const int index : indices) {
+        const RationalBezierElement3D& element =
+            elements_[static_cast<std::size_t>(index)];
+        candidates.push_back(NurbsSurfaceCandidate3D(
+            this, static_cast<std::size_t>(index),
+            element.patch_index, element.component, element.bounds()));
+    }
+    return candidates;
+}
+
+std::vector<NurbsSurfaceCandidate3D>
+NurbsSurfaceIntersector3D::conservative_segment_candidates(
+    const Eigen::Vector3d& start,
+    const Eigen::Vector3d& end) const
+{
+    validate_segment(start, end);
+    return conservative_candidates(segment_bounds(start, end));
+}
+
+NurbsSurfaceCandidateCertificate3D
+NurbsSurfaceIntersector3D::certify_candidate_segment(
+    const NurbsSurfaceCandidate3D& candidate,
+    const Eigen::Vector3d& start,
+    const Eigen::Vector3d& end) const
+{
+    validate_candidate_owner(candidate);
+    validate_segment(start, end);
+
+    const RationalBezierElement3D& element =
+        elements_[candidate.query_element_];
+    NurbsElementIntersectionOptions3D options;
+    options.geometry_tolerance = geometry_tolerance_;
+    options.use_triangle_seed = options_.use_triangle_seeds;
+    options.max_subdivision_depth =
+        options_.local_max_subdivision_depth;
+    const std::vector<NurbsElementParameterSeed3D> sample_seeds =
+        select_sample_seeds(
+            element_samples_[candidate.query_element_], start, end);
+    std::optional<Eigen::Vector2d> preferred_seed;
+    if (!sample_seeds.empty()) {
+        preferred_seed = Eigen::Vector2d(
+            sample_seeds.front().u, sample_seeds.front().v);
+    }
+    const NurbsElementSegmentCertificate3D certificate =
+        certify_nurbs_bezier_element_segment_3d(
+            element, model_.patch(element.patch_index), start, end,
+            options, preferred_seed);
+
+    NurbsSurfaceCandidateCertificate3D result;
+    result.kind = certificate.kind;
+    result.diagnostics = certificate.diagnostics;
+    result.overlap_detected = certificate.overlap_detected;
+    if (!certificate.root)
+        return result;
+
+    result.crossing = as_surface_crossing(*certificate.root);
+    result.crossing->feature_edge_contact =
+        root_on_non_g1_feature(*result.crossing, model_);
+    const double segment_length = (end - start).norm();
+    const double edge_tolerance =
+        segment_parameter_tolerance(geometry_tolerance_, segment_length);
+    result.segment_parameter_strictly_interior =
+        certificate.root->t > edge_tolerance
+        && certificate.root->t < 1.0 - edge_tolerance;
+
+    const NurbsSurfacePatch3D& patch =
+        model_.patch(element.patch_index);
+    const double uv_tolerance = parameter_tolerance(patch);
+    result.element_parameter_strictly_interior =
+        certificate.root->u > element.u0() + uv_tolerance
+        && certificate.root->u < element.u1() - uv_tolerance
+        && certificate.root->v > element.v0() + uv_tolerance
+        && certificate.root->v < element.v1() - uv_tolerance;
+    result.patch_parameter_strictly_interior =
+        certificate.root->u > patch.domain_start_u() + uv_tolerance
+        && certificate.root->u < patch.domain_end_u() - uv_tolerance
+        && certificate.root->v > patch.domain_start_v() + uv_tolerance
+        && certificate.root->v < patch.domain_end_v() - uv_tolerance;
+    return result;
 }
 
 int NurbsSurfaceIntersector3D::build_bvh_node(int begin, int end)
@@ -1378,20 +1547,30 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
     const Eigen::Vector3d& end,
     const NurbsCartesianEdgeQuery3D* cartesian_edge) const
 {
-    if (!start.allFinite() || !end.allFinite())
-        throw std::invalid_argument("NURBS intersection segment must be finite");
-    const double segment_length = (end - start).norm();
-    if (!std::isfinite(segment_length)
-        || segment_length <= geometry_tolerance_) {
-        throw std::invalid_argument(
-            "NURBS intersection segment endpoints must be distinct");
-    }
-
-    std::vector<int> candidates;
+    validate_segment(start, end);
+    std::vector<int> candidate_indices;
     collect_candidate_elements(
-        bvh_root_, segment_bounds(start, end), candidates);
-    std::sort(candidates.begin(), candidates.end());
+        bvh_root_, segment_bounds(start, end), candidate_indices);
+    std::sort(candidate_indices.begin(), candidate_indices.end());
+    std::vector<std::size_t> candidates;
+    candidates.reserve(candidate_indices.size());
+    for (const int candidate : candidate_indices)
+        candidates.push_back(static_cast<std::size_t>(candidate));
+    return intersect_segment_candidate_indices(
+        start, end, candidates, cartesian_edge, 0, nullptr, nullptr);
+}
 
+NurbsSurfaceIntersectionResult3D
+NurbsSurfaceIntersector3D::intersect_segment_candidate_indices(
+    const Eigen::Vector3d& start,
+    const Eigen::Vector3d& end,
+    const std::vector<std::size_t>& candidates,
+    const NurbsCartesianEdgeQuery3D* cartesian_edge,
+    int maximum_independent_crossings,
+    bool* all_candidates_processed,
+    bool* independent_crossing_limit_reached) const
+{
+    const double segment_length = (end - start).norm();
     NurbsSurfaceIntersectionResult3D result;
     std::vector<NurbsSurfaceCrossing3D> roots;
     std::vector<NurbsSurfaceCrossing3D> tangential_roots;
@@ -1490,17 +1669,17 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
     local_options.use_triangle_seed = options_.use_triangle_seeds;
     local_options.max_subdivision_depth =
         options_.local_max_subdivision_depth;
-    for (const int candidate : candidates) {
+    for (const std::size_t candidate : candidates) {
         checked_increment_diagnostic(
             result.diagnostics.candidate_elements,
             "NURBS candidate-element diagnostic overflow");
         const RationalBezierElement3D& element =
-            elements_[static_cast<std::size_t>(candidate)];
+            elements_[candidate];
         const NurbsSurfacePatch3D& source_patch =
             model_.patch(element.patch_index);
         NurbsElementIntersectionOptions3D candidate_options = local_options;
         candidate_options.parameter_seeds = select_sample_seeds(
-            element_samples_[static_cast<std::size_t>(candidate)], start, end);
+            element_samples_[candidate], start, end);
         checked_accumulate_diagnostic(
             result.diagnostics.sample_seed_candidates,
             16, "NURBS sample-candidate diagnostic overflow");
@@ -1510,6 +1689,53 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
                     element, source_patch,
                     start, end, candidate_options);
             accumulate_local(local);
+            if (maximum_independent_crossings > 0) {
+                NurbsSurfaceIntersectionDiagnostics3D
+                    canonical_diagnostics = result.diagnostics;
+                std::vector<NurbsSurfaceCrossing3D> canonical =
+                    canonicalize_roots(
+                        roots, model_, geometry_tolerance_, segment_length,
+                        canonical_diagnostics, true);
+                struct RootInterval {
+                    double lower = 0.0;
+                    double upper = 0.0;
+                };
+                std::vector<RootInterval> intervals;
+                intervals.reserve(canonical.size());
+                for (const NurbsSurfaceCrossing3D& root : canonical) {
+                    const double uncertainty =
+                        root_edge_parameter_uncertainty(
+                            root, geometry_tolerance_, segment_length);
+                    intervals.push_back({
+                        root.edge_parameter - uncertainty,
+                        root.edge_parameter + uncertainty});
+                }
+                std::sort(
+                    intervals.begin(), intervals.end(),
+                    [](const RootInterval& first,
+                       const RootInterval& second) {
+                        return std::tie(first.upper, first.lower)
+                            < std::tie(second.upper, second.lower);
+                    });
+                int independent = 0;
+                double previous_upper =
+                    -std::numeric_limits<double>::infinity();
+                for (const RootInterval& interval : intervals) {
+                    if (independent == 0
+                        || interval.lower > previous_upper) {
+                        ++independent;
+                        previous_upper = interval.upper;
+                    }
+                }
+                if (independent >= maximum_independent_crossings) {
+                    result.crossings = std::move(canonical);
+                    result.diagnostics =
+                        std::move(canonical_diagnostics);
+                    *all_candidates_processed = false;
+                    *independent_crossing_limit_reached = true;
+                    return result;
+                }
+            }
             continue;
         }
 
@@ -1609,6 +1835,44 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
         result.diagnostics,
         result.diagnostics.unresolved_candidates == 0);
 
+    return result;
+}
+
+NurbsSurfaceFilteredIntersectionResult3D
+NurbsSurfaceIntersector3D::intersect_segment_candidates(
+    const Eigen::Vector3d& start,
+    const Eigen::Vector3d& end,
+    const std::vector<NurbsSurfaceCandidate3D>& ordered_candidates,
+    const NurbsSurfaceFilteredIntersectionOptions3D& options) const
+{
+    validate_segment(start, end);
+    if (options.maximum_independent_crossings < 2) {
+        throw std::invalid_argument(
+            "maximum independent NURBS crossings must be at least two");
+    }
+
+    std::vector<bool> seen(elements_.size(), false);
+    std::vector<std::size_t> candidates;
+    candidates.reserve(ordered_candidates.size());
+    for (const NurbsSurfaceCandidate3D& candidate : ordered_candidates) {
+        validate_candidate_owner(candidate);
+        if (seen[candidate.query_element_]) {
+            throw std::invalid_argument(
+                "NURBS surface candidates must be unique");
+        }
+        seen[candidate.query_element_] = true;
+        candidates.push_back(candidate.query_element_);
+    }
+
+    NurbsSurfaceFilteredIntersectionResult3D result;
+    result.intersection = intersect_segment_candidate_indices(
+        start, end, candidates, nullptr,
+        options.maximum_independent_crossings,
+        &result.all_candidates_processed,
+        &result.independent_crossing_limit_reached);
+    (void)analyze_close_root_pairs(
+        result.intersection.crossings, model_, elements_, start, end,
+        geometry_tolerance_, result.intersection.diagnostics);
     return result;
 }
 

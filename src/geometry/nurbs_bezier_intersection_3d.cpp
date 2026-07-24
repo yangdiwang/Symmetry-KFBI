@@ -1690,6 +1690,104 @@ UnresolvedNurbsIntersectionCandidate3D::partial_result() const noexcept
     return partial_result_;
 }
 
+NurbsElementSegmentCertificate3D certify_nurbs_bezier_element_segment_3d(
+    const RationalBezierElement3D& element,
+    const NurbsSurfacePatch3D& patch,
+    const Eigen::Vector3d& segment_start,
+    const Eigen::Vector3d& segment_end,
+    const NurbsElementIntersectionOptions3D& options,
+    std::optional<Eigen::Vector2d> preferred_seed)
+{
+    using CertificateKind = NurbsElementSegmentCertificateKind3D;
+
+    validate_inputs(element, patch, segment_start, segment_end, options);
+    const SegmentFrame frame = make_segment_frame(segment_start, segment_end);
+    NurbsElementIntersectionDiagnostics3D diagnostics;
+    checked_increment_diagnostic(
+        diagnostics.subdivision_boxes,
+        "NURBS subdivision-box diagnostic overflow");
+
+    if (!is_conservative_candidate(
+            projected_ranges(element, frame), frame,
+            options.geometry_tolerance)) {
+        checked_increment_diagnostic(
+            diagnostics.conservative_rejections,
+            "NURBS conservative-rejection diagnostic overflow");
+        return {CertificateKind::CertifiedMiss, std::nullopt,
+                diagnostics, false};
+    }
+
+    if (certifies_supported_overlap(element, patch, frame, options)) {
+        return {CertificateKind::Unresolved, std::nullopt,
+                diagnostics, true};
+    }
+
+    const NurbsElementSegmentClosestPointResult3D closest =
+        run_closest_point_assistance(
+            element, patch, frame, options, diagnostics, preferred_seed);
+    const double contact_tolerance =
+        8.0 * options.geometry_tolerance;
+    if (!closest.converged || !std::isfinite(closest.distance)) {
+        checked_increment_diagnostic(
+            diagnostics.closest_point_failures,
+            "NURBS closest-point failure diagnostic overflow");
+        checked_increment_diagnostic(
+            diagnostics.unresolved_boxes,
+            "NURBS unresolved-box diagnostic overflow");
+        return {CertificateKind::Unresolved, std::nullopt,
+                diagnostics, false};
+    }
+
+    const Eigen::Vector3d preferred_separation =
+        closest.surface_point - closest.segment_point;
+    if (closest.distance > contact_tolerance) {
+        if (certifies_terminal_separation(
+                element, frame, preferred_separation,
+                options.geometry_tolerance, diagnostics)) {
+            checked_increment_diagnostic(
+                diagnostics.terminal_misses_by_closest_point,
+                "NURBS terminal-miss diagnostic overflow");
+            return {CertificateKind::CertifiedMiss, std::nullopt,
+                    diagnostics, false};
+        }
+        checked_increment_diagnostic(
+            diagnostics.unresolved_boxes,
+            "NURBS unresolved-box diagnostic overflow");
+        return {CertificateKind::Unresolved, std::nullopt,
+                diagnostics, false};
+    }
+
+    const std::optional<NurbsElementRoot3D> root =
+        root_from_closest_point(element, patch, frame, options, closest);
+    if (!root) {
+        checked_increment_diagnostic(
+            diagnostics.closest_point_failures,
+            "NURBS closest-point failure diagnostic overflow");
+        checked_increment_diagnostic(
+            diagnostics.unresolved_boxes,
+            "NURBS unresolved-box diagnostic overflow");
+        return {CertificateKind::Unresolved, std::nullopt,
+                diagnostics, false};
+    }
+    checked_increment_diagnostic(
+        diagnostics.roots_recovered_by_closest_point,
+        "NURBS closest-point recovery diagnostic overflow");
+
+    const bool one_root_is_proved = certifies_terminal_single_root(
+        element, *root, frame, preferred_separation,
+        options.geometry_tolerance, diagnostics);
+    if (one_root_is_proved
+        && root->transversality
+            > root->reliable_transversality_tolerance) {
+        return {CertificateKind::CertifiedUniqueTransverseRoot, root,
+                diagnostics, false};
+    }
+    checked_increment_diagnostic(
+        diagnostics.unresolved_boxes,
+        "NURBS unresolved-box diagnostic overflow");
+    return {CertificateKind::Unresolved, root, diagnostics, false};
+}
+
 NurbsElementIntersectionResult3D intersect_nurbs_bezier_element_3d(
     const RationalBezierElement3D& element,
     const NurbsSurfacePatch3D& patch,

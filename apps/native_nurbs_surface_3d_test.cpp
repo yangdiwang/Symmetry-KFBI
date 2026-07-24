@@ -23,6 +23,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 
 namespace {
 
@@ -786,6 +787,109 @@ void test_closest_point_classifies_terminal_intersection_boxes()
             "uncertified terminal tangent is retained in a fail-closed result");
 }
 
+void test_nurbs_element_segment_certificates()
+{
+    using kfbim::geometry::NurbsBasis1D;
+    using kfbim::geometry3d::NurbsElementIntersectionOptions3D;
+    using kfbim::geometry3d::NurbsSurfaceModel3D;
+    using kfbim::geometry3d::NurbsSurfacePatch3D;
+    using CertificateKind =
+        kfbim::geometry3d::NurbsElementSegmentCertificateKind3D;
+
+    NurbsElementIntersectionOptions3D options;
+    options.geometry_tolerance = 1.0e-12;
+    options.parameter_tolerance = 1.0e-12;
+    options.max_subdivision_depth = 0;
+    options.use_triangle_seed = false;
+
+    const NurbsSurfacePatch3D separated_plane(
+        NurbsBasis1D(1, {0.0, 0.0, 1.0, 1.0}),
+        NurbsBasis1D(1, {0.0, 0.0, 1.0, 1.0}),
+        {{{0.0, -1.0, 2.0}, {0.0, 2.0, -1.0}},
+         {{1.0, -1.0, 2.0}, {1.0, 2.0, -1.0}}},
+        {{1.0, 1.0}, {1.0, 1.0}});
+    const NurbsSurfaceModel3D separated_model(
+        {separated_plane}, {0}, {});
+    const auto separated_element =
+        kfbim::geometry3d::extract_rational_bezier_elements_3d(
+            separated_model).front();
+    const auto miss =
+        kfbim::geometry3d::certify_nurbs_bezier_element_segment_3d(
+            separated_element, separated_model.patch(0),
+            {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, options);
+    require(miss.kind == CertificateKind::CertifiedMiss
+                && !miss.root.has_value()
+                && !miss.overlap_detected,
+            "typed certificate proves a terminal miss");
+
+    const NurbsSurfaceModel3D plane_model(
+        {NurbsSurfacePatch3D::make_unit_square_xy()}, {0}, {});
+    const auto plane_element =
+        kfbim::geometry3d::extract_rational_bezier_elements_3d(
+            plane_model).front();
+    const auto root =
+        kfbim::geometry3d::certify_nurbs_bezier_element_segment_3d(
+            plane_element, plane_model.patch(0),
+            {0.3, 0.4, -0.5}, {0.3, 0.4, 0.5}, options,
+            Eigen::Vector2d(0.3, 0.4));
+    require(root.kind == CertificateKind::CertifiedUniqueTransverseRoot
+                && root.root.has_value()
+                && root.root->transversality
+                       > root.root->reliable_transversality_tolerance,
+            "typed certificate preserves the producer reliability threshold");
+
+    const NurbsSurfaceModel3D cylinder_model(
+        {NurbsSurfacePatch3D::make_quarter_cylinder_patch(1.0, 0.0, 1.0)},
+        {0}, {});
+    const auto cylinder_element =
+        kfbim::geometry3d::extract_rational_bezier_elements_3d(
+            cylinder_model).front();
+    const auto contact_data =
+        cylinder_model.patch(0).evaluate_with_derivatives(0.4, 0.6);
+    const Eigen::Vector3d contact = contact_data.point;
+    const Eigen::Vector3d tangent_direction =
+        contact_data.du.normalized();
+    auto tangent_options = options;
+    tangent_options.max_newton_iterations = 1;
+    const auto tangent =
+        kfbim::geometry3d::certify_nurbs_bezier_element_segment_3d(
+            cylinder_element, cylinder_model.patch(0),
+            contact - 0.25 * tangent_direction,
+            contact + 0.25 * tangent_direction,
+            tangent_options, Eigen::Vector2d(0.4, 0.6));
+    require(tangent.kind == CertificateKind::Unresolved,
+            "typed certificate fails closed at tangency");
+
+    const NurbsSurfacePatch3D two_root_graph(
+        NurbsBasis1D(2, {0.0, 0.0, 0.0, 1.0, 1.0, 1.0}),
+        NurbsBasis1D(1, {0.0, 0.0, 1.0, 1.0}),
+        {{{0.0, 0.0, 0.16}, {0.0, 1.0, 0.16}},
+         {{0.5, 0.0, -0.34}, {0.5, 1.0, -0.34}},
+         {{1.0, 0.0, 0.16}, {1.0, 1.0, 0.16}}},
+        {{1.0, 1.0}, {1.0, 1.0}, {1.0, 1.0}});
+    const NurbsSurfaceModel3D two_root_model(
+        {two_root_graph}, {0}, {});
+    const auto two_root_element =
+        kfbim::geometry3d::extract_rational_bezier_elements_3d(
+            two_root_model).front();
+    const auto two_root =
+        kfbim::geometry3d::certify_nurbs_bezier_element_segment_3d(
+            two_root_element, two_root_model.patch(0),
+            {0.0, 0.5, 0.0}, {1.0, 0.5, 0.0}, options);
+    require(two_root.kind == CertificateKind::Unresolved,
+            "typed certificate does not collapse two roots");
+
+    const double coordinate = std::sqrt(0.5);
+    const auto overlap =
+        kfbim::geometry3d::certify_nurbs_bezier_element_segment_3d(
+            cylinder_element, cylinder_model.patch(0),
+            {coordinate, coordinate, 0.2},
+            {coordinate, coordinate, 0.8}, options);
+    require(overlap.kind == CertificateKind::Unresolved
+                && overlap.overlap_detected,
+            "typed certificate reports overlap as unresolved");
+}
+
 void test_bezier_element_intersection_isolates_all_roots_and_fails_safe()
 {
     using kfbim::geometry::NurbsBasis1D;
@@ -1524,6 +1628,194 @@ void test_tangent_witness_does_not_swallow_unresolved_candidate()
                 && !unresolved_edge.parity_known_from_roots
                 && !unresolved_edge.crossings.empty(),
             "Cartesian unresolved query preserves roots and unknown parity");
+}
+
+void test_nurbs_surface_candidate_facade()
+{
+    using kfbim::geometry3d::NurbsElementSegmentCertificateKind3D;
+    using kfbim::geometry3d::NurbsSurfaceIntersector3D;
+
+    const NativeNurbsSurface3D torus =
+        make_native_nurbs_surface_3d(GeometryKind3D::Torus);
+    const NurbsSurfaceIntersector3D intersector(torus.geometry_model());
+    const Eigen::Vector3d start(0.80, -0.04, 0.03);
+    const Eigen::Vector3d end(0.84, -0.04, 0.03);
+    const auto candidates =
+        intersector.conservative_segment_candidates(start, end);
+    require(!candidates.empty()
+                && std::is_sorted(
+                    candidates.begin(), candidates.end(),
+                    [](const auto& a, const auto& b) {
+                        return std::make_tuple(
+                                   a.patch_index(), a.component())
+                             < std::make_tuple(
+                                   b.patch_index(), b.component());
+                    }),
+            "candidate metadata is deterministic");
+    require(std::all_of(
+                candidates.begin(), candidates.end(), [](const auto& candidate) {
+                    return candidate.patch_index() >= 0
+                        && candidate.component() >= 0
+                        && candidate.bounds().lower.allFinite()
+                        && candidate.bounds().upper.allFinite()
+                        && (candidate.bounds().lower.array()
+                            <= candidate.bounds().upper.array()).all();
+                }),
+            "opaque candidates expose finite conservative metadata");
+
+    bool found_unique_certificate = false;
+    for (const auto& candidate : candidates) {
+        const auto certificate =
+            intersector.certify_candidate_segment(candidate, start, end);
+        found_unique_certificate =
+            found_unique_certificate
+            || (certificate.kind
+                    == NurbsElementSegmentCertificateKind3D::
+                        CertifiedUniqueTransverseRoot
+                && certificate.crossing.has_value());
+    }
+    require(found_unique_certificate,
+            "candidate facade exposes a typed unique-root certificate");
+
+    const NurbsSurfaceIntersector3D other_intersector(torus.geometry_model());
+    require_throws_type_contains<std::invalid_argument>(
+        [&] {
+            (void)other_intersector.certify_candidate_segment(
+                candidates.front(), start, end);
+        },
+        "different NURBS surface intersector",
+        "candidate ownership is enforced");
+}
+
+void test_filtered_nurbs_surface_intersection()
+{
+    using kfbim::geometry3d::NurbsSurfaceFilteredIntersectionOptions3D;
+    using kfbim::geometry3d::NurbsSurfaceIntersector3D;
+
+    const NativeNurbsSurface3D torus =
+        make_native_nurbs_surface_3d(GeometryKind3D::Torus);
+    const NurbsSurfaceIntersector3D intersector(torus.geometry_model());
+
+    const Eigen::Vector3d seam_start(0.80, -0.04, 0.03);
+    const Eigen::Vector3d seam_end(0.84, -0.04, 0.03);
+    const auto seam_candidates =
+        intersector.conservative_segment_candidates(seam_start, seam_end);
+    const auto seam_filtered = intersector.intersect_segment_candidates(
+        seam_start, seam_end, seam_candidates);
+    const auto seam_reference =
+        intersector.intersect_segment(seam_start, seam_end);
+    require(seam_filtered.all_candidates_processed
+                && !seam_filtered.independent_crossing_limit_reached
+                && seam_filtered.intersection.crossings.size() == 1,
+            "periodic G1 seam duplicate remains one canonical crossing");
+    const auto& filtered_crossing =
+        seam_filtered.intersection.crossings.front();
+    const auto& reference_crossing = seam_reference.crossings.front();
+    require(filtered_crossing.patch_index == reference_crossing.patch_index
+                && std::abs(filtered_crossing.u - reference_crossing.u)
+                       <= 2.0e-12
+                && std::abs(filtered_crossing.v - reference_crossing.v)
+                       <= 2.0e-12
+                && std::abs(filtered_crossing.edge_parameter
+                            - reference_crossing.edge_parameter)
+                       <= 2.0e-12
+                && std::abs(filtered_crossing.residual
+                            - reference_crossing.residual)
+                       <= intersector.geometry_tolerance()
+                && filtered_crossing.residual
+                       <= intersector.geometry_tolerance(),
+            "filtered unique crossing agrees with the full segment query");
+
+    const Eigen::Vector3d long_torus_start(-1.0, -0.04, 0.03);
+    const Eigen::Vector3d long_torus_end(1.0, -0.04, 0.03);
+    auto ordered = intersector.conservative_segment_candidates(
+        long_torus_start, long_torus_end);
+    std::stable_sort(
+        ordered.begin(), ordered.end(),
+        [](const auto& a, const auto& b) {
+            return std::make_tuple(
+                       a.bounds().lower.x(), a.bounds().upper.x(),
+                       a.patch_index(), a.component())
+                 < std::make_tuple(
+                       b.bounds().lower.x(), b.bounds().upper.x(),
+                       b.patch_index(), b.component());
+        });
+    NurbsSurfaceFilteredIntersectionOptions3D capped;
+    capped.maximum_independent_crossings = 2;
+    const auto filtered =
+        intersector.intersect_segment_candidates(
+            long_torus_start, long_torus_end, ordered, capped);
+    require(filtered.independent_crossing_limit_reached
+                && !filtered.all_candidates_processed
+                && filtered.intersection.crossings.size() == 2,
+            "filtered query stops at two independent canonical roots");
+
+    constexpr double crossing_transversality = 1.0e-1;
+    const Eigen::Vector3d near_tangent_direction(
+        crossing_transversality,
+        std::sqrt(1.0 - crossing_transversality
+                          * crossing_transversality),
+        0.0);
+    const double translation_distance =
+        40.0 * intersector.geometry_tolerance();
+    const auto base_model = torus.geometry_model();
+    const int patch_offset = base_model.num_patches();
+    const int component_offset = base_model.num_components();
+    auto translated_patches = base_model.patches();
+    for (const auto& patch : base_model.patches()) {
+        auto controls = patch.control_net();
+        for (auto& row : controls) {
+            for (Eigen::Vector3d& control : row)
+                control += translation_distance * near_tangent_direction;
+        }
+        translated_patches.emplace_back(
+            patch.basis_u(), patch.basis_v(),
+            std::move(controls), patch.weights());
+    }
+    std::vector<int> translated_components;
+    for (int patch = 0; patch < patch_offset; ++patch)
+        translated_components.push_back(base_model.patch_component(patch));
+    for (int patch = 0; patch < patch_offset; ++patch) {
+        translated_components.push_back(
+            base_model.patch_component(patch) + component_offset);
+    }
+    auto translated_connections = base_model.connections();
+    for (auto connection : base_model.connections()) {
+        connection.first.patch += patch_offset;
+        connection.second.patch += patch_offset;
+        translated_connections.push_back(connection);
+    }
+    const NurbsSurfaceIntersector3D translated_intersector(
+        kfbim::geometry3d::NurbsSurfaceModel3D(
+            std::move(translated_patches),
+            std::move(translated_components),
+            std::move(translated_connections)));
+    const Eigen::Vector3d crossing_point = reference_crossing.point;
+    const Eigen::Vector3d near_tangent_start =
+        crossing_point - 0.02 * near_tangent_direction;
+    const Eigen::Vector3d near_tangent_end =
+        crossing_point + 0.02 * near_tangent_direction;
+    const auto near_tangent_candidates =
+        translated_intersector.conservative_segment_candidates(
+            near_tangent_start, near_tangent_end);
+    const auto near_tangent_filtered =
+        translated_intersector.intersect_segment_candidates(
+            near_tangent_start, near_tangent_end,
+            near_tangent_candidates, capped);
+    require(near_tangent_filtered.all_candidates_processed
+                && !near_tangent_filtered.independent_crossing_limit_reached
+                && near_tangent_filtered.intersection.crossings.size() == 2,
+            "overlapping root uncertainty intervals do not stop early");
+
+    auto duplicate_candidates = seam_candidates;
+    duplicate_candidates.push_back(seam_candidates.front());
+    require_throws_type_contains<std::invalid_argument>(
+        [&] {
+            (void)intersector.intersect_segment_candidates(
+                seam_start, seam_end, duplicate_candidates);
+        },
+        "unique",
+        "filtered query rejects duplicate candidates");
 }
 
 void test_native_nurbs_surface_intersector()
@@ -3163,6 +3455,7 @@ int main()
         test_benchmark_rational_bezier_elements_are_conservative();
         test_nurbs_bezier_segment_closest_point();
         test_closest_point_classifies_terminal_intersection_boxes();
+        test_nurbs_element_segment_certificates();
         test_rational_bezier_element_intersection();
         test_bezier_element_intersection_isolates_all_roots_and_fails_safe();
         test_analytic_ruled_graph_root_cases();
@@ -3177,6 +3470,8 @@ int main()
         test_bezier_rejects_extreme_degree_control_count();
         test_single_patch_periodic_seam_canonicalization();
         test_tangent_witness_does_not_swallow_unresolved_candidate();
+        test_nurbs_surface_candidate_facade();
+        test_filtered_nurbs_surface_intersection();
         test_native_nurbs_surface_intersector();
         test_direct_nurbs_point_classification();
         test_nurbs_cartesian_l_prism_labels();

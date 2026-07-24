@@ -3,6 +3,7 @@
 #include "rational_bezier_element_3d.hpp"
 
 #include <Eigen/Dense>
+#include <optional>
 #include <stdexcept>
 
 #include <vector>
@@ -56,6 +57,20 @@ struct NurbsElementIntersectionResult3D {
     bool overlap_detected = false;
 };
 
+enum class NurbsElementSegmentCertificateKind3D {
+    CertifiedMiss,
+    CertifiedUniqueTransverseRoot,
+    Unresolved
+};
+
+struct NurbsElementSegmentCertificate3D {
+    NurbsElementSegmentCertificateKind3D kind =
+        NurbsElementSegmentCertificateKind3D::Unresolved;
+    std::optional<NurbsElementRoot3D> root;
+    NurbsElementIntersectionDiagnostics3D diagnostics;
+    bool overlap_detected = false;
+};
+
 class UnresolvedNurbsIntersectionCandidate3D : public std::runtime_error {
 public:
     explicit UnresolvedNurbsIntersectionCandidate3D(
@@ -75,6 +90,14 @@ struct NurbsElementIntersectionOptions3D {
     bool use_triangle_seed = true;
     std::vector<NurbsElementParameterSeed3D> parameter_seeds;
 };
+
+NurbsElementSegmentCertificate3D certify_nurbs_bezier_element_segment_3d(
+    const RationalBezierElement3D& element,
+    const NurbsSurfacePatch3D& patch,
+    const Eigen::Vector3d& segment_start,
+    const Eigen::Vector3d& segment_end,
+    const NurbsElementIntersectionOptions3D& options,
+    std::optional<Eigen::Vector2d> preferred_seed = std::nullopt);
 
 NurbsElementIntersectionResult3D intersect_nurbs_bezier_element_3d(
     const RationalBezierElement3D& element,
