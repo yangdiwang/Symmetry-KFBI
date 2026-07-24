@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -27,6 +28,7 @@
 #include "dirichlet_rigid_transform_study_3d.hpp"
 #include "exterior_only_cubic_normal_restrict_3d.hpp"
 #include "harmonic_polynomial_space_3d.hpp"
+#include "kfbi_phase_profile_3d.hpp"
 #include "native_nurbs_surface_3d.hpp"
 #include "src/bulk_solvers/laplace_zfft_bulk_solver_3d.hpp"
 #include "src/geometry/grid_pair_3d.hpp"
@@ -59,6 +61,7 @@ using NativeNurbsSurface3D = app3d::NativeNurbsSurface3D;
 using SurfaceDof = app3d::SurfaceDof3D;
 using SurfaceDofCloud = app3d::SurfaceDofCloud3D;
 using SurfacePatchInfo = app3d::SurfaceDofPatch3D;
+using PhaseProfileKind3D = app3d::PhaseProfileKind3D;
 
 enum class CauchyStencilPolicy3D {
     G1Nearest,
@@ -77,6 +80,44 @@ enum class ExteriorNormalRestrictMode3D {
     JointTricubicCrossingOwner,
     ExteriorOnlyHarmonicCubic
 };
+
+using ProfileClock3D = std::chrono::steady_clock;
+
+template <class Function>
+auto profile_phase_3d(app3d::PhaseProfile3D* profile,
+                      PhaseProfileKind3D kind,
+                      std::uint64_t calls,
+                      Function&& function)
+    -> decltype(function())
+{
+    if (profile == nullptr)
+        return function();
+
+    profile->note_timer_reads(1);
+    const ProfileClock3D::time_point start = ProfileClock3D::now();
+    const auto finish = [&] {
+        profile->note_timer_reads(1);
+        profile->add(
+            kind,
+            std::chrono::duration<double>(
+                ProfileClock3D::now() - start).count(),
+            calls);
+    };
+    try {
+        using Result = decltype(function());
+        if constexpr (std::is_void<Result>::value) {
+            function();
+            finish();
+        } else {
+            Result result = function();
+            finish();
+            return result;
+        }
+    } catch (...) {
+        finish();
+        throw;
+    }
+}
 
 std::string cauchy_policy_name(CauchyStencilPolicy3D policy)
 {
@@ -843,13 +884,15 @@ public:
                                  const SurfaceDofCloud& cloud,
                                  const CauchyStencilSet& stencils,
                                  bool build_exterior_only_restrict = false,
-                                 bool build_crossing_owner_restrict = false)
+                                 bool build_crossing_owner_restrict = false,
+                                 app3d::PhaseProfile3D* phase_profile = nullptr)
         : grid_(grid)
         , grid_pair_(grid_pair)
         , native_surface_(native_surface)
         , correction_triangles_(correction_triangles)
         , geometry_triangles_(geometry_triangles)
         , cloud_(cloud)
+        , phase_profile_(phase_profile)
         , h_(grid.spacing()[0])
         , fit_(cloud, stencils, h_, kCauchyPolynomialDegree)
         , bulk_(grid, ZfftBcType::Dirichlet, 0.0, 2)
@@ -867,14 +910,47 @@ public:
                 std::make_unique<app3d::ExteriorOnlyCubicNormalRestrict3D>(
                     grid_, grid_pair_, cloud_);
         }
-        build_crossing_rows();
+        profile_phase_3d(
+            phase_profile_, PhaseProfileKind3D::CrossingRows, 1,
+            [&] {
+                build_crossing_rows();
+            });
         if (build_crossing_owner_restrict) {
             geometry3d::NurbsSurfaceIntersectorOptions3D options;
             options.maximum_element_extent = 2.0 * h_;
             options.local_max_subdivision_depth = 4;
             const geometry3d::NurbsSurfaceIntersector3D intersector(
                 native_surface_.geometry_model(), options);
+            double intersection_before = 0.0;
+            ProfileClock3D::time_point trace_start{};
+            if (phase_profile_ != nullptr) {
+                intersection_before = phase_profile_->record(
+                    PhaseProfileKind3D::NurbsSegmentIntersections).seconds;
+                phase_profile_->note_timer_reads(1);
+                trace_start = ProfileClock3D::now();
+            }
             build_trace_templates(&intersector);
+            if (phase_profile_ != nullptr) {
+                phase_profile_->note_timer_reads(1);
+                const double trace_seconds =
+                    std::chrono::duration<double>(
+                        ProfileClock3D::now() - trace_start).count();
+                const double intersection_seconds =
+                    phase_profile_->record(
+                        PhaseProfileKind3D::NurbsSegmentIntersections).seconds
+                    - intersection_before;
+                const double owner_assembly_seconds =
+                    trace_seconds - intersection_seconds;
+                const double tolerance =
+                    std::max(1.0e-9, 1.0e-8 * trace_seconds);
+                if (owner_assembly_seconds < -tolerance) {
+                    throw std::logic_error(
+                        "trace-template child timers exceed parent time");
+                }
+                phase_profile_->add(
+                    PhaseProfileKind3D::TraceOwnerTemplateAssembly,
+                    std::max(0.0, owner_assembly_seconds), 1);
+            }
             crossing_owner_templates_built_ = true;
         } else {
             build_trace_templates(nullptr);
@@ -1033,16 +1109,29 @@ public:
                                 const Eigen::VectorXd& normal_jump) const
     {
         HarmonicJetField3D result;
-        result.coefficients = fit_.coefficients(value_jump, normal_jump);
+        result.coefficients = profile_phase_3d(
+            phase_profile_, PhaseProfileKind3D::CauchyCoefficients, 1,
+            [&] {
+                return fit_.coefficients(value_jump, normal_jump);
+            });
         Eigen::VectorXd rhs = Eigen::VectorXd::Zero(grid_.num_dofs());
-        for (const HarmonicCrossingRow3D& row : crossing_rows_) {
-            rhs[row.rhs_node] += row.scale
-                * row.evaluation.dot(
-                    result.coefficients.row(row.center_dof).transpose());
-        }
+        profile_phase_3d(
+            phase_profile_, PhaseProfileKind3D::SpreadRhsAssembly, 1,
+            [&] {
+                for (const HarmonicCrossingRow3D& row : crossing_rows_) {
+                    rhs[row.rhs_node] += row.scale
+                        * row.evaluation.dot(
+                            result.coefficients.row(
+                                row.center_dof).transpose());
+                }
+            });
         // The spread correction is assembled for Delta_h, while the project
         // bulk solver accepts the right-hand side of -Delta_h.
-        bulk_.solve(-rhs, result.potential);
+        profile_phase_3d(
+            phase_profile_, PhaseProfileKind3D::FftBulkSolve, 1,
+            [&] {
+                bulk_.solve(-rhs, result.potential);
+            });
         return result;
     }
 
@@ -1057,7 +1146,12 @@ public:
             throw std::invalid_argument(
                 "exact-grid field received incompatible sizes");
         }
-        return {potential, fit_.coefficients(value_jump, normal_jump)};
+        Eigen::MatrixXd coefficients = profile_phase_3d(
+            phase_profile_, PhaseProfileKind3D::CauchyCoefficients, 1,
+            [&] {
+                return fit_.coefficients(value_jump, normal_jump);
+            });
+        return {potential, std::move(coefficients)};
     }
 
     Eigen::VectorXd exterior_trace(const HarmonicJetField3D& field,
@@ -1125,6 +1219,9 @@ private:
                                           ExteriorNormalRestrictMode3D::
                                               JointTricubicCauchy) const
     {
+        return profile_phase_3d(
+            phase_profile_, PhaseProfileKind3D::RestrictContinuedSamples, 1,
+            [&] {
         const bool use_crossing_owner =
             mode == ExteriorNormalRestrictMode3D::JointTricubicCrossingOwner;
         if (use_crossing_owner && !crossing_owner_templates_built_) {
@@ -1186,6 +1283,7 @@ private:
             }
         }
         return samples;
+            });
     }
 
     Eigen::VectorXd recover_trace(
@@ -1193,6 +1291,9 @@ private:
         const std::array<double, 8>& weights,
         double scale) const
     {
+        return profile_phase_3d(
+            phase_profile_, PhaseProfileKind3D::RestrictRecovery, 1,
+            [&] {
         Eigen::VectorXd trace(samples.rows());
         for (int center = 0; center < samples.rows(); ++center) {
             double value = 0.0;
@@ -1202,6 +1303,7 @@ private:
             trace[center] = scale * value;
         }
         return trace;
+            });
     }
 
     std::size_t trace_sample_index(int center, int side, int layer) const
@@ -1390,9 +1492,17 @@ private:
                             int owner = center;
                             try {
                                 const geometry3d::
-                                    NurbsSurfaceIntersectionResult3D intersection =
-                                        restrict_intersector->intersect_segment(
-                                            query, node_point);
+                                    NurbsSurfaceIntersectionResult3D
+                                        intersection = profile_phase_3d(
+                                            phase_profile_,
+                                            PhaseProfileKind3D::
+                                                NurbsSegmentIntersections,
+                                            1,
+                                            [&] {
+                                                return restrict_intersector->
+                                                    intersect_segment(
+                                                        query, node_point);
+                                            });
                                 const app3d::RestrictOwnerDecision3D decision =
                                     app3d::select_restrict_correction_owner_3d(
                                         center, query, node_point,
@@ -1548,6 +1658,7 @@ private:
     const std::vector<geometry3d::NurbsParamTriangle3D>& correction_triangles_;
     const std::vector<geometry3d::NurbsParamTriangle3D>& geometry_triangles_;
     const SurfaceDofCloud& cloud_;
+    app3d::PhaseProfile3D* phase_profile_ = nullptr;
     bool crossing_owner_templates_built_ = false;
     double h_ = 0.0;
     PanelCenterCauchyFit3D fit_;
