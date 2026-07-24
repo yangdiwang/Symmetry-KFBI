@@ -23,6 +23,7 @@ struct NurbsSurfaceCrossing3D {
     double residual = 0.0;
     double transversality = 0.0;
     bool feature_edge_contact = false;
+    double reliable_transversality_tolerance = 0.0;
 };
 
 struct NurbsSurfaceIntersectionDiagnostics3D {

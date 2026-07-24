@@ -52,8 +52,11 @@ void validate_root(const geometry3d::NurbsSurfaceCrossing3D& root,
         || !std::isfinite(root.edge_parameter) || !root.point.allFinite()
         || !root.normal.allFinite() || !std::isfinite(root.residual)
         || !std::isfinite(root.transversality)
+        || !std::isfinite(
+            root.reliable_transversality_tolerance)
         || root.normal.squaredNorm() == 0.0 || root.residual < 0.0
-        || root.transversality < 0.0) {
+        || root.transversality < 0.0
+        || root.reliable_transversality_tolerance <= 0.0) {
         throw std::invalid_argument(
             "crossing-owner selection has nonfinite or invalid crossing data");
     }
@@ -71,20 +74,6 @@ void validate_root(const geometry3d::NurbsSurfaceCrossing3D& root,
         throw std::invalid_argument(
             "crossing-owner root lies outside its segment or patch domain");
     }
-}
-
-double reliable_transversality_tolerance(
-    double geometry_tolerance,
-    double segment_length)
-{
-    // The intersection result does not expose its element scale. Omitting that
-    // nonnegative term from the intersector's maximum can only raise this
-    // threshold, so this consumer cannot admit a root the producer rejects.
-    const double geometry_scale =
-        std::max(segment_length, geometry_tolerance);
-    return std::max(
-        32.0 * std::sqrt(std::numeric_limits<double>::epsilon()),
-        std::sqrt(8.0 * geometry_tolerance / geometry_scale));
 }
 
 RestrictOwnerDecision3D target_decision(
@@ -225,8 +214,7 @@ RestrictOwnerDecision3D select_restrict_correction_owner_3d(
             RestrictOwnerDecisionKind3D::AmbiguousEdgeFallback, &root);
     }
     if (root.transversality
-        <= reliable_transversality_tolerance(
-            geometry_tolerance, segment_length)) {
+        <= root.reliable_transversality_tolerance) {
         return target_decision(
             target_dof,
             RestrictOwnerDecisionKind3D::DegenerateCrossingFallback, &root);

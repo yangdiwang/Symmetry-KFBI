@@ -19,6 +19,7 @@ struct NurbsElementRoot3D {
     Eigen::Vector3d normal = Eigen::Vector3d::Zero();
     double residual = 0.0;
     double transversality = 0.0;
+    double reliable_transversality_tolerance = 0.0;
 };
 
 struct NurbsElementParameterSeed3D {

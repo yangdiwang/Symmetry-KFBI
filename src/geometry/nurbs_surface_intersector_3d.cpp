@@ -55,7 +55,9 @@ NurbsSurfaceCrossing3D as_surface_crossing(
             root.point,
             root.normal,
             root.residual,
-            root.transversality};
+            root.transversality,
+            false,
+            root.reliable_transversality_tolerance};
 }
 
 
@@ -466,7 +468,9 @@ std::optional<NurbsSurfaceCrossing3D> find_cartesian_tangent_witness(
                 derivatives.point,
                 normal,
                 residual,
-                transversality};
+                transversality,
+                false,
+                1.0e-10};
         }
     }
     return std::nullopt;
@@ -740,9 +744,14 @@ std::vector<NurbsSurfaceCrossing3D> canonicalize_roots(
                 "NURBS same-patch diagnostic overflow");
             const double minimum_transversality = std::min(
                 duplicate->transversality, root.transversality);
+            const double maximum_reliable_tolerance = std::max(
+                duplicate->reliable_transversality_tolerance,
+                root.reliable_transversality_tolerance);
             if (root.residual < duplicate->residual)
                 *duplicate = root;
             duplicate->transversality = minimum_transversality;
+            duplicate->reliable_transversality_tolerance =
+                maximum_reliable_tolerance;
         }
     }
 
@@ -836,11 +845,16 @@ std::vector<NurbsSurfaceCrossing3D> canonicalize_roots(
                 patch_unique[static_cast<std::size_t>(root_index)];
             const double minimum_transversality = std::min(
                 current.transversality, candidate.transversality);
+            const double maximum_reliable_tolerance = std::max(
+                current.reliable_transversality_tolerance,
+                candidate.reliable_transversality_tolerance);
             if (candidate.residual < current.residual)
                 current = candidate;
             current.feature_edge_contact = feature_contact;
             if (!feature_contact)
                 current.transversality = minimum_transversality;
+            current.reliable_transversality_tolerance =
+                maximum_reliable_tolerance;
         }
     }
     std::sort(canonical.begin(), canonical.end(),

@@ -515,6 +515,21 @@ void test_rational_bezier_element_intersection()
                 && std::abs(plane.roots[0].v - 0.75) < 2e-12
                 && std::abs(plane.roots[0].t - 0.5) < 2e-12,
             "unit-plane native root");
+    const double plane_geometry_scale = std::max(
+        {plane_element.bounds().max_extent(), 2.0,
+         options.geometry_tolerance});
+    const double expected_plane_tolerance = std::max(
+        32.0 * std::sqrt(std::numeric_limits<double>::epsilon()),
+        std::sqrt(
+            8.0 * options.geometry_tolerance / plane_geometry_scale));
+    require(
+        std::isfinite(
+            plane.roots[0].reliable_transversality_tolerance)
+            && std::abs(
+                plane.roots[0].reliable_transversality_tolerance
+                - expected_plane_tolerance) <= 16.0
+                * std::numeric_limits<double>::epsilon(),
+        "native Newton root carries its exact producer threshold");
 
     const kfbim::geometry3d::NurbsSurfaceModel3D cylinder_model(
         {kfbim::geometry3d::NurbsSurfacePatch3D::
@@ -731,6 +746,15 @@ void test_closest_point_classifies_terminal_intersection_boxes()
         cylinder_model.patch(0).evaluate_with_derivatives(0.4, 0.6);
     const Eigen::Vector3d contact = contact_data.point;
     const Eigen::Vector3d tangent = contact_data.du.normalized();
+    const double tangent_segment_length = 0.5;
+    const double tangent_geometry_scale = std::max(
+        {cylinder_element.bounds().max_extent(),
+         tangent_segment_length, options.geometry_tolerance});
+    const double expected_tangent_tolerance = std::max(
+        32.0 * std::sqrt(std::numeric_limits<double>::epsilon()),
+        std::sqrt(
+            8.0 * options.geometry_tolerance
+            / tangent_geometry_scale));
     options.max_newton_iterations = 1;
     bool tangent_failed_closed = false;
     try {
@@ -747,6 +771,12 @@ void test_closest_point_classifies_terminal_intersection_boxes()
             partial.roots.size() == 1
             && partial.roots.front().residual
                    <= 8.0 * options.geometry_tolerance
+            && std::abs(
+                partial.roots.front()
+                    .reliable_transversality_tolerance
+                - expected_tangent_tolerance)
+                   <= 16.0
+                       * std::numeric_limits<double>::epsilon()
             && partial.roots.front().transversality < 1.0e-10
             && partial.diagnostics.closest_point_attempts == 1
             && partial.diagnostics.roots_recovered_by_closest_point == 1

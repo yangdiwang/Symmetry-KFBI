@@ -17,6 +17,7 @@ using kfbim::app3d::make_native_nurbs_surface_3d;
 using kfbim::app3d::make_native_surface_dofs_3d;
 using kfbim::app3d::select_restrict_correction_owner_3d;
 using kfbim::geometry3d::NurbsSurfaceCrossing3D;
+using kfbim::geometry3d::NurbsSurfaceIntersector3D;
 using kfbim::geometry3d::NurbsSurfaceIntersectionResult3D;
 
 void require(bool value, const std::string& message)
@@ -65,8 +66,11 @@ struct Fixture {
         const double u = 0.5 * (p.domain_start_u() + p.domain_end_u());
         const double v = 0.5 * (p.domain_start_v() + p.domain_end_v());
         const auto d = p.evaluate_with_derivatives(u, v);
-        return {patch, -1, u, v, t, d.point,
-                d.du.cross(d.dv).normalized(), 1.0e-14, 1.0, false};
+        auto value = NurbsSurfaceCrossing3D{
+            patch, -1, u, v, t, d.point,
+            d.du.cross(d.dv).normalized(), 1.0e-14, 1.0, false};
+        value.reliable_transversality_tolerance = 1.0e-8;
+        return value;
     }
 
     NurbsSurfaceIntersectionResult3D result(
@@ -259,6 +263,40 @@ void test_invalid_inputs_are_rejected()
         },
         "nonfinite root rejected");
 
+    auto nonfinite_certification = result;
+    nonfinite_certification.crossings.front()
+        .reliable_transversality_tolerance =
+        std::numeric_limits<double>::quiet_NaN();
+    require_invalid(
+        [&] {
+            (void)select_restrict_correction_owner_3d(
+                target, query, support, fixture.surface, fixture.cloud,
+                nonfinite_certification);
+        },
+        "nonfinite producer certification rejected");
+
+    auto negative_certification = result;
+    negative_certification.crossings.front()
+        .reliable_transversality_tolerance = -1.0e-8;
+    require_invalid(
+        [&] {
+            (void)select_restrict_correction_owner_3d(
+                target, query, support, fixture.surface, fixture.cloud,
+                negative_certification);
+        },
+        "negative producer certification rejected");
+
+    auto zero_certification = result;
+    zero_certification.crossings.front()
+        .reliable_transversality_tolerance = 0.0;
+    require_invalid(
+        [&] {
+            (void)select_restrict_correction_owner_3d(
+                target, query, support, fixture.surface, fixture.cloud,
+                zero_certification);
+        },
+        "zero producer certification rejected");
+
     require_invalid(
         [&] {
             (void)select_restrict_correction_owner_3d(
@@ -268,7 +306,7 @@ void test_invalid_inputs_are_rejected()
         "zero segment rejected");
 }
 
-void test_bounded_root_data_and_conservative_transversality()
+void test_bounded_root_data_and_certified_transversality()
 {
     const Fixture fixture;
     const int target = fixture.target(6);
@@ -310,27 +348,66 @@ void test_bounded_root_data_and_conservative_transversality()
     invalid_v.v = patch.domain_end_v() + 1.0e-8 * parameter_scale;
     record_missing_rejection("v above patch domain", invalid_v);
 
-    auto near_tangent = fixture.root(7);
-    near_tangent.transversality = 5.0e-6;
-    const auto near_tangent_owner = select_restrict_correction_owner_3d(
+    auto producer_certified_reliable = fixture.root(7);
+    producer_certified_reliable.transversality = 5.0e-6;
+    producer_certified_reliable.reliable_transversality_tolerance = 3.63e-6;
+    const auto reliable_owner = select_restrict_correction_owner_3d(
         target,
-        Fixture::query(near_tangent),
-        Fixture::support(near_tangent),
+        Fixture::query(producer_certified_reliable),
+        Fixture::support(producer_certified_reliable),
         fixture.surface,
         fixture.cloud,
-        fixture.result(near_tangent));
-    if (near_tangent_owner.owner_dof != target
-        || near_tangent_owner.kind
-               != RestrictOwnerDecisionKind3D::DegenerateCrossingFallback) {
-        failures.push_back("conservative near-tangent fallback");
+        fixture.result(producer_certified_reliable));
+    if (reliable_owner.owner_dof == target
+        || reliable_owner.kind
+               != RestrictOwnerDecisionKind3D::
+                      ForeignNonG1SingleCrossing) {
+        failures.push_back("producer-certified reliable crossing reroutes");
+    }
+
+    auto producer_certified_degenerate = fixture.root(7);
+    producer_certified_degenerate.transversality = 5.0e-6;
+    producer_certified_degenerate.reliable_transversality_tolerance = 6.0e-6;
+    const auto degenerate_owner = select_restrict_correction_owner_3d(
+        target,
+        Fixture::query(producer_certified_degenerate),
+        Fixture::support(producer_certified_degenerate),
+        fixture.surface,
+        fixture.cloud,
+        fixture.result(producer_certified_degenerate));
+    if (degenerate_owner.owner_dof != target
+        || degenerate_owner.kind
+               != RestrictOwnerDecisionKind3D::
+                      DegenerateCrossingFallback) {
+        failures.push_back("producer-certified degenerate crossing fallback");
     }
 
     if (!failures.empty()) {
-        std::string message = "bounded-root validation failures:";
+        std::string message =
+            "bounded-root and certification failures:";
         for (const std::string& failure : failures)
             message += " " + failure + ";";
         throw std::runtime_error(message);
     }
+}
+
+void test_real_intersector_root_carries_certified_threshold()
+{
+    const NativeNurbsSurface3D torus =
+        make_native_nurbs_surface_3d(GeometryKind3D::Torus);
+    const NurbsSurfaceIntersector3D intersector(torus.geometry_model());
+    const auto hit = intersector.intersect_segment(
+        {0.80, -0.04, 0.03}, {0.84, -0.04, 0.03});
+    require(hit.crossings.size() == 1,
+            "real intersector produces one transverse root");
+    const auto& root = hit.crossings.front();
+    require(
+        std::isfinite(root.reliable_transversality_tolerance)
+            && root.reliable_transversality_tolerance > 0.0,
+        "real intersector root carries finite positive certification");
+    require(root.transversality
+                > root.reliable_transversality_tolerance,
+            "real transverse root exceeds its producer certification");
 }
 } // namespace
 
@@ -341,7 +418,8 @@ int main()
         test_foreign_non_g1_selects_crossing_patch();
         test_fallbacks_retain_target();
         test_invalid_inputs_are_rejected();
-        test_bounded_root_data_and_conservative_transversality();
+        test_bounded_root_data_and_certified_transversality();
+        test_real_intersector_root_carries_certified_threshold();
         std::cout << "crossing owner restrict 3D tests passed\n";
         return 0;
     } catch (const std::exception& error) {

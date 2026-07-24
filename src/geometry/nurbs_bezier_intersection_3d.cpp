@@ -81,6 +81,21 @@ void checked_increment_diagnostic(int& value, const char* message)
     checked_accumulate_diagnostic(value, 1, message);
 }
 
+double reliable_transversality_tolerance(
+    const RationalBezierElement3D& box,
+    const SegmentFrame& frame,
+    const NurbsElementIntersectionOptions3D& options)
+{
+    const double contact_tolerance =
+        8.0 * options.geometry_tolerance;
+    const double geometry_scale = std::max(
+        {box.bounds().max_extent(), frame.length,
+         options.geometry_tolerance});
+    return std::max(
+        32.0 * std::sqrt(std::numeric_limits<double>::epsilon()),
+        std::sqrt(contact_tolerance / geometry_scale));
+}
+
 double midpoint(double begin, double end)
 {
     return 0.5 * begin + 0.5 * end;
@@ -741,6 +756,8 @@ NativeNewtonOutcome native_newton(
             root.residual = residual;
             root.transversality =
                 std::abs(root.normal.dot(frame.direction));
+            root.reliable_transversality_tolerance =
+                reliable_transversality_tolerance(box, frame, options);
             outcome.root = std::move(root);
             return outcome;
         }
@@ -820,9 +837,14 @@ bool append_root(std::vector<NurbsElementRoot3D>& roots,
             continue;
         const double minimum_transversality =
             std::min(existing.transversality, root.transversality);
+        const double maximum_reliable_tolerance = std::max(
+            existing.reliable_transversality_tolerance,
+            root.reliable_transversality_tolerance);
         if (root.residual < existing.residual)
             existing = std::move(root);
         existing.transversality = minimum_transversality;
+        existing.reliable_transversality_tolerance =
+            maximum_reliable_tolerance;
         return false;
     }
     roots.push_back(std::move(root));
@@ -1184,14 +1206,11 @@ std::optional<NurbsElementRoot3D> root_from_closest_point(
     root.residual = residual;
     const double measured_transversality =
         std::abs(root.normal.dot(frame.direction));
-    const double geometry_scale = std::max(
-        {box.bounds().max_extent(), frame.length,
-         options.geometry_tolerance});
-    const double reliable_tangency_tolerance = std::max(
-        32.0 * std::sqrt(std::numeric_limits<double>::epsilon()),
-        std::sqrt(contact_tolerance / geometry_scale));
+    root.reliable_transversality_tolerance =
+        reliable_transversality_tolerance(box, frame, options);
     root.transversality =
-        measured_transversality <= reliable_tangency_tolerance
+        measured_transversality
+                <= root.reliable_transversality_tolerance
         ? 0.0
         : measured_transversality;
     return root;
