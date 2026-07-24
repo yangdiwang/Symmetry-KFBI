@@ -21,8 +21,27 @@ void validate_cloud(const NativeNurbsSurface3D& surface,
     }
 }
 
+double patch_parameter_tolerance(
+    const geometry3d::NurbsSurfacePatch3D& patch)
+{
+    const double scale = std::max({
+        1.0,
+        patch.domain_end_u() - patch.domain_start_u(),
+        patch.domain_end_v() - patch.domain_start_v()});
+    return 16.0e-12 * scale;
+}
+
+double segment_parameter_tolerance(double geometry_tolerance,
+                                   double segment_length)
+{
+    return std::max(16.0e-12,
+                    16.0 * geometry_tolerance / segment_length);
+}
+
 void validate_root(const geometry3d::NurbsSurfaceCrossing3D& root,
-                   const NativeNurbsSurface3D& surface)
+                   const NativeNurbsSurface3D& surface,
+                   double geometry_tolerance,
+                   double segment_length)
 {
     if (root.patch_index < 0
         || root.patch_index >= static_cast<int>(surface.patches.size())) {
@@ -38,18 +57,31 @@ void validate_root(const geometry3d::NurbsSurfaceCrossing3D& root,
         throw std::invalid_argument(
             "crossing-owner selection has nonfinite or invalid crossing data");
     }
+    const auto& patch =
+        surface.patches[static_cast<std::size_t>(root.patch_index)];
+    const double uv_tolerance = patch_parameter_tolerance(patch);
+    const double edge_tolerance = segment_parameter_tolerance(
+        geometry_tolerance, segment_length);
+    if (root.edge_parameter < -edge_tolerance
+        || root.edge_parameter > 1.0 + edge_tolerance
+        || root.u < patch.domain_start_u() - uv_tolerance
+        || root.u > patch.domain_end_u() + uv_tolerance
+        || root.v < patch.domain_start_v() - uv_tolerance
+        || root.v > patch.domain_end_v() + uv_tolerance) {
+        throw std::invalid_argument(
+            "crossing-owner root lies outside its segment or patch domain");
+    }
 }
 
 double reliable_transversality_tolerance(
-    const NativeNurbsSurface3D& surface,
+    double geometry_tolerance,
     double segment_length)
 {
-    const double diameter =
-        surface.geometry_model().control_bounds().diameter();
-    const double geometry_tolerance =
-        std::max(1.0e-12 * diameter, 1.0e-14);
+    // The intersection result does not expose its element scale. Omitting that
+    // nonnegative term from the intersector's maximum can only raise this
+    // threshold, so this consumer cannot admit a root the producer rejects.
     const double geometry_scale =
-        std::max({diameter, segment_length, geometry_tolerance});
+        std::max(segment_length, geometry_tolerance);
     return std::max(
         32.0 * std::sqrt(std::numeric_limits<double>::epsilon()),
         std::sqrt(8.0 * geometry_tolerance / geometry_scale));
@@ -161,7 +193,8 @@ RestrictOwnerDecision3D select_restrict_correction_owner_3d(
             "crossing-owner selection target patch is invalid");
     }
     for (const auto& root : intersection.crossings)
-        validate_root(root, surface);
+        validate_root(
+            root, surface, geometry_tolerance, segment_length);
 
     if (intersection.overlap_detected) {
         return target_decision(
@@ -192,7 +225,8 @@ RestrictOwnerDecision3D select_restrict_correction_owner_3d(
             RestrictOwnerDecisionKind3D::AmbiguousEdgeFallback, &root);
     }
     if (root.transversality
-        <= reliable_transversality_tolerance(surface, segment_length)) {
+        <= reliable_transversality_tolerance(
+            geometry_tolerance, segment_length)) {
         return target_decision(
             target_dof,
             RestrictOwnerDecisionKind3D::DegenerateCrossingFallback, &root);

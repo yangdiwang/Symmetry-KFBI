@@ -6,6 +6,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 using kfbim::app3d::GeometryKind3D;
@@ -33,6 +34,17 @@ void require_invalid(Function&& function, const std::string& message)
         return;
     }
     throw std::runtime_error(message);
+}
+
+template <class Function>
+bool returns_invalid_argument(Function&& function)
+{
+    try {
+        function();
+    } catch (const std::invalid_argument&) {
+        return true;
+    }
+    return false;
 }
 
 struct Fixture {
@@ -179,6 +191,16 @@ void test_fallbacks_retain_target()
                 == RestrictOwnerDecisionKind3D::AmbiguousEdgeFallback,
         "unresolved retains target");
 
+    auto ambiguous = fixture.result(root);
+    ambiguous.diagnostics.ambiguous_root_clusters = 1;
+    const auto ambiguous_owner = select_restrict_correction_owner_3d(
+        target, query, support, fixture.surface, fixture.cloud, ambiguous);
+    require(
+        ambiguous_owner.owner_dof == target
+            && ambiguous_owner.kind
+                == RestrictOwnerDecisionKind3D::AmbiguousEdgeFallback,
+        "ambiguous root cluster retains target");
+
     auto tangent = fixture.result(root);
     tangent.crossings.front().transversality = 0.0;
     const auto tangent_owner = select_restrict_correction_owner_3d(
@@ -245,6 +267,71 @@ void test_invalid_inputs_are_rejected()
         },
         "zero segment rejected");
 }
+
+void test_bounded_root_data_and_conservative_transversality()
+{
+    const Fixture fixture;
+    const int target = fixture.target(6);
+    const auto valid_root = fixture.root(6);
+    const auto query = Fixture::query(valid_root);
+    const auto support = Fixture::support(valid_root);
+    std::vector<std::string> failures;
+
+    const auto record_missing_rejection =
+        [&](const std::string& name, const auto& root) {
+            if (!returns_invalid_argument([&] {
+                    (void)select_restrict_correction_owner_3d(
+                        target, query, support, fixture.surface,
+                        fixture.cloud, fixture.result(root));
+                })) {
+                failures.push_back(name);
+            }
+        };
+
+    auto negative_t = valid_root;
+    negative_t.edge_parameter = -1.0e-8;
+    record_missing_rejection("negative edge parameter", negative_t);
+
+    auto excessive_t = valid_root;
+    excessive_t.edge_parameter = 1.0 + 1.0e-8;
+    record_missing_rejection("edge parameter above one", excessive_t);
+
+    const auto& patch = fixture.surface.patches[
+        static_cast<std::size_t>(valid_root.patch_index)];
+    const double parameter_scale = std::max({
+        1.0,
+        patch.domain_end_u() - patch.domain_start_u(),
+        patch.domain_end_v() - patch.domain_start_v()});
+    auto invalid_u = valid_root;
+    invalid_u.u = patch.domain_start_u() - 1.0e-8 * parameter_scale;
+    record_missing_rejection("u below patch domain", invalid_u);
+
+    auto invalid_v = valid_root;
+    invalid_v.v = patch.domain_end_v() + 1.0e-8 * parameter_scale;
+    record_missing_rejection("v above patch domain", invalid_v);
+
+    auto near_tangent = fixture.root(7);
+    near_tangent.transversality = 5.0e-6;
+    const auto near_tangent_owner = select_restrict_correction_owner_3d(
+        target,
+        Fixture::query(near_tangent),
+        Fixture::support(near_tangent),
+        fixture.surface,
+        fixture.cloud,
+        fixture.result(near_tangent));
+    if (near_tangent_owner.owner_dof != target
+        || near_tangent_owner.kind
+               != RestrictOwnerDecisionKind3D::DegenerateCrossingFallback) {
+        failures.push_back("conservative near-tangent fallback");
+    }
+
+    if (!failures.empty()) {
+        std::string message = "bounded-root validation failures:";
+        for (const std::string& failure : failures)
+            message += " " + failure + ";";
+        throw std::runtime_error(message);
+    }
+}
 } // namespace
 
 int main()
@@ -254,6 +341,7 @@ int main()
         test_foreign_non_g1_selects_crossing_patch();
         test_fallbacks_retain_target();
         test_invalid_inputs_are_rejected();
+        test_bounded_root_data_and_conservative_transversality();
         std::cout << "crossing owner restrict 3D tests passed\n";
         return 0;
     } catch (const std::exception& error) {
