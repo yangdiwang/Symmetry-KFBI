@@ -767,15 +767,68 @@ constexpr std::size_t kRestrictOwnerDecisionKindCount =
         app3d::RestrictOwnerDecisionKind3D::AmbiguousEdgeFallback)
     + std::size_t{1};
 
+struct HarmonicTraceOwnerAuditTerm3D {
+    int grid_node = -1;
+    double interpolation_weight = 0.0;
+    int owner_dof = -1;
+    int crossing_patch = -1;
+    double crossing_u = 0.0;
+    double crossing_v = 0.0;
+    double segment_parameter = 0.0;
+    double residual = 0.0;
+    double transversality = 0.0;
+};
+
 struct HarmonicTraceSample3D {
     std::array<int, 64> grid_ids{};
     std::array<double, 64> weights{};
     Eigen::VectorXd legacy_correction_evaluation;
     std::vector<HarmonicTraceCorrectionTerm3D> owner_corrections;
     int wrong_side_node_count = 0;
+    double wrong_side_sum_abs_weight = 0.0;
     std::array<int, kRestrictOwnerDecisionKindCount> owner_decision_counts{};
+    std::array<double, kRestrictOwnerDecisionKindCount>
+        owner_decision_sum_abs_weights{};
     int owner_unresolved_fallback_count = 0;
+    double owner_unresolved_fallback_sum_abs_weight = 0.0;
     int owner_unrelated_coincidence_fallback_count = 0;
+    double owner_unrelated_coincidence_fallback_sum_abs_weight = 0.0;
+    std::size_t owner_geometry_query_count = 0;
+    std::vector<HarmonicTraceOwnerAuditTerm3D> owner_reroute_terms;
+};
+
+struct RestrictOwnerSampleDiagnostics3D {
+    int target_dof = -1;
+    int target_patch = -1;
+    int side = -1;
+    int layer = -1;
+    int wrong_side_count = 0;
+    double wrong_side_sum_abs_weight = 0.0;
+    std::array<int, kRestrictOwnerDecisionKindCount> decision_counts{};
+    std::array<double, kRestrictOwnerDecisionKindCount>
+        decision_sum_abs_weights{};
+    int unresolved_fallback_count = 0;
+    double unresolved_fallback_sum_abs_weight = 0.0;
+    int unrelated_coincidence_fallback_count = 0;
+    double unrelated_coincidence_fallback_sum_abs_weight = 0.0;
+    std::size_t geometry_query_count = 0;
+};
+
+struct RestrictOwnerAuditRecord3D {
+    int target_dof = -1;
+    int target_patch = -1;
+    int side = -1;
+    int layer = -1;
+    int grid_node = -1;
+    double interpolation_weight = 0.0;
+    int owner_dof = -1;
+    int owner_patch = -1;
+    int crossing_patch = -1;
+    double crossing_u = 0.0;
+    double crossing_v = 0.0;
+    double segment_parameter = 0.0;
+    double residual = 0.0;
+    double transversality = 0.0;
 };
 
 class PanelCenterHarmonicJetKFBI3D {
@@ -873,6 +926,106 @@ public:
                 }
             }
         }
+        return result;
+    }
+
+    std::vector<RestrictOwnerSampleDiagnostics3D>
+    restrict_owner_sample_diagnostics() const
+    {
+        if (!crossing_owner_templates_built_) {
+            throw std::runtime_error(
+                "crossing-owner normal restrict was not initialized");
+        }
+        std::vector<RestrictOwnerSampleDiagnostics3D> result;
+        result.reserve(trace_samples_.size());
+        for (int center = 0; center < surface_size(); ++center) {
+            const int target_patch =
+                cloud_.dofs[static_cast<std::size_t>(center)].patch_id;
+            for (int side = 0; side < 2; ++side) {
+                for (int layer = 0; layer < 4; ++layer) {
+                    const HarmonicTraceSample3D& sample = trace_samples_[
+                        trace_sample_index(center, side, layer)];
+                    RestrictOwnerSampleDiagnostics3D item;
+                    item.target_dof = center;
+                    item.target_patch = target_patch;
+                    item.side = side;
+                    item.layer = layer;
+                    item.wrong_side_count = sample.wrong_side_node_count;
+                    item.wrong_side_sum_abs_weight =
+                        sample.wrong_side_sum_abs_weight;
+                    item.decision_counts = sample.owner_decision_counts;
+                    item.decision_sum_abs_weights =
+                        sample.owner_decision_sum_abs_weights;
+                    item.unresolved_fallback_count =
+                        sample.owner_unresolved_fallback_count;
+                    item.unresolved_fallback_sum_abs_weight =
+                        sample.owner_unresolved_fallback_sum_abs_weight;
+                    item.unrelated_coincidence_fallback_count =
+                        sample.owner_unrelated_coincidence_fallback_count;
+                    item.unrelated_coincidence_fallback_sum_abs_weight =
+                        sample.
+                            owner_unrelated_coincidence_fallback_sum_abs_weight;
+                    item.geometry_query_count =
+                        sample.owner_geometry_query_count;
+                    result.push_back(std::move(item));
+                }
+            }
+        }
+        return result;
+    }
+
+    std::vector<RestrictOwnerAuditRecord3D>
+    restrict_owner_audit_records() const
+    {
+        if (!crossing_owner_templates_built_) {
+            throw std::runtime_error(
+                "crossing-owner normal restrict was not initialized");
+        }
+        std::vector<RestrictOwnerAuditRecord3D> result;
+        for (int center = 0; center < surface_size(); ++center) {
+            const int target_patch =
+                cloud_.dofs[static_cast<std::size_t>(center)].patch_id;
+            for (int side = 0; side < 2; ++side) {
+                for (int layer = 0; layer < 4; ++layer) {
+                    const HarmonicTraceSample3D& sample = trace_samples_[
+                        trace_sample_index(center, side, layer)];
+                    for (const HarmonicTraceOwnerAuditTerm3D& term
+                         : sample.owner_reroute_terms) {
+                        if (term.owner_dof < 0
+                            || term.owner_dof >= surface_size()) {
+                            throw std::logic_error(
+                                "crossing-owner audit has invalid owner DOF");
+                        }
+                        RestrictOwnerAuditRecord3D item;
+                        item.target_dof = center;
+                        item.target_patch = target_patch;
+                        item.side = side;
+                        item.layer = layer;
+                        item.grid_node = term.grid_node;
+                        item.interpolation_weight =
+                            term.interpolation_weight;
+                        item.owner_dof = term.owner_dof;
+                        item.owner_patch = cloud_.dofs[
+                            static_cast<std::size_t>(term.owner_dof)].patch_id;
+                        item.crossing_patch = term.crossing_patch;
+                        item.crossing_u = term.crossing_u;
+                        item.crossing_v = term.crossing_v;
+                        item.segment_parameter = term.segment_parameter;
+                        item.residual = term.residual;
+                        item.transversality = term.transversality;
+                        result.push_back(std::move(item));
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    std::size_t restrict_owner_geometry_query_count() const
+    {
+        std::size_t result = 0;
+        for (const HarmonicTraceSample3D& sample : trace_samples_)
+            result += sample.owner_geometry_query_count;
         return result;
     }
 
@@ -1220,6 +1373,8 @@ private:
                     const bool node_inside = grid_pair_.domain_label(node) > 0;
                     if (node_inside != desired_inside) {
                         ++result.wrong_side_node_count;
+                        const double absolute_weight = std::abs(weight);
+                        result.wrong_side_sum_abs_weight += absolute_weight;
                         const Eigen::Vector3d node_point =
                             grid_point(grid_, node);
                         const Eigen::Vector3d target_xi =
@@ -1231,6 +1386,7 @@ private:
                                 target_xi.x(), target_xi.y(), target_xi.z());
 
                         if (restrict_intersector != nullptr) {
+                            ++result.owner_geometry_query_count;
                             int owner = center;
                             try {
                                 const geometry3d::
@@ -1250,9 +1406,39 @@ private:
                                         "crossing-owner decision kind is invalid");
                                 }
                                 ++result.owner_decision_counts[kind];
+                                result.owner_decision_sum_abs_weights[kind] +=
+                                    absolute_weight;
+                                if (decision.kind == app3d::
+                                        RestrictOwnerDecisionKind3D::
+                                            ForeignNonG1SingleCrossing) {
+                                    if (intersection.crossings.size() != 1) {
+                                        throw std::logic_error(
+                                            "foreign crossing-owner decision "
+                                            "does not have one crossing");
+                                    }
+                                    const geometry3d::NurbsSurfaceCrossing3D&
+                                        root = intersection.crossings.front();
+                                    HarmonicTraceOwnerAuditTerm3D audit;
+                                    audit.grid_node = node;
+                                    audit.interpolation_weight = weight;
+                                    audit.owner_dof = owner;
+                                    audit.crossing_patch = root.patch_index;
+                                    audit.crossing_u = root.u;
+                                    audit.crossing_v = root.v;
+                                    audit.segment_parameter =
+                                        root.edge_parameter;
+                                    audit.residual = root.residual;
+                                    audit.transversality =
+                                        root.transversality;
+                                    result.owner_reroute_terms.push_back(
+                                        std::move(audit));
+                                }
                             } catch (const geometry3d::
                                          UnresolvedNurbsIntersectionCandidate3D&) {
                                 ++result.owner_unresolved_fallback_count;
+                                result.
+                                    owner_unresolved_fallback_sum_abs_weight +=
+                                        absolute_weight;
                             } catch (const std::runtime_error& error) {
                                 if (std::string(error.what())
                                     != "coincident roots on unrelated NURBS patches") {
@@ -1260,6 +1446,9 @@ private:
                                 }
                                 ++result.
                                     owner_unrelated_coincidence_fallback_count;
+                                result.
+                                    owner_unrelated_coincidence_fallback_sum_abs_weight +=
+                                        absolute_weight;
                             }
 
                             const Eigen::Vector3d owner_xi =
@@ -1285,6 +1474,30 @@ private:
             term.owner_dof = owner_evaluation.first;
             term.evaluation = std::move(owner_evaluation.second);
             result.owner_corrections.push_back(std::move(term));
+        }
+        if (restrict_intersector != nullptr) {
+            int classified_count =
+                result.owner_unresolved_fallback_count
+                + result.owner_unrelated_coincidence_fallback_count;
+            for (int count : result.owner_decision_counts)
+                classified_count += count;
+            if (classified_count != result.wrong_side_node_count
+                || result.owner_geometry_query_count
+                       != static_cast<std::size_t>(
+                           result.wrong_side_node_count)) {
+                throw std::logic_error(
+                    "crossing-owner restrict did not classify every "
+                    "wrong-side support node");
+            }
+            const std::size_t foreign_kind = static_cast<std::size_t>(
+                app3d::RestrictOwnerDecisionKind3D::
+                    ForeignNonG1SingleCrossing);
+            if (result.owner_reroute_terms.size()
+                != static_cast<std::size_t>(
+                    result.owner_decision_counts[foreign_kind])) {
+                throw std::logic_error(
+                    "crossing-owner reroute audit count is inconsistent");
+            }
         }
         return result;
     }
@@ -3193,6 +3406,41 @@ struct CommonRhsGmresProbe3D {
     std::vector<double> residuals;
 };
 
+double residual_contraction(
+    const std::vector<double>& residuals,
+    std::size_t begin,
+    std::size_t end)
+{
+    const double invalid = std::numeric_limits<double>::quiet_NaN();
+    if (begin >= end || end >= residuals.size())
+        return invalid;
+    const double first = residuals[begin];
+    const double last = residuals[end];
+    if (!std::isfinite(first) || !std::isfinite(last)
+        || !(first > 0.0) || last < 0.0) {
+        return invalid;
+    }
+    if (last == 0.0)
+        return 0.0;
+    return std::exp(
+        (std::log(last) - std::log(first))
+        / static_cast<double>(end - begin));
+}
+
+double worst_five_step_contraction(const std::vector<double>& residuals)
+{
+    double worst = std::numeric_limits<double>::quiet_NaN();
+    for (std::size_t begin = 0; begin + 5 < residuals.size(); ++begin) {
+        const double candidate =
+            residual_contraction(residuals, begin, begin + 5);
+        if (std::isfinite(candidate)
+            && (!std::isfinite(worst) || candidate > worst)) {
+            worst = candidate;
+        }
+    }
+    return worst;
+}
+
 struct NormalRestrictRouteProbe3D {
     bool complete = false;
     std::string route;
@@ -3206,6 +3454,12 @@ struct NormalRestrictRouteProbe3D {
     SolveMetrics3D physical;
     std::vector<double> physical_residuals;
     CommonRhsGmresProbe3D common;
+    double physical_rho_10_30 =
+        std::numeric_limits<double>::quiet_NaN();
+    double physical_worst_rho_5 =
+        std::numeric_limits<double>::quiet_NaN();
+    double common_rho_10_30 = std::numeric_limits<double>::quiet_NaN();
+    double common_worst_rho_5 = std::numeric_limits<double>::quiet_NaN();
     double seconds = 0.0;
 };
 
@@ -3218,19 +3472,38 @@ struct NormalRestrictCaseProbe3D {
     std::vector<double> weights;
     std::vector<double> feature_edge_distance_over_h;
     std::vector<int> wrong_side_support_count;
-    std::array<NormalRestrictRouteProbe3D, 2> routes;
+    std::vector<RestrictOwnerSampleDiagnostics3D> owner_diagnostics;
+    std::vector<RestrictOwnerAuditRecord3D> owner_audit_records;
+    std::size_t owner_geometry_query_count = 0;
+    double setup_seconds = 0.0;
+    double pipeline_setup_seconds = 0.0;
+    std::array<NormalRestrictRouteProbe3D, 3> routes;
 };
 
 const char* normal_restrict_route_name(ExteriorNormalRestrictMode3D mode)
 {
-    return mode == ExteriorNormalRestrictMode3D::JointTricubicCauchy
-        ? "joint_tricubic_cauchy"
-        : "exterior_only_harmonic_cubic";
+    switch (mode) {
+    case ExteriorNormalRestrictMode3D::JointTricubicCauchy:
+        return "joint_tricubic_cauchy";
+    case ExteriorNormalRestrictMode3D::JointTricubicCrossingOwner:
+        return "joint_tricubic_crossing_owner";
+    case ExteriorNormalRestrictMode3D::ExteriorOnlyHarmonicCubic:
+        return "exterior_only_harmonic_cubic";
+    }
+    throw std::runtime_error("unknown exterior-normal restrict mode");
 }
 
 int normal_restrict_route_index(ExteriorNormalRestrictMode3D mode)
 {
-    return mode == ExteriorNormalRestrictMode3D::JointTricubicCauchy ? 0 : 1;
+    switch (mode) {
+    case ExteriorNormalRestrictMode3D::JointTricubicCauchy:
+        return 0;
+    case ExteriorNormalRestrictMode3D::JointTricubicCrossingOwner:
+        return 1;
+    case ExteriorNormalRestrictMode3D::ExteriorOnlyHarmonicCubic:
+        return 2;
+    }
+    throw std::runtime_error("unknown exterior-normal restrict mode");
 }
 
 NormalRestrictNorms3D normal_restrict_weighted_norms(
@@ -3321,8 +3594,11 @@ void write_normal_restrict_probe_outputs(
                "smooth_grid_wrms,exact_equation_linf,exact_equation_wrms,"
                "physical_converged,physical_iterations,"
                "physical_final_residual,physical_interior_linf,"
+               "physical_rho_10_30,physical_worst_rho_5,"
                "common_converged,common_iterations,common_final_residual,"
-               "seconds\n";
+               "common_rho_10_30,common_worst_rho_5,"
+               "setup_seconds,pipeline_setup_seconds,"
+               "route_seconds\n";
     std::ofstream residuals = open_output_file(
         output_dir / "gmres_residuals.csv");
     residuals << std::setprecision(17)
@@ -3345,8 +3621,14 @@ void write_normal_restrict_probe_outputs(
                     << route.physical.converged << ','
                     << route.physical.iterations << ',' << physical_final << ','
                     << route.physical.interior_linf << ','
+                    << route.physical_rho_10_30 << ','
+                    << route.physical_worst_rho_5 << ','
                     << route.common.converged << ',' << route.common.iterations
                     << ',' << route.common.final_residual << ','
+                    << route.common_rho_10_30 << ','
+                    << route.common_worst_rho_5 << ','
+                    << probe_case.setup_seconds << ','
+                    << probe_case.pipeline_setup_seconds << ','
                     << route.seconds << '\n';
             for (std::size_t k = 0; k < route.physical_residuals.size(); ++k)
                 residuals << probe_case.case_id << ',' << probe_case.N << ','
@@ -3432,6 +3714,91 @@ void write_normal_restrict_probe_localization(
     }
 }
 
+const char* restrict_owner_decision_kind_name(std::size_t kind)
+{
+    switch (static_cast<app3d::RestrictOwnerDecisionKind3D>(kind)) {
+    case app3d::RestrictOwnerDecisionKind3D::TargetSideNode:
+        return "target_side_node";
+    case app3d::RestrictOwnerDecisionKind3D::TargetOrG1SingleCrossing:
+        return "target_or_g1_single_crossing";
+    case app3d::RestrictOwnerDecisionKind3D::ForeignNonG1SingleCrossing:
+        return "foreign_non_g1_single_crossing";
+    case app3d::RestrictOwnerDecisionKind3D::NoCrossingFallback:
+        return "no_crossing_fallback";
+    case app3d::RestrictOwnerDecisionKind3D::MultipleCrossingFallback:
+        return "multiple_crossing_fallback";
+    case app3d::RestrictOwnerDecisionKind3D::DegenerateCrossingFallback:
+        return "degenerate_crossing_fallback";
+    case app3d::RestrictOwnerDecisionKind3D::AmbiguousEdgeFallback:
+        return "ambiguous_edge_fallback";
+    }
+    throw std::logic_error("unknown crossing-owner decision kind");
+}
+
+void write_restrict_owner_probe_outputs(
+    const std::filesystem::path& output_dir,
+    const std::vector<NormalRestrictCaseProbe3D>& cases)
+{
+    std::ofstream summary =
+        open_output_file(output_dir / "restrict_owner_summary.csv");
+    summary << std::setprecision(17)
+            << "case_id,N,target_dof,target_patch,side,layer,decision_kind,"
+               "count,sum_abs_weight,wrong_side_count,"
+               "wrong_side_sum_abs_weight,geometry_query_count\n";
+    std::ofstream terms =
+        open_output_file(output_dir / "restrict_owner_terms.csv");
+    terms << std::setprecision(17)
+          << "case_id,N,target_dof,target_patch,side,layer,grid_node,weight,"
+             "owner_dof,owner_patch,crossing_patch,crossing_u,crossing_v,"
+             "segment_parameter,residual,transversality\n";
+    for (const NormalRestrictCaseProbe3D& probe_case : cases) {
+        for (const RestrictOwnerSampleDiagnostics3D& item
+             : probe_case.owner_diagnostics) {
+            for (std::size_t kind = 0;
+                 kind < kRestrictOwnerDecisionKindCount; ++kind) {
+                summary << probe_case.case_id << ',' << probe_case.N << ','
+                        << item.target_dof << ',' << item.target_patch << ','
+                        << item.side << ',' << item.layer << ','
+                        << restrict_owner_decision_kind_name(kind) << ','
+                        << item.decision_counts[kind] << ','
+                        << item.decision_sum_abs_weights[kind] << ','
+                        << item.wrong_side_count << ','
+                        << item.wrong_side_sum_abs_weight << ','
+                        << item.geometry_query_count << '\n';
+            }
+            summary << probe_case.case_id << ',' << probe_case.N << ','
+                    << item.target_dof << ',' << item.target_patch << ','
+                    << item.side << ',' << item.layer
+                    << ",unresolved_exception_fallback,"
+                    << item.unresolved_fallback_count << ','
+                    << item.unresolved_fallback_sum_abs_weight << ','
+                    << item.wrong_side_count << ','
+                    << item.wrong_side_sum_abs_weight << ','
+                    << item.geometry_query_count << '\n';
+            summary << probe_case.case_id << ',' << probe_case.N << ','
+                    << item.target_dof << ',' << item.target_patch << ','
+                    << item.side << ',' << item.layer
+                    << ",unrelated_coincidence_fallback,"
+                    << item.unrelated_coincidence_fallback_count << ','
+                    << item.unrelated_coincidence_fallback_sum_abs_weight << ','
+                    << item.wrong_side_count << ','
+                    << item.wrong_side_sum_abs_weight << ','
+                    << item.geometry_query_count << '\n';
+        }
+        for (const RestrictOwnerAuditRecord3D& item
+             : probe_case.owner_audit_records) {
+            terms << probe_case.case_id << ',' << probe_case.N << ','
+                  << item.target_dof << ',' << item.target_patch << ','
+                  << item.side << ',' << item.layer << ',' << item.grid_node
+                  << ',' << item.interpolation_weight << ',' << item.owner_dof
+                  << ',' << item.owner_patch << ',' << item.crossing_patch
+                  << ',' << item.crossing_u << ',' << item.crossing_v << ','
+                  << item.segment_parameter << ',' << item.residual << ','
+                  << item.transversality << '\n';
+        }
+    }
+}
+
 void write_all_normal_restrict_probe_outputs(
     const std::filesystem::path& output_dir,
     const std::vector<NormalRestrictCaseProbe3D>& cases)
@@ -3468,19 +3835,34 @@ bool normal_restrict_hypothesis_supported(
             supported = false;
             continue;
         }
-        const NormalRestrictRouteProbe3D& baseline_current =
+        const NormalRestrictRouteProbe3D& baseline_legacy =
             baseline->routes[0];
-        const NormalRestrictRouteProbe3D& baseline_reference =
+        const NormalRestrictRouteProbe3D& baseline_owner =
             baseline->routes[1];
+        const int baseline_physical_margin = std::max(
+            5, static_cast<int>(std::ceil(
+                   0.10 * static_cast<double>(
+                       std::max(1, baseline_legacy.physical.iterations)))));
+        const int baseline_common_margin = std::max(
+            5, static_cast<int>(std::ceil(
+                   0.10 * static_cast<double>(
+                       std::max(1, baseline_legacy.common.iterations)))));
+        const bool baseline_behavior_stable =
+            std::abs(baseline_owner.physical.iterations
+                     - baseline_legacy.physical.iterations)
+                <= baseline_physical_margin
+            && std::abs(baseline_owner.common.iterations
+                        - baseline_legacy.common.iterations)
+                <= baseline_common_margin;
         const bool baseline_valid =
-            baseline_current.physical.converged
-            && baseline_current.common.converged
-            && baseline_reference.physical.converged
-            && baseline_reference.common.converged
-            && baseline_reference.exact_grid_norms.linf <= 1.0e-12
-            && baseline_reference.physical.interior_linf
-               <= 2.0 * std::max(
-                    baseline_current.physical.interior_linf, 1.0e-14);
+            baseline_legacy.physical.converged
+            && baseline_legacy.common.converged
+            && baseline_owner.physical.converged
+            && baseline_owner.common.converged
+            && baseline_behavior_stable
+            && baseline_owner.physical.interior_linf
+               <= 1.25 * std::max(
+                    baseline_legacy.physical.interior_linf, 1.0e-14);
         supported = supported && baseline_valid;
         for (const std::string& rotated_id : rotated_ids) {
             const NormalRestrictCaseProbe3D* rotated =
@@ -3491,53 +3873,48 @@ bool normal_restrict_hypothesis_supported(
                 supported = false;
                 continue;
             }
-            const NormalRestrictRouteProbe3D& current = rotated->routes[0];
-            const NormalRestrictRouteProbe3D& reference = rotated->routes[1];
-            const int current_physical_excess =
-                current.physical.iterations
-                - baseline_current.physical.iterations;
-            const int reference_physical_excess =
-                reference.physical.iterations
-                - baseline_reference.physical.iterations;
-            const int current_common_excess =
-                current.common.iterations - baseline_current.common.iterations;
-            const int reference_common_excess =
-                reference.common.iterations - baseline_reference.common.iterations;
-            const bool current_inflation =
-                current_physical_excess > 0 && current_common_excess > 0;
+            const NormalRestrictRouteProbe3D& legacy = rotated->routes[0];
+            const NormalRestrictRouteProbe3D& owner = rotated->routes[1];
             const bool routes_valid =
-                current.physical.converged && current.common.converged
-                && reference.physical.converged && reference.common.converged;
-            const bool half_removed = routes_valid &&
-                static_cast<double>(reference_physical_excess)
-                    <= 0.5 * static_cast<double>(current_physical_excess)
-                && static_cast<double>(reference_common_excess)
-                    <= 0.5 * static_cast<double>(current_common_excess);
-            const bool exact_grid_isolated =
-                current.exact_grid_norms.linf
-                    >= 1.10 * baseline_current.exact_grid_norms.linf
-                && current.exact_grid_norms.linf
-                    >= baseline_current.exact_grid_norms.linf + 1.0e-8
-                && reference.exact_grid_norms.linf <= 1.0e-12;
-            const bool smooth_control_stable =
-                reference.smooth_grid_norms.linf
-                    <= 2.0 * baseline_reference.smooth_grid_norms.linf
-                       + 1.0e-12;
+                legacy.physical.converged && legacy.common.converged
+                && owner.physical.converged && owner.common.converged;
+            const bool accuracy_stable =
+                owner.physical.interior_linf
+                <= 1.50 * std::max(
+                    legacy.physical.interior_linf, 1.0e-14);
+            const bool physical_plateau_shortened =
+                owner.physical.iterations + 3
+                    <= legacy.physical.iterations
+                || (std::isfinite(owner.physical_rho_10_30)
+                    && std::isfinite(legacy.physical_rho_10_30)
+                    && owner.physical_rho_10_30
+                       <= 0.98 * legacy.physical_rho_10_30);
+            const bool common_plateau_shortened =
+                owner.common.iterations + 3 <= legacy.common.iterations
+                || (std::isfinite(owner.common_rho_10_30)
+                    && std::isfinite(legacy.common_rho_10_30)
+                    && owner.common_rho_10_30
+                       <= 0.98 * legacy.common_rho_10_30);
             const bool pair_supported = baseline_valid && routes_valid
-                && current_inflation && half_removed
-                && exact_grid_isolated && smooth_control_stable;
+                && accuracy_stable
+                && (physical_plateau_shortened
+                    || common_plateau_shortened);
             supported = supported && pair_supported;
             std::cout << "[restrict-decision] case=" << rotated_id
                       << " N=" << N
-                      << " physical_excess(current/reference)="
-                      << current_physical_excess << '/'
-                      << reference_physical_excess
-                      << " common_excess(current/reference)="
-                      << current_common_excess << '/'
-                      << reference_common_excess
-                      << " exact_grid_isolated=" << exact_grid_isolated
-                      << " smooth_control_stable=" << smooth_control_stable
-                      << " half_removed=" << half_removed << '\n';
+                      << " physical_iterations(legacy/owner)="
+                      << legacy.physical.iterations << '/'
+                      << owner.physical.iterations
+                      << " common_iterations(legacy/owner)="
+                      << legacy.common.iterations << '/'
+                      << owner.common.iterations
+                      << " physical_plateau_shortened="
+                      << physical_plateau_shortened
+                      << " common_plateau_shortened="
+                      << common_plateau_shortened
+                      << " baseline_behavior_stable="
+                      << baseline_behavior_stable
+                      << " accuracy_stable=" << accuracy_stable << '\n';
         }
     }
     return supported;
@@ -3579,6 +3956,7 @@ int run_normal_restrict_causal_probe(std::vector<int> levels)
 
     std::vector<NormalRestrictCaseProbe3D> results;
     write_all_normal_restrict_probe_outputs(output_dir, results);
+    write_restrict_owner_probe_outputs(output_dir, results);
     std::cout << "KFBI3D exterior-normal restrict causal probe\n"
               << "  geometry=l_prism cauchy=g1_nearest/degree3/48/28\n"
               << "  gmres_tolerance=2e-10 restart=0 cap=160\n";
@@ -3614,11 +3992,15 @@ int run_normal_restrict_causal_probe(std::vector<int> levels)
                         "restrict-probe native NURBS label mismatch");
                 }
             }
+            const auto pipeline_start = std::chrono::steady_clock::now();
             PanelCenterHarmonicJetKFBI3D pipeline(
                 grid, grid_pair, geometry.native_surface,
                 geometry.correction_triangles,
                 geometry.geometry_triangles,
-                surface_dofs, cauchy_stencils, true);
+                surface_dofs, cauchy_stencils, true, true);
+            const double pipeline_setup_seconds =
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - pipeline_start).count();
 
             NormalRestrictCaseProbe3D probe_case;
             probe_case.case_id = study_case.id;
@@ -3626,6 +4008,27 @@ int run_normal_restrict_causal_probe(std::vector<int> levels)
             probe_case.h = h;
             probe_case.wrong_side_support_count =
                 pipeline.joint_trace_wrong_side_node_counts();
+            probe_case.owner_diagnostics =
+                pipeline.restrict_owner_sample_diagnostics();
+            probe_case.owner_audit_records =
+                pipeline.restrict_owner_audit_records();
+            probe_case.owner_geometry_query_count =
+                pipeline.restrict_owner_geometry_query_count();
+            probe_case.pipeline_setup_seconds = pipeline_setup_seconds;
+            if (probe_case.owner_diagnostics.empty()
+                || probe_case.owner_geometry_query_count == 0) {
+                throw std::runtime_error(
+                    "restrict-probe crossing-owner diagnostics are empty");
+            }
+            std::size_t classified_queries = 0;
+            for (const RestrictOwnerSampleDiagnostics3D& diagnostic
+                 : probe_case.owner_diagnostics) {
+                classified_queries +=
+                    static_cast<std::size_t>(diagnostic.wrong_side_count);
+            }
+            if (classified_queries != probe_case.owner_geometry_query_count)
+                throw std::logic_error(
+                    "crossing-owner probe query count is inconsistent");
             const int size = pipeline.surface_size();
             probe_case.patch_ids.reserve(static_cast<std::size_t>(size));
             probe_case.points.reserve(static_cast<std::size_t>(size));
@@ -3677,11 +4080,15 @@ int run_normal_restrict_causal_probe(std::vector<int> levels)
                     smooth_exact, zero_jump, zero_jump);
             const Eigen::VectorXd common_rhs =
                 make_common_normal_restrict_rhs(size);
+            probe_case.setup_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - setup_start).count();
             results.push_back(std::move(probe_case));
+            write_restrict_owner_probe_outputs(output_dir, results);
             NormalRestrictCaseProbe3D& stored = results.back();
 
-            const std::array<ExteriorNormalRestrictMode3D, 2> modes{{
+            const std::array<ExteriorNormalRestrictMode3D, 3> modes{{
                 ExteriorNormalRestrictMode3D::JointTricubicCauchy,
+                ExteriorNormalRestrictMode3D::JointTricubicCrossingOwner,
                 ExteriorNormalRestrictMode3D::ExteriorOnlyHarmonicCubic}};
             for (ExteriorNormalRestrictMode3D mode : modes) {
                 const auto route_start = std::chrono::steady_clock::now();
@@ -3689,9 +4096,9 @@ int run_normal_restrict_causal_probe(std::vector<int> levels)
                     static_cast<std::size_t>(normal_restrict_route_index(mode))];
                 route.route = normal_restrict_route_name(mode);
                 route.conditions = summarize_conditions(
-                    mode == ExteriorNormalRestrictMode3D::JointTricubicCauchy
-                        ? pipeline.cauchy_condition_values()
-                        : pipeline.exterior_only_restrict_condition_values());
+                    mode == ExteriorNormalRestrictMode3D::ExteriorOnlyHarmonicCubic
+                        ? pipeline.exterior_only_restrict_condition_values()
+                        : pipeline.cauchy_condition_values());
                 route.exact_grid_error = pipeline.exterior_normal_trace(
                     piecewise_field, value_data, exact_normal, mode);
                 route.smooth_grid_error = pipeline.exterior_normal_trace(
@@ -3712,6 +4119,19 @@ int run_normal_restrict_causal_probe(std::vector<int> levels)
                     mode, &route.physical_residuals);
                 route.common = run_common_normal_restrict_gmres(
                     pipeline, mode, common_rhs);
+                route.physical_rho_10_30 =
+                    residual_contraction(route.physical_residuals, 10, 30);
+                route.physical_worst_rho_5 =
+                    worst_five_step_contraction(route.physical_residuals);
+                route.common_rho_10_30 =
+                    residual_contraction(route.common.residuals, 10, 30);
+                route.common_worst_rho_5 =
+                    worst_five_step_contraction(route.common.residuals);
+                if (pipeline.restrict_owner_geometry_query_count()
+                    != stored.owner_geometry_query_count) {
+                    throw std::runtime_error(
+                        "GMRES apply performed a crossing-owner geometry query");
+                }
                 route.seconds = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - route_start).count();
                 route.complete = true;
@@ -3730,11 +4150,14 @@ int run_normal_restrict_causal_probe(std::vector<int> levels)
                           << " common_iter=" << route.common.iterations
                           << " seconds=" << route.seconds << '\n';
             }
-            const double setup_seconds = std::chrono::duration<double>(
+            const double total_seconds = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - setup_start).count();
             std::cout << "[restrict-probe-case] case=" << stored.case_id
                       << " N=" << N << " dofs=" << size
-                      << " total_seconds=" << setup_seconds << '\n';
+                      << " setup_seconds=" << stored.setup_seconds
+                      << " pipeline_setup_seconds="
+                      << stored.pipeline_setup_seconds
+                      << " total_seconds=" << total_seconds << '\n';
         }
     }
     const bool supported = normal_restrict_hypothesis_supported(results, levels);
