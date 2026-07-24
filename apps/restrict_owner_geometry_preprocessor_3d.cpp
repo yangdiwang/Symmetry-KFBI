@@ -126,6 +126,67 @@ std::size_t fallback_index(FallbackCause cause)
     return static_cast<std::size_t>(cause);
 }
 
+double segment_parameter_tolerance(
+    double geometry_tolerance,
+    double segment_length)
+{
+    return std::max(
+        16.0e-12, 16.0 * geometry_tolerance / segment_length);
+}
+
+double patch_parameter_tolerance(
+    const geometry3d::NurbsSurfacePatch3D& patch)
+{
+    const double scale = std::max({
+        1.0,
+        patch.domain_end_u() - patch.domain_start_u(),
+        patch.domain_end_v() - patch.domain_start_v()});
+    return 16.0e-12 * scale;
+}
+
+std::optional<FallbackCause> filtered_fallback_cause(
+    const NativeNurbsSurface3D& surface,
+    double geometry_tolerance,
+    const Eigen::Vector3d& query,
+    const Eigen::Vector3d& support,
+    const geometry3d::NurbsSurfaceIntersectionResult3D& intersection)
+{
+    if (intersection.overlap_detected)
+        return FallbackCause::Overlap;
+    if (intersection.diagnostics.unresolved_candidates > 0
+        || intersection.diagnostics.ambiguous_root_clusters > 0) {
+        return FallbackCause::Unresolved;
+    }
+    const double edge_tolerance = segment_parameter_tolerance(
+        geometry_tolerance, (support - query).norm());
+    for (const auto& root : intersection.crossings) {
+        if (root.edge_parameter <= edge_tolerance
+            || root.edge_parameter >= 1.0 - edge_tolerance) {
+            return FallbackCause::Endpoint;
+        }
+        if (root.feature_edge_contact)
+            return FallbackCause::FeatureContact;
+        if (root.transversality
+            <= root.reliable_transversality_tolerance) {
+            return FallbackCause::NearTangent;
+        }
+    }
+    if (intersection.diagnostics.seam_deduplications > 0)
+        return FallbackCause::Seam;
+    for (const auto& root : intersection.crossings) {
+        const auto& patch =
+            surface.patches[static_cast<std::size_t>(root.patch_index)];
+        const double tolerance = patch_parameter_tolerance(patch);
+        if (root.u <= patch.domain_start_u() + tolerance
+            || root.u >= patch.domain_end_u() - tolerance
+            || root.v <= patch.domain_start_v() + tolerance
+            || root.v >= patch.domain_end_v() - tolerance) {
+            return FallbackCause::ParameterBoundary;
+        }
+    }
+    return std::nullopt;
+}
+
 } // namespace
 
 const char* restrict_owner_preprocess_mode_name_3d(
@@ -353,12 +414,79 @@ RestrictOwnerGeometryPreprocessor3D::full_reference_result(
 
 RestrictOwnerPreprocessResult3D
 RestrictOwnerGeometryPreprocessor3D::optimized_intersection_result(
-    int,
-    const Eigen::Vector3d&,
-    const Eigen::Vector3d&)
+    int target_dof,
+    const Eigen::Vector3d& query,
+    const Eigen::Vector3d& support)
 {
-    throw std::logic_error(
-        "optimized restrict-owner preprocessing is not implemented");
+    const int target_patch =
+        cloud_.dofs[static_cast<std::size_t>(target_dof)].patch_id;
+    CandidatePartition partition = partition_candidates(
+        target_patch,
+        intersector_.conservative_segment_candidates(query, support));
+    diagnostics_.compatible_aabb_candidates +=
+        static_cast<std::uint64_t>(partition.compatible.size());
+    diagnostics_.foreign_aabb_candidates +=
+        static_cast<std::uint64_t>(partition.foreign.size());
+
+    if (partition.foreign.empty()) {
+        return make_target_result(
+            target_dof, QueryPath::SegmentTargetOnly);
+    }
+
+    std::vector<Candidate> ordered_candidates;
+    ordered_candidates.reserve(
+        partition.foreign.size() + partition.compatible.size());
+    for (Candidate& candidate : partition.foreign)
+        ordered_candidates.push_back(std::move(candidate));
+    for (Candidate& candidate : partition.compatible)
+        ordered_candidates.push_back(std::move(candidate));
+
+    const auto full_fallback = [&](FallbackCause cause) {
+        ++diagnostics_.full_fallback_calls;
+        RestrictOwnerPreprocessResult3D result = full_reference_result(
+            target_dof, query, support,
+            QueryPath::FullIntersectionFallback);
+        result.query_path = QueryPath::FullIntersectionFallback;
+        result.fallback_cause = cause;
+        return result;
+    };
+
+    ++diagnostics_.optimized_intersection_calls;
+    try {
+        geometry3d::NurbsSurfaceFilteredIntersectionOptions3D
+            filtered_options;
+        filtered_options.maximum_independent_crossings =
+            options_.maximum_independent_crossings;
+        const auto filtered = intersector_.intersect_segment_candidates(
+            query, support, ordered_candidates, filtered_options);
+
+        if (filtered.independent_crossing_limit_reached) {
+            return make_fail_closed_target_result(
+                target_dof, QueryPath::OptimizedIntersection,
+                FallbackCause::MultipleCrossings);
+        }
+        if (!filtered.all_candidates_processed) {
+            return full_fallback(FallbackCause::Unresolved);
+        }
+        if (const auto cause = filtered_fallback_cause(
+                surface_, intersector_.geometry_tolerance(),
+                query, support, filtered.intersection)) {
+            return full_fallback(*cause);
+        }
+
+        return normalize_intersection_result(
+            target_dof, query, support, filtered.intersection,
+            QueryPath::OptimizedIntersection);
+    } catch (const geometry3d::
+                 UnresolvedNurbsIntersectionCandidate3D&) {
+        return full_fallback(FallbackCause::Unresolved);
+    } catch (const std::runtime_error& error) {
+        if (std::string(error.what())
+            == "coincident roots on unrelated NURBS patches") {
+            return full_fallback(FallbackCause::Coincidence);
+        }
+        throw;
+    }
 }
 
 RestrictOwnerSampleResult3D
