@@ -57,6 +57,17 @@ struct PendingBox {
     int depth = 0;
 };
 
+enum class AffinePlanarRoute3D {
+    Fallback,
+    Hit,
+    Miss
+};
+
+struct AffinePlanarResult3D {
+    AffinePlanarRoute3D route = AffinePlanarRoute3D::Fallback;
+    NurbsElementRoot3D root;
+};
+
 struct Interval {
     double lower = std::numeric_limits<double>::infinity();
     double upper = -std::numeric_limits<double>::infinity();
@@ -851,29 +862,287 @@ bool append_root(std::vector<NurbsElementRoot3D>& roots,
     return true;
 }
 
+AffinePlanarResult3D classify_affine_planar_intersection(
+    const RationalBezierElement3D& element,
+    const NurbsSurfacePatch3D& patch,
+    const SegmentFrame& frame,
+    const NurbsElementIntersectionOptions3D& options)
+{
+    AffinePlanarResult3D result;
+    if (element.degree_u != 1 || element.degree_v != 1
+        || patch.basis_u().degree() != 1
+        || patch.basis_v().degree() != 1) {
+        return result;
+    }
+
+    const double weight = element.control(0, 0).w();
+    if (!std::isfinite(weight) || !(weight > 0.0))
+        return result;
+    for (int i = 0; i <= 1; ++i) {
+        for (int j = 0; j <= 1; ++j) {
+            const double candidate = element.control(i, j).w();
+            if (!std::isfinite(candidate) || !(candidate > 0.0)
+                || candidate != weight) {
+                return result;
+            }
+        }
+    }
+
+    const Eigen::Vector3d p00 = projected_control(element.control(0, 0));
+    const Eigen::Vector3d p10 = projected_control(element.control(1, 0));
+    const Eigen::Vector3d p01 = projected_control(element.control(0, 1));
+    const Eigen::Vector3d p11 = projected_control(element.control(1, 1));
+    const Eigen::Vector3d tangent_u = p10 - p00;
+    const Eigen::Vector3d tangent_v = p01 - p00;
+    const double geometry_scale = std::max(
+        {element.bounds().max_extent(), frame.length, 1.0});
+    const double machine_epsilon =
+        std::numeric_limits<double>::epsilon();
+    const double absolute_coordinate_scale = std::max({
+        geometry_scale,
+        p00.cwiseAbs().maxCoeff(), p10.cwiseAbs().maxCoeff(),
+        p01.cwiseAbs().maxCoeff(), p11.cwiseAbs().maxCoeff(),
+        frame.start.cwiseAbs().maxCoeff(),
+        (frame.start + frame.delta).cwiseAbs().maxCoeff()});
+    if (!std::isfinite(absolute_coordinate_scale))
+        return result;
+    const double roundoff_tolerance =
+        64.0 * machine_epsilon * absolute_coordinate_scale;
+    const double contact_tolerance =
+        8.0 * options.geometry_tolerance;
+    const double conditioning_tolerance =
+        64.0 * std::sqrt(machine_epsilon);
+    if (roundoff_tolerance >= contact_tolerance)
+        return result;
+    std::array<Eigen::Vector3d, 4> source_corners;
+    try {
+        source_corners = {{
+            patch.evaluate(element.u0(), element.v0()),
+            patch.evaluate(element.u1(), element.v0()),
+            patch.evaluate(element.u0(), element.v1()),
+            patch.evaluate(element.u1(), element.v1())}};
+    } catch (const std::exception&) {
+        return result;
+    }
+    const std::array<Eigen::Vector3d, 4> element_corners{{
+        p00, p10, p01, p11}};
+    for (std::size_t corner = 0; corner < source_corners.size(); ++corner) {
+        if (!source_corners[corner].allFinite()
+            || (source_corners[corner] - element_corners[corner]).norm()
+                    + roundoff_tolerance
+                >= contact_tolerance) {
+            return result;
+        }
+    }
+    const double minimum_tangent_norm =
+        std::min(tangent_u.norm(), tangent_v.norm());
+    if ((p11 - p10 - p01 + p00).norm() > roundoff_tolerance
+        || !std::isfinite(minimum_tangent_norm)
+        || minimum_tangent_norm
+            <= roundoff_tolerance / conditioning_tolerance) {
+        return result;
+    }
+
+    const Eigen::Vector3d cross = tangent_u.cross(tangent_v);
+    const double cross_norm = cross.norm();
+    if (!std::isfinite(cross_norm)
+        || cross_norm <= conditioning_tolerance
+            * tangent_u.norm() * tangent_v.norm()) {
+        return result;
+    }
+    const Eigen::Vector3d normal = cross / cross_norm;
+    const double measured_transversality =
+        std::abs(normal.dot(frame.direction));
+    const double transversality_tolerance =
+        reliable_transversality_tolerance(element, frame, options);
+    const double angular_roundoff_tolerance =
+        4.0 * roundoff_tolerance / minimum_tangent_norm;
+    if (!std::isfinite(measured_transversality)
+        || !std::isfinite(angular_roundoff_tolerance)
+        || measured_transversality
+            <= transversality_tolerance + angular_roundoff_tolerance) {
+        return result;
+    }
+
+    const double denominator = normal.dot(frame.delta);
+    if (!std::isfinite(denominator) || denominator == 0.0)
+        return result;
+    const double segment_parameter =
+        normal.dot(p00 - frame.start) / denominator;
+    const Eigen::Vector3d line_point =
+        frame.start + segment_parameter * frame.delta;
+    const Eigen::Vector3d relative = line_point - p00;
+    const double uu = tangent_u.squaredNorm();
+    const double uv = tangent_u.dot(tangent_v);
+    const double vv = tangent_v.squaredNorm();
+    const double determinant = uu * vv - uv * uv;
+    if (!std::isfinite(determinant)
+        || determinant <= conditioning_tolerance * uu * vv) {
+        return result;
+    }
+    const double normalized_determinant = determinant / (uu * vv);
+    if (!std::isfinite(normalized_determinant)
+        || !(normalized_determinant > 0.0)) {
+        return result;
+    }
+    const double right_u = tangent_u.dot(relative);
+    const double right_v = tangent_v.dot(relative);
+    const double local_u = (right_u * vv - right_v * uv) / determinant;
+    const double local_v = (right_v * uu - right_u * uv) / determinant;
+    if (!std::isfinite(segment_parameter) || !std::isfinite(local_u)
+        || !std::isfinite(local_v)) {
+        return result;
+    }
+
+    const Eigen::Vector3d reconstructed =
+        p00 + local_u * tangent_u + local_v * tangent_v;
+    if (!reconstructed.allFinite()
+        || (reconstructed - line_point).norm() + roundoff_tolerance
+            >= contact_tolerance
+        || std::abs(normal.dot(line_point - p00)) + roundoff_tolerance
+            >= contact_tolerance) {
+        return result;
+    }
+
+    const double center_u = midpoint(element.u0(), element.u1());
+    const double center_v = midpoint(element.v0(), element.v1());
+    NurbsSurfaceDerivatives3D center;
+    try {
+        center = patch.evaluate_with_derivatives(center_u, center_v);
+    } catch (const std::exception&) {
+        return result;
+    }
+    const Eigen::Vector3d center_cross = center.du.cross(center.dv);
+    const double center_cross_norm = center_cross.norm();
+    const Eigen::Vector3d affine_center =
+        p00 + 0.5 * tangent_u + 0.5 * tangent_v;
+    if (!center.point.allFinite() || !center.du.allFinite()
+        || !center.dv.allFinite() || !std::isfinite(center_cross_norm)
+        || center_cross_norm <= roundoff_tolerance * roundoff_tolerance
+        || (center.point - affine_center).norm() + roundoff_tolerance
+            >= contact_tolerance
+        || normal.dot(center_cross / center_cross_norm)
+            < 1.0 - 256.0 * std::numeric_limits<double>::epsilon()) {
+        return result;
+    }
+
+    const double coordinate_parameter_uncertainty =
+        256.0 * machine_epsilon * absolute_coordinate_scale
+        / (minimum_tangent_norm
+           * std::max(normalized_determinant, machine_epsilon));
+    const double segment_parameter_uncertainty =
+        256.0 * machine_epsilon * absolute_coordinate_scale
+        / (frame.length
+           * std::max(measured_transversality, machine_epsilon));
+    const double parameter_margin = std::max({
+        8.0 * options.parameter_tolerance,
+        64.0 * machine_epsilon,
+        256.0 * machine_epsilon
+            / std::max(normalized_determinant, machine_epsilon),
+        coordinate_parameter_uncertainty});
+    const double segment_margin = std::max({
+        8.0 * options.parameter_tolerance,
+        8.0 * options.geometry_tolerance / frame.length,
+        64.0 * machine_epsilon,
+        256.0 * machine_epsilon
+            / std::max(measured_transversality, machine_epsilon),
+        segment_parameter_uncertainty});
+    if (!std::isfinite(parameter_margin)
+        || !std::isfinite(segment_margin)) {
+        return result;
+    }
+    const auto strictly_inside = [](double value, double margin) {
+        return value > margin && value < 1.0 - margin;
+    };
+    const auto strictly_outside = [](double value, double margin) {
+        return value < -margin || value > 1.0 + margin;
+    };
+    const bool inside =
+        strictly_inside(segment_parameter, segment_margin)
+        && strictly_inside(local_u, parameter_margin)
+        && strictly_inside(local_v, parameter_margin);
+    const bool outside =
+        strictly_outside(segment_parameter, segment_margin)
+        || strictly_outside(local_u, parameter_margin)
+        || strictly_outside(local_v, parameter_margin);
+    if (!inside) {
+        if (outside)
+            result.route = AffinePlanarRoute3D::Miss;
+        return result;
+    }
+
+    const double u = element.u0()
+        + local_u * (element.u1() - element.u0());
+    const double v = element.v0()
+        + local_v * (element.v1() - element.v0());
+    NurbsSurfaceDerivatives3D derivatives;
+    try {
+        derivatives = patch.evaluate_with_derivatives(u, v);
+    } catch (const std::exception&) {
+        return result;
+    }
+    const Eigen::Vector3d root_cross = derivatives.du.cross(derivatives.dv);
+    const double root_cross_norm = root_cross.norm();
+    const Eigen::Vector3d root_normal = root_cross / root_cross_norm;
+    const double root_transversality =
+        std::abs(root_normal.dot(frame.direction));
+    const double residual = (derivatives.point - line_point).norm();
+    if (!derivatives.point.allFinite() || !std::isfinite(root_cross_norm)
+        || root_cross_norm <= roundoff_tolerance * roundoff_tolerance
+        || !root_normal.allFinite()
+        || !std::isfinite(root_transversality)
+        || root_transversality
+            <= transversality_tolerance + angular_roundoff_tolerance
+        || !std::isfinite(residual)
+        || residual + roundoff_tolerance >= contact_tolerance
+        || normal.dot(root_normal)
+            < 1.0 - 256.0 * std::numeric_limits<double>::epsilon()) {
+        return result;
+    }
+
+    result.route = AffinePlanarRoute3D::Hit;
+    result.root.patch_index = element.patch_index;
+    result.root.component = element.component;
+    result.root.u = u;
+    result.root.v = v;
+    result.root.t = segment_parameter;
+    result.root.point = derivatives.point;
+    result.root.normal = root_normal;
+    result.root.residual = residual;
+    result.root.transversality = root_transversality;
+    result.root.reliable_transversality_tolerance =
+        transversality_tolerance;
+    return result;
+}
+
 NurbsElementSegmentClosestPointResult3D run_closest_point_assistance(
     const RationalBezierElement3D& box,
     const NurbsSurfacePatch3D& patch,
     const SegmentFrame& frame,
     const NurbsElementIntersectionOptions3D& options,
     NurbsElementIntersectionDiagnostics3D& diagnostics,
-    std::optional<Eigen::Vector2d> preferred_seed)
+    std::optional<Eigen::Vector2d> preferred_seed,
+    bool record_terminal_diagnostics = true)
 {
     NurbsElementSegmentClosestPointOptions3D closest_options;
     closest_options.distance_tolerance = options.geometry_tolerance;
     closest_options.parameter_tolerance = options.parameter_tolerance;
     closest_options.max_iterations =
         std::max(36, options.max_newton_iterations);
-    checked_increment_diagnostic(
-        diagnostics.closest_point_attempts,
-        "NURBS closest-point attempt diagnostic overflow");
+    if (record_terminal_diagnostics) {
+        checked_increment_diagnostic(
+            diagnostics.closest_point_attempts,
+            "NURBS closest-point attempt diagnostic overflow");
+    }
     const auto result =
         closest_point_nurbs_bezier_element_to_segment_3d(
             box, patch, frame.start, frame.start + frame.delta,
             closest_options, preferred_seed);
-    checked_accumulate_diagnostic(
-        diagnostics.closest_point_iterations, result.iterations,
-        "NURBS closest-point iteration diagnostic overflow");
+    if (record_terminal_diagnostics) {
+        checked_accumulate_diagnostic(
+            diagnostics.closest_point_iterations, result.iterations,
+            "NURBS closest-point iteration diagnostic overflow");
+    }
     return result;
 }
 
@@ -1701,10 +1970,131 @@ NurbsElementIntersectionResult3D intersect_nurbs_bezier_element_3d(
     const SegmentFrame frame = make_segment_frame(segment_start, segment_end);
 
     NurbsElementIntersectionResult3D result;
-    const ProjectedRanges initial_ranges = projected_ranges(element, frame);
     checked_increment_diagnostic(
         result.diagnostics.subdivision_boxes,
         "NURBS subdivision-box diagnostic overflow");
+    if (options.use_affine_planar_fast_path) {
+        const AffinePlanarResult3D planar =
+            classify_affine_planar_intersection(
+                element, patch, frame, options);
+        if (planar.route == AffinePlanarRoute3D::Hit) {
+            checked_increment_diagnostic(
+                result.diagnostics.planar_analytic_hits,
+                "NURBS planar analytic-hit diagnostic overflow");
+            result.roots.push_back(planar.root);
+            return result;
+        }
+        if (planar.route == AffinePlanarRoute3D::Miss) {
+            checked_increment_diagnostic(
+                result.diagnostics.planar_analytic_misses,
+                "NURBS planar analytic-miss diagnostic overflow");
+            return result;
+        }
+        checked_increment_diagnostic(
+            result.diagnostics.planar_analytic_fallbacks,
+            "NURBS planar analytic-fallback diagnostic overflow");
+    }
+
+    std::optional<NurbsElementRoot3D> closest_prefilter_root;
+    std::optional<TriangleSeed> closest_prefilter_seed;
+    if (options.use_closest_point_prefilter) {
+        checked_increment_diagnostic(
+            result.diagnostics.closest_point_prefilter_attempts,
+            "NURBS closest-point prefilter-attempt diagnostic overflow");
+        std::optional<Eigen::Vector2d> preferred_seed;
+        if (!options.parameter_seeds.empty()) {
+            preferred_seed = Eigen::Vector2d(
+                options.parameter_seeds.front().u,
+                options.parameter_seeds.front().v);
+        }
+        const NurbsElementSegmentClosestPointResult3D closest =
+            run_closest_point_assistance(
+                element, patch, frame, options, result.diagnostics,
+                preferred_seed, false);
+        if (std::isfinite(closest.u) && std::isfinite(closest.v)
+            && std::isfinite(closest.t)
+            && closest.u >= element.u0() - options.parameter_tolerance
+            && closest.u <= element.u1() + options.parameter_tolerance
+            && closest.v >= element.v0() - options.parameter_tolerance
+            && closest.v <= element.v1() + options.parameter_tolerance
+            && closest.t >= -options.parameter_tolerance
+            && closest.t <= 1.0 + options.parameter_tolerance) {
+            closest_prefilter_seed = TriangleSeed{
+                std::clamp(closest.u, element.u0(), element.u1()),
+                std::clamp(closest.v, element.v0(), element.v1()),
+                std::clamp(closest.t, 0.0, 1.0)};
+        }
+        closest_prefilter_root = root_from_closest_point(
+            element, patch, frame, options, closest);
+
+        const auto root_is_strictly_interior = [&]() {
+            if (!closest_prefilter_root)
+                return false;
+            const double epsilon =
+                std::numeric_limits<double>::epsilon();
+            const double u_scale = std::max(
+                {1.0, std::abs(element.u0()), std::abs(element.u1()),
+                 element.u1() - element.u0()});
+            const double v_scale = std::max(
+                {1.0, std::abs(element.v0()), std::abs(element.v1()),
+                 element.v1() - element.v0()});
+            const double u_margin = std::max(
+                8.0 * options.parameter_tolerance,
+                64.0 * epsilon * u_scale);
+            const double v_margin = std::max(
+                8.0 * options.parameter_tolerance,
+                64.0 * epsilon * v_scale);
+            const double t_margin = std::max({
+                8.0 * options.parameter_tolerance,
+                8.0 * options.geometry_tolerance / frame.length,
+                64.0 * epsilon});
+            const NurbsElementRoot3D& root = *closest_prefilter_root;
+            return root.u > element.u0() + u_margin
+                && root.u < element.u1() - u_margin
+                && root.v > element.v0() + v_margin
+                && root.v < element.v1() - v_margin
+                && root.t > t_margin && root.t < 1.0 - t_margin;
+        };
+        if (root_is_strictly_interior()
+            && certifies_unique_transverse_root(
+                element, *closest_prefilter_root, frame)) {
+            checked_increment_diagnostic(
+                result.diagnostics
+                    .closest_point_prefilter_certified_hits,
+                "NURBS closest-point prefilter-hit diagnostic overflow");
+            result.roots.push_back(*closest_prefilter_root);
+            return result;
+        }
+
+        const double contact_tolerance =
+            8.0 * options.geometry_tolerance;
+        if (closest.converged && std::isfinite(closest.distance)
+            && closest.surface_point.allFinite()
+            && closest.segment_point.allFinite()
+            && closest.distance > contact_tolerance
+            && certifies_terminal_separation(
+                element, frame,
+                closest.surface_point - closest.segment_point,
+                options.geometry_tolerance,
+                result.diagnostics)) {
+            checked_increment_diagnostic(
+                result.diagnostics
+                    .closest_point_prefilter_certified_misses,
+                "NURBS closest-point prefilter-miss diagnostic overflow");
+            return result;
+        }
+        checked_increment_diagnostic(
+            result.diagnostics.closest_point_prefilter_fallbacks,
+            "NURBS closest-point prefilter-fallback diagnostic overflow");
+    }
+
+    if (options.use_affine_planar_fast_path
+        || options.use_closest_point_prefilter) {
+        checked_increment_diagnostic(
+            result.diagnostics.certified_fallback_elements,
+            "NURBS certified-fallback diagnostic overflow");
+    }
+    const ProjectedRanges initial_ranges = projected_ranges(element, frame);
     if (!is_conservative_candidate(
             initial_ranges, frame, options.geometry_tolerance)) {
         checked_increment_diagnostic(
@@ -1716,6 +2106,20 @@ NurbsElementIntersectionResult3D intersect_nurbs_bezier_element_3d(
     if (certifies_supported_overlap(element, patch, frame, options)) {
         result.overlap_detected = true;
         return result;
+    }
+
+    if (closest_prefilter_root)
+        (void)append_root(result.roots, *closest_prefilter_root, options);
+    if (!closest_prefilter_root && closest_prefilter_seed) {
+        const NativeNewtonOutcome outcome = native_newton(
+            element, patch, frame, *closest_prefilter_seed,
+            options, result.diagnostics);
+        if (outcome.root
+            && append_root(result.roots, *outcome.root, options)) {
+            checked_increment_diagnostic(
+                result.diagnostics.roots_recovered_without_triangle_seed,
+                "NURBS prefilter-seed recovery diagnostic overflow");
+        }
     }
 
     if (options.use_triangle_seed) {

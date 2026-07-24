@@ -38,6 +38,14 @@ struct NurbsSurfaceIntersectionDiagnostics3D {
     int newton_iterations = 0;
     int early_unique_certificate_attempts = 0;
     int early_unique_certificate_successes = 0;
+    int planar_analytic_hits = 0;
+    int planar_analytic_misses = 0;
+    int planar_analytic_fallbacks = 0;
+    int closest_point_prefilter_attempts = 0;
+    int closest_point_prefilter_certified_hits = 0;
+    int closest_point_prefilter_certified_misses = 0;
+    int closest_point_prefilter_fallbacks = 0;
+    int certified_fallback_elements = 0;
     int same_patch_deduplications = 0;
     int seam_deduplications = 0;
     int unresolved_candidates = 0;
@@ -117,6 +125,8 @@ struct NurbsCartesianEdgeQueryOptions3D {
 struct NurbsSurfaceIntersectorOptions3D {
     bool use_triangle_seeds = true;
     bool use_early_unique_root_certificate = false;
+    bool use_affine_planar_fast_path = false;
+    bool use_closest_point_prefilter = false;
     int bvh_leaf_size = 8;
     double maximum_element_extent =
         std::numeric_limits<double>::infinity();
@@ -185,6 +195,7 @@ private:
     double geometry_tolerance_ = 1e-14;
     double maximum_query_element_extent_ = 0.0;
     std::vector<RationalBezierElement3D> elements_;
+    std::vector<bool> element_touches_non_g1_feature_;
     std::vector<NurbsQueryElementDescriptor3D> query_elements_;
     std::vector<std::array<NurbsQueryElementSample3D, 16>> element_samples_;
     std::vector<int> element_order_;

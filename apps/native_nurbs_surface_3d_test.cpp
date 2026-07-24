@@ -133,6 +133,22 @@ void require_same_route_neutral_intersection_diagnostics(
                     == second.early_unique_certificate_attempts
                 && first.early_unique_certificate_successes
                     == second.early_unique_certificate_successes
+                && first.planar_analytic_hits
+                    == second.planar_analytic_hits
+                && first.planar_analytic_misses
+                    == second.planar_analytic_misses
+                && first.planar_analytic_fallbacks
+                    == second.planar_analytic_fallbacks
+                && first.closest_point_prefilter_attempts
+                    == second.closest_point_prefilter_attempts
+                && first.closest_point_prefilter_certified_hits
+                    == second.closest_point_prefilter_certified_hits
+                && first.closest_point_prefilter_certified_misses
+                    == second.closest_point_prefilter_certified_misses
+                && first.closest_point_prefilter_fallbacks
+                    == second.closest_point_prefilter_fallbacks
+                && first.certified_fallback_elements
+                    == second.certified_fallback_elements
                 && first.same_patch_deduplications
                     == second.same_patch_deduplications
                 && first.seam_deduplications
@@ -865,6 +881,319 @@ void test_rational_bezier_element_intersection()
     require(miss.roots.empty() && miss.diagnostics.newton_attempts == 0
                 && miss.diagnostics.conservative_rejections > 0,
             "control hull rejects an impossible line before Newton");
+}
+
+void test_affine_planar_fast_path()
+{
+    using kfbim::geometry::NurbsBasis1D;
+    using kfbim::geometry3d::NurbsElementIntersectionOptions3D;
+    using kfbim::geometry3d::NurbsElementIntersectionResult3D;
+    using kfbim::geometry3d::NurbsSurfaceModel3D;
+    using kfbim::geometry3d::NurbsSurfacePatch3D;
+    using kfbim::geometry3d::UnresolvedNurbsIntersectionCandidate3D;
+    using kfbim::geometry3d::extract_rational_bezier_elements_3d;
+    using kfbim::geometry3d::intersect_nurbs_bezier_element_3d;
+
+    const auto make_plane = [](double z) {
+        return NurbsSurfacePatch3D(
+            NurbsBasis1D(1, {0.0, 0.0, 1.0, 1.0}),
+            NurbsBasis1D(1, {0.0, 0.0, 1.0, 1.0}),
+            {{{0.0, 0.0, z}, {0.0, 1.0, z}},
+             {{1.0, 0.0, z}, {1.0, 1.0, z}}},
+            {{1.0, 1.0}, {1.0, 1.0}});
+    };
+    const NurbsSurfaceModel3D model(
+        {make_plane(0.0), make_plane(1.0)}, {0, 0}, {});
+    const auto elements = extract_rational_bezier_elements_3d(model);
+    require(elements.size() == 2, "affine route fixture has two elements");
+
+    NurbsElementIntersectionOptions3D options;
+    options.geometry_tolerance = 1.0e-12;
+    options.use_affine_planar_fast_path = true;
+    const auto solve = [&](std::size_t element,
+                           const Eigen::Vector3d& start,
+                           const Eigen::Vector3d& end) {
+        try {
+            return intersect_nurbs_bezier_element_3d(
+                elements[element], model.patch(static_cast<int>(element)),
+                start, end, options);
+        } catch (const UnresolvedNurbsIntersectionCandidate3D& error) {
+            return error.partial_result();
+        }
+    };
+
+    const NurbsElementIntersectionResult3D interior =
+        solve(0, {0.25, 0.75, -1.0}, {0.25, 0.75, 1.0});
+    require(interior.roots.size() == 1
+                && interior.diagnostics.planar_analytic_hits == 1
+                && interior.diagnostics.planar_analytic_misses == 0
+                && interior.diagnostics.planar_analytic_fallbacks == 0
+                && interior.diagnostics.certified_fallback_elements == 0,
+            "affine route certifies a strict interior hit");
+
+    const NurbsElementIntersectionResult3D miss =
+        solve(0, {1.5, 0.5, -1.0}, {1.5, 0.5, 1.0});
+    require(miss.roots.empty()
+                && miss.diagnostics.planar_analytic_hits == 0
+                && miss.diagnostics.planar_analytic_misses == 1
+                && miss.diagnostics.planar_analytic_fallbacks == 0
+                && miss.diagnostics.certified_fallback_elements == 0,
+            "affine route certifies a clear patch miss");
+
+    const NurbsSurfacePatch3D curved_source(
+        NurbsBasis1D(2, {0.0, 0.0, 0.0, 1.0, 1.0, 1.0}),
+        NurbsBasis1D(1, {0.0, 0.0, 1.0, 1.0}),
+        {{{0.0, 0.0, 0.25}, {0.0, 1.0, 0.25}},
+         {{0.5, 0.0, -0.25}, {0.5, 1.0, -0.25}},
+         {{1.0, 0.0, 0.25}, {1.0, 1.0, 0.25}}},
+        {{1.0, 1.0}, {1.0, 1.0}, {1.0, 1.0}});
+    const auto mismatched_source = intersect_nurbs_bezier_element_3d(
+        elements.front(), curved_source,
+        {1.5, 0.5, -1.0}, {1.5, 0.5, 1.0}, options);
+    require(mismatched_source.diagnostics.planar_analytic_fallbacks == 1
+                && mismatched_source.diagnostics
+                       .certified_fallback_elements == 1,
+            "affine route rejects a higher-degree source patch");
+
+    constexpr double translated_origin = 1.0e15;
+    const NurbsSurfaceModel3D translated_model(
+        {NurbsSurfacePatch3D(
+            NurbsBasis1D(1, {0.0, 0.0, 1.0, 1.0}),
+            NurbsBasis1D(1, {0.0, 0.0, 1.0, 1.0}),
+            {{{translated_origin, translated_origin, 0.0},
+              {translated_origin, translated_origin + 1.0, 0.0}},
+             {{translated_origin + 1.0, translated_origin, 0.0},
+              {translated_origin + 1.0,
+               translated_origin + 1.0, 0.0}}},
+            {{1.0, 1.0}, {1.0, 1.0}})},
+        {0}, {});
+    const auto translated_element =
+        extract_rational_bezier_elements_3d(translated_model).front();
+    const auto translated = intersect_nurbs_bezier_element_3d(
+        translated_element, translated_model.patch(0),
+        {translated_origin + 0.25, translated_origin + 0.75, -1.0},
+        {translated_origin + 0.25, translated_origin + 0.75, 1.0},
+        options);
+    require(translated.diagnostics.planar_analytic_fallbacks == 1
+                && translated.diagnostics.certified_fallback_elements == 1,
+            "affine route falls back when absolute-coordinate roundoff dominates");
+
+    const NurbsElementIntersectionResult3D reversed =
+        solve(0, {0.25, 0.75, 1.0}, {0.25, 0.75, -1.0});
+    require(reversed.roots.size() == 1
+                && reversed.diagnostics.planar_analytic_hits == 1
+                && std::abs(reversed.roots.front().t - 0.5) < 2.0e-12,
+            "affine route handles a reversed segment");
+
+    const NurbsElementIntersectionResult3D near_parallel =
+        solve(0, {0.25, 0.5, -1.0e-13}, {0.75, 0.5, 1.0e-13});
+    require(near_parallel.diagnostics.planar_analytic_fallbacks == 1
+                && near_parallel.diagnostics.certified_fallback_elements == 1,
+            "near-parallel affine query falls back");
+
+    const NurbsElementIntersectionResult3D coplanar =
+        solve(0, {0.25, 0.5, 0.0}, {0.75, 0.5, 0.0});
+    require(coplanar.overlap_detected
+                && coplanar.diagnostics.planar_analytic_fallbacks == 1
+                && coplanar.diagnostics.certified_fallback_elements == 1,
+            "coplanar affine overlap falls back");
+
+    const NurbsElementIntersectionResult3D endpoint =
+        solve(0, {0.25, 0.5, 0.0}, {0.25, 0.5, 1.0});
+    require(endpoint.roots.size() == 1
+                && endpoint.diagnostics.planar_analytic_fallbacks == 1
+                && endpoint.diagnostics.certified_fallback_elements == 1,
+            "Cartesian endpoint contact falls back");
+
+    const NurbsElementIntersectionResult3D patch_boundary =
+        solve(0, {0.0, 0.5, -1.0}, {0.0, 0.5, 1.0});
+    require(patch_boundary.roots.size() == 1
+                && patch_boundary.diagnostics.planar_analytic_fallbacks == 1
+                && patch_boundary.diagnostics.certified_fallback_elements == 1,
+            "affine patch-boundary contact falls back");
+
+    const NurbsElementIntersectionResult3D first =
+        solve(0, {0.4, 0.6, -1.0}, {0.4, 0.6, 2.0});
+    const NurbsElementIntersectionResult3D second =
+        solve(1, {0.4, 0.6, -1.0}, {0.4, 0.6, 2.0});
+    require(first.roots.size() == 1 && second.roots.size() == 1
+                && first.roots.front().t < second.roots.front().t
+                && first.diagnostics.planar_analytic_hits == 1
+                && second.diagnostics.planar_analytic_hits == 1,
+            "two planar elements produce two analytic roots");
+}
+
+void test_closest_point_prefilter_routes()
+{
+    using kfbim::geometry::NurbsBasis1D;
+    using kfbim::geometry3d::NurbsCartesianEdgeQuery3D;
+    using kfbim::geometry3d::NurbsElementIntersectionOptions3D;
+    using kfbim::geometry3d::NurbsElementIntersectionResult3D;
+    using kfbim::geometry3d::NurbsSurfaceIntersector3D;
+    using kfbim::geometry3d::NurbsSurfaceIntersectorOptions3D;
+    using kfbim::geometry3d::NurbsSurfaceModel3D;
+    using kfbim::geometry3d::NurbsSurfacePatch3D;
+    using kfbim::geometry3d::UnresolvedNurbsIntersectionCandidate3D;
+    using kfbim::geometry3d::extract_rational_bezier_elements_3d;
+    using kfbim::geometry3d::intersect_nurbs_bezier_element_3d;
+
+    const NurbsSurfaceModel3D cylinder_model(
+        {NurbsSurfacePatch3D::make_quarter_cylinder_patch(1.0, 0.0, 1.0)},
+        {0}, {});
+    const auto cylinder_element =
+        extract_rational_bezier_elements_3d(cylinder_model).front();
+    NurbsElementIntersectionOptions3D options;
+    options.geometry_tolerance = 1.0e-12;
+    options.use_triangle_seed = false;
+    options.use_closest_point_prefilter = true;
+    options.parameter_seeds = {{0.5, 0.5, 0.5}};
+    const auto smooth_hit = intersect_nurbs_bezier_element_3d(
+        cylinder_element, cylinder_model.patch(0),
+        {0.8, 0.5, 0.5}, {0.95, 0.5, 0.5}, options);
+    require(smooth_hit.roots.size() == 1
+                && smooth_hit.diagnostics
+                       .closest_point_prefilter_attempts == 1
+                && smooth_hit.diagnostics
+                       .closest_point_prefilter_certified_hits == 1
+                && smooth_hit.diagnostics
+                       .closest_point_prefilter_certified_misses == 0
+                && smooth_hit.diagnostics
+                       .closest_point_prefilter_fallbacks == 0
+                && smooth_hit.diagnostics.certified_fallback_elements == 0
+                && smooth_hit.diagnostics.closest_point_attempts == 0,
+            "closest prefilter certifies a smooth quarter-cylinder hit");
+
+    const NativeNurbsSurface3D torus =
+        make_native_nurbs_surface_3d(GeometryKind3D::Torus);
+    const NurbsSurfaceModel3D torus_model = torus.geometry_model();
+    const auto torus_element =
+        extract_rational_bezier_elements_3d(torus_model).front();
+    options.parameter_seeds = {{
+        0.5 * (torus_element.u0() + torus_element.u1()),
+        0.5 * (torus_element.v0() + torus_element.v1()), 0.5}};
+    const auto torus_middle =
+        torus_model.patch(torus_element.patch_index)
+            .evaluate_with_derivatives(
+                options.parameter_seeds.front().u,
+                options.parameter_seeds.front().v);
+    const Eigen::Vector3d torus_normal =
+        torus_middle.du.cross(torus_middle.dv).normalized();
+    const auto smooth_miss = intersect_nurbs_bezier_element_3d(
+        torus_element, torus_model.patch(torus_element.patch_index),
+        torus_middle.point + 2.0 * torus_normal,
+        torus_middle.point + 2.1 * torus_normal, options);
+    require(smooth_miss.roots.empty(),
+            "separated torus-element query has no roots");
+    require(smooth_miss.diagnostics.closest_point_prefilter_attempts == 1,
+            "separated torus-element prefilter attempts once");
+    require(smooth_miss.diagnostics.closest_point_prefilter_certified_hits == 0,
+            "separated torus-element prefilter has no certified hit");
+    require(smooth_miss.diagnostics.closest_point_prefilter_certified_misses == 1,
+            "separated torus-element prefilter certifies the miss");
+    require(smooth_miss.diagnostics.closest_point_prefilter_fallbacks == 0,
+            "separated torus-element prefilter avoids fallback");
+    require(smooth_miss.diagnostics.certified_fallback_elements == 0,
+            "separated torus-element avoids the legacy solver");
+    require(smooth_miss.diagnostics.closest_point_attempts == 0,
+            "separated torus prefilter does not count as terminal closest work");
+
+    const auto contact_data =
+        cylinder_model.patch(0).evaluate_with_derivatives(0.4, 0.6);
+    const Eigen::Vector3d contact = contact_data.point;
+    const Eigen::Vector3d tangent = contact_data.du.normalized();
+    options.parameter_seeds = {{0.4, 0.6, 0.5}};
+    const auto solve_fallback = [&](const auto& element,
+                                    const auto& patch,
+                                    const Eigen::Vector3d& start,
+                                    const Eigen::Vector3d& end,
+                                    const auto& fallback_options) {
+        try {
+            return intersect_nurbs_bezier_element_3d(
+                element, patch, start, end, fallback_options);
+        } catch (const UnresolvedNurbsIntersectionCandidate3D& error) {
+            return error.partial_result();
+        }
+    };
+    const NurbsElementIntersectionResult3D tangent_result = solve_fallback(
+        cylinder_element, cylinder_model.patch(0),
+        contact - 0.25 * tangent, contact + 0.25 * tangent, options);
+    require(tangent_result.diagnostics
+                    .closest_point_prefilter_attempts == 1
+                && tangent_result.diagnostics
+                       .closest_point_prefilter_certified_hits == 0
+                && tangent_result.diagnostics
+                       .closest_point_prefilter_certified_misses == 0
+                && tangent_result.diagnostics
+                       .closest_point_prefilter_fallbacks == 1
+                && tangent_result.diagnostics.certified_fallback_elements == 1,
+            "closest prefilter falls back for tangency");
+
+    const NurbsSurfacePatch3D two_root_graph(
+        NurbsBasis1D(2, {0.0, 0.0, 0.0, 1.0, 1.0, 1.0}),
+        NurbsBasis1D(1, {0.0, 0.0, 1.0, 1.0}),
+        {{{0.0, 0.0, 0.16}, {0.0, 1.0, 0.16}},
+         {{0.5, 0.0, -0.34}, {0.5, 1.0, -0.34}},
+         {{1.0, 0.0, 0.16}, {1.0, 1.0, 0.16}}},
+        {{1.0, 1.0}, {1.0, 1.0}, {1.0, 1.0}});
+    const NurbsSurfaceModel3D two_root_model({two_root_graph}, {0}, {});
+    const auto two_root_element =
+        extract_rational_bezier_elements_3d(two_root_model).front();
+    options.parameter_seeds = {{0.3, 0.5, 0.3}};
+    const NurbsElementIntersectionResult3D close_roots = solve_fallback(
+        two_root_element, two_root_model.patch(0),
+        {0.0, 0.5, 0.0}, {1.0, 0.5, 0.0}, options);
+    require(close_roots.diagnostics.closest_point_prefilter_attempts == 1
+                && close_roots.diagnostics
+                       .closest_point_prefilter_certified_hits == 0
+                && close_roots.diagnostics
+                       .closest_point_prefilter_certified_misses == 0
+                && close_roots.diagnostics
+                       .closest_point_prefilter_fallbacks == 1
+                && close_roots.diagnostics.certified_fallback_elements == 1,
+            "closest prefilter cannot hide two complete-element roots");
+
+    NurbsSurfaceIntersectorOptions3D surface_options;
+    surface_options.use_affine_planar_fast_path = true;
+    surface_options.use_closest_point_prefilter = true;
+    const NurbsSurfaceIntersector3D torus_intersector(
+        torus.geometry_model(), surface_options);
+    const auto g1_seam = torus_intersector.intersect_cartesian_edge(
+        NurbsCartesianEdgeQuery3D{
+            0, 70, 71, 72,
+            {0.80, -0.04, 0.03}, {0.84, -0.04, 0.03}});
+    require(g1_seam.crossings.size() == 1
+                && g1_seam.diagnostics
+                       .closest_point_prefilter_certified_hits == 0
+                && g1_seam.diagnostics
+                       .closest_point_prefilter_fallbacks > 0
+                && g1_seam.diagnostics.certified_fallback_elements > 0,
+            "closest prefilter falls back at a G1 element seam");
+
+    const NativeNurbsSurface3D cylinder =
+        make_native_nurbs_surface_3d(GeometryKind3D::HollowCylinder);
+    const NurbsSurfaceIntersector3D cylinder_intersector(
+        cylinder.geometry_model(), surface_options);
+    const auto rim = cylinder_intersector.intersect_cartesian_edge(
+        NurbsCartesianEdgeQuery3D{
+            1, 73, 74, 75,
+            {0.61, -0.07, 0.67}, {0.61, -0.03, 0.67}});
+    require(rim.crossings.size() == 1
+                && rim.crossings.front().feature_edge_contact
+                && rim.diagnostics.closest_point_prefilter_attempts == 0
+                && rim.diagnostics.certified_fallback_elements > 0,
+            "closest prefilter is disabled at a declared non-G1 rim");
+
+    const NativeNurbsSurface3D lprism =
+        make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
+    const NurbsSurfaceIntersector3D lprism_intersector(
+        lprism.geometry_model(), surface_options);
+    const auto reentrant = lprism_intersector.intersect_segment(
+        {0.05, -0.09, 0.0}, {0.09, -0.05, 0.0});
+    require(reentrant.crossings.size() == 1
+                && reentrant.crossings.front().feature_edge_contact
+                && reentrant.diagnostics.closest_point_prefilter_attempts == 0
+                && reentrant.diagnostics.certified_fallback_elements > 0,
+            "L-prism reentrant edge uses the certified fallback");
 }
 
 void test_early_unique_root_certificate()
@@ -2544,8 +2873,24 @@ void require_triangle_seed_independent_domain(
     require(seeded.diagnostics().intersections
                     .early_unique_certificate_attempts == 0
                 && seeded.diagnostics().intersections
-                       .early_unique_certificate_successes == 0,
-            name + " certified baseline keeps early certificates disabled");
+                       .early_unique_certificate_successes == 0
+                && seeded.diagnostics().intersections
+                       .planar_analytic_hits == 0
+                && seeded.diagnostics().intersections
+                       .planar_analytic_misses == 0
+                && seeded.diagnostics().intersections
+                       .planar_analytic_fallbacks == 0
+                && seeded.diagnostics().intersections
+                       .closest_point_prefilter_attempts == 0
+                && seeded.diagnostics().intersections
+                       .closest_point_prefilter_certified_hits == 0
+                && seeded.diagnostics().intersections
+                       .closest_point_prefilter_certified_misses == 0
+                && seeded.diagnostics().intersections
+                       .closest_point_prefilter_fallbacks == 0
+                && seeded.diagnostics().intersections
+                       .certified_fallback_elements == 0,
+            name + " certified baseline keeps Hybrid routes disabled");
 
     const auto require_strategy_equivalence =
         [&](kfbim::geometry3d::NurbsCartesianPreprocessStrategy3D strategy,
@@ -2557,22 +2902,53 @@ void require_triangle_seed_independent_domain(
             require_same_domain_outputs(
                 grid, model, seeded, candidate,
                 name + " " + strategy_name);
+            const auto& route = candidate.diagnostics().intersections;
             require(
                 candidate.diagnostics().candidate_element_incidence_count > 0
-                    && candidate.diagnostics().intersections
-                           .mapped_candidate_elements
-                        == candidate.diagnostics().intersections
-                               .candidate_elements
-                    && candidate.diagnostics().intersections
-                           .bvh_candidate_elements == 0
-                    && candidate.diagnostics().intersections
-                           .early_unique_certificate_attempts
-                        >= candidate.diagnostics().intersections
-                               .early_unique_certificate_successes
-                    && candidate.diagnostics().intersections
-                           .early_unique_certificate_successes > 0,
+                    && route.mapped_candidate_elements
+                        == route.candidate_elements
+                    && route.bvh_candidate_elements == 0
+                    && route.early_unique_certificate_attempts
+                        >= route.early_unique_certificate_successes,
                 name + " " + strategy_name
                     + " uses stable mapped candidates");
+            if (strategy
+                == kfbim::geometry3d::
+                    NurbsCartesianPreprocessStrategy3D::
+                        OptimizedIntersection) {
+                require(route.early_unique_certificate_successes > 0
+                            && route.planar_analytic_hits == 0
+                            && route.planar_analytic_misses == 0
+                            && route.planar_analytic_fallbacks == 0
+                            && route.closest_point_prefilter_attempts == 0
+                            && route.closest_point_prefilter_certified_hits == 0
+                            && route.closest_point_prefilter_certified_misses == 0
+                            && route.closest_point_prefilter_fallbacks == 0
+                            && route.certified_fallback_elements == 0,
+                        name
+                            + " optimized strategy keeps Hybrid routes disabled");
+                return;
+            }
+            require(route.planar_analytic_hits
+                            + route.planar_analytic_misses
+                            + route.planar_analytic_fallbacks > 0
+                        && route.closest_point_prefilter_attempts
+                            == route.closest_point_prefilter_certified_hits
+                                + route.closest_point_prefilter_certified_misses
+                                + route.closest_point_prefilter_fallbacks,
+                    name + " hybrid strategy accounts for every fast route");
+            if (name == "L-prism") {
+                require(route.planar_analytic_hits
+                                + route.planar_analytic_misses > 0,
+                        "L-prism hybrid uses planar routing");
+            } else {
+                require(route.closest_point_prefilter_attempts > 0
+                            && (route.closest_point_prefilter_certified_hits
+                                    + route.closest_point_prefilter_certified_misses
+                                    + route.closest_point_prefilter_fallbacks > 0),
+                        name
+                            + " hybrid exposes curved closest-point routing diagnostics");
+            }
         };
     require_strategy_equivalence(
         kfbim::geometry3d::NurbsCartesianPreprocessStrategy3D::
@@ -3732,6 +4108,8 @@ int main()
         test_nurbs_bezier_segment_closest_point();
         test_closest_point_classifies_terminal_intersection_boxes();
         test_rational_bezier_element_intersection();
+        test_affine_planar_fast_path();
+        test_closest_point_prefilter_routes();
         test_early_unique_root_certificate();
         test_bezier_element_intersection_isolates_all_roots_and_fails_safe();
         test_analytic_ruled_graph_root_cases();

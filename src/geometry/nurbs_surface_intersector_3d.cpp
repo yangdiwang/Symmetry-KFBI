@@ -1237,6 +1237,13 @@ NurbsSurfaceIntersector3D::NurbsSurfaceIntersector3D(
     } else {
         elements_ = std::move(base_elements);
     }
+    if (options_.use_closest_point_prefilter) {
+        element_touches_non_g1_feature_.reserve(elements_.size());
+        for (const RationalBezierElement3D& element : elements_) {
+            element_touches_non_g1_feature_.push_back(
+                element_touches_non_g1_feature(element, model_));
+        }
+    }
     element_samples_.reserve(elements_.size());
     query_elements_.reserve(elements_.size());
     for (std::size_t id = 0; id < elements_.size(); ++id) {
@@ -1450,6 +1457,42 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
                 result.diagnostics.early_unique_certificate_successes,
                 work.diagnostics.early_unique_certificate_successes,
                 "NURBS early unique-root certificate success diagnostic overflow");
+            checked_accumulate_diagnostic(
+                result.diagnostics.planar_analytic_hits,
+                work.diagnostics.planar_analytic_hits,
+                "NURBS planar analytic-hit diagnostic overflow");
+            checked_accumulate_diagnostic(
+                result.diagnostics.planar_analytic_misses,
+                work.diagnostics.planar_analytic_misses,
+                "NURBS planar analytic-miss diagnostic overflow");
+            checked_accumulate_diagnostic(
+                result.diagnostics.planar_analytic_fallbacks,
+                work.diagnostics.planar_analytic_fallbacks,
+                "NURBS planar analytic-fallback diagnostic overflow");
+            checked_accumulate_diagnostic(
+                result.diagnostics.closest_point_prefilter_attempts,
+                work.diagnostics.closest_point_prefilter_attempts,
+                "NURBS closest-point prefilter-attempt diagnostic overflow");
+            checked_accumulate_diagnostic(
+                result.diagnostics
+                    .closest_point_prefilter_certified_hits,
+                work.diagnostics
+                    .closest_point_prefilter_certified_hits,
+                "NURBS closest-point prefilter-hit diagnostic overflow");
+            checked_accumulate_diagnostic(
+                result.diagnostics
+                    .closest_point_prefilter_certified_misses,
+                work.diagnostics
+                    .closest_point_prefilter_certified_misses,
+                "NURBS closest-point prefilter-miss diagnostic overflow");
+            checked_accumulate_diagnostic(
+                result.diagnostics.closest_point_prefilter_fallbacks,
+                work.diagnostics.closest_point_prefilter_fallbacks,
+                "NURBS closest-point prefilter-fallback diagnostic overflow");
+            checked_accumulate_diagnostic(
+                result.diagnostics.certified_fallback_elements,
+                work.diagnostics.certified_fallback_elements,
+                "NURBS certified-fallback diagnostic overflow");
             if (include_unresolved) {
                 checked_accumulate_diagnostic(
                     result.diagnostics.unresolved_candidates,
@@ -1522,6 +1565,10 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
     local_options.use_triangle_seed = options_.use_triangle_seeds;
     local_options.use_early_unique_root_certificate =
         options_.use_early_unique_root_certificate;
+    local_options.use_affine_planar_fast_path =
+        options_.use_affine_planar_fast_path;
+    local_options.use_closest_point_prefilter =
+        options_.use_closest_point_prefilter;
     local_options.max_subdivision_depth =
         local_max_subdivision_depth < 0
         ? options_.local_max_subdivision_depth
@@ -1540,6 +1587,10 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
         const NurbsSurfacePatch3D& source_patch =
             model_.patch(element.patch_index);
         NurbsElementIntersectionOptions3D candidate_options = local_options;
+        candidate_options.use_closest_point_prefilter =
+            local_options.use_closest_point_prefilter
+            && !element_touches_non_g1_feature_[
+                static_cast<std::size_t>(candidate)];
         candidate_options.parameter_seeds = select_sample_seeds(
             element_samples_[static_cast<std::size_t>(candidate)], start, end);
         checked_accumulate_diagnostic(

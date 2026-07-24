@@ -211,6 +211,36 @@ void accumulate_intersection_diagnostics(
         increment.early_unique_certificate_successes,
         "NURBS early unique-root certificate success diagnostic overflow");
     checked_accumulate_int(
+        total.planar_analytic_hits, increment.planar_analytic_hits,
+        "NURBS planar analytic-hit diagnostic overflow");
+    checked_accumulate_int(
+        total.planar_analytic_misses, increment.planar_analytic_misses,
+        "NURBS planar analytic-miss diagnostic overflow");
+    checked_accumulate_int(
+        total.planar_analytic_fallbacks,
+        increment.planar_analytic_fallbacks,
+        "NURBS planar analytic-fallback diagnostic overflow");
+    checked_accumulate_int(
+        total.closest_point_prefilter_attempts,
+        increment.closest_point_prefilter_attempts,
+        "NURBS closest-point prefilter-attempt diagnostic overflow");
+    checked_accumulate_int(
+        total.closest_point_prefilter_certified_hits,
+        increment.closest_point_prefilter_certified_hits,
+        "NURBS closest-point prefilter-hit diagnostic overflow");
+    checked_accumulate_int(
+        total.closest_point_prefilter_certified_misses,
+        increment.closest_point_prefilter_certified_misses,
+        "NURBS closest-point prefilter-miss diagnostic overflow");
+    checked_accumulate_int(
+        total.closest_point_prefilter_fallbacks,
+        increment.closest_point_prefilter_fallbacks,
+        "NURBS closest-point prefilter-fallback diagnostic overflow");
+    checked_accumulate_int(
+        total.certified_fallback_elements,
+        increment.certified_fallback_elements,
+        "NURBS certified-fallback diagnostic overflow");
+    checked_accumulate_int(
         total.same_patch_deduplications,
         increment.same_patch_deduplications,
         "NURBS same-patch diagnostic overflow");
@@ -418,6 +448,12 @@ struct NurbsCartesianDomain3D::Impl {
         intersector_options.use_early_unique_root_certificate =
             options.strategy
             != NurbsCartesianPreprocessStrategy3D::CertifiedBaseline;
+        intersector_options.use_affine_planar_fast_path =
+            options.strategy
+            == NurbsCartesianPreprocessStrategy3D::Hybrid;
+        intersector_options.use_closest_point_prefilter =
+            options.strategy
+            == NurbsCartesianPreprocessStrategy3D::Hybrid;
         intersector_options.maximum_element_extent = maximum_leaf_extent;
         intersector_options.local_max_subdivision_depth = 4;
         const PreprocessClock3D::time_point intersector_begin =
