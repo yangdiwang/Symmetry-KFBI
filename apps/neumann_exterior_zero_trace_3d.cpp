@@ -3920,7 +3920,7 @@ bool normal_restrict_hypothesis_supported(
     return supported;
 }
 
-int run_normal_restrict_causal_probe(std::vector<int> levels)
+int run_normal_restrict_causal_probe(std::vector<int> levels, bool owner_only)
 {
     std::sort(levels.begin(), levels.end());
     levels.erase(std::unique(levels.begin(), levels.end()), levels.end());
@@ -3932,10 +3932,12 @@ int run_normal_restrict_causal_probe(std::vector<int> levels)
 #ifdef KFBIM_APP_OUTPUT_DIR
     const std::filesystem::path output_dir =
         std::filesystem::path(KFBIM_APP_OUTPUT_DIR)
-        / "dirichlet_normal_restrict_causal_probe_3d";
+        / (owner_only ? "dirichlet_normal_restrict_crossing_owner_3d"
+                      : "dirichlet_normal_restrict_causal_probe_3d");
 #else
     const std::filesystem::path output_dir =
-        "output/dirichlet_normal_restrict_causal_probe_3d";
+        owner_only ? "output/dirichlet_normal_restrict_crossing_owner_3d"
+                   : "output/dirichlet_normal_restrict_causal_probe_3d";
 #endif
     const std::array<std::string, 3> selected_ids{{
         "baseline", "rot_axis123_17deg",
@@ -3997,7 +3999,7 @@ int run_normal_restrict_causal_probe(std::vector<int> levels)
                 grid, grid_pair, geometry.native_surface,
                 geometry.correction_triangles,
                 geometry.geometry_triangles,
-                surface_dofs, cauchy_stencils, true, true);
+                surface_dofs, cauchy_stencils, !owner_only, true);
             const double pipeline_setup_seconds =
                 std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - pipeline_start).count();
@@ -4086,10 +4088,13 @@ int run_normal_restrict_causal_probe(std::vector<int> levels)
             write_restrict_owner_probe_outputs(output_dir, results);
             NormalRestrictCaseProbe3D& stored = results.back();
 
-            const std::array<ExteriorNormalRestrictMode3D, 3> modes{{
-                ExteriorNormalRestrictMode3D::JointTricubicCauchy,
-                ExteriorNormalRestrictMode3D::JointTricubicCrossingOwner,
-                ExteriorNormalRestrictMode3D::ExteriorOnlyHarmonicCubic}};
+            const std::vector<ExteriorNormalRestrictMode3D> modes = owner_only
+                ? std::vector<ExteriorNormalRestrictMode3D>{
+                    ExteriorNormalRestrictMode3D::JointTricubicCrossingOwner}
+                : std::vector<ExteriorNormalRestrictMode3D>{
+                    ExteriorNormalRestrictMode3D::JointTricubicCauchy,
+                    ExteriorNormalRestrictMode3D::JointTricubicCrossingOwner,
+                    ExteriorNormalRestrictMode3D::ExteriorOnlyHarmonicCubic};
             for (ExteriorNormalRestrictMode3D mode : modes) {
                 const auto route_start = std::chrono::steady_clock::now();
                 NormalRestrictRouteProbe3D& route = stored.routes[
@@ -4160,10 +4165,13 @@ int run_normal_restrict_causal_probe(std::vector<int> levels)
                       << " total_seconds=" << total_seconds << '\n';
         }
     }
-    const bool supported = normal_restrict_hypothesis_supported(results, levels);
-    std::cout << "[restrict-hypothesis] "
-              << (supported ? "supported" : "not_proven") << '\n'
-              << "Restrict probe output: " << output_dir.string() << '\n';
+    if (!owner_only) {
+        const bool supported =
+            normal_restrict_hypothesis_supported(results, levels);
+        std::cout << "[restrict-hypothesis] "
+                  << (supported ? "supported" : "not_proven") << '\n';
+    }
+    std::cout << "Restrict probe output: " << output_dir.string() << '\n';
     return 0;
 }
 
@@ -4174,6 +4182,7 @@ void print_usage(const char* executable)
         << " [torus|cylinder|l_prism|all] [N ...]\n"
         << "       " << executable << " --rigid-study [N ...]\n"
         << "       " << executable << " --restrict-probe [N ...]\n"
+        << "       " << executable << " --restrict-probe-owner [N ...]\n"
         << "  Each N must be a power of two and at least 16 (default: 32).\n"
         << "  Rigid-study default levels: 32, 64, 128.\n"
         << "  Restrict-probe default levels: 32, 64.\n"
@@ -4200,12 +4209,16 @@ int main(int argc, char** argv)
                               && std::string(argv[1]) == "--rigid-study";
         const bool restrict_probe = argc >= 2
                                   && std::string(argv[1]) == "--restrict-probe";
+        const bool restrict_probe_owner = argc >= 2
+            && std::string(argv[1]) == "--restrict-probe-owner";
         std::string selection = "all";
         std::vector<int> levels = rigid_study
             ? std::vector<int>{32, 64, 128}
-            : restrict_probe ? std::vector<int>{32, 64}
-                             : std::vector<int>{32};
-        if (argc >= 2 && !rigid_study && !restrict_probe)
+            : (restrict_probe || restrict_probe_owner)
+                ? std::vector<int>{32, 64}
+                : std::vector<int>{32};
+        if (argc >= 2 && !rigid_study && !restrict_probe
+            && !restrict_probe_owner)
             selection = argv[1];
         if (selection == "--help" || selection == "-h") {
             print_usage(argv[0]);
@@ -4222,8 +4235,9 @@ int main(int argc, char** argv)
                 levels.push_back(N);
             }
         }
-        if (restrict_probe)
-            return run_normal_restrict_causal_probe(levels);
+        if (restrict_probe || restrict_probe_owner)
+            return run_normal_restrict_causal_probe(levels,
+                                                     restrict_probe_owner);
         const CauchyStencilPolicy3D cauchy_policy = selected_cauchy_policy();
         const int cauchy_value_count = positive_environment_integer(
             "KFBIM_3D_CAUCHY_VALUE_COUNT", kCauchyValueNeighborCount);
