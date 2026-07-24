@@ -36,6 +36,8 @@ struct NurbsSurfaceIntersectionDiagnostics3D {
     int subdivision_boxes = 0;
     int newton_attempts = 0;
     int newton_iterations = 0;
+    int early_unique_certificate_attempts = 0;
+    int early_unique_certificate_successes = 0;
     int same_patch_deduplications = 0;
     int seam_deduplications = 0;
     int unresolved_candidates = 0;
@@ -114,6 +116,7 @@ struct NurbsCartesianEdgeQueryOptions3D {
 
 struct NurbsSurfaceIntersectorOptions3D {
     bool use_triangle_seeds = true;
+    bool use_early_unique_root_certificate = false;
     int bvh_leaf_size = 8;
     double maximum_element_extent =
         std::numeric_limits<double>::infinity();

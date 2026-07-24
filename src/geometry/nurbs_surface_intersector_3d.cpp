@@ -1442,6 +1442,14 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
                 result.diagnostics.newton_iterations,
                 work.diagnostics.newton_iterations,
                 "NURBS Newton-iteration diagnostic overflow");
+            checked_accumulate_diagnostic(
+                result.diagnostics.early_unique_certificate_attempts,
+                work.diagnostics.early_unique_certificate_attempts,
+                "NURBS early unique-root certificate diagnostic overflow");
+            checked_accumulate_diagnostic(
+                result.diagnostics.early_unique_certificate_successes,
+                work.diagnostics.early_unique_certificate_successes,
+                "NURBS early unique-root certificate success diagnostic overflow");
             if (include_unresolved) {
                 checked_accumulate_diagnostic(
                     result.diagnostics.unresolved_candidates,
@@ -1512,6 +1520,8 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
     NurbsElementIntersectionOptions3D local_options;
     local_options.geometry_tolerance = geometry_tolerance_;
     local_options.use_triangle_seed = options_.use_triangle_seeds;
+    local_options.use_early_unique_root_certificate =
+        options_.use_early_unique_root_certificate;
     local_options.max_subdivision_depth =
         local_max_subdivision_depth < 0
         ? options_.local_max_subdivision_depth

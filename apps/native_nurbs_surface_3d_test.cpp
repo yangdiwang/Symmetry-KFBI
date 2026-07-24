@@ -52,19 +52,53 @@ void require_same_surface_crossing(
     const kfbim::geometry3d::NurbsSurfaceCrossing3D& second,
     const std::string& message)
 {
-    require(first.patch_index == second.patch_index
-                && first.component == second.component
-                && first.u == second.u
-                && first.v == second.v
-                && first.edge_parameter == second.edge_parameter
-                && (first.point - second.point).norm() == 0.0
-                && (first.normal - second.normal).norm() == 0.0
-                && first.residual == second.residual
-                && first.transversality == second.transversality
-                && first.feature_edge_contact == second.feature_edge_contact
-                && first.reliable_transversality_tolerance
-                    == second.reliable_transversality_tolerance,
-            message);
+    require(first.patch_index == second.patch_index, message + " patch");
+    require(first.component == second.component, message + " component");
+    require(first.u == second.u, message + " u");
+    require(first.v == second.v, message + " v");
+    require(first.edge_parameter == second.edge_parameter, message + " t");
+    require((first.point - second.point).norm() == 0.0, message + " point");
+    require((first.normal - second.normal).norm() == 0.0, message + " normal");
+    require(first.residual == second.residual, message + " residual");
+    require(first.transversality == second.transversality,
+            message + " transversality");
+    require(first.feature_edge_contact == second.feature_edge_contact,
+            message + " feature");
+    require(first.reliable_transversality_tolerance
+                == second.reliable_transversality_tolerance,
+            message + " tolerance");
+}
+
+void require_equivalent_surface_crossing(
+    const kfbim::geometry3d::NurbsSurfaceCrossing3D& first,
+    const kfbim::geometry3d::NurbsSurfaceCrossing3D& second,
+    double edge_length,
+    double tolerance,
+    const std::string& message)
+{
+    require(first.patch_index == second.patch_index, message + " patch");
+    require(first.component == second.component, message + " component");
+    require(std::abs(first.u - second.u) <= tolerance, message + " u");
+    require(std::abs(first.v - second.v) <= tolerance, message + " v");
+    require(std::abs(first.edge_parameter - second.edge_parameter)
+                    * edge_length <= tolerance,
+            message + " t");
+    require((first.point - second.point).norm() <= tolerance,
+            message + " point");
+    require((first.normal - second.normal).norm() <= tolerance,
+            message + " normal");
+    require(std::abs(first.residual - second.residual) <= tolerance,
+            message + " residual");
+    require(std::abs(first.transversality - second.transversality)
+                <= tolerance,
+            message + " transversality");
+    require(first.feature_edge_contact == second.feature_edge_contact,
+            message + " feature");
+    require(std::abs(
+                first.reliable_transversality_tolerance
+                - second.reliable_transversality_tolerance)
+                <= tolerance,
+            message + " tolerance");
 }
 
 void require_same_route_neutral_intersection_diagnostics(
@@ -81,6 +115,10 @@ void require_same_route_neutral_intersection_diagnostics(
                 && first.subdivision_boxes == second.subdivision_boxes
                 && first.newton_attempts == second.newton_attempts
                 && first.newton_iterations == second.newton_iterations
+                && first.early_unique_certificate_attempts
+                    == second.early_unique_certificate_attempts
+                && first.early_unique_certificate_successes
+                    == second.early_unique_certificate_successes
                 && first.same_patch_deduplications
                     == second.same_patch_deduplications
                 && first.seam_deduplications
@@ -216,6 +254,8 @@ void require_same_domain_outputs(
                 && (baseline.surface_bounds().upper
                         - candidate.surface_bounds().upper).norm() == 0.0,
             message + " geometry metadata");
+    const double crossing_tolerance = 8.0 * std::max(
+        baseline.geometry_tolerance(), candidate.geometry_tolerance());
 
     const auto dims = grid.dof_dims();
     for (int k = 0; k < dims[2]; ++k) {
@@ -229,6 +269,13 @@ void require_same_domain_outputs(
                 for (const int neighbor : neighbors) {
                     if (neighbor < 0)
                         continue;
+                    const auto node_coord = grid.coord(node);
+                    const auto neighbor_coord = grid.coord(neighbor);
+                    const Eigen::Vector3d edge(
+                        neighbor_coord[0] - node_coord[0],
+                        neighbor_coord[1] - node_coord[1],
+                        neighbor_coord[2] - node_coord[2]);
+                    const double edge_length = edge.norm();
                     require(baseline.has_barrier_between(node, neighbor)
                                 == candidate.has_barrier_between(
                                     node, neighbor)
@@ -253,23 +300,29 @@ void require_same_domain_outputs(
                             message + " crossing count");
                     for (std::size_t root = 0;
                          root < baseline_crossings.size(); ++root) {
-                        require_same_surface_crossing(
+                        require_equivalent_surface_crossing(
                             baseline_crossings[root],
                             candidate_crossings[root],
+                            edge_length,
+                            crossing_tolerance,
                             message + " crossing");
                     }
                     if (baseline_crossings.size() == 1) {
-                        require_same_surface_crossing(
+                        require_equivalent_surface_crossing(
                             baseline.crossing_between(node, neighbor),
                             candidate.crossing_between(node, neighbor),
+                            edge_length,
+                            crossing_tolerance,
                             message + " single crossing lookup");
                     }
                     if (baseline_info.correction_safe) {
-                        require_same_surface_crossing(
+                        require_equivalent_surface_crossing(
                             baseline.correction_crossing_between(
                                 node, neighbor),
                             candidate.correction_crossing_between(
                                 node, neighbor),
+                            edge_length,
+                            crossing_tolerance,
                             message + " strict correction crossing");
                     }
                 }
@@ -787,6 +840,119 @@ void test_rational_bezier_element_intersection()
     require(miss.roots.empty() && miss.diagnostics.newton_attempts == 0
                 && miss.diagnostics.conservative_rejections > 0,
             "control hull rejects an impossible line before Newton");
+}
+
+void test_early_unique_root_certificate()
+{
+    using kfbim::geometry::NurbsBasis1D;
+    using kfbim::geometry3d::NurbsElementIntersectionOptions3D;
+    using kfbim::geometry3d::NurbsElementIntersectionResult3D;
+    using kfbim::geometry3d::NurbsSurfaceModel3D;
+    using kfbim::geometry3d::NurbsSurfacePatch3D;
+    using kfbim::geometry3d::UnresolvedNurbsIntersectionCandidate3D;
+    using kfbim::geometry3d::extract_rational_bezier_elements_3d;
+    using kfbim::geometry3d::intersect_nurbs_bezier_element_3d;
+
+    const NurbsSurfaceModel3D plane_model(
+        {NurbsSurfacePatch3D::make_unit_square_xy()}, {0}, {});
+    const auto plane_element =
+        extract_rational_bezier_elements_3d(plane_model).front();
+    NurbsElementIntersectionOptions3D baseline_options;
+    baseline_options.geometry_tolerance = 1.0e-12;
+    baseline_options.parameter_seeds = {{0.25, 0.75, 0.5}};
+    const auto baseline = intersect_nurbs_bezier_element_3d(
+        plane_element, plane_model.patch(0),
+        {0.25, 0.75, -1.0}, {0.25, 0.75, 1.0},
+        baseline_options);
+    NurbsElementIntersectionOptions3D optimized_options = baseline_options;
+    optimized_options.use_early_unique_root_certificate = true;
+    const auto optimized = intersect_nurbs_bezier_element_3d(
+        plane_element, plane_model.patch(0),
+        {0.25, 0.75, -1.0}, {0.25, 0.75, 1.0},
+        optimized_options);
+    require(baseline.roots.size() == 1
+                && optimized.roots.size() == baseline.roots.size(),
+            "early certificate preserves the affine root count");
+    const auto& first = baseline.roots.front();
+    const auto& second = optimized.roots.front();
+    require(first.patch_index == second.patch_index
+                && first.component == second.component
+                && first.u == second.u
+                && first.v == second.v
+                && first.t == second.t
+                && (first.point - second.point).norm() == 0.0
+                && (first.normal - second.normal).norm() == 0.0
+                && first.residual == second.residual
+                && first.transversality == second.transversality
+                && first.reliable_transversality_tolerance
+                    == second.reliable_transversality_tolerance,
+            "early certificate preserves the affine root data");
+    require(optimized.diagnostics.early_unique_certificate_attempts == 1
+                && optimized.diagnostics
+                       .early_unique_certificate_successes == 1
+                && optimized.diagnostics.supplied_seed_attempts == 0
+                && optimized.diagnostics.newton_attempts
+                    < baseline.diagnostics.newton_attempts,
+            "early certificate skips redundant affine intersection work");
+
+    const auto solve_graph = [](
+        int degree, const std::vector<double>& coefficients) {
+        std::vector<double> knots(
+            static_cast<std::size_t>(2 * (degree + 1)), 1.0);
+        std::fill(knots.begin(), knots.begin() + degree + 1, 0.0);
+        std::vector<std::vector<Eigen::Vector3d>> controls(
+            static_cast<std::size_t>(degree + 1),
+            std::vector<Eigen::Vector3d>(2));
+        std::vector<std::vector<double>> weights(
+            static_cast<std::size_t>(degree + 1),
+            std::vector<double>(2, 1.0));
+        for (int i = 0; i <= degree; ++i) {
+            for (int j = 0; j < 2; ++j) {
+                controls[static_cast<std::size_t>(i)]
+                        [static_cast<std::size_t>(j)] = {
+                    static_cast<double>(i) / degree,
+                    static_cast<double>(j),
+                    coefficients[static_cast<std::size_t>(i)]};
+            }
+        }
+        const NurbsSurfaceModel3D model(
+            {NurbsSurfacePatch3D(
+                NurbsBasis1D(degree, knots),
+                NurbsBasis1D(1, {0.0, 0.0, 1.0, 1.0}),
+                std::move(controls), std::move(weights))},
+            {0}, {});
+        const auto element =
+            extract_rational_bezier_elements_3d(model).front();
+        NurbsElementIntersectionOptions3D options;
+        options.geometry_tolerance = 1.0e-12;
+        options.use_early_unique_root_certificate = true;
+        try {
+            return intersect_nurbs_bezier_element_3d(
+                element, model.patch(0),
+                {0.0, 0.5, 0.0}, {1.0, 0.5, 0.0}, options);
+        } catch (const UnresolvedNurbsIntersectionCandidate3D& error) {
+            return error.partial_result();
+        }
+    };
+    const NurbsElementIntersectionResult3D two_root =
+        solve_graph(2, {0.14, -0.31, 0.24});
+    require(two_root.roots.size() == 2
+                && two_root.diagnostics
+                       .early_unique_certificate_successes == 0,
+            "early certificate does not accept a two-root ruled element");
+    const NurbsElementIntersectionResult3D tangent =
+        solve_graph(2, {0.25, -0.25, 0.25});
+    require(tangent.roots.size() == 1
+                && tangent.roots.front().transversality < 1.0e-10
+                && tangent.diagnostics
+                       .early_unique_certificate_successes == 0,
+            "early certificate does not accept a tangent root");
+    const NurbsElementIntersectionResult3D odd_flat =
+        solve_graph(3, {-0.125, 0.125, -0.125, 0.125});
+    require(odd_flat.diagnostics.unresolved_boxes > 0
+                && odd_flat.diagnostics
+                       .early_unique_certificate_successes == 0,
+            "early certificate does not accept a zero-derivative odd root");
 }
 
 void test_nurbs_bezier_segment_closest_point()
@@ -2323,6 +2489,11 @@ void require_triangle_seed_independent_domain(
             name + " has an interface for reverse range lookup");
     require(checked_missing_crossing,
             name + " has an edge with an empty crossing range");
+    require(seeded.diagnostics().intersections
+                    .early_unique_certificate_attempts == 0
+                && seeded.diagnostics().intersections
+                       .early_unique_certificate_successes == 0,
+            name + " certified baseline keeps early certificates disabled");
 
     const auto require_strategy_equivalence =
         [&](kfbim::geometry3d::NurbsCartesianPreprocessStrategy3D strategy,
@@ -2341,7 +2512,13 @@ void require_triangle_seed_independent_domain(
                         == candidate.diagnostics().intersections
                                .candidate_elements
                     && candidate.diagnostics().intersections
-                           .bvh_candidate_elements == 0,
+                           .bvh_candidate_elements == 0
+                    && candidate.diagnostics().intersections
+                           .early_unique_certificate_attempts
+                        >= candidate.diagnostics().intersections
+                               .early_unique_certificate_successes
+                    && candidate.diagnostics().intersections
+                           .early_unique_certificate_successes > 0,
                 name + " " + strategy_name
                     + " uses stable mapped candidates");
         };
@@ -2585,6 +2762,8 @@ void test_nurbs_cartesian_curved_targets_and_triangle_independence()
         make_native_nurbs_surface_3d(GeometryKind3D::Torus);
     const NativeNurbsSurface3D cylinder =
         make_native_nurbs_surface_3d(GeometryKind3D::HollowCylinder);
+    const NativeNurbsSurface3D l_prism =
+        make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
 
     require_triangle_seed_independent_domain(
         grid, torus.geometry_model(),
@@ -2593,6 +2772,10 @@ void test_nurbs_cartesian_curved_targets_and_triangle_independence()
         grid, cylinder.geometry_model(),
         grid.index(17, 16, 15), grid.index(25, 16, 15),
         "hollow cylinder");
+    require_triangle_seed_independent_domain(
+        grid, l_prism.geometry_model(),
+        grid.index(22, 21, 15), grid.index(24, 11, 15),
+        "L-prism");
 }
 
 void test_cartesian_edge_collects_multiple_crossings()
@@ -3497,6 +3680,7 @@ int main()
         test_nurbs_bezier_segment_closest_point();
         test_closest_point_classifies_terminal_intersection_boxes();
         test_rational_bezier_element_intersection();
+        test_early_unique_root_certificate();
         test_bezier_element_intersection_isolates_all_roots_and_fails_safe();
         test_analytic_ruled_graph_root_cases();
         test_close_roots_have_stationary_witness();

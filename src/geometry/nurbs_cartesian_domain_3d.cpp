@@ -203,6 +203,14 @@ void accumulate_intersection_diagnostics(
         total.newton_iterations, increment.newton_iterations,
         "NURBS Newton-iteration diagnostic overflow");
     checked_accumulate_int(
+        total.early_unique_certificate_attempts,
+        increment.early_unique_certificate_attempts,
+        "NURBS early unique-root certificate diagnostic overflow");
+    checked_accumulate_int(
+        total.early_unique_certificate_successes,
+        increment.early_unique_certificate_successes,
+        "NURBS early unique-root certificate success diagnostic overflow");
+    checked_accumulate_int(
         total.same_patch_deduplications,
         increment.same_patch_deduplications,
         "NURBS same-patch diagnostic overflow");
@@ -407,6 +415,9 @@ struct NurbsCartesianDomain3D::Impl {
 
         NurbsSurfaceIntersectorOptions3D intersector_options;
         intersector_options.use_triangle_seeds = options.use_triangle_seeds;
+        intersector_options.use_early_unique_root_certificate =
+            options.strategy
+            != NurbsCartesianPreprocessStrategy3D::CertifiedBaseline;
         intersector_options.maximum_element_extent = maximum_leaf_extent;
         intersector_options.local_max_subdivision_depth = 4;
         const PreprocessClock3D::time_point intersector_begin =

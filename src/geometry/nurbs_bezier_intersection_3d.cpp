@@ -1732,6 +1732,19 @@ NurbsElementIntersectionResult3D intersect_nurbs_bezier_element_3d(
 
     result.diagnostics.maximum_supplied_seed_count =
         static_cast<int>(options.parameter_seeds.size());
+    if (options.use_early_unique_root_certificate
+        && result.roots.size() == 1) {
+        checked_increment_diagnostic(
+            result.diagnostics.early_unique_certificate_attempts,
+            "NURBS early unique-root certificate diagnostic overflow");
+        if (certifies_unique_transverse_root(
+                element, result.roots.front(), frame)) {
+            checked_increment_diagnostic(
+                result.diagnostics.early_unique_certificate_successes,
+                "NURBS early unique-root certificate success diagnostic overflow");
+            return result;
+        }
+    }
     for (const NurbsElementParameterSeed3D& supplied :
          options.parameter_seeds) {
         checked_increment_diagnostic(

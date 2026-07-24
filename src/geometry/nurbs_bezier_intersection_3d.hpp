@@ -34,6 +34,8 @@ struct NurbsElementIntersectionDiagnostics3D {
     int triangle_seed_hits = 0;
     int newton_attempts = 0;
     int newton_iterations = 0;
+    int early_unique_certificate_attempts = 0;
+    int early_unique_certificate_successes = 0;
     int roots_recovered_without_triangle_seed = 0;
     int unresolved_boxes = 0;
     int maximum_subdivision_depth_reached = 0;
@@ -73,6 +75,7 @@ struct NurbsElementIntersectionOptions3D {
     int max_subdivision_depth = 4;
     int max_newton_iterations = 24;
     bool use_triangle_seed = true;
+    bool use_early_unique_root_certificate = false;
     std::vector<NurbsElementParameterSeed3D> parameter_seeds;
 };
 
