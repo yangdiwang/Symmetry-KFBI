@@ -72,32 +72,46 @@ void require_same_surface_crossing(
 void require_equivalent_surface_crossing(
     const kfbim::geometry3d::NurbsSurfaceCrossing3D& first,
     const kfbim::geometry3d::NurbsSurfaceCrossing3D& second,
+    const kfbim::geometry3d::NurbsSurfaceModel3D& model,
     double edge_length,
-    double tolerance,
+    double physical_tolerance,
+    double dimensionless_tolerance,
     const std::string& message)
 {
     require(first.patch_index == second.patch_index, message + " patch");
     require(first.component == second.component, message + " component");
-    require(std::abs(first.u - second.u) <= tolerance, message + " u");
-    require(std::abs(first.v - second.v) <= tolerance, message + " v");
+    const auto& patch = model.patch(first.patch_index);
+    const Eigen::Vector3d first_uv_point = patch.evaluate(first.u, first.v);
+    const Eigen::Vector3d second_uv_point = patch.evaluate(second.u, second.v);
+    require((first_uv_point - second_uv_point).norm() <= physical_tolerance,
+            message + " uv");
     require(std::abs(first.edge_parameter - second.edge_parameter)
-                    * edge_length <= tolerance,
+                    * edge_length <= physical_tolerance,
             message + " t");
-    require((first.point - second.point).norm() <= tolerance,
+    require((first.point - second.point).norm() <= physical_tolerance,
             message + " point");
-    require((first.normal - second.normal).norm() <= tolerance,
-            message + " normal");
-    require(std::abs(first.residual - second.residual) <= tolerance,
+    const Eigen::Vector3d first_patch_normal =
+        patch.normal(first.u, first.v);
+    const Eigen::Vector3d second_patch_normal =
+        patch.normal(second.u, second.v);
+    require((first.normal - first_patch_normal).norm()
+                <= dimensionless_tolerance,
+            message + " first normal");
+    require((second.normal - second_patch_normal).norm()
+                <= dimensionless_tolerance,
+            message + " second normal");
+    const double normal_delta = (first.normal - second.normal).norm();
+    require(std::abs(first.residual - second.residual) <= physical_tolerance,
             message + " residual");
     require(std::abs(first.transversality - second.transversality)
-                <= tolerance,
+                <= normal_delta + dimensionless_tolerance,
             message + " transversality");
     require(first.feature_edge_contact == second.feature_edge_contact,
             message + " feature");
     require(std::abs(
                 first.reliable_transversality_tolerance
                 - second.reliable_transversality_tolerance)
-                <= tolerance,
+                <= dimensionless_tolerance,
             message + " tolerance");
 }
 
@@ -243,6 +257,7 @@ void require_same_edge_classification(
 
 void require_same_domain_outputs(
     const kfbim::CartesianGrid3D& grid,
+    const kfbim::geometry3d::NurbsSurfaceModel3D& model,
     const kfbim::geometry3d::NurbsCartesianDomain3D& baseline,
     const kfbim::geometry3d::NurbsCartesianDomain3D& candidate,
     const std::string& message)
@@ -254,8 +269,12 @@ void require_same_domain_outputs(
                 && (baseline.surface_bounds().upper
                         - candidate.surface_bounds().upper).norm() == 0.0,
             message + " geometry metadata");
-    const double crossing_tolerance = 8.0 * std::max(
+    const double physical_tolerance = 8.0 * std::max(
         baseline.geometry_tolerance(), candidate.geometry_tolerance());
+    const double dimensionless_tolerance = std::max(
+        64.0 * std::numeric_limits<double>::epsilon(),
+        physical_tolerance / std::max(
+            baseline.surface_bounds().diameter(), physical_tolerance));
 
     const auto dims = grid.dof_dims();
     for (int k = 0; k < dims[2]; ++k) {
@@ -303,16 +322,20 @@ void require_same_domain_outputs(
                         require_equivalent_surface_crossing(
                             baseline_crossings[root],
                             candidate_crossings[root],
+                            model,
                             edge_length,
-                            crossing_tolerance,
+                            physical_tolerance,
+                            dimensionless_tolerance,
                             message + " crossing");
                     }
                     if (baseline_crossings.size() == 1) {
                         require_equivalent_surface_crossing(
                             baseline.crossing_between(node, neighbor),
                             candidate.crossing_between(node, neighbor),
+                            model,
                             edge_length,
-                            crossing_tolerance,
+                            physical_tolerance,
+                            dimensionless_tolerance,
                             message + " single crossing lookup");
                     }
                     if (baseline_info.correction_safe) {
@@ -321,8 +344,10 @@ void require_same_domain_outputs(
                                 node, neighbor),
                             candidate.correction_crossing_between(
                                 node, neighbor),
+                            model,
                             edge_length,
-                            crossing_tolerance,
+                            physical_tolerance,
+                            dimensionless_tolerance,
                             message + " strict correction crossing");
                     }
                 }
@@ -896,7 +921,10 @@ void test_early_unique_root_certificate()
             "early certificate skips redundant affine intersection work");
 
     const auto solve_graph = [](
-        int degree, const std::vector<double>& coefficients) {
+        int degree,
+        const std::vector<double>& coefficients,
+        double segment_start_x = 0.0,
+        double segment_end_x = 1.0) {
         std::vector<double> knots(
             static_cast<std::size_t>(2 * (degree + 1)), 1.0);
         std::fill(knots.begin(), knots.begin() + degree + 1, 0.0);
@@ -929,27 +957,51 @@ void test_early_unique_root_certificate()
         try {
             return intersect_nurbs_bezier_element_3d(
                 element, model.patch(0),
-                {0.0, 0.5, 0.0}, {1.0, 0.5, 0.0}, options);
+                {segment_start_x, 0.5, 0.0},
+                {segment_end_x, 0.5, 0.0}, options);
         } catch (const UnresolvedNurbsIntersectionCandidate3D& error) {
             return error.partial_result();
         }
     };
     const NurbsElementIntersectionResult3D two_root =
-        solve_graph(2, {0.14, -0.31, 0.24});
+        solve_graph(2, {0.0, -0.325, 0.35}, -0.2, 1.2);
     require(two_root.roots.size() == 2
+                && std::abs(two_root.roots[0].u) < 2.0e-10
+                && std::abs(two_root.roots[1].u - 0.65) < 2.0e-10
+                && two_root.diagnostics
+                       .early_unique_certificate_attempts == 1
                 && two_root.diagnostics
                        .early_unique_certificate_successes == 0,
-            "early certificate does not accept a two-root ruled element");
+            "early certificate rejects one preliminary root when the "
+            "complete element has two roots");
     const NurbsElementIntersectionResult3D tangent =
-        solve_graph(2, {0.25, -0.25, 0.25});
-    require(tangent.roots.size() == 1
-                && tangent.roots.front().transversality < 1.0e-10
+        solve_graph(3, {-0.1225, 0.1575, -0.1125, 0.0675});
+    const auto transverse_root = std::find_if(
+        tangent.roots.begin(), tangent.roots.end(), [](const auto& root) {
+            return std::abs(root.u - 0.25) < 2.0e-10
+                && root.transversality
+                    > root.reliable_transversality_tolerance;
+        });
+    const auto near_tangent_root = std::find_if(
+        tangent.roots.begin(), tangent.roots.end(), [](const auto& root) {
+            return std::abs(root.u - 0.7) < 2.0e-6
+                && root.transversality
+                    < root.reliable_transversality_tolerance;
+        });
+    require(tangent.roots.size() >= 2
+                && transverse_root != tangent.roots.end()
+                && near_tangent_root != tangent.roots.end()
+                && tangent.diagnostics
+                       .early_unique_certificate_attempts == 1
                 && tangent.diagnostics
                        .early_unique_certificate_successes == 0,
-            "early certificate does not accept a tangent root");
+            "early certificate rejects one preliminary root when the "
+            "complete element also has a tangent root");
     const NurbsElementIntersectionResult3D odd_flat =
         solve_graph(3, {-0.125, 0.125, -0.125, 0.125});
     require(odd_flat.diagnostics.unresolved_boxes > 0
+                && odd_flat.diagnostics
+                       .early_unique_certificate_attempts == 1
                 && odd_flat.diagnostics
                        .early_unique_certificate_successes == 0,
             "early certificate does not accept a zero-derivative odd root");
@@ -2503,7 +2555,7 @@ void require_triangle_seed_independent_domain(
             const NurbsCartesianDomain3D candidate(
                 grid, model, strategy_options);
             require_same_domain_outputs(
-                grid, seeded, candidate,
+                grid, model, seeded, candidate,
                 name + " " + strategy_name);
             require(
                 candidate.diagnostics().candidate_element_incidence_count > 0

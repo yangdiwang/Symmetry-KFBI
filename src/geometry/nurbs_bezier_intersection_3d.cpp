@@ -1742,6 +1742,29 @@ NurbsElementIntersectionResult3D intersect_nurbs_bezier_element_3d(
             checked_increment_diagnostic(
                 result.diagnostics.early_unique_certificate_successes,
                 "NURBS early unique-root certificate success diagnostic overflow");
+            const double geometry_scale = std::max(
+                {element.bounds().max_extent(), frame.length, 1.0});
+            const double polish_tolerance = std::min(
+                options.geometry_tolerance,
+                64.0 * std::numeric_limits<double>::epsilon()
+                    * geometry_scale);
+            if (result.roots.front().residual > polish_tolerance) {
+                NurbsElementIntersectionOptions3D polish_options = options;
+                polish_options.geometry_tolerance = polish_tolerance;
+                const NurbsElementRoot3D& root = result.roots.front();
+                const NativeNewtonOutcome polished = native_newton(
+                    element, patch, frame,
+                    TriangleSeed{root.u, root.v, root.t},
+                    polish_options, result.diagnostics);
+                if (polished.root) {
+                    const double reliable_tolerance =
+                        root.reliable_transversality_tolerance;
+                    result.roots.front() = *polished.root;
+                    result.roots.front()
+                        .reliable_transversality_tolerance =
+                            reliable_tolerance;
+                }
+            }
             return result;
         }
     }
