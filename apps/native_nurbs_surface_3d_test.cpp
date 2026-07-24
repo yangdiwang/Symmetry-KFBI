@@ -3667,6 +3667,41 @@ void test_nurbs_cartesian_targeted_retry()
                 && correction_safe_barriers
                        == diagnostics.correction_safe_edge_count,
             "retry and correction-safe diagnostics match edge records");
+
+    kfbim::geometry3d::NurbsCartesianDomainOptions3D hybrid_options;
+    hybrid_options.strategy =
+        kfbim::geometry3d::NurbsCartesianPreprocessStrategy3D::Hybrid;
+    const kfbim::geometry3d::NurbsCartesianDomain3D hybrid(
+        grid, torus.geometry_model(), hybrid_options);
+    const int shallow_root_start = grid.index(35, 63, 65);
+    const int shallow_root_end = grid.index(35, 64, 65);
+    const auto shallow_root_info = hybrid.edge_classification_between(
+        shallow_root_start, shallow_root_end);
+    require(shallow_root_info.used_targeted_retry
+                && shallow_root_info.root_count_known
+                && shallow_root_info.parity_known_from_roots
+                && shallow_root_info.confirmed_crossing_count == 1
+                && shallow_root_info.confirmed_transverse_count == 1
+                && shallow_root_info.correction_safe,
+            "hybrid targeted retry resolves the N=128 shallow torus root");
+    (void)hybrid.correction_crossing_between(
+        shallow_root_start, shallow_root_end);
+    require(hybrid.diagnostics().targeted_retry_unsafe_count == 0
+                && hybrid.diagnostics().unsafe_label_changing_edge_count == 0,
+            "hybrid leaves no unsafe N=128 torus barriers");
+    const auto& hybrid_retry =
+        hybrid.diagnostics().targeted_retry_intersections;
+    require(hybrid_retry.mapped_candidate_elements > 0
+                && hybrid_retry.bvh_candidate_elements == 0
+                && hybrid_retry.planar_analytic_hits == 0
+                && hybrid_retry.planar_analytic_misses == 0
+                && hybrid_retry.planar_analytic_fallbacks == 0
+                && hybrid_retry.closest_point_prefilter_attempts == 0
+                && hybrid_retry.closest_point_prefilter_certified_hits == 0
+                && hybrid_retry.closest_point_prefilter_certified_misses == 0
+                && hybrid_retry.closest_point_prefilter_fallbacks == 0
+                && hybrid_retry.certified_fallback_elements == 0,
+            "hybrid targeted retry uses mapped optimized-certified work");
 }
 void test_nurbs_cartesian_input_contracts()
 {

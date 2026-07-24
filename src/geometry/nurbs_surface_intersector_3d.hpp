@@ -118,8 +118,15 @@ struct NurbsQueryElementDescriptor3D {
     int component = -1;
 };
 
+enum class NurbsCartesianEdgeQueryRoute3D {
+    Configured,
+    OptimizedCertified
+};
+
 struct NurbsCartesianEdgeQueryOptions3D {
     int local_max_subdivision_depth = -1;
+    NurbsCartesianEdgeQueryRoute3D route =
+        NurbsCartesianEdgeQueryRoute3D::Configured;
 };
 
 struct NurbsSurfaceIntersectorOptions3D {
@@ -183,11 +190,12 @@ private:
         const Eigen::Vector3d& end,
         const NurbsCartesianEdgeQuery3D* cartesian_edge,
         const std::vector<int>* mapped_candidates,
-        int local_max_subdivision_depth) const;
+        int local_max_subdivision_depth,
+        NurbsCartesianEdgeQueryRoute3D route) const;
     NurbsCartesianEdgeIntersections3D intersect_cartesian_edge_impl(
         const NurbsCartesianEdgeQuery3D& edge,
         const std::vector<int>* mapped_candidates,
-        int local_max_subdivision_depth) const;
+        NurbsCartesianEdgeQueryOptions3D options) const;
 
     NurbsSurfaceModel3D model_;
     NurbsSurfaceIntersectorOptions3D options_;

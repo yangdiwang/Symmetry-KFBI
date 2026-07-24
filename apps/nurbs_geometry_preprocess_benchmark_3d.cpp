@@ -283,6 +283,7 @@ void record_mismatch(std::vector<std::string>& rows,
         detail}));
 }
 
+// used_targeted_retry records backend control flow, not edge geometry.
 bool same_classification(
     const NurbsCartesianEdgeClassification3D& first,
     const NurbsCartesianEdgeClassification3D& second)
@@ -295,7 +296,6 @@ bool same_classification(
         && first.parity_known_from_roots == second.parity_known_from_roots
         && first.has_near_tangent_candidate
             == second.has_near_tangent_candidate
-        && first.used_targeted_retry == second.used_targeted_retry
         && first.correction_safe == second.correction_safe
         && first.confirmed_crossing_count == second.confirmed_crossing_count
         && first.ambiguous_cluster_count == second.ambiguous_cluster_count
@@ -313,7 +313,6 @@ void hash_classification(
     checksum.add_bool(value.root_count_known);
     checksum.add_bool(value.parity_known_from_roots);
     checksum.add_bool(value.has_near_tangent_candidate);
-    checksum.add_bool(value.used_targeted_retry);
     checksum.add_bool(value.correction_safe);
     checksum.add_unsigned(value.confirmed_crossing_count);
     checksum.add_unsigned(value.ambiguous_cluster_count);
@@ -369,8 +368,6 @@ std::string classification_error_detail(
            << ";has_near_tangent_candidate="
            << (baseline.has_near_tangent_candidate
                != candidate.has_near_tangent_candidate)
-           << ";used_targeted_retry="
-           << (baseline.used_targeted_retry != candidate.used_targeted_retry)
            << ";correction_safe="
            << (baseline.correction_safe != candidate.correction_safe)
            << ";confirmed_crossing_count="

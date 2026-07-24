@@ -1383,7 +1383,9 @@ NurbsSurfaceIntersector3D::intersect_segment(
     const Eigen::Vector3d& end) const
 {
     NurbsSurfaceIntersectionResult3D result =
-        intersect_segment_impl(start, end, nullptr, nullptr, -1);
+        intersect_segment_impl(
+            start, end, nullptr, nullptr, -1,
+            NurbsCartesianEdgeQueryRoute3D::Configured);
     (void)analyze_close_root_pairs(
         result.crossings, model_, elements_, start, end,
         geometry_tolerance_, result.diagnostics);
@@ -1396,8 +1398,15 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
     const Eigen::Vector3d& end,
     const NurbsCartesianEdgeQuery3D* cartesian_edge,
     const std::vector<int>* mapped_candidates,
-    int local_max_subdivision_depth) const
+    int local_max_subdivision_depth,
+    NurbsCartesianEdgeQueryRoute3D route) const
 {
+    if (route != NurbsCartesianEdgeQueryRoute3D::Configured
+        && route
+            != NurbsCartesianEdgeQueryRoute3D::OptimizedCertified) {
+        throw std::invalid_argument(
+            "unknown NURBS Cartesian edge query route");
+    }
     if (!start.allFinite() || !end.allFinite())
         throw std::invalid_argument("NURBS intersection segment must be finite");
     const double segment_length = (end - start).norm();
@@ -1561,14 +1570,19 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
             accumulate_work(probe, false);
         };
     NurbsElementIntersectionOptions3D local_options;
+    const bool force_optimized_certified =
+        route == NurbsCartesianEdgeQueryRoute3D::OptimizedCertified;
     local_options.geometry_tolerance = geometry_tolerance_;
     local_options.use_triangle_seed = options_.use_triangle_seeds;
     local_options.use_early_unique_root_certificate =
-        options_.use_early_unique_root_certificate;
+        force_optimized_certified
+        || options_.use_early_unique_root_certificate;
     local_options.use_affine_planar_fast_path =
-        options_.use_affine_planar_fast_path;
+        !force_optimized_certified
+        && options_.use_affine_planar_fast_path;
     local_options.use_closest_point_prefilter =
-        options_.use_closest_point_prefilter;
+        !force_optimized_certified
+        && options_.use_closest_point_prefilter;
     local_options.max_subdivision_depth =
         local_max_subdivision_depth < 0
         ? options_.local_max_subdivision_depth
@@ -1708,7 +1722,7 @@ NurbsCartesianEdgeIntersections3D
 NurbsSurfaceIntersector3D::intersect_cartesian_edge(
     const NurbsCartesianEdgeQuery3D& edge) const
 {
-    return intersect_cartesian_edge_impl(edge, nullptr, -1);
+    return intersect_cartesian_edge_impl(edge, nullptr, {});
 }
 
 NurbsCartesianEdgeIntersections3D
@@ -1741,21 +1755,20 @@ NurbsSurfaceIntersector3D::intersect_cartesian_edge(
         throw std::invalid_argument(
             "duplicate NURBS query-element candidate ID");
     }
-    return intersect_cartesian_edge_impl(
-        edge, &candidates, options.local_max_subdivision_depth);
+    return intersect_cartesian_edge_impl(edge, &candidates, options);
 }
 
 NurbsCartesianEdgeIntersections3D
 NurbsSurfaceIntersector3D::intersect_cartesian_edge_impl(
     const NurbsCartesianEdgeQuery3D& edge,
     const std::vector<int>* mapped_candidates,
-    int local_max_subdivision_depth) const
+    NurbsCartesianEdgeQueryOptions3D options) const
 {
     NurbsSurfaceIntersectionResult3D result;
     try {
         result = intersect_segment_impl(
             edge.start, edge.end, &edge, mapped_candidates,
-            local_max_subdivision_depth);
+            options.local_max_subdivision_depth, options.route);
     } catch (const UnrelatedPatchCoincidence& coincidence) {
         throw std::runtime_error(cartesian_edge_diagnostic(
             "coincident roots on unrelated NURBS patches", edge,

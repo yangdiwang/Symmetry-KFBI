@@ -686,7 +686,10 @@ struct NurbsCartesianDomain3D::Impl {
             if (use_mapped_candidates) {
                 return intersector.intersect_cartesian_edge(
                     query, candidate_ids,
-                    NurbsCartesianEdgeQueryOptions3D{6});
+                    NurbsCartesianEdgeQueryOptions3D{
+                        6,
+                        NurbsCartesianEdgeQueryRoute3D::
+                            OptimizedCertified});
             }
             if (!retry_intersector) {
                 NurbsSurfaceIntersectorOptions3D retry_options =
