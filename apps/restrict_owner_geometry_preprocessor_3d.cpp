@@ -725,11 +725,25 @@ RestrictOwnerGeometryPreprocessor3D::preprocess_sample(
         if (safe_state && safe_root != nullptr) {
             geometry3d::NurbsSurfaceIntersectionResult3D intersection;
             intersection.crossings.push_back(*safe_root);
-            const auto result = normalize_intersection_result(
+            const auto closest_result = normalize_intersection_result(
                 input.target_dof, input.query, support, intersection,
                 QueryPath::ClosestCertifiedRoot);
-            if (result.owner_class == NormalizedClass::UniqueForeign)
-                return result;
+            if (closest_result.owner_class
+                == NormalizedClass::UniqueForeign) {
+                RestrictOwnerPreprocessResult3D confirmed =
+                    optimized_intersection_result(
+                        input.target_dof, input.query, support);
+                if (confirmed.owner_class
+                        == NormalizedClass::UniqueForeign
+                    && confirmed.owner_dof
+                           == closest_result.owner_dof
+                    && confirmed.query_path
+                           == QueryPath::OptimizedIntersection) {
+                    confirmed.query_path =
+                        QueryPath::ClosestCertifiedRoot;
+                }
+                return confirmed;
+            }
         }
         return optimized_intersection_result(
             input.target_dof, input.query, support);

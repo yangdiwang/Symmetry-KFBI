@@ -1004,6 +1004,74 @@ void test_hybrid_segment_closest_miss_and_root_paths()
                     root_results.hybrid.owner_class)));
 }
 
+void test_hybrid_hollow_grid_stencil_matches_reference()
+{
+    const NativeNurbsSurface3D cylinder =
+        make_native_nurbs_surface_3d(GeometryKind3D::HollowCylinder);
+    const double spacing = 3.0 / 16.0;
+    const SurfaceDofCloud3D cloud =
+        make_native_surface_dofs_3d(cylinder, spacing);
+    const int target = 19;
+    require(target < static_cast<int>(cloud.dofs.size()),
+            "hollow-grid regression target DOF exists");
+
+    const Eigen::Vector3d query(
+        0.26329319959113251,
+        0.15329319959113238,
+        0.39142857142857140);
+    const Eigen::Vector3d support(0.5625, -0.1875, 0.75);
+
+    const RestrictOwnerSampleInput3D sample =
+        one_wrong_side_sample(target, query, support);
+    RestrictOwnerGeometryPreprocessor3D reference(
+        cylinder, cloud, spacing, Mode::FullIntersectionReference);
+    RestrictOwnerGeometryPreprocessor3D optimized(
+        cylinder, cloud, spacing, Mode::OptimizedIntersection);
+    RestrictOwnerGeometryPreprocessor3D hybrid(
+        cylinder, cloud, spacing, Mode::RegionClosestHybrid);
+    const auto oracle = one_result(reference, sample);
+    const auto optimized_result = one_result(optimized, sample);
+    const auto hybrid_result = one_result(hybrid, sample);
+
+    require(oracle.owner_dof == target
+                && oracle.owner_class == NormalizedClass::FailClosedTarget,
+            "hollow-grid oracle conservatively keeps the target owner");
+    require_matches_reference_owner(
+        optimized_result, oracle,
+        "hollow-grid optimized path matches the oracle");
+    require_matches_reference_owner(
+        hybrid_result, oracle,
+        "hollow-grid hybrid certificate matches the oracle");
+    require(hybrid_result.query_path == optimized_result.query_path
+                && hybrid_result.fallback_cause
+                       == optimized_result.fallback_cause
+                && hybrid_result.foreign_crossing.has_value()
+                       == optimized_result.foreign_crossing.has_value(),
+            "hollow-grid hybrid preserves the optimized confirmation "
+            "classification");
+    if (hybrid_result.foreign_crossing.has_value()) {
+        require(hybrid_result.foreign_crossing->patch_index
+                    == optimized_result.foreign_crossing->patch_index,
+                "hollow-grid hybrid preserves the optimized crossing "
+                "patch");
+    }
+
+    const auto& hybrid_diagnostics = hybrid.diagnostics();
+    require(hybrid_diagnostics.optimized_intersection_calls == 1,
+            "hollow-grid closest root is confirmed exactly once by the "
+            "optimized policy");
+    require(hybrid_diagnostics.path_counts[
+                static_cast<std::size_t>(
+                    hybrid_result.query_path)] == 1,
+            "hollow-grid hybrid records its final normalized path");
+    const bool used_full_fallback =
+        hybrid_result.query_path
+        == QueryPath::FullIntersectionFallback;
+    require(hybrid_diagnostics.full_fallback_calls
+                == (used_full_fallback ? 1u : 0u),
+            "hollow-grid hybrid fallback count matches its final path");
+}
+
 bool certificate_has_safe_root(
     const kfbim::geometry3d::NurbsSurfaceCandidateCertificate3D& certificate)
 {
@@ -1507,6 +1575,7 @@ int main()
         test_optimized_multi_root_seam_and_coincidence_paths();
         test_hybrid_sweep_target_path();
         test_hybrid_segment_closest_miss_and_root_paths();
+        test_hybrid_hollow_grid_stencil_matches_reference();
         test_hybrid_unsafe_geometry_uses_optimized_fallback();
         test_hybrid_unresolved_boundary_seam_and_multi_fallbacks();
         test_hybrid_compatible_unsafe_root_uses_optimized_fallback();
