@@ -1,10 +1,12 @@
 #include "nurbs_geometry_preprocess_benchmark_3d.hpp"
+#include "src/geometry/grid_pair_3d.hpp"
 
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <initializer_list>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -29,6 +31,15 @@ void require_throws(Function&& function, const std::string& message)
         return;
     }
     throw std::runtime_error(message);
+}
+
+void require_contains_all(const std::string& text,
+                          std::initializer_list<const char*> fields,
+                          const std::string& message)
+{
+    for (const char* field : fields)
+        require(text.find(field) != std::string::npos,
+                message + " missing " + field);
 }
 
 void test_complete_backend_equivalence()
@@ -131,6 +142,14 @@ void test_cli_statistics_and_csv_support()
         [] {
             (void)parse_benchmark_cli_3d(
                 {"--backend", "baseline", "--geometry", "torus",
+                 "--N", "1290", "--warmup", "0", "--reps", "1",
+                 "--out", "out"});
+        },
+        "CLI parser rejects grids whose Node DOF product exceeds int");
+    require_throws(
+        [] {
+            (void)parse_benchmark_cli_3d(
+                {"--backend", "baseline", "--geometry", "torus",
                  "--N", "16", "--warmup", "0", "--reps", "0",
                  "--out", "out"});
         },
@@ -175,6 +194,57 @@ void test_cli_statistics_and_csv_support()
             "CSV encoder quotes commas and doubles embedded quotes");
 }
 
+void test_checked_node_capacity_validation()
+{
+    BenchmarkOptions3D options;
+    options.levels = {1289};
+    validate_benchmark_options_3d(options);
+    options.levels = {1290};
+    require_throws(
+        [&] { validate_benchmark_options_3d(options); },
+        "direct benchmark options reject a Node DOF product above int");
+}
+
+void test_complete_diagnostic_serializers()
+{
+    kfbim::geometry3d::NurbsCartesianEdgeClassification3D classification;
+    const std::string classification_text =
+        serialize_edge_classification_3d(classification);
+    require_contains_all(classification_text, {
+        "queried", "has_confirmed_interface", "changes_component_membership",
+        "root_count_known", "parity_known_from_roots",
+        "has_near_tangent_candidate", "used_targeted_retry",
+        "correction_safe", "confirmed_crossing_count",
+        "ambiguous_cluster_count", "confirmed_transverse_count"},
+        "classification serializer covers all 11 fields");
+
+    kfbim::geometry3d::NurbsSurfaceCrossing3D crossing;
+    const std::string crossing_text = serialize_surface_crossing_3d(crossing);
+    require_contains_all(crossing_text, {
+        "patch_index", "component", "u", "v", "edge_parameter", "point",
+        "normal", "residual", "transversality", "feature_edge_contact",
+        "reliable_transversality_tolerance"},
+        "crossing serializer covers every field");
+
+    kfbim::P2CrossingOwner3D owner;
+    const std::string owner_text = serialize_crossing_owner_3d(owner);
+    require_contains_all(owner_text, {
+        "center_index", "panel_index", "edge_parameter", "barycentric",
+        "geometry_panel_index", "geometry_barycentric", "nurbs_patch_index",
+        "nurbs_parameter", "crossing_point", "crossing_normal",
+        "surface_component", "crossing_residual", "status"},
+        "owner serializer covers every field");
+
+    const std::string mismatch_text = compose_mismatch_detail_3d(
+        classification_text, crossing_text,
+        "{patch_index=1;point=0.25}",
+        "{physical=1e-12;dimensionless=1e-10}");
+    require_contains_all(mismatch_text, {
+        "baseline={", "candidate={", "errors={",
+        "tolerance={physical=", "dimensionless="},
+        "mismatch detail identifies both records, errors, and tolerances");
+}
+
 void test_successful_run_removes_stale_mismatch_artifact()
 {
     const std::filesystem::path output =
@@ -208,6 +278,8 @@ int main()
     try {
         test_complete_backend_equivalence();
         test_cli_statistics_and_csv_support();
+        test_checked_node_capacity_validation();
+        test_complete_diagnostic_serializers();
         test_successful_run_removes_stale_mismatch_artifact();
         std::cout << "nurbs geometry preprocess benchmark 3d tests passed\n";
         return 0;

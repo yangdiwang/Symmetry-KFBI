@@ -8,6 +8,10 @@
 #include <string>
 #include <vector>
 
+namespace kfbim {
+struct P2CrossingOwner3D;
+}
+
 namespace kfbim::app3d::benchmark3d {
 
 enum class Backend3D {
@@ -106,6 +110,7 @@ struct BenchmarkRunResult3D {
 
 [[nodiscard]] BenchmarkOptions3D parse_benchmark_cli_3d(
     const std::vector<std::string>& arguments);
+void validate_benchmark_options_3d(const BenchmarkOptions3D& options);
 
 [[nodiscard]] TimingSummary3D summarize_timings_3d(
     const std::vector<double>& samples,
@@ -119,6 +124,17 @@ struct BenchmarkRunResult3D {
     const SummaryBenchmarkRecord3D& record);
 [[nodiscard]] std::string encode_csv_row_3d(
     const std::vector<std::string>& fields);
+[[nodiscard]] std::string serialize_edge_classification_3d(
+    const geometry3d::NurbsCartesianEdgeClassification3D& value);
+[[nodiscard]] std::string serialize_surface_crossing_3d(
+    const geometry3d::NurbsSurfaceCrossing3D& value);
+[[nodiscard]] std::string serialize_crossing_owner_3d(
+    const P2CrossingOwner3D& value);
+[[nodiscard]] std::string compose_mismatch_detail_3d(
+    const std::string& baseline,
+    const std::string& candidate,
+    const std::string& errors,
+    const std::string& tolerance);
 
 [[nodiscard]] BenchmarkSupportCase3D run_benchmark_support_case_3d(
     GeometryKind3D geometry,

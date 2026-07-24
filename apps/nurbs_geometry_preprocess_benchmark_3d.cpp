@@ -45,6 +45,8 @@ using geometry3d::NurbsCartesianPreprocessStrategy3D;
 using geometry3d::NurbsPatchTriangulation3D;
 using geometry3d::NurbsSurfaceCrossing3D;
 
+std::uint64_t checked_node_dimension(int N);
+
 std::string format_double(double value)
 {
     if (!std::isfinite(value))
@@ -53,6 +55,19 @@ std::string format_double(double value)
     stream.imbue(std::locale::classic());
     stream << std::setprecision(17) << value;
     return stream.str();
+}
+
+std::string format_vector(const Eigen::Vector3d& value)
+{
+    return "[" + format_double(value.x()) + ";"
+        + format_double(value.y()) + ";"
+        + format_double(value.z()) + "]";
+}
+
+std::string format_vector(const Eigen::Vector2d& value)
+{
+    return "[" + format_double(value.x()) + ";"
+        + format_double(value.y()) + "]";
 }
 
 class FnvChecksum {
@@ -139,8 +154,7 @@ NurbsPatchTriangulation3D make_production_triangulation(
 
 double production_grid_spacing(int N)
 {
-    if (N <= 0)
-        throw std::invalid_argument("benchmark grid N must be positive");
+    (void)checked_node_dimension(N);
     return kBoxSide / static_cast<double>(N);
 }
 
@@ -322,6 +336,135 @@ CrossingTolerance crossing_tolerance(
         physical / std::max(
             baseline.surface_bounds().diameter(), physical));
     return {physical, dimensionless};
+}
+
+std::string tolerance_payload(const CrossingTolerance& value)
+{
+    return "{physical=" + format_double(value.physical)
+        + ";dimensionless=" + format_double(value.dimensionless) + '}';
+}
+
+std::string tolerance_detail(const CrossingTolerance& value)
+{
+    return "tolerance=" + tolerance_payload(value);
+}
+
+std::string classification_error_detail(
+    const NurbsCartesianEdgeClassification3D& baseline,
+    const NurbsCartesianEdgeClassification3D& candidate)
+{
+    std::ostringstream stream;
+    stream << "{queried=" << (baseline.queried != candidate.queried)
+           << ";has_confirmed_interface="
+           << (baseline.has_confirmed_interface
+               != candidate.has_confirmed_interface)
+           << ";changes_component_membership="
+           << (baseline.changes_component_membership
+               != candidate.changes_component_membership)
+           << ";root_count_known="
+           << (baseline.root_count_known != candidate.root_count_known)
+           << ";parity_known_from_roots="
+           << (baseline.parity_known_from_roots
+               != candidate.parity_known_from_roots)
+           << ";has_near_tangent_candidate="
+           << (baseline.has_near_tangent_candidate
+               != candidate.has_near_tangent_candidate)
+           << ";used_targeted_retry="
+           << (baseline.used_targeted_retry != candidate.used_targeted_retry)
+           << ";correction_safe="
+           << (baseline.correction_safe != candidate.correction_safe)
+           << ";confirmed_crossing_count="
+           << (baseline.confirmed_crossing_count
+               != candidate.confirmed_crossing_count)
+           << ";ambiguous_cluster_count="
+           << (baseline.ambiguous_cluster_count
+               != candidate.ambiguous_cluster_count)
+           << ";confirmed_transverse_count="
+           << (baseline.confirmed_transverse_count
+               != candidate.confirmed_transverse_count) << '}';
+    return stream.str();
+}
+
+std::string classification_comparison_detail(
+    const NurbsCartesianEdgeClassification3D& baseline,
+    const NurbsCartesianEdgeClassification3D& candidate,
+    const CrossingTolerance& tolerance)
+{
+    return compose_mismatch_detail_3d(
+        serialize_edge_classification_3d(baseline),
+        serialize_edge_classification_3d(candidate),
+        classification_error_detail(baseline, candidate),
+        tolerance_payload(tolerance));
+}
+
+std::string comparison_number(double value)
+{
+    return std::isfinite(value) ? format_double(value) : "nonfinite";
+}
+
+std::string crossing_comparison_detail(
+    const PreparedCase& prepared,
+    const NurbsSurfaceCrossing3D& baseline,
+    const NurbsSurfaceCrossing3D& candidate,
+    double edge_length,
+    const CrossingTolerance& tolerance)
+{
+    double uv_error = std::numeric_limits<double>::infinity();
+    double baseline_normal_error = std::numeric_limits<double>::infinity();
+    double candidate_normal_error = std::numeric_limits<double>::infinity();
+    const int patch_count = static_cast<int>(prepared.surface.patches.size());
+    if (baseline.patch_index >= 0 && baseline.patch_index < patch_count
+        && candidate.patch_index >= 0 && candidate.patch_index < patch_count) {
+        const auto& baseline_patch = prepared.surface.patches[
+            static_cast<std::size_t>(baseline.patch_index)];
+        const auto& candidate_patch = prepared.surface.patches[
+            static_cast<std::size_t>(candidate.patch_index)];
+        uv_error = (baseline_patch.evaluate(baseline.u, baseline.v)
+            - candidate_patch.evaluate(candidate.u, candidate.v)).norm();
+        baseline_normal_error = (baseline.normal
+            - baseline_patch.normal(baseline.u, baseline.v)).norm();
+        candidate_normal_error = (candidate.normal
+            - candidate_patch.normal(candidate.u, candidate.v)).norm();
+    }
+    std::ostringstream errors;
+    errors << "{patch_index="
+           << (baseline.patch_index != candidate.patch_index)
+           << ";component=" << (baseline.component != candidate.component)
+           << ";uv_point=" << comparison_number(uv_error)
+           << ";edge_parameter="
+           << format_double(std::abs(
+                baseline.edge_parameter - candidate.edge_parameter)
+                * edge_length)
+           << ";point=" << format_double((baseline.point - candidate.point).norm())
+           << ";normal_delta="
+           << format_double((baseline.normal - candidate.normal).norm())
+           << ";baseline_normal_to_patch="
+           << comparison_number(baseline_normal_error)
+           << ";candidate_normal_to_patch="
+           << comparison_number(candidate_normal_error)
+           << ";residual_delta="
+           << format_double(std::abs(baseline.residual - candidate.residual))
+           << ";baseline_abs_residual=" << format_double(std::abs(baseline.residual))
+           << ";candidate_abs_residual=" << format_double(std::abs(candidate.residual))
+           << ";transversality="
+           << format_double(std::abs(
+                baseline.transversality - candidate.transversality))
+           << ";feature_edge_contact="
+           << (baseline.feature_edge_contact != candidate.feature_edge_contact)
+           << ";reliability_tolerance=" << format_double(std::abs(
+                baseline.reliable_transversality_tolerance
+                - candidate.reliable_transversality_tolerance)) << '}';
+    const std::string thresholds =
+        "{physical=" + format_double(tolerance.physical)
+        + ";dimensionless=" + format_double(tolerance.dimensionless)
+        + ";uv_point=physical;edge_parameter=physical;point=physical"
+        + ";normal_to_patch=dimensionless;residual_delta=physical"
+        + ";absolute_residual=" + format_double(tolerance.physical / 8.0)
+        + ";transversality=normal_delta+dimensionless"
+        + ";reliability_tolerance=dimensionless}";
+    return compose_mismatch_detail_3d(
+        serialize_surface_crossing_3d(baseline),
+        serialize_surface_crossing_3d(candidate), errors.str(), thresholds);
 }
 
 bool equivalent_crossing(
@@ -597,6 +740,187 @@ bool equivalent_owner(
         && residual_error <= tolerance.physical;
 }
 
+std::string edge_state_detail(
+    int label_a,
+    int label_b,
+    const NurbsCartesianEdgeClassification3D& classification)
+{
+    return "{label_a=" + std::to_string(label_a)
+        + ";label_b=" + std::to_string(label_b)
+        + ";classification="
+        + serialize_edge_classification_3d(classification) + '}';
+}
+
+struct OwnerComparisonErrors {
+    bool center_index = false;
+    bool panel_index = false;
+    bool geometry_panel_index = false;
+    bool nurbs_patch_index = false;
+    bool surface_component = false;
+    bool status = false;
+    double edge_parameter = 0.0;
+    double barycentric = 0.0;
+    double geometry_barycentric = 0.0;
+    double uv_point = std::numeric_limits<double>::infinity();
+    double crossing_point = 0.0;
+    double baseline_normal_to_patch = std::numeric_limits<double>::infinity();
+    double candidate_normal_to_patch = std::numeric_limits<double>::infinity();
+    double crossing_residual = 0.0;
+    bool strict_status = false;
+    bool strict_patch_index = false;
+    bool strict_component = false;
+    bool strict_owner_nonfinite = false;
+    double strict_uv_point = std::numeric_limits<double>::infinity();
+    double strict_edge_parameter = 0.0;
+    double strict_point = 0.0;
+    double strict_normal_delta = 0.0;
+    double strict_residual = 0.0;
+};
+
+OwnerComparisonErrors measure_owner_comparison(
+    const PreparedCase& prepared,
+    const P2CrossingOwner3D& baseline,
+    const P2CrossingOwner3D& candidate,
+    const NurbsSurfaceCrossing3D& strict_crossing,
+    double edge_length)
+{
+    OwnerComparisonErrors value;
+    value.center_index = baseline.center_index != candidate.center_index;
+    value.panel_index = baseline.panel_index != candidate.panel_index;
+    value.geometry_panel_index =
+        baseline.geometry_panel_index != candidate.geometry_panel_index;
+    value.nurbs_patch_index =
+        baseline.nurbs_patch_index != candidate.nurbs_patch_index;
+    value.surface_component =
+        baseline.surface_component != candidate.surface_component;
+    value.status = baseline.status != candidate.status;
+    value.edge_parameter = std::abs(
+        baseline.edge_parameter - candidate.edge_parameter) * edge_length;
+    value.barycentric =
+        (baseline.barycentric - candidate.barycentric).norm();
+    value.geometry_barycentric =
+        (baseline.geometry_barycentric
+         - candidate.geometry_barycentric).norm();
+    value.crossing_point =
+        (baseline.crossing_point - candidate.crossing_point).norm();
+    value.crossing_residual = std::abs(
+        baseline.crossing_residual - candidate.crossing_residual);
+    const int patch_count = static_cast<int>(prepared.surface.patches.size());
+    if (baseline.nurbs_patch_index >= 0
+        && baseline.nurbs_patch_index < patch_count
+        && candidate.nurbs_patch_index >= 0
+        && candidate.nurbs_patch_index < patch_count) {
+        const auto& baseline_patch = prepared.surface.patches[
+            static_cast<std::size_t>(baseline.nurbs_patch_index)];
+        const auto& candidate_patch = prepared.surface.patches[
+            static_cast<std::size_t>(candidate.nurbs_patch_index)];
+        const Eigen::Vector3d baseline_uv = baseline_patch.evaluate(
+            baseline.nurbs_parameter.x(), baseline.nurbs_parameter.y());
+        const Eigen::Vector3d candidate_uv = candidate_patch.evaluate(
+            candidate.nurbs_parameter.x(), candidate.nurbs_parameter.y());
+        value.uv_point = (baseline_uv - candidate_uv).norm();
+        value.baseline_normal_to_patch = (baseline.crossing_normal
+            - baseline_patch.normal(baseline.nurbs_parameter.x(),
+                                    baseline.nurbs_parameter.y())).norm();
+        value.candidate_normal_to_patch = (candidate.crossing_normal
+            - candidate_patch.normal(candidate.nurbs_parameter.x(),
+                                     candidate.nurbs_parameter.y())).norm();
+    }
+    value.strict_status =
+        candidate.status != P2CrossingOwnerStatus3D::ExactIntersection;
+    value.strict_patch_index =
+        candidate.nurbs_patch_index != strict_crossing.patch_index;
+    value.strict_component =
+        candidate.surface_component != strict_crossing.component;
+    value.strict_owner_nonfinite = !(candidate.nurbs_parameter.allFinite()
+        && candidate.crossing_point.allFinite()
+        && candidate.crossing_normal.allFinite());
+    value.strict_edge_parameter = std::abs(
+        candidate.edge_parameter - strict_crossing.edge_parameter) * edge_length;
+    value.strict_point =
+        (candidate.crossing_point - strict_crossing.point).norm();
+    value.strict_normal_delta =
+        (candidate.crossing_normal - strict_crossing.normal).norm();
+    value.strict_residual = std::abs(
+        candidate.crossing_residual - strict_crossing.residual);
+    if (candidate.nurbs_patch_index >= 0
+        && candidate.nurbs_patch_index < patch_count
+        && strict_crossing.patch_index >= 0
+        && strict_crossing.patch_index < patch_count) {
+        value.strict_uv_point = (prepared.surface.patches[
+            static_cast<std::size_t>(candidate.nurbs_patch_index)].evaluate(
+                candidate.nurbs_parameter.x(), candidate.nurbs_parameter.y())
+            - prepared.surface.patches[
+                static_cast<std::size_t>(strict_crossing.patch_index)].evaluate(
+                    strict_crossing.u, strict_crossing.v)).norm();
+    }
+    return value;
+}
+
+std::string serialize_owner_comparison_errors(
+    const OwnerComparisonErrors& value)
+{
+    std::ostringstream stream;
+    stream << "{center_index=" << value.center_index
+           << ";panel_index=" << value.panel_index
+           << ";geometry_panel_index=" << value.geometry_panel_index
+           << ";nurbs_patch_index=" << value.nurbs_patch_index
+           << ";surface_component=" << value.surface_component
+           << ";status=" << value.status
+           << ";edge_parameter=" << format_double(value.edge_parameter)
+           << ";barycentric=" << format_double(value.barycentric)
+           << ";geometry_barycentric="
+           << format_double(value.geometry_barycentric)
+           << ";uv_point=" << comparison_number(value.uv_point)
+           << ";crossing_point=" << format_double(value.crossing_point)
+           << ";baseline_normal_to_patch="
+           << comparison_number(value.baseline_normal_to_patch)
+           << ";candidate_normal_to_patch="
+           << comparison_number(value.candidate_normal_to_patch)
+           << ";crossing_residual="
+           << format_double(value.crossing_residual)
+           << ";strict_status=" << value.strict_status
+           << ";strict_patch_index=" << value.strict_patch_index
+           << ";strict_component=" << value.strict_component
+           << ";strict_owner_nonfinite=" << value.strict_owner_nonfinite
+           << ";strict_uv_point="
+           << comparison_number(value.strict_uv_point)
+           << ";strict_edge_parameter="
+           << format_double(value.strict_edge_parameter)
+           << ";strict_point=" << format_double(value.strict_point)
+           << ";strict_normal_delta="
+           << format_double(value.strict_normal_delta)
+           << ";strict_residual=" << format_double(value.strict_residual)
+           << '}';
+    return stream.str();
+}
+
+std::string owner_comparison_detail(
+    const PreparedCase& prepared,
+    const P2CrossingOwner3D& baseline,
+    const P2CrossingOwner3D& candidate,
+    const NurbsSurfaceCrossing3D& strict_crossing,
+    double edge_length,
+    const CrossingTolerance& tolerance)
+{
+    const OwnerComparisonErrors errors = measure_owner_comparison(
+        prepared, baseline, candidate, strict_crossing, edge_length);
+    const std::string thresholds =
+        "{physical=" + format_double(tolerance.physical)
+        + ";dimensionless=" + format_double(tolerance.dimensionless)
+        + ";discrete=exact;edge_parameter=physical"
+        + ";barycentric=dimensionless"
+        + ";geometry_barycentric=dimensionless;uv_point=physical"
+        + ";normal_to_patch=dimensionless;crossing_point=physical"
+        + ";crossing_residual=physical;strict_normal_delta=dimensionless}";
+    return compose_mismatch_detail_3d(
+        serialize_crossing_owner_3d(baseline),
+        serialize_crossing_owner_3d(candidate),
+        serialize_owner_comparison_errors(errors), thresholds)
+        + ";strict_crossing="
+        + serialize_surface_crossing_3d(strict_crossing);
+}
+
 struct ScanContext {
     const PreparedCase& prepared;
     Backend3D backend;
@@ -658,24 +982,30 @@ void scan_nodes(ScanContext& context)
             record_mismatch(
                 context.mismatches, context.prepared, context.backend,
                 "analytic_label", -1, node, -1, -1,
-                "domain=" + std::to_string(candidate_label)
-                    + " exact=" + std::to_string(exact ? 1 : 0));
+                compose_mismatch_detail_3d(
+                    "{analytic_inside=" + std::to_string(exact ? 1 : 0) + '}',
+                    "{domain_label=" + std::to_string(candidate_label) + '}',
+                    "{membership_mismatch=1}", "{label=exact}"));
         }
         if (candidate_label != baseline_label) {
             ++context.result.baseline_label_mismatch_count;
             record_mismatch(
                 context.mismatches, context.prepared, context.backend,
                 "baseline_label", -1, node, -1, -1,
-                "baseline=" + std::to_string(baseline_label)
-                    + " candidate=" + std::to_string(candidate_label));
+                compose_mismatch_detail_3d(
+                    "{domain_label=" + std::to_string(baseline_label) + '}',
+                    "{domain_label=" + std::to_string(candidate_label) + '}',
+                    "{label_mismatch=1}", "{label=exact}"));
         }
         if (pair_label != candidate_label) {
             ++context.result.baseline_label_mismatch_count;
             record_mismatch(
                 context.mismatches, context.prepared, context.backend,
                 "grid_pair_label", -1, node, -1, -1,
-                "domain=" + std::to_string(candidate_label)
-                    + " pair=" + std::to_string(pair_label));
+                compose_mismatch_detail_3d(
+                    "{domain_label=" + std::to_string(candidate_label) + '}',
+                    "{grid_pair_label=" + std::to_string(pair_label) + '}',
+                    "{label_mismatch=1}", "{label=exact}"));
         }
     }
 }
@@ -706,8 +1036,11 @@ void scan_crossings(ScanContext& context,
         record_mismatch(
             context.mismatches, context.prepared, context.backend,
             "crossing_count", axis, i, j, k,
-            "baseline=" + std::to_string(baseline_crossings.size())
-                + " candidate=" + std::to_string(candidate_crossings.size()));
+            "baseline={count=" + std::to_string(baseline_crossings.size())
+                + "};candidate={count="
+                + std::to_string(candidate_crossings.size())
+                + "};errors={count_mismatch=1};"
+                + tolerance_detail(context.tolerance) + ";count_tolerance=exact");
     }
     const std::size_t common =
         std::min(candidate_crossings.size(), baseline_crossings.size());
@@ -720,7 +1053,11 @@ void scan_crossings(ScanContext& context,
             record_mismatch(
                 context.mismatches, context.prepared, context.backend,
                 "crossing_fields", axis, i, j, k,
-                "root=" + std::to_string(root));
+                "root=" + std::to_string(root) + ';'
+                    + crossing_comparison_detail(
+                        context.prepared, baseline_crossings[root],
+                        candidate_crossings[root], edge_length,
+                        context.tolerance));
         }
     }
     if (candidate_crossings.size() == 1) {
@@ -733,7 +1070,11 @@ void scan_crossings(ScanContext& context,
             record_mismatch(
                 context.mismatches, context.prepared, context.backend,
                 "single_crossing_lookup", axis, i, j, k,
-                "range and single-crossing API differ");
+                "baseline_source=crossings_between;candidate_source="
+                    "crossing_between;"
+                    + crossing_comparison_detail(
+                        context.prepared, candidate_crossings[0], single,
+                        edge_length, context.tolerance));
         }
     }
 }
@@ -749,24 +1090,39 @@ void scan_owner(ScanContext& context,
                 const NurbsSurfaceCrossing3D& candidate_crossing)
 {
     ++context.result.correction_owner_count;
+    const int candidate_label_a = context.candidate.label(node);
+    const int candidate_label_b = context.candidate.label(neighbor);
+    const int baseline_label_a = context.baseline.label(node);
+    const int baseline_label_b = context.baseline.label(neighbor);
+    const auto candidate_info =
+        context.candidate.edge_classification_between(node, neighbor);
+    const auto baseline_info =
+        context.baseline.edge_classification_between(node, neighbor);
+    const std::string candidate_state = edge_state_detail(
+        candidate_label_a, candidate_label_b, candidate_info);
+    const std::string baseline_state = edge_state_detail(
+        baseline_label_a, baseline_label_b, baseline_info);
+    P2CrossingOwner3D candidate_owner;
+    P2CrossingOwner3D baseline_owner;
+    bool candidate_owner_available = false;
+    bool baseline_owner_available = false;
     try {
-        const P2CrossingOwner3D candidate_owner =
+        candidate_owner =
             context.candidate_pair.p2_crossing_owner_between(node, neighbor);
+        candidate_owner_available = true;
         hash_owner(
             context.prepared, context.topology, context.materialization,
             candidate_owner, edge_length, context.tolerance);
         bool owner_matches = owner_matches_strict_crossing(
             context.prepared, candidate_owner, candidate_crossing,
             edge_length, context.tolerance, context.result);
-        const bool baseline_a = context.baseline.label(node) > 0;
-        const bool baseline_b = context.baseline.label(neighbor) > 0;
-        const auto baseline_info =
-            context.baseline.edge_classification_between(node, neighbor);
-        if (baseline_a == baseline_b || !baseline_info.correction_safe) {
+        if ((baseline_label_a > 0) == (baseline_label_b > 0)
+            || !baseline_info.correction_safe) {
             owner_matches = false;
         } else {
-            const P2CrossingOwner3D baseline_owner =
+            baseline_owner =
                 context.baseline_pair.p2_crossing_owner_between(node, neighbor);
+            baseline_owner_available = true;
             owner_matches = owner_matches
                 && equivalent_owner(
                     context.prepared, baseline_owner, candidate_owner,
@@ -777,13 +1133,34 @@ void scan_owner(ScanContext& context,
             record_mismatch(
                 context.mismatches, context.prepared, context.backend,
                 "correction_owner", axis, i, j, k,
-                "GridPair owner is not the baseline ExactIntersection owner");
+                "baseline_edge=" + baseline_state
+                    + ";candidate_edge=" + candidate_state + ';'
+                    + (baseline_owner_available
+                        ? owner_comparison_detail(
+                            context.prepared, baseline_owner, candidate_owner,
+                            candidate_crossing, edge_length, context.tolerance)
+                        : "baseline={owner=unavailable};candidate="
+                            + serialize_crossing_owner_3d(candidate_owner)
+                            + ";strict_crossing="
+                            + serialize_surface_crossing_3d(candidate_crossing)
+                            + ";errors={baseline_owner_unavailable=1};"
+                            + tolerance_detail(context.tolerance)));
         }
     } catch (const std::exception& error) {
         ++context.result.correction_owner_mismatch_count;
         record_mismatch(
             context.mismatches, context.prepared, context.backend,
-            "correction_owner_exception", axis, i, j, k, error.what());
+            "correction_owner_exception", axis, i, j, k,
+            "baseline={edge=" + baseline_state + ";owner="
+                + (baseline_owner_available
+                    ? serialize_crossing_owner_3d(baseline_owner)
+                    : "unavailable")
+                + "};candidate={edge=" + candidate_state + ";owner="
+                + (candidate_owner_available
+                    ? serialize_crossing_owner_3d(candidate_owner)
+                    : "unavailable")
+                + "};errors={exception=" + error.what() + "};"
+                + tolerance_detail(context.tolerance));
     }
 }
 
@@ -798,16 +1175,28 @@ void scan_label_changing_edge(
     int neighbor,
     double edge_length)
 {
-    if ((context.candidate.label(node) > 0)
-        == (context.candidate.label(neighbor) > 0))
+    const int candidate_label_a = context.candidate.label(node);
+    const int candidate_label_b = context.candidate.label(neighbor);
+    if ((candidate_label_a > 0) == (candidate_label_b > 0))
         return;
+    const int baseline_label_a = context.baseline.label(node);
+    const int baseline_label_b = context.baseline.label(neighbor);
+    const auto baseline_info =
+        context.baseline.edge_classification_between(node, neighbor);
+    const std::string baseline_state = edge_state_detail(
+        baseline_label_a, baseline_label_b, baseline_info);
+    const std::string candidate_state = edge_state_detail(
+        candidate_label_a, candidate_label_b, candidate_info);
     ++context.result.label_changing_edge_count;
     if (!candidate_info.correction_safe) {
         ++context.result.unsafe_label_changing_edge_count;
         record_mismatch(
             context.mismatches, context.prepared, context.backend,
             "unsafe_label_change", axis, i, j, k,
-            "classification.correction_safe is false");
+            "baseline=" + baseline_state + ";candidate=" + candidate_state
+                + ";errors={candidate_correction_unsafe=1};"
+                + tolerance_detail(context.tolerance)
+                + ";correction_safe_tolerance=exact_true");
         return;
     }
     try {
@@ -817,13 +1206,12 @@ void scan_label_changing_edge(
             context.prepared, context.topology, context.materialization,
             candidate_crossing, edge_length, context.tolerance);
         bool crossing_matches = false;
-        const bool baseline_a = context.baseline.label(node) > 0;
-        const bool baseline_b = context.baseline.label(neighbor) > 0;
-        const auto baseline_info =
-            context.baseline.edge_classification_between(node, neighbor);
-        if (baseline_a != baseline_b && baseline_info.correction_safe) {
+        const NurbsSurfaceCrossing3D* baseline_crossing_ptr = nullptr;
+        if ((baseline_label_a > 0) != (baseline_label_b > 0)
+            && baseline_info.correction_safe) {
             const NurbsSurfaceCrossing3D& baseline_crossing =
                 context.baseline.correction_crossing_between(node, neighbor);
+            baseline_crossing_ptr = &baseline_crossing;
             crossing_matches = equivalent_crossing(
                 context.prepared, baseline_crossing, candidate_crossing,
                 edge_length, context.tolerance, context.result);
@@ -833,7 +1221,17 @@ void scan_label_changing_edge(
             record_mismatch(
                 context.mismatches, context.prepared, context.backend,
                 "correction_crossing", axis, i, j, k,
-                "strict correction crossing differs from baseline");
+                "baseline_edge=" + baseline_state
+                    + ";candidate_edge=" + candidate_state + ';'
+                    + (baseline_crossing_ptr != nullptr
+                        ? crossing_comparison_detail(
+                            context.prepared, *baseline_crossing_ptr,
+                            candidate_crossing, edge_length,
+                            context.tolerance)
+                        : "baseline={crossing=unavailable};candidate="
+                            + serialize_surface_crossing_3d(candidate_crossing)
+                            + ";errors={baseline_correction_unavailable=1};"
+                            + tolerance_detail(context.tolerance)));
         }
         scan_owner(
             context, axis, i, j, k, node, neighbor,
@@ -843,7 +1241,10 @@ void scan_label_changing_edge(
         ++context.result.correction_owner_mismatch_count;
         record_mismatch(
             context.mismatches, context.prepared, context.backend,
-            "correction_crossing_exception", axis, i, j, k, error.what());
+            "correction_crossing_exception", axis, i, j, k,
+            "baseline=" + baseline_state + ";candidate=" + candidate_state
+                + ";errors={exception=" + error.what() + "};"
+                + tolerance_detail(context.tolerance));
     }
 }
 
@@ -897,14 +1298,32 @@ void scan_edge(ScanContext& context,
         record_mismatch(
             context.mismatches, context.prepared, context.backend,
             "edge_flags", axis, i, j, k,
-            "barrier/interface differs from baseline");
+            "baseline={barrier=" + std::to_string(baseline_barrier ? 1 : 0)
+                + ";interface="
+                + std::to_string(baseline_interface ? 1 : 0)
+                + ";classification="
+                + serialize_edge_classification_3d(baseline_info)
+                + "};candidate={barrier="
+                + std::to_string(candidate_barrier ? 1 : 0)
+                + ";interface="
+                + std::to_string(candidate_interface ? 1 : 0)
+                + ";classification="
+                + serialize_edge_classification_3d(candidate_info)
+                + "};errors={barrier="
+                + std::to_string(candidate_barrier != baseline_barrier)
+                + ";interface="
+                + std::to_string(candidate_interface != baseline_interface)
+                + "};" + tolerance_detail(context.tolerance)
+                + ";flag_tolerance=exact");
     }
     if (!same_classification(baseline_info, candidate_info)) {
         ++context.result.edge_classification_mismatch_count;
         record_mismatch(
             context.mismatches, context.prepared, context.backend,
             "edge_classification", axis, i, j, k,
-            "one or more of 11 classification fields differ");
+            classification_comparison_detail(
+                baseline_info, candidate_info, context.tolerance)
+                + ";classification_tolerance=exact");
     }
     scan_crossings(
         context, axis, i, j, k, node, neighbor, edge_length);
@@ -947,10 +1366,9 @@ BackendMaterialization3D materialize_backend(
             }
         }
     }
-    const std::uint64_t expected_edges =
-        3ULL * static_cast<std::uint64_t>(prepared.N)
-        * static_cast<std::uint64_t>(prepared.N + 1)
-        * static_cast<std::uint64_t>(prepared.N + 1);
+    const std::uint64_t N = static_cast<std::uint64_t>(prepared.N);
+    const std::uint64_t dimension = N + 1ULL;
+    const std::uint64_t expected_edges = 3ULL * N * dimension * dimension;
     if (context.result.edge_count != expected_edges)
         throw std::logic_error("benchmark did not scan every structured edge");
     context.result.topology_checksum = context.topology.value();
@@ -1259,6 +1677,24 @@ int parse_integer(const std::string& text,
     }
 }
 
+std::uint64_t checked_node_dimension(int N)
+{
+    if (N <= 0)
+        throw std::invalid_argument("benchmark grid N must be positive");
+    const std::uint64_t dimension =
+        static_cast<std::uint64_t>(N) + 1ULL;
+    const std::uint64_t maximum_dofs =
+        static_cast<std::uint64_t>(std::numeric_limits<int>::max());
+    if (dimension > maximum_dofs / dimension)
+        throw std::invalid_argument(
+            "benchmark Node grid DOF count exceeds int capacity");
+    const std::uint64_t plane_dofs = dimension * dimension;
+    if (dimension > maximum_dofs / plane_dofs)
+        throw std::invalid_argument(
+            "benchmark Node grid DOF count exceeds int capacity");
+    return dimension;
+}
+
 bool is_option(const std::string& value)
 {
     return value.size() >= 2 && value[0] == '-' && value[1] == '-';
@@ -1484,6 +1920,78 @@ std::string encode_csv_row_3d(const std::vector<std::string>& fields)
     return stream.str();
 }
 
+std::string serialize_edge_classification_3d(
+    const geometry3d::NurbsCartesianEdgeClassification3D& value)
+{
+    std::ostringstream stream;
+    stream << "{queried=" << value.queried
+           << ";has_confirmed_interface=" << value.has_confirmed_interface
+           << ";changes_component_membership="
+           << value.changes_component_membership
+           << ";root_count_known=" << value.root_count_known
+           << ";parity_known_from_roots=" << value.parity_known_from_roots
+           << ";has_near_tangent_candidate="
+           << value.has_near_tangent_candidate
+           << ";used_targeted_retry=" << value.used_targeted_retry
+           << ";correction_safe=" << value.correction_safe
+           << ";confirmed_crossing_count="
+           << value.confirmed_crossing_count
+           << ";ambiguous_cluster_count=" << value.ambiguous_cluster_count
+           << ";confirmed_transverse_count="
+           << value.confirmed_transverse_count << '}';
+    return stream.str();
+}
+
+std::string serialize_surface_crossing_3d(
+    const geometry3d::NurbsSurfaceCrossing3D& value)
+{
+    std::ostringstream stream;
+    stream << "{patch_index=" << value.patch_index
+           << ";component=" << value.component
+           << ";u=" << format_double(value.u)
+           << ";v=" << format_double(value.v)
+           << ";edge_parameter=" << format_double(value.edge_parameter)
+           << ";point=" << format_vector(value.point)
+           << ";normal=" << format_vector(value.normal)
+           << ";residual=" << format_double(value.residual)
+           << ";transversality=" << format_double(value.transversality)
+           << ";feature_edge_contact=" << value.feature_edge_contact
+           << ";reliable_transversality_tolerance="
+           << format_double(value.reliable_transversality_tolerance) << '}';
+    return stream.str();
+}
+
+std::string serialize_crossing_owner_3d(const P2CrossingOwner3D& value)
+{
+    std::ostringstream stream;
+    stream << "{center_index=" << value.center_index
+           << ";panel_index=" << value.panel_index
+           << ";edge_parameter=" << format_double(value.edge_parameter)
+           << ";barycentric=" << format_vector(value.barycentric)
+           << ";geometry_panel_index=" << value.geometry_panel_index
+           << ";geometry_barycentric="
+           << format_vector(value.geometry_barycentric)
+           << ";nurbs_patch_index=" << value.nurbs_patch_index
+           << ";nurbs_parameter=" << format_vector(value.nurbs_parameter)
+           << ";crossing_point=" << format_vector(value.crossing_point)
+           << ";crossing_normal=" << format_vector(value.crossing_normal)
+           << ";surface_component=" << value.surface_component
+           << ";crossing_residual="
+           << format_double(value.crossing_residual)
+           << ";status=" << static_cast<int>(value.status) << '}';
+    return stream.str();
+}
+
+std::string compose_mismatch_detail_3d(
+    const std::string& baseline,
+    const std::string& candidate,
+    const std::string& errors,
+    const std::string& tolerance)
+{
+    return "baseline=" + baseline + ";candidate=" + candidate
+        + ";errors=" + errors + ";tolerance=" + tolerance;
+}
+
 BenchmarkOptions3D parse_benchmark_cli_3d(
     const std::vector<std::string>& arguments)
 {
@@ -1535,6 +2043,7 @@ BenchmarkOptions3D parse_benchmark_cli_3d(
             while (index + 1 < arguments.size()
                    && !is_option(arguments[index + 1])) {
                 const int level = parse_integer(arguments[++index], "--N", false);
+                (void)checked_node_dimension(level);
                 if (std::find(options.levels.begin(), options.levels.end(), level)
                     != options.levels.end()) {
                     throw std::invalid_argument("duplicate --N value");
@@ -1575,6 +2084,20 @@ BenchmarkOptions3D parse_benchmark_cli_3d(
     return options;
 }
 
+void validate_benchmark_options_3d(const BenchmarkOptions3D& options)
+{
+    if (options.backends.empty() || options.geometries.empty()
+        || options.levels.empty()) {
+        throw std::invalid_argument("benchmark selections must be nonempty");
+    }
+    if (options.warmup < 0 || options.repetitions <= 0)
+        throw std::invalid_argument("invalid warmup or repetition count");
+    if (options.output_directory.empty())
+        throw std::invalid_argument("benchmark output directory is empty");
+    for (int level : options.levels)
+        (void)checked_node_dimension(level);
+}
+
 BenchmarkSupportCase3D run_benchmark_support_case_3d(
     GeometryKind3D geometry,
     int N)
@@ -1600,18 +2123,7 @@ BenchmarkSupportCase3D run_benchmark_support_case_3d(
 BenchmarkRunResult3D run_nurbs_geometry_preprocess_benchmark_3d(
     const BenchmarkOptions3D& options)
 {
-    if (options.backends.empty() || options.geometries.empty()
-        || options.levels.empty()) {
-        throw std::invalid_argument("benchmark selections must be nonempty");
-    }
-    if (options.warmup < 0 || options.repetitions <= 0)
-        throw std::invalid_argument("invalid warmup or repetition count");
-    if (options.output_directory.empty())
-        throw std::invalid_argument("benchmark output directory is empty");
-    for (int level : options.levels) {
-        if (level <= 0)
-            throw std::invalid_argument("benchmark grid N must be positive");
-    }
+    validate_benchmark_options_3d(options);
     BenchmarkRunResult3D result;
     for (GeometryKind3D geometry : options.geometries) {
         for (int level : options.levels) {
