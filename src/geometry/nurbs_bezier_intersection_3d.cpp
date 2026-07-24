@@ -926,13 +926,19 @@ AffinePlanarResult3D classify_affine_planar_intersection(
     }
     const std::array<Eigen::Vector3d, 4> element_corners{{
         p00, p10, p01, p11}};
+    double maximum_correspondence_residual = 0.0;
     for (std::size_t corner = 0; corner < source_corners.size(); ++corner) {
+        const double correspondence_residual =
+            (source_corners[corner] - element_corners[corner]).norm();
         if (!source_corners[corner].allFinite()
-            || (source_corners[corner] - element_corners[corner]).norm()
-                    + roundoff_tolerance
+            || !std::isfinite(correspondence_residual)
+            || correspondence_residual + roundoff_tolerance
                 >= contact_tolerance) {
             return result;
         }
+        maximum_correspondence_residual = std::max(
+            maximum_correspondence_residual,
+            correspondence_residual);
     }
     const double minimum_tangent_norm =
         std::min(tangent_u.norm(), tangent_v.norm());
@@ -1016,18 +1022,29 @@ AffinePlanarResult3D classify_affine_planar_intersection(
     const double center_cross_norm = center_cross.norm();
     const Eigen::Vector3d affine_center =
         p00 + 0.5 * tangent_u + 0.5 * tangent_v;
+    const double center_correspondence_residual =
+        (center.point - affine_center).norm();
     if (!center.point.allFinite() || !center.du.allFinite()
         || !center.dv.allFinite() || !std::isfinite(center_cross_norm)
         || center_cross_norm <= roundoff_tolerance * roundoff_tolerance
-        || (center.point - affine_center).norm() + roundoff_tolerance
+        || !std::isfinite(center_correspondence_residual)
+        || center_correspondence_residual + roundoff_tolerance
             >= contact_tolerance
         || normal.dot(center_cross / center_cross_norm)
             < 1.0 - 256.0 * std::numeric_limits<double>::epsilon()) {
         return result;
     }
+    maximum_correspondence_residual = std::max(
+        maximum_correspondence_residual,
+        center_correspondence_residual);
 
     const double coordinate_parameter_uncertainty =
         256.0 * machine_epsilon * absolute_coordinate_scale
+        / (minimum_tangent_norm
+           * std::max(normalized_determinant, machine_epsilon));
+    const double physical_parameter_uncertainty =
+        (contact_tolerance + maximum_correspondence_residual
+         + roundoff_tolerance)
         / (minimum_tangent_norm
            * std::max(normalized_determinant, machine_epsilon));
     const double segment_parameter_uncertainty =
@@ -1039,7 +1056,8 @@ AffinePlanarResult3D classify_affine_planar_intersection(
         64.0 * machine_epsilon,
         256.0 * machine_epsilon
             / std::max(normalized_determinant, machine_epsilon),
-        coordinate_parameter_uncertainty});
+        coordinate_parameter_uncertainty,
+        physical_parameter_uncertainty});
     const double segment_margin = std::max({
         8.0 * options.parameter_tolerance,
         8.0 * options.geometry_tolerance / frame.length,

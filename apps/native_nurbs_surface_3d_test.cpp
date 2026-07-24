@@ -978,6 +978,45 @@ void test_affine_planar_fast_path()
                 && translated.diagnostics.certified_fallback_elements == 1,
             "affine route falls back when absolute-coordinate roundoff dominates");
 
+    constexpr double thin_u_span = 1.0e-6;
+    const NurbsSurfaceModel3D thin_model(
+        {NurbsSurfacePatch3D(
+            NurbsBasis1D(1, {0.0, 0.0, 1.0, 1.0}),
+            NurbsBasis1D(1, {0.0, 0.0, 1.0, 1.0}),
+            {{{0.0, 0.0, 0.0}, {0.0, 1.0, 0.0}},
+             {{thin_u_span, 0.0, 0.0},
+              {thin_u_span, 1.0, 0.0}}},
+            {{1.0, 1.0}, {1.0, 1.0}})},
+        {0}, {});
+    const auto thin_element =
+        extract_rational_bezier_elements_3d(thin_model).front();
+    const auto solve_thin = [&](double physical_u) {
+        try {
+            return intersect_nurbs_bezier_element_3d(
+                thin_element, thin_model.patch(0),
+                {physical_u, 0.5, -1.0},
+                {physical_u, 0.5, 1.0}, options);
+        } catch (const UnresolvedNurbsIntersectionCandidate3D& error) {
+            return error.partial_result();
+        }
+    };
+    const double physical_boundary_offset =
+        0.5 * 8.0 * options.geometry_tolerance;
+    const NurbsElementIntersectionResult3D thin_near_hit =
+        solve_thin(physical_boundary_offset);
+    require(thin_near_hit.diagnostics.planar_analytic_hits == 0
+                && thin_near_hit.diagnostics.planar_analytic_misses == 0
+                && thin_near_hit.diagnostics.planar_analytic_fallbacks == 1
+                && thin_near_hit.diagnostics.certified_fallback_elements == 1,
+            "physical u-boundary tolerance band does not certify an affine hit");
+    const NurbsElementIntersectionResult3D thin_near_miss =
+        solve_thin(-physical_boundary_offset);
+    require(thin_near_miss.diagnostics.planar_analytic_hits == 0
+                && thin_near_miss.diagnostics.planar_analytic_misses == 0
+                && thin_near_miss.diagnostics.planar_analytic_fallbacks == 1
+                && thin_near_miss.diagnostics.certified_fallback_elements == 1,
+            "physical u-boundary tolerance band does not certify an affine miss");
+
     const NurbsElementIntersectionResult3D reversed =
         solve(0, {0.25, 0.75, 1.0}, {0.25, 0.75, -1.0});
     require(reversed.roots.size() == 1
@@ -2760,6 +2799,162 @@ void test_direct_nurbs_point_classification()
         "point lies on NURBS surface",
         "direct classification rejects an exact surface point");
 }
+void require_exact_grid_pair_correction_owners(
+    const kfbim::CartesianGrid3D& grid,
+    const kfbim::geometry3d::NurbsSurfaceModel3D& model,
+    const kfbim::geometry3d::NurbsCartesianDomain3D& baseline,
+    const std::shared_ptr<const
+        kfbim::geometry3d::NurbsCartesianDomain3D>& candidate,
+    const kfbim::Interface3D& correction_interface,
+    const kfbim::Interface3D& crossing_geometry,
+    const std::string& message)
+{
+    kfbim::GridPair3D pair(
+        grid, correction_interface, crossing_geometry, candidate);
+    require(pair.has_nurbs_domain(),
+            message + " GridPair retains the candidate NURBS domain");
+    require(&pair.nurbs_domain_diagnostics()
+                == &candidate->diagnostics(),
+            message + " GridPair exposes candidate diagnostics");
+
+    const double physical_tolerance = 8.0 * std::max(
+        baseline.geometry_tolerance(), candidate->geometry_tolerance());
+    const double dimensionless_tolerance = std::max(
+        64.0 * std::numeric_limits<double>::epsilon(),
+        physical_tolerance / std::max(
+            baseline.surface_bounds().diameter(), physical_tolerance));
+    const auto dims = grid.dof_dims();
+    int exact_owner_count = 0;
+    for (int k = 0; k < dims[2]; ++k) {
+        for (int j = 0; j < dims[1]; ++j) {
+            for (int i = 0; i < dims[0]; ++i) {
+                const int node = grid.index(i, j, k);
+                const std::array<int, 3> positive_neighbors{{
+                    i + 1 < dims[0] ? grid.index(i + 1, j, k) : -1,
+                    j + 1 < dims[1] ? grid.index(i, j + 1, k) : -1,
+                    k + 1 < dims[2] ? grid.index(i, j, k + 1) : -1}};
+                for (const int neighbor : positive_neighbors) {
+                    if (neighbor < 0)
+                        continue;
+                    const bool baseline_changes =
+                        (baseline.label(node) > 0)
+                        != (baseline.label(neighbor) > 0);
+                    const bool candidate_changes =
+                        (candidate->label(node) > 0)
+                        != (candidate->label(neighbor) > 0);
+                    require(baseline_changes == candidate_changes,
+                            message + " label-changing edge set");
+                    require(pair.domain_label(node) == candidate->label(node)
+                                && pair.domain_label(neighbor)
+                                    == candidate->label(neighbor),
+                            message + " GridPair candidate labels");
+                    if (!candidate_changes)
+                        continue;
+
+                    ++exact_owner_count;
+                    const auto baseline_info =
+                        baseline.edge_classification_between(node, neighbor);
+                    const auto candidate_info =
+                        candidate->edge_classification_between(node, neighbor);
+                    require(baseline_info.changes_component_membership
+                                && baseline_info.correction_safe
+                                && candidate_info.queried
+                                && candidate_info.has_confirmed_interface
+                                && candidate_info.changes_component_membership
+                                && candidate_info.root_count_known
+                                && candidate_info.parity_known_from_roots
+                                && candidate_info.confirmed_crossing_count == 1
+                                && candidate_info.confirmed_transverse_count == 1
+                                && candidate_info.ambiguous_cluster_count == 0
+                                && !candidate_info.has_near_tangent_candidate
+                                && candidate_info.correction_safe,
+                            message + " label-changing edge is correction-safe");
+
+                    const auto node_coord = grid.coord(node);
+                    const auto neighbor_coord = grid.coord(neighbor);
+                    const Eigen::Vector3d start(
+                        node_coord[0], node_coord[1], node_coord[2]);
+                    const Eigen::Vector3d end(
+                        neighbor_coord[0], neighbor_coord[1],
+                        neighbor_coord[2]);
+                    const double edge_length = (end - start).norm();
+                    const auto& baseline_crossing =
+                        baseline.correction_crossing_between(node, neighbor);
+                    const auto& candidate_crossing =
+                        candidate->correction_crossing_between(node, neighbor);
+                    require_equivalent_surface_crossing(
+                        baseline_crossing, candidate_crossing, model,
+                        edge_length, physical_tolerance,
+                        dimensionless_tolerance,
+                        message + " correction crossing");
+
+                    const kfbim::P2CrossingOwner3D owner =
+                        pair.p2_crossing_owner_between(node, neighbor);
+                    require(owner.status
+                                == kfbim::P2CrossingOwnerStatus3D::
+                                       ExactIntersection,
+                            message + " label-changing owner is exact");
+                    require(owner.nurbs_patch_index
+                                    == candidate_crossing.patch_index
+                                && owner.surface_component
+                                    == candidate_crossing.component,
+                            message + " owner patch and component");
+                    require(owner.nurbs_parameter.x()
+                                    == candidate_crossing.u
+                                && owner.nurbs_parameter.y()
+                                    == candidate_crossing.v
+                                && (owner.crossing_point
+                                        - candidate_crossing.point).norm()
+                                    == 0.0
+                                && (owner.crossing_normal
+                                        - candidate_crossing.normal).norm()
+                                    == 0.0
+                                && owner.crossing_residual
+                                    == candidate_crossing.residual,
+                            message + " owner authoritative fields");
+                    require(std::abs(owner.edge_parameter
+                                        - candidate_crossing.edge_parameter)
+                                    * edge_length
+                                <= physical_tolerance
+                                && (owner.crossing_point
+                                        - (start + owner.edge_parameter
+                                                * (end - start))).norm()
+                                    <= physical_tolerance,
+                            message + " owner directed edge parameter");
+
+                    const kfbim::P2CrossingOwner3D reverse =
+                        pair.p2_crossing_owner_between(neighbor, node);
+                    require(reverse.status
+                                    == kfbim::P2CrossingOwnerStatus3D::
+                                           ExactIntersection
+                                && reverse.nurbs_patch_index
+                                    == owner.nurbs_patch_index
+                                && reverse.surface_component
+                                    == owner.surface_component
+                                && (reverse.nurbs_parameter
+                                        - owner.nurbs_parameter).norm()
+                                    == 0.0
+                                && (reverse.crossing_point
+                                        - owner.crossing_point).norm()
+                                    == 0.0
+                                && (reverse.crossing_normal
+                                        - owner.crossing_normal).norm()
+                                    == 0.0
+                                && reverse.crossing_residual
+                                    == owner.crossing_residual
+                                && std::abs(reverse.edge_parameter
+                                            + owner.edge_parameter - 1.0)
+                                        * edge_length
+                                    <= physical_tolerance,
+                            message + " reverse owner preserves geometry and orientation");
+                }
+            }
+        }
+    }
+    require(exact_owner_count > 0,
+            message + " materializes exact label-changing owners");
+}
+
 void require_triangle_seed_independent_domain(
     const kfbim::CartesianGrid3D& grid,
     const kfbim::geometry3d::NurbsSurfaceModel3D& model,
@@ -2892,19 +3087,32 @@ void require_triangle_seed_independent_domain(
                        .certified_fallback_elements == 0,
             name + " certified baseline keeps Hybrid routes disabled");
 
+    const auto grid_spacing = grid.spacing();
+    const double triangulation_h = std::max(
+        {grid_spacing[0], grid_spacing[1], grid_spacing[2]});
+    const auto triangulation =
+        kfbim::geometry3d::triangulate_nurbs_surface_patches_3d(
+            model.patches(), triangulation_h);
+
     const auto require_strategy_equivalence =
         [&](kfbim::geometry3d::NurbsCartesianPreprocessStrategy3D strategy,
             const std::string& strategy_name) {
             NurbsCartesianDomainOptions3D strategy_options;
             strategy_options.strategy = strategy;
-            const NurbsCartesianDomain3D candidate(
-                grid, model, strategy_options);
+            const auto candidate = std::make_shared<const
+                NurbsCartesianDomain3D>(
+                    grid, model, strategy_options);
             require_same_domain_outputs(
-                grid, model, seeded, candidate,
+                grid, model, seeded, *candidate,
                 name + " " + strategy_name);
-            const auto& route = candidate.diagnostics().intersections;
+            require_exact_grid_pair_correction_owners(
+                grid, model, seeded, candidate,
+                triangulation.interface,
+                triangulation.geometry_interface,
+                name + " " + strategy_name);
+            const auto& route = candidate->diagnostics().intersections;
             require(
-                candidate.diagnostics().candidate_element_incidence_count > 0
+                candidate->diagnostics().candidate_element_incidence_count > 0
                     && route.mapped_candidate_elements
                         == route.candidate_elements
                     && route.bvh_candidate_elements == 0
