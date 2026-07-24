@@ -106,6 +106,25 @@ std::pair<Eigen::Vector3d, Eigen::Vector3d> transverse_segment(
             data.point + half_length * normal};
 }
 
+std::pair<Eigen::Vector3d, Eigen::Vector3d> transverse_segment_at(
+    const NativeNurbsSurface3D& surface,
+    int patch,
+    double u_fraction,
+    double v_fraction,
+    double half_length = 0.04)
+{
+    const auto& p = surface.patches.at(static_cast<std::size_t>(patch));
+    const double u = p.domain_start_u()
+        + u_fraction * (p.domain_end_u() - p.domain_start_u());
+    const double v = p.domain_start_v()
+        + v_fraction * (p.domain_end_v() - p.domain_start_v());
+    const auto data = p.evaluate_with_derivatives(u, v);
+    const Eigen::Vector3d normal =
+        data.du.cross(data.dv).normalized();
+    return {data.point - half_length * normal,
+            data.point + half_length * normal};
+}
+
 RestrictOwnerSampleInput3D one_wrong_side_sample(
     int target,
     const Eigen::Vector3d& query,
@@ -779,6 +798,378 @@ void test_optimized_multi_root_seam_and_coincidence_paths()
             "unrelated coincident components use full fallback");
 }
 
+void test_hybrid_sweep_target_path()
+{
+    Fixture fixture;
+    const int target = center_dof(fixture.cloud, 0);
+    const auto local = transverse_segment(fixture.surface, 0);
+    RestrictOwnerSampleInput3D input;
+    input.target_dof = target;
+    input.query = local.first;
+    input.support_points.fill(local.first);
+    input.support_points[7] = local.second;
+    input.support_points[11] = local.second;
+    input.wrong_side[7] = true;
+    input.wrong_side[11] = true;
+
+    RestrictOwnerGeometryPreprocessor3D hybrid(
+        fixture.surface, fixture.cloud, 3.0 / 16.0,
+        Mode::RegionClosestHybrid);
+    const auto result = hybrid.preprocess_sample(input);
+    require(result.nodes[7].has_value()
+                && result.nodes[11].has_value()
+                && result.nodes[7]->owner_dof == target
+                && result.nodes[11]->owner_dof == target
+                && result.nodes[7]->query_path
+                       == QueryPath::SweepTargetOnly
+                && result.nodes[11]->query_path
+                       == QueryPath::SweepTargetOnly,
+            "compatible sample sweep classifies every wrong-side slot");
+    require(hybrid.diagnostics().path_counts[
+                static_cast<std::size_t>(
+                    QueryPath::SweepTargetOnly)] == 2,
+            "sample sweep records one path per wrong-side slot");
+}
+
+struct ThreeModeOwnerResults {
+    kfbim::app3d::RestrictOwnerPreprocessResult3D reference;
+    kfbim::app3d::RestrictOwnerPreprocessResult3D optimized;
+    kfbim::app3d::RestrictOwnerPreprocessResult3D hybrid;
+};
+
+ThreeModeOwnerResults evaluate_three_modes(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud3D& cloud,
+    double spacing,
+    const RestrictOwnerSampleInput3D& sample)
+{
+    RestrictOwnerGeometryPreprocessor3D reference(
+        surface, cloud, spacing, Mode::FullIntersectionReference);
+    RestrictOwnerGeometryPreprocessor3D optimized(
+        surface, cloud, spacing, Mode::OptimizedIntersection);
+    RestrictOwnerGeometryPreprocessor3D hybrid(
+        surface, cloud, spacing, Mode::RegionClosestHybrid);
+    ThreeModeOwnerResults result{
+        one_result(reference, sample),
+        one_result(optimized, sample),
+        one_result(hybrid, sample)};
+    require_matches_reference_owner(
+        result.optimized, result.reference,
+        "optimized policy agrees with the reference owner");
+    require_matches_reference_owner(
+        result.hybrid, result.reference,
+        "hybrid policy agrees with the reference owner");
+    return result;
+}
+
+struct ClosestMissFixture {
+    int target_dof = -1;
+    Eigen::Vector3d start = Eigen::Vector3d::Zero();
+    Eigen::Vector3d end = Eigen::Vector3d::Zero();
+};
+
+ClosestMissFixture find_closest_miss_fixture(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud3D& cloud,
+    double spacing)
+{
+    kfbim::geometry3d::NurbsSurfaceIntersectorOptions3D options;
+    options.maximum_element_extent = 2.0 * spacing;
+    options.local_max_subdivision_depth = 4;
+    const kfbim::geometry3d::NurbsSurfaceIntersector3D intersector(
+        surface.geometry_model(), options);
+    const Eigen::Vector3d center(0.06, -0.05, 0.0);
+    constexpr double pi = 3.14159265358979323846;
+    for (double radius : {0.56, 0.57, 0.58, 0.59}) {
+        for (double degrees : {15.0, 30.0, 45.0, 60.0, 75.0}) {
+            const double angle = degrees * pi / 180.0;
+            const Eigen::Vector3d point(
+                center.x() + radius * std::cos(angle),
+                center.y() + radius * std::sin(angle), 0.0);
+            const Eigen::Vector3d start =
+                point + Eigen::Vector3d(0.0, 0.0, -0.08);
+            const Eigen::Vector3d end =
+                point + Eigen::Vector3d(0.0, 0.0, 0.08);
+            const auto candidates =
+                intersector.conservative_segment_candidates(start, end);
+            if (candidates.empty())
+                continue;
+            bool all_miss = true;
+            int closest_attempts = 0;
+            for (const auto& candidate : candidates) {
+                const auto certificate =
+                    intersector.certify_candidate_segment(
+                        candidate, start, end);
+                all_miss = all_miss
+                    && certificate.kind == CertificateKind::CertifiedMiss;
+                closest_attempts +=
+                    certificate.diagnostics.closest_point_attempts;
+            }
+            if (!all_miss || closest_attempts == 0)
+                continue;
+            for (int patch = 0;
+                 patch < static_cast<int>(cloud.patches.size()); ++patch) {
+                const auto& smooth = cloud.patches[
+                    static_cast<std::size_t>(patch)].smooth_patch_ids;
+                const bool all_foreign = std::all_of(
+                    candidates.begin(), candidates.end(),
+                    [&](const auto& candidate) {
+                        return candidate.patch_index() != patch
+                            && std::find(
+                                   smooth.begin(), smooth.end(),
+                                   candidate.patch_index()) == smooth.end();
+                    });
+                if (all_foreign) {
+                    return {
+                        center_dof(cloud, patch), start, end};
+                }
+            }
+        }
+    }
+    throw std::runtime_error(
+        "failed to find a deterministic closest-certified miss fixture");
+}
+
+void test_hybrid_segment_closest_miss_and_root_paths()
+{
+    Fixture fixture;
+    const int local_target = center_dof(fixture.cloud, 0);
+    const auto local = transverse_segment(fixture.surface, 0);
+    auto segment_input =
+        one_wrong_side_sample(local_target, local.first, local.second);
+    segment_input.support_points[0] =
+        transverse_segment(fixture.surface, 7).second;
+    const auto segment_results = evaluate_three_modes(
+        fixture.surface, fixture.cloud, 3.0 / 16.0, segment_input);
+    require(segment_results.hybrid.query_path
+                == QueryPath::SegmentTargetOnly,
+            "failed sweep with no foreign segment leaf uses segment target");
+
+    const NativeNurbsSurface3D cylinder =
+        make_native_nurbs_surface_3d(GeometryKind3D::HollowCylinder);
+    const double spacing = 3.0 / 16.0;
+    const SurfaceDofCloud3D cloud =
+        make_native_surface_dofs_3d(cylinder, spacing);
+    const ClosestMissFixture miss =
+        find_closest_miss_fixture(cylinder, cloud, spacing);
+    const auto miss_results = evaluate_three_modes(
+        cylinder, cloud, spacing,
+        one_wrong_side_sample(
+            miss.target_dof, miss.start, miss.end));
+    require(miss_results.hybrid.query_path
+                == QueryPath::ClosestCertifiedMiss,
+            "closest terminal separation certifies an AABB false positive");
+
+    const auto root_segment =
+        transverse_segment_at(cylinder, 7, 0.37, 0.43);
+    const int target = foreign_target_dof_for_segment(
+        cylinder, cloud, root_segment.first, root_segment.second);
+    const auto root_results = evaluate_three_modes(
+        cylinder, cloud, spacing,
+        one_wrong_side_sample(
+            target, root_segment.first, root_segment.second));
+    require(root_results.hybrid.query_path
+                    == QueryPath::ClosestCertifiedRoot
+                && root_results.hybrid.owner_class
+                       == NormalizedClass::UniqueForeign
+                && root_results.hybrid.foreign_crossing.has_value(),
+            "one safe interior foreign root uses the closest certificate: "
+                + std::to_string(static_cast<int>(
+                    root_results.hybrid.query_path))
+                + ", class=" + std::to_string(static_cast<int>(
+                    root_results.hybrid.owner_class)));
+}
+
+void test_hybrid_unsafe_geometry_uses_optimized_fallback()
+{
+    const NativeNurbsSurface3D cylinder =
+        make_native_nurbs_surface_3d(GeometryKind3D::HollowCylinder);
+    const SurfaceDofCloud3D cloud =
+        make_native_surface_dofs_3d(cylinder, 3.0 / 16.0);
+    const Eigen::Vector3d center(0.06, -0.05, 0.0);
+    const double c = 0.55 * std::sqrt(0.5);
+    std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> segments{
+        {center + Eigen::Vector3d(c, c, -0.2),
+         center + Eigen::Vector3d(c, c, 0.2)},
+        {{0.61, -0.10, 0.0}, {0.61, 0.0, 0.0}},
+        {{0.63, -0.05, 0.69}, {0.59, -0.05, 0.65}}};
+    const auto& patch = cylinder.patches[0];
+    const auto endpoint = patch.evaluate_with_derivatives(
+        0.5 * (patch.domain_start_u() + patch.domain_end_u()),
+        0.5 * (patch.domain_start_v() + patch.domain_end_v()));
+    const Eigen::Vector3d normal =
+        endpoint.du.cross(endpoint.dv).normalized();
+    segments.push_back(
+        {endpoint.point, endpoint.point + 0.04 * normal});
+    for (const auto& segment : segments) {
+        const int target = foreign_target_dof_for_segment(
+            cylinder, cloud, segment.first, segment.second);
+        const auto results = evaluate_three_modes(
+            cylinder, cloud, 3.0 / 16.0,
+            one_wrong_side_sample(
+                target, segment.first, segment.second));
+        require(results.hybrid.query_path
+                    == results.optimized.query_path
+                    && results.hybrid.query_path
+                           != QueryPath::ClosestCertifiedMiss
+                    && results.hybrid.query_path
+                           != QueryPath::ClosestCertifiedRoot,
+                "unsafe closest state delegates to optimized intersection");
+    }
+}
+
+void test_hybrid_unresolved_boundary_seam_and_multi_fallbacks()
+{
+    const NativeNurbsSurface3D cylinder =
+        make_native_nurbs_surface_3d(GeometryKind3D::HollowCylinder);
+    const double spacing = 3.0 / 16.0;
+    const SurfaceDofCloud3D cylinder_cloud =
+        make_native_surface_dofs_3d(cylinder, spacing);
+    const Eigen::Vector3d center(0.06, -0.05, 0.0);
+    const Eigen::Vector3d direction =
+        Eigen::Vector3d(
+            1.0, 0.3713906763541037, 0.6947465906068658)
+            .normalized();
+    Eigen::Vector2d planar(direction.x(), direction.y());
+    planar.normalize();
+    const Eigen::Vector3d radius(
+        -0.55 * planar.y(), 0.55 * planar.x(), 0.0);
+    const Eigen::Vector3d unresolved_start =
+        center + radius - 0.2 * direction;
+    const Eigen::Vector3d unresolved_end =
+        unresolved_start + direction;
+    const int unresolved_target = foreign_target_dof_for_segment(
+        cylinder, cylinder_cloud, unresolved_start, unresolved_end);
+    const auto unresolved = evaluate_three_modes(
+        cylinder, cylinder_cloud, spacing,
+        one_wrong_side_sample(
+            unresolved_target, unresolved_start, unresolved_end));
+    require(unresolved.hybrid.query_path
+                == unresolved.optimized.query_path,
+            "unresolved closest work delegates to optimized intersection");
+
+    const auto element_boundary = transverse_segment(cylinder, 7);
+    const int boundary_target = foreign_target_dof_for_segment(
+        cylinder, cylinder_cloud,
+        element_boundary.first, element_boundary.second);
+    const auto boundary = evaluate_three_modes(
+        cylinder, cylinder_cloud, spacing,
+        one_wrong_side_sample(
+            boundary_target,
+            element_boundary.first, element_boundary.second));
+    require(boundary.hybrid.query_path
+                == boundary.optimized.query_path
+                && boundary.hybrid.query_path
+                       != QueryPath::ClosestCertifiedRoot,
+            "element-boundary root delegates to optimized intersection");
+
+    const NativeNurbsSurface3D torus =
+        make_native_nurbs_surface_3d(GeometryKind3D::Torus);
+    const SurfaceDofCloud3D torus_cloud =
+        make_native_surface_dofs_3d(torus, spacing);
+    const auto multiple = evaluate_three_modes(
+        torus, torus_cloud, spacing,
+        one_wrong_side_sample(
+            center_dof(torus_cloud, 0),
+            {-1.0, -0.04, 0.03}, {1.0, -0.04, 0.03}));
+    require(multiple.hybrid.query_path
+                == multiple.optimized.query_path
+                && multiple.hybrid.owner_class
+                       == NormalizedClass::FailClosedTarget,
+            "multi-root closest state delegates to optimized intersection");
+
+    const Eigen::Vector3d seam_start(0.80, -0.04, 0.03);
+    const Eigen::Vector3d seam_end(0.84, -0.04, 0.03);
+    const int seam_target = foreign_target_dof_for_segment(
+        torus, torus_cloud, seam_start, seam_end);
+    const auto seam = evaluate_three_modes(
+        torus, torus_cloud, spacing,
+        one_wrong_side_sample(
+            seam_target, seam_start, seam_end));
+    require(seam.hybrid.query_path
+                == seam.optimized.query_path
+                && seam.hybrid.query_path
+                       == QueryPath::FullIntersectionFallback,
+            "periodic seam delegates to optimized intersection");
+
+    const NativeNurbsSurface3D coincident = duplicate_surface(torus);
+    const SurfaceDofCloud3D coincident_cloud =
+        make_native_surface_dofs_3d(coincident, spacing);
+    const auto coincidence = evaluate_three_modes(
+        coincident, coincident_cloud, spacing,
+        one_wrong_side_sample(
+            center_dof(coincident_cloud, 0),
+            seam_start, seam_end));
+    require(coincidence.hybrid.query_path
+                == coincidence.optimized.query_path
+                && coincidence.hybrid.fallback_cause
+                       == FallbackCause::Coincidence,
+            "unrelated coincidence delegates to optimized intersection");
+
+    Fixture chain_fixture;
+    chain_fixture.cloud.patches[0].smooth_patch_ids = {0, 1};
+    chain_fixture.cloud.patches[1].smooth_patch_ids = {0, 1, 2};
+    chain_fixture.cloud.patches[2].smooth_patch_ids = {1, 2};
+    const auto chain_segment =
+        transverse_segment_at(chain_fixture.surface, 2, 0.37, 0.43);
+    const auto chain = evaluate_three_modes(
+        chain_fixture.surface, chain_fixture.cloud, spacing,
+        one_wrong_side_sample(
+            center_dof(chain_fixture.cloud, 0),
+            chain_segment.first, chain_segment.second));
+    require(chain.hybrid.owner_class == NormalizedClass::UniqueForeign
+                && chain_fixture.cloud.dofs[
+                       static_cast<std::size_t>(chain.hybrid.owner_dof)]
+                       .patch_id == 2,
+            "hybrid compatibility does not take a transitive G1 closure");
+}
+
+void test_hybrid_partial_connection_and_stage_timing()
+{
+    Fixture fixture;
+    const int partial_target = center_dof(fixture.cloud, 6);
+    const auto partial_sample = one_wrong_side_sample(
+        partial_target, {0.07, -0.67, -0.61},
+        {0.07, -0.67, -0.65});
+    const auto partial_results = evaluate_three_modes(
+        fixture.surface, fixture.cloud, 3.0 / 16.0, partial_sample);
+    require(partial_results.hybrid.query_path
+                != QueryPath::SweepTargetOnly,
+            "partial one-to-many connection cannot certify a local sweep");
+
+    const auto root_segment =
+        transverse_segment_at(fixture.surface, 7, 0.37, 0.43);
+    const auto root_sample = one_wrong_side_sample(
+        center_dof(fixture.cloud, 6),
+        root_segment.first, root_segment.second);
+    RestrictOwnerGeometryPreprocessor3D ordinary(
+        fixture.surface, fixture.cloud, 3.0 / 16.0,
+        Mode::RegionClosestHybrid);
+    (void)one_result(ordinary, partial_sample);
+    (void)one_result(ordinary, root_sample);
+    const auto& ordinary_diagnostics = ordinary.diagnostics();
+    require(ordinary_diagnostics.region_seconds == 0.0
+                && ordinary_diagnostics.closest_point_seconds == 0.0
+                && ordinary_diagnostics.optimized_intersection_seconds
+                       == 0.0
+                && ordinary_diagnostics.full_fallback_seconds == 0.0,
+            "ordinary policy execution performs no per-query clock reads");
+
+    RestrictOwnerPreprocessOptions3D timing;
+    timing.collect_stage_timings = true;
+    RestrictOwnerGeometryPreprocessor3D timed(
+        fixture.surface, fixture.cloud, 3.0 / 16.0,
+        Mode::RegionClosestHybrid, timing);
+    (void)one_result(timed, partial_sample);
+    (void)one_result(timed, root_sample);
+    const auto& timed_diagnostics = timed.diagnostics();
+    require(timed_diagnostics.region_seconds > 0.0
+                && timed_diagnostics.closest_point_seconds > 0.0
+                && timed_diagnostics.optimized_intersection_seconds > 0.0
+                && timed_diagnostics.full_fallback_seconds > 0.0,
+            "instrumentation replay records all hybrid geometry stages");
+}
+
 void test_validation_slots_and_diagnostics()
 {
     const Fixture fixture;
@@ -873,6 +1264,11 @@ int main()
         test_full_reference_pathologies_fail_closed();
         test_unrelated_coincidence_fails_closed();
         test_optimized_multi_root_seam_and_coincidence_paths();
+        test_hybrid_sweep_target_path();
+        test_hybrid_segment_closest_miss_and_root_paths();
+        test_hybrid_unsafe_geometry_uses_optimized_fallback();
+        test_hybrid_unresolved_boundary_seam_and_multi_fallbacks();
+        test_hybrid_partial_connection_and_stage_timing();
         test_validation_slots_and_diagnostics();
         std::cout
             << "restrict-owner geometry preprocessor tests passed\n";

@@ -1,6 +1,7 @@
 #include "restrict_owner_geometry_preprocessor_3d.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -13,6 +14,53 @@ using DecisionKind = RestrictOwnerDecisionKind3D;
 using FallbackCause = RestrictOwnerFallbackCause3D;
 using NormalizedClass = RestrictOwnerNormalizedClass3D;
 using QueryPath = RestrictOwnerQueryPath3D;
+using CertificateKind =
+    geometry3d::NurbsElementSegmentCertificateKind3D;
+
+class OptionalStageTimer {
+public:
+    OptionalStageTimer(bool enabled, double& accumulator)
+        : enabled_(enabled)
+        , accumulator_(accumulator)
+    {
+        if (enabled_)
+            start_ = Clock::now();
+    }
+
+    ~OptionalStageTimer()
+    {
+        if (enabled_) {
+            accumulator_ += std::chrono::duration<double>(
+                Clock::now() - start_).count();
+        }
+    }
+
+private:
+    using Clock = std::chrono::steady_clock;
+
+    bool enabled_ = false;
+    double& accumulator_;
+    Clock::time_point start_{};
+};
+
+void accumulate_certificate_diagnostics(
+    RestrictOwnerPreprocessDiagnostics3D& diagnostics,
+    const geometry3d::NurbsSurfaceCandidateCertificate3D& certificate)
+{
+    const auto& work = certificate.diagnostics;
+    if (work.conservative_rejections > 0
+        && work.closest_point_attempts == 0) {
+        ++diagnostics.control_hull_rejections;
+    }
+    diagnostics.closest_point_attempts +=
+        static_cast<std::uint64_t>(work.closest_point_attempts);
+    diagnostics.closest_point_converged +=
+        static_cast<std::uint64_t>(
+            work.roots_recovered_by_closest_point
+            + work.terminal_misses_by_closest_point);
+    diagnostics.closest_point_iterations +=
+        static_cast<std::uint64_t>(work.closest_point_iterations);
+}
 
 void validate_cloud_topology(
     const NativeNurbsSurface3D& surface,
@@ -418,6 +466,10 @@ RestrictOwnerGeometryPreprocessor3D::optimized_intersection_result(
     const Eigen::Vector3d& query,
     const Eigen::Vector3d& support)
 {
+    OptionalStageTimer optimized_timer(
+        options_.collect_stage_timings,
+        diagnostics_.optimized_intersection_seconds);
+
     const int target_patch =
         cloud_.dofs[static_cast<std::size_t>(target_dof)].patch_id;
     CandidatePartition partition = partition_candidates(
@@ -442,6 +494,9 @@ RestrictOwnerGeometryPreprocessor3D::optimized_intersection_result(
         ordered_candidates.push_back(std::move(candidate));
 
     const auto full_fallback = [&](FallbackCause cause) {
+        OptionalStageTimer fallback_timer(
+            options_.collect_stage_timings,
+            diagnostics_.full_fallback_seconds);
         ++diagnostics_.full_fallback_calls;
         RestrictOwnerPreprocessResult3D result = full_reference_result(
             target_dof, query, support,
@@ -516,6 +571,143 @@ RestrictOwnerGeometryPreprocessor3D::preprocess_sample(
         }
     }
 
+    const int target_patch =
+        cloud_.dofs[static_cast<std::size_t>(input.target_dof)].patch_id;
+    bool hybrid_sweep_target = false;
+    if (mode_ == RestrictOwnerPreprocessMode3D::RegionClosestHybrid) {
+        geometry3d::NurbsAabb3D sweep{input.query, input.query};
+        for (const Eigen::Vector3d& point : input.support_points) {
+            sweep.lower = sweep.lower.cwiseMin(point);
+            sweep.upper = sweep.upper.cwiseMax(point);
+        }
+        CandidatePartition sweep_partition;
+        {
+            OptionalStageTimer region_timer(
+                options_.collect_stage_timings,
+                diagnostics_.region_seconds);
+            sweep_partition = partition_candidates(
+                target_patch,
+                intersector_.conservative_candidates(sweep));
+        }
+        diagnostics_.compatible_aabb_candidates +=
+            static_cast<std::uint64_t>(
+                sweep_partition.compatible.size());
+        diagnostics_.foreign_aabb_candidates +=
+            static_cast<std::uint64_t>(sweep_partition.foreign.size());
+        hybrid_sweep_target = sweep_partition.foreign.empty();
+    }
+
+    const auto hybrid_segment_result =
+        [&](const Eigen::Vector3d& support)
+            -> RestrictOwnerPreprocessResult3D {
+        CandidatePartition partition = partition_candidates(
+            target_patch,
+            intersector_.conservative_segment_candidates(
+                input.query, support));
+        diagnostics_.compatible_aabb_candidates +=
+            static_cast<std::uint64_t>(partition.compatible.size());
+        diagnostics_.foreign_aabb_candidates +=
+            static_cast<std::uint64_t>(partition.foreign.size());
+        if (partition.foreign.empty()) {
+            return make_target_result(
+                input.target_dof, QueryPath::SegmentTargetOnly);
+        }
+
+        struct CandidateCertificate {
+            bool foreign = false;
+            geometry3d::NurbsSurfaceCandidateCertificate3D certificate;
+        };
+        std::vector<CandidateCertificate> certificates;
+        certificates.reserve(
+            partition.foreign.size() + partition.compatible.size());
+        const auto certify_partition =
+            [&](const std::vector<Candidate>& candidates, bool foreign) {
+            for (const Candidate& candidate : candidates) {
+                geometry3d::NurbsSurfaceCandidateCertificate3D
+                    certificate;
+                {
+                    OptionalStageTimer closest_timer(
+                        options_.collect_stage_timings,
+                        diagnostics_.closest_point_seconds);
+                    certificate =
+                        intersector_.certify_candidate_segment(
+                            candidate, input.query, support);
+                }
+                accumulate_certificate_diagnostics(
+                    diagnostics_, certificate);
+                switch (certificate.kind) {
+                case CertificateKind::CertifiedMiss:
+                    ++diagnostics_.closest_certified_misses;
+                    break;
+                case CertificateKind::CertifiedUniqueTransverseRoot:
+                    ++diagnostics_.closest_certified_roots;
+                    break;
+                case CertificateKind::Unresolved:
+                    ++diagnostics_.closest_unresolved;
+                    break;
+                }
+                certificates.push_back(
+                    {foreign, std::move(certificate)});
+            }
+        };
+        certify_partition(partition.foreign, true);
+        certify_partition(partition.compatible, false);
+
+        const bool all_miss = std::all_of(
+            certificates.begin(), certificates.end(),
+            [](const CandidateCertificate& work) {
+                return work.certificate.kind
+                    == CertificateKind::CertifiedMiss;
+            });
+        if (all_miss) {
+            const bool used_closest = std::any_of(
+                certificates.begin(), certificates.end(),
+                [](const CandidateCertificate& work) {
+                    return work.certificate.diagnostics
+                               .closest_point_attempts > 0;
+                });
+            return make_target_result(
+                input.target_dof,
+                used_closest
+                    ? QueryPath::ClosestCertifiedMiss
+                    : QueryPath::SegmentTargetOnly);
+        }
+
+        const geometry3d::NurbsSurfaceCrossing3D* safe_root = nullptr;
+        bool safe_state = true;
+        for (const CandidateCertificate& work : certificates) {
+            const auto& certificate = work.certificate;
+            const bool root_is_safe =
+                work.foreign
+                && certificate.kind
+                       == CertificateKind::CertifiedUniqueTransverseRoot
+                && certificate.crossing.has_value()
+                && certificate.segment_parameter_strictly_interior
+                && certificate.element_parameter_strictly_interior
+                && certificate.patch_parameter_strictly_interior
+                && !certificate.crossing->feature_edge_contact
+                && certificate.crossing->transversality
+                       > certificate.crossing
+                             ->reliable_transversality_tolerance;
+            if (root_is_safe && safe_root == nullptr) {
+                safe_root = &*certificate.crossing;
+            } else if (certificate.kind != CertificateKind::CertifiedMiss) {
+                safe_state = false;
+            }
+        }
+        if (safe_state && safe_root != nullptr) {
+            geometry3d::NurbsSurfaceIntersectionResult3D intersection;
+            intersection.crossings.push_back(*safe_root);
+            const auto result = normalize_intersection_result(
+                input.target_dof, input.query, support, intersection,
+                QueryPath::ClosestCertifiedRoot);
+            if (result.owner_class == NormalizedClass::UniqueForeign)
+                return result;
+        }
+        return optimized_intersection_result(
+            input.target_dof, input.query, support);
+    };
+
     RestrictOwnerSampleResult3D sample_result;
     const std::uint64_t before_queries =
         diagnostics_.wrong_side_queries;
@@ -532,10 +724,18 @@ RestrictOwnerGeometryPreprocessor3D::preprocess_sample(
                 input.support_points[q], QueryPath::FullIntersection);
             break;
         case RestrictOwnerPreprocessMode3D::OptimizedIntersection:
-        case RestrictOwnerPreprocessMode3D::RegionClosestHybrid:
             result = optimized_intersection_result(
                 input.target_dof, input.query,
                 input.support_points[q]);
+            break;
+        case RestrictOwnerPreprocessMode3D::RegionClosestHybrid:
+            if (hybrid_sweep_target) {
+                result = make_target_result(
+                    input.target_dof, QueryPath::SweepTargetOnly);
+            } else {
+                result = hybrid_segment_result(
+                    input.support_points[q]);
+            }
             break;
         default:
             throw std::logic_error(
