@@ -653,17 +653,26 @@ RestrictOwnerGeometryPreprocessor3D::preprocess_sample(
         certify_partition(partition.foreign, true);
         certify_partition(partition.compatible, false);
 
-        const bool all_miss = std::all_of(
+        const bool foreign_all_miss = std::all_of(
             certificates.begin(), certificates.end(),
             [](const CandidateCertificate& work) {
-                return work.certificate.kind
-                    == CertificateKind::CertifiedMiss;
+                return !work.foreign
+                    || work.certificate.kind
+                           == CertificateKind::CertifiedMiss;
             });
-        if (all_miss) {
+        const bool no_compatible_unresolved = std::none_of(
+            certificates.begin(), certificates.end(),
+            [](const CandidateCertificate& work) {
+                return !work.foreign
+                    && work.certificate.kind
+                           == CertificateKind::Unresolved;
+            });
+        if (foreign_all_miss && no_compatible_unresolved) {
             const bool used_closest = std::any_of(
                 certificates.begin(), certificates.end(),
                 [](const CandidateCertificate& work) {
-                    return work.certificate.diagnostics
+                    return work.foreign
+                        && work.certificate.diagnostics
                                .closest_point_attempts > 0;
                 });
             return make_target_result(

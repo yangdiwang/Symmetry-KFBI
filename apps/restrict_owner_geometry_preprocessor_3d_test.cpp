@@ -302,6 +302,27 @@ void require_matches_reference_owner(
                     static_cast<int>(reference.owner_class)));
 }
 
+void require_matches_reference_target_side(
+    const kfbim::app3d::RestrictOwnerPreprocessResult3D& actual,
+    const kfbim::app3d::RestrictOwnerPreprocessResult3D& reference,
+    const std::string& message)
+{
+    const bool actual_is_foreign =
+        actual.owner_class == NormalizedClass::UniqueForeign;
+    const bool reference_is_foreign =
+        reference.owner_class == NormalizedClass::UniqueForeign;
+    require(actual.owner_dof == reference.owner_dof
+                && actual_is_foreign == reference_is_foreign,
+            message
+                + ": actual owner="
+                + std::to_string(actual.owner_dof)
+                + " is_foreign=" + std::to_string(actual_is_foreign)
+                + ", reference owner="
+                + std::to_string(reference.owner_dof)
+                + " is_foreign="
+                + std::to_string(reference_is_foreign));
+}
+
 void test_optimized_local_and_unique_foreign_paths()
 {
     Fixture fixture;
@@ -853,10 +874,10 @@ ThreeModeOwnerResults evaluate_three_modes(
         one_result(reference, sample),
         one_result(optimized, sample),
         one_result(hybrid, sample)};
-    require_matches_reference_owner(
+    require_matches_reference_target_side(
         result.optimized, result.reference,
         "optimized policy agrees with the reference owner");
-    require_matches_reference_owner(
+    require_matches_reference_target_side(
         result.hybrid, result.reference,
         "hybrid policy agrees with the reference owner");
     return result;
@@ -957,7 +978,10 @@ void test_hybrid_segment_closest_miss_and_root_paths()
         one_wrong_side_sample(
             miss.target_dof, miss.start, miss.end));
     require(miss_results.hybrid.query_path
-                == QueryPath::ClosestCertifiedMiss,
+                    == QueryPath::ClosestCertifiedMiss
+                && miss_results.hybrid.owner_class
+                       == NormalizedClass::Target
+                && miss_results.hybrid.owner_dof == miss.target_dof,
             "closest terminal separation certifies an AABB false positive");
 
     const auto root_segment =
