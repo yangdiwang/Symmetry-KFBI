@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -14,15 +15,31 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <numeric>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+#ifdef interface
+#undef interface
+#endif
+#else
+#include <sys/resource.h>
+#endif
 
 #include <Eigen/Dense>
 #include <Eigen/SVD>
@@ -897,6 +914,8 @@ struct RestrictOwnerOracleNode3D {
     app3d::RestrictOwnerNormalizedClass3D owner_class =
         app3d::RestrictOwnerNormalizedClass3D::Target;
     int crossing_patch = -1;
+    std::optional<app3d::RestrictOwnerDecisionKind3D>
+        legacy_decision_kind;
 };
 
 struct RestrictOwnerWorkloadSample3D {
@@ -905,6 +924,7 @@ struct RestrictOwnerWorkloadSample3D {
     int layer = -1;
     Eigen::Vector3d query = Eigen::Vector3d::Zero();
     std::array<int, 3> lower_stencil_index{};
+    std::uint64_t wrong_side_mask = 0;
     std::vector<RestrictOwnerOracleNode3D> oracle_nodes;
 };
 
@@ -960,6 +980,37 @@ RestrictOwnerTraceStencil3D build_restrict_owner_trace_stencil_3d(
         }
     }
     return result;
+}
+
+app3d::RestrictOwnerSampleInput3D
+reconstruct_restrict_owner_sample_input_3d(
+    const CartesianGrid3D& grid,
+    int target_dof,
+    const Eigen::Vector3d& query,
+    const std::array<int, 3>& lower_stencil_index,
+    std::uint64_t wrong_side_mask)
+{
+    app3d::RestrictOwnerSampleInput3D input;
+    input.target_dof = target_dof;
+    input.query = query;
+    int q = 0;
+    for (int iz = 0; iz < 4; ++iz) {
+        for (int iy = 0; iy < 4; ++iy) {
+            for (int ix = 0; ix < 4; ++ix) {
+                const int node = grid.index(
+                    lower_stencil_index[0] - 1 + ix,
+                    lower_stencil_index[1] - 1 + iy,
+                    lower_stencil_index[2] - 1 + iz);
+                const std::size_t slot = static_cast<std::size_t>(q);
+                input.support_points[slot] = grid_point(grid, node);
+                input.wrong_side[slot] =
+                    (wrong_side_mask
+                     & (UINT64_C(1) << static_cast<unsigned>(q))) != 0;
+                ++q;
+            }
+        }
+    }
+    return input;
 }
 
 void restrict_owner_fingerprint_append(
@@ -1074,6 +1125,178 @@ void validate_restrict_owner_preprocess_diagnostics(
     }
 }
 
+std::uint64_t current_working_set_bytes_3d()
+{
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    counters.cb = sizeof(counters);
+    const BOOL memory_ok = GetProcessMemoryInfo(GetCurrentProcess(),
+        reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(std::addressof(counters)),
+        sizeof(counters));
+    if (memory_ok == FALSE)
+        throw std::runtime_error("GetProcessMemoryInfo failed");
+    return static_cast<std::uint64_t>(counters.WorkingSetSize);
+#else
+    rusage usage{};
+    const int resource_status = getrusage(RUSAGE_SELF, std::addressof(usage));
+    if (resource_status != 0)
+        throw std::runtime_error("getrusage(RUSAGE_SELF) failed");
+#if defined(__APPLE__)
+    return static_cast<std::uint64_t>(usage.ru_maxrss);
+#else
+    return static_cast<std::uint64_t>(usage.ru_maxrss) * UINT64_C(1024);
+#endif
+#endif
+}
+
+class WorkingSetPeakSampler3D {
+public:
+    WorkingSetPeakSampler3D()
+    {
+        const std::uint64_t initial = current_working_set_bytes_3d();
+        peak_bytes_.store(initial, std::memory_order_relaxed);
+#ifdef _WIN32
+        worker_ = std::thread([this] {
+            while (!stop_.load(std::memory_order_relaxed)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                if (!enabled_.load(std::memory_order_acquire))
+                    continue;
+                std::lock_guard<std::mutex> lock(sample_mutex_);
+                if (!enabled_.load(std::memory_order_relaxed))
+                    continue;
+                try {
+                    update_sample(current_working_set_bytes_3d());
+                } catch (...) {
+                    failed_.store(true, std::memory_order_relaxed);
+                    enabled_.store(false, std::memory_order_release);
+                }
+            }
+        });
+#endif
+    }
+
+    WorkingSetPeakSampler3D(const WorkingSetPeakSampler3D&) = delete;
+    WorkingSetPeakSampler3D& operator=(
+        const WorkingSetPeakSampler3D&) = delete;
+
+    ~WorkingSetPeakSampler3D()
+    {
+        stop_worker();
+    }
+
+    void resume()
+    {
+        std::lock_guard<std::mutex> lock(sample_mutex_);
+        if (finished_)
+            throw std::logic_error("working-set sampler is finished");
+        if (enabled_.load(std::memory_order_relaxed))
+            throw std::logic_error("working-set sampler is already active");
+        if (failed_.load(std::memory_order_relaxed))
+            throw std::runtime_error("working-set sampler failed");
+        const std::uint64_t baseline = current_working_set_bytes_3d();
+        active_window_baseline_bytes_ = baseline;
+        update_sample(baseline);
+        enabled_.store(true, std::memory_order_release);
+    }
+
+    void pause() noexcept
+    {
+        enabled_.store(false, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(sample_mutex_);
+    }
+
+    void checkpoint()
+    {
+        std::lock_guard<std::mutex> lock(sample_mutex_);
+        if (!enabled_.load(std::memory_order_relaxed))
+            throw std::logic_error(
+                "working-set checkpoint requires an active window");
+        update_sample(current_working_set_bytes_3d());
+    }
+
+    void finish()
+    {
+        if (enabled_.load(std::memory_order_relaxed))
+            throw std::logic_error(
+                "working-set sampler must be paused before finish");
+        stop_worker();
+        if (failed_.load(std::memory_order_relaxed))
+            throw std::runtime_error("working-set sampler failed");
+        finished_ = true;
+    }
+
+    std::uint64_t peak_bytes() const
+    {
+        if (!finished_)
+            throw std::logic_error("working-set sampler is not finished");
+        return peak_bytes_.load(std::memory_order_relaxed);
+    }
+
+    std::uint64_t max_active_increase_bytes() const
+    {
+        if (!finished_)
+            throw std::logic_error("working-set sampler is not finished");
+        return max_active_increase_bytes_.load(
+            std::memory_order_relaxed);
+    }
+
+private:
+    void update_sample(std::uint64_t sample) noexcept
+    {
+        update_atomic_max(peak_bytes_, sample);
+        const std::uint64_t active_increase =
+            sample > active_window_baseline_bytes_
+                ? sample - active_window_baseline_bytes_ : 0;
+        update_atomic_max(max_active_increase_bytes_, active_increase);
+    }
+
+    static void update_atomic_max(
+        std::atomic<std::uint64_t>& destination,
+        std::uint64_t sample) noexcept
+    {
+        std::uint64_t peak = destination.load(std::memory_order_relaxed);
+        while (peak < sample
+               && !destination.compare_exchange_weak(
+                   peak, sample, std::memory_order_relaxed)) {
+        }
+    }
+
+    void stop_worker() noexcept
+    {
+#ifdef _WIN32
+        enabled_.store(false, std::memory_order_release);
+        stop_.store(true, std::memory_order_relaxed);
+        if (worker_.joinable())
+            worker_.join();
+#endif
+    }
+
+    std::uint64_t active_window_baseline_bytes_ = 0;
+    std::atomic<std::uint64_t> peak_bytes_{0};
+    std::atomic<std::uint64_t> max_active_increase_bytes_{0};
+    std::atomic<bool> stop_{false};
+    std::atomic<bool> enabled_{false};
+    std::atomic<bool> failed_{false};
+    std::mutex sample_mutex_;
+    bool finished_ = false;
+#ifdef _WIN32
+    std::thread worker_;
+#endif
+};
+struct RestrictOwnerPipelinePreprocessTiming3D {
+    double construction_seconds = 0.0;
+    double query_seconds = 0.0;
+    std::uint64_t peak_working_set_bytes = 0;
+    std::uint64_t max_active_increase_bytes = 0;
+    std::uint64_t output_digest = UINT64_C(14695981039346656037);
+    double assembly_seconds = 0.0;
+    double workload_capture_seconds = 0.0;
+};
+
+double production_pipeline_setup_seconds_3d(
+    double outer_constructor_seconds,
+    const RestrictOwnerPipelinePreprocessTiming3D& timing);
+
 constexpr std::size_t kRestrictOwnerDecisionKindCount =
     static_cast<std::size_t>(
         app3d::RestrictOwnerDecisionKind3D::AmbiguousEdgeFallback)
@@ -1116,20 +1339,209 @@ struct RestrictOwnerStagedDecision3D {
         app3d::RestrictOwnerNormalizedClass3D::Target;
     app3d::RestrictOwnerFallbackCause3D fallback_cause =
         app3d::RestrictOwnerFallbackCause3D::None;
+    app3d::RestrictOwnerQueryPath3D query_path =
+        app3d::RestrictOwnerQueryPath3D::FullIntersection;
     int legacy_decision_kind = -1;
     int foreign_crossing_index = -1;
 };
 
-struct RestrictOwnerPreparedTraceSample3D {
+struct RestrictOwnerTraceSeed3D {
     int target_dof = -1;
     int side = -1;
     int layer = -1;
+    Eigen::Vector3d query = Eigen::Vector3d::Zero();
     std::array<int, 3> lower_stencil_index{};
     std::uint64_t wrong_side_mask = 0;
+};
+
+struct RestrictOwnerPreparedTraceSample3D : RestrictOwnerTraceSeed3D {
+    std::uint64_t output_digest = UINT64_C(14695981039346656037);
     std::vector<RestrictOwnerStagedDecision3D> decisions;
     std::vector<geometry3d::NurbsSurfaceCrossing3D>
         foreign_crossings;
 };
+
+int restrict_owner_mask_count_3d(std::uint64_t mask) noexcept
+{
+    int count = 0;
+    while (mask != 0) {
+        mask &= mask - UINT64_C(1);
+        ++count;
+    }
+    return count;
+}
+
+void prepare_restrict_owner_result_sink_3d(
+    RestrictOwnerPreparedTraceSample3D& sink)
+{
+    const std::size_t capacity = static_cast<std::size_t>(
+        restrict_owner_mask_count_3d(sink.wrong_side_mask));
+    sink.decisions.clear();
+    sink.foreign_crossings.clear();
+    sink.decisions.reserve(capacity);
+    sink.foreign_crossings.reserve(capacity);
+}
+
+void append_restrict_owner_output_digest_double_3d(
+    std::uint64_t& digest, double value) noexcept
+{
+    std::uint64_t bits = 0;
+    std::memcpy(&bits, std::addressof(value), sizeof(bits));
+    restrict_owner_fingerprint_append(digest, bits);
+}
+
+void append_restrict_owner_output_digest_crossing_3d(
+    std::uint64_t& digest,
+    const geometry3d::NurbsSurfaceCrossing3D& crossing) noexcept
+{
+    restrict_owner_fingerprint_append(
+        digest, static_cast<std::uint32_t>(crossing.patch_index));
+    restrict_owner_fingerprint_append(
+        digest, static_cast<std::uint32_t>(crossing.component));
+    append_restrict_owner_output_digest_double_3d(digest, crossing.u);
+    append_restrict_owner_output_digest_double_3d(digest, crossing.v);
+    append_restrict_owner_output_digest_double_3d(
+        digest, crossing.edge_parameter);
+    for (int axis = 0; axis < 3; ++axis) {
+        append_restrict_owner_output_digest_double_3d(
+            digest, crossing.point[axis]);
+        append_restrict_owner_output_digest_double_3d(
+            digest, crossing.normal[axis]);
+    }
+    append_restrict_owner_output_digest_double_3d(
+        digest, crossing.residual);
+    append_restrict_owner_output_digest_double_3d(
+        digest, crossing.transversality);
+    restrict_owner_fingerprint_append(
+        digest, crossing.feature_edge_contact ? UINT64_C(1) : UINT64_C(0));
+    append_restrict_owner_output_digest_double_3d(
+        digest, crossing.reliable_transversality_tolerance);
+}
+
+void stage_restrict_owner_compact_result_3d(
+    const app3d::RestrictOwnerSampleInput3D& input,
+    app3d::RestrictOwnerSampleResult3D owner_result,
+    RestrictOwnerPreparedTraceSample3D& sink)
+{
+    const std::size_t expected_count = static_cast<std::size_t>(
+        restrict_owner_mask_count_3d(sink.wrong_side_mask));
+    if (sink.decisions.size() != 0 || sink.foreign_crossings.size() != 0
+        || sink.decisions.capacity() < expected_count
+        || sink.foreign_crossings.capacity() < expected_count) {
+        throw std::logic_error(
+            "restrict-owner result sink was not preallocated");
+    }
+    sink.output_digest = UINT64_C(14695981039346656037);
+    for (int q = 0; q < 64; ++q) {
+        const std::size_t slot = static_cast<std::size_t>(q);
+        if (!input.wrong_side[slot]) {
+            if (owner_result.nodes[slot].has_value()) {
+                throw std::logic_error(
+                    "restrict-owner preprocessing classified a "
+                    "same-side support node");
+            }
+            continue;
+        }
+        if (!owner_result.nodes[slot].has_value()) {
+            throw std::logic_error(
+                "restrict-owner preprocessing omitted a wrong-side "
+                "support node");
+        }
+        app3d::RestrictOwnerPreprocessResult3D& source =
+            owner_result.nodes[slot].value();
+        RestrictOwnerStagedDecision3D decision;
+        decision.slot = static_cast<std::uint8_t>(q);
+        decision.owner_dof = source.owner_dof;
+        decision.owner_class = source.owner_class;
+        decision.fallback_cause = source.fallback_cause;
+        decision.query_path = source.query_path;
+        if (source.legacy_decision_kind.has_value()) {
+            decision.legacy_decision_kind = static_cast<int>(
+                *source.legacy_decision_kind);
+        }
+        if (source.owner_class
+            == app3d::RestrictOwnerNormalizedClass3D::UniqueForeign) {
+            if (!source.foreign_crossing.has_value()) {
+                throw std::logic_error(
+                    "foreign restrict-owner decision has no crossing");
+            }
+            decision.foreign_crossing_index = static_cast<int>(
+                sink.foreign_crossings.size());
+            sink.foreign_crossings.push_back(
+                std::move(*source.foreign_crossing));
+        } else if (source.foreign_crossing.has_value()) {
+            throw std::logic_error(
+                "target restrict-owner decision has a foreign crossing");
+        }
+        restrict_owner_fingerprint_append(
+            sink.output_digest, static_cast<std::uint32_t>(decision.slot));
+        restrict_owner_fingerprint_append(
+            sink.output_digest,
+            static_cast<std::uint32_t>(decision.owner_dof));
+        restrict_owner_fingerprint_append(
+            sink.output_digest,
+            static_cast<std::uint32_t>(decision.owner_class));
+        restrict_owner_fingerprint_append(
+            sink.output_digest,
+            static_cast<std::uint32_t>(decision.query_path));
+        restrict_owner_fingerprint_append(
+            sink.output_digest,
+            static_cast<std::uint32_t>(decision.fallback_cause));
+        restrict_owner_fingerprint_append(
+            sink.output_digest,
+            static_cast<std::uint32_t>(decision.legacy_decision_kind));
+        if (decision.foreign_crossing_index >= 0) {
+            append_restrict_owner_output_digest_crossing_3d(
+                sink.output_digest,
+                sink.foreign_crossings[static_cast<std::size_t>(
+                    decision.foreign_crossing_index)]);
+        }
+        sink.decisions.push_back(std::move(decision));
+    }
+    if (sink.decisions.size() != expected_count)
+        throw std::logic_error(
+            "restrict-owner compact result count is inconsistent");
+}
+
+void run_restrict_owner_sample_core_3d(
+    const CartesianGrid3D& grid,
+    app3d::RestrictOwnerGeometryPreprocessor3D& preprocessor,
+    RestrictOwnerPreparedTraceSample3D& sink)
+{
+    const app3d::RestrictOwnerSampleInput3D input =
+        reconstruct_restrict_owner_sample_input_3d(
+            grid, sink.target_dof, sink.query,
+            sink.lower_stencil_index, sink.wrong_side_mask);
+    stage_restrict_owner_compact_result_3d(
+        input, preprocessor.preprocess_sample(input), sink);
+}
+
+double run_restrict_owner_timed_sample_3d(
+    const CartesianGrid3D& grid,
+    app3d::RestrictOwnerGeometryPreprocessor3D& preprocessor,
+    RestrictOwnerPreparedTraceSample3D& sink,
+    WorkingSetPeakSampler3D* memory_sampler = nullptr)
+{
+    if (memory_sampler != nullptr) {
+        memory_sampler->resume();
+        memory_sampler->checkpoint();
+    }
+    const auto query_start = std::chrono::steady_clock::now();
+    try {
+        run_restrict_owner_sample_core_3d(grid, preprocessor, sink);
+        const auto query_end = std::chrono::steady_clock::now();
+        if (memory_sampler != nullptr) {
+            memory_sampler->checkpoint();
+            memory_sampler->pause();
+        }
+        return std::chrono::duration<double>(
+            query_end - query_start).count();
+    } catch (...) {
+        if (memory_sampler != nullptr)
+            memory_sampler->pause();
+        throw;
+    }
+}
 
 struct RestrictOwnerSampleDiagnostics3D {
     int target_dof = -1;
@@ -1182,7 +1594,9 @@ public:
                                      restrict_owner_mode = std::nullopt,
                                  app3d::PhaseProfile3D* phase_profile = nullptr,
                                  RestrictOwnerWorkload3D* workload_capture =
-                                     nullptr)
+                                     nullptr,
+                                 RestrictOwnerPipelinePreprocessTiming3D*
+                                     preprocess_timing = nullptr)
         : grid_(grid)
         , grid_pair_(grid_pair)
         , native_surface_(native_surface)
@@ -1214,49 +1628,116 @@ public:
                 build_crossing_rows();
             });
         if (restrict_owner_mode.has_value()) {
-            const ProfileClock3D::time_point trace_start =
-                profile_timer_start_3d(phase_profile_);
-            if (workload_capture_ != nullptr) {
-                workload_capture_->clear();
-                workload_capture_->reserve(
-                    static_cast<std::size_t>(
-                        surface_size() * 2 * 4));
-            }
-            std::vector<RestrictOwnerPreparedTraceSample3D>
+            RestrictOwnerPipelinePreprocessTiming3D phase_timing;
+            RestrictOwnerPipelinePreprocessTiming3D* timing =
+                preprocess_timing != nullptr
+                    ? preprocess_timing
+                    : (phase_profile_ != nullptr
+                        ? std::addressof(phase_timing) : nullptr);
+            if (preprocess_timing != nullptr)
+                *preprocess_timing = {};
+            std::chrono::steady_clock::time_point preparation_start;
+            if (phase_profile_ != nullptr)
+                preparation_start = std::chrono::steady_clock::now();
+            std::vector<RestrictOwnerTraceSeed3D>
                 prepared_samples =
                     prepare_restrict_owner_trace_templates();
-            const double preprocess_before = phase_profile_ != nullptr
-                ? phase_profile_->record(
-                    PhaseProfileKind3D::
-                        RestrictOwnerGeometryPreprocessing).seconds
-                : 0.0;
-            profile_phase_3d(
-                phase_profile_,
-                PhaseProfileKind3D::RestrictOwnerGeometryPreprocessing,
-                1,
-                [&] {
+            RestrictOwnerPreparedTraceSample3D scratch;
+            scratch.decisions.reserve(64);
+            scratch.foreign_crossings.reserve(64);
+            double preparation_seconds = 0.0;
+            if (phase_profile_ != nullptr) {
+                preparation_seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now()
+                    - preparation_start).count();
+            }
+            if (workload_capture_ != nullptr) {
+                std::chrono::steady_clock::time_point capture_start;
+                if (timing != nullptr)
+                    capture_start = std::chrono::steady_clock::now();
+                workload_capture_->clear();
+                workload_capture_->reserve(prepared_samples.size());
+                if (timing != nullptr) {
+                    timing->workload_capture_seconds +=
+                        std::chrono::duration<double>(
+                            std::chrono::steady_clock::now()
+                            - capture_start).count();
+                }
+            }
+            std::unique_ptr<WorkingSetPeakSampler3D> memory_sampler;
+            const bool sample_working_set =
+                preprocess_timing != nullptr
+                && phase_profile_ == nullptr;
+            if (sample_working_set) {
+                memory_sampler = std::make_unique<
+                    WorkingSetPeakSampler3D>();
+            }
+            if (timing != nullptr) {
+                if (memory_sampler != nullptr) {
+                    memory_sampler->resume();
+                    memory_sampler->checkpoint();
+                }
+                try {
+                    const auto construction_start =
+                        std::chrono::steady_clock::now();
                     restrict_owner_preprocessor_ = std::make_unique<
                         app3d::RestrictOwnerGeometryPreprocessor3D>(
                             native_surface_, cloud_, h_,
                             *restrict_owner_mode);
-                    preprocess_restrict_owner_trace_templates(
-                        prepared_samples);
-                });
-            assemble_restrict_owner_trace_templates(
-                prepared_samples);
+                    const auto construction_end =
+                        std::chrono::steady_clock::now();
+                    if (memory_sampler != nullptr) {
+                        memory_sampler->checkpoint();
+                        memory_sampler->pause();
+                    }
+                    timing->construction_seconds =
+                        std::chrono::duration<double>(
+                            construction_end
+                            - construction_start).count();
+                } catch (...) {
+                    if (memory_sampler != nullptr)
+                        memory_sampler->pause();
+                    throw;
+                }
+            } else {
+                restrict_owner_preprocessor_ = std::make_unique<
+                    app3d::RestrictOwnerGeometryPreprocessor3D>(
+                        native_surface_, cloud_, h_,
+                        *restrict_owner_mode);
+            }
+            stream_restrict_owner_trace_templates(
+                prepared_samples, scratch, timing,
+                memory_sampler.get());
+            if (memory_sampler != nullptr) {
+                memory_sampler->finish();
+                preprocess_timing->peak_working_set_bytes =
+                    memory_sampler->peak_bytes();
+                preprocess_timing->max_active_increase_bytes =
+                    memory_sampler->max_active_increase_bytes();
+            }
             if (phase_profile_ != nullptr) {
-                const double trace_seconds = profile_timer_elapsed_3d(
-                    phase_profile_, trace_start);
-                const double preprocess_seconds =
-                    phase_profile_->record(
-                        PhaseProfileKind3D::
-                            RestrictOwnerGeometryPreprocessing).seconds
-                    - preprocess_before;
+                const std::uint64_t samples =
+                    static_cast<std::uint64_t>(
+                        prepared_samples.size());
+                std::uint64_t internal_timer_reads =
+                    UINT64_C(2)  // template preparation
+                    + UINT64_C(2)  // preprocessor construction
+                    + UINT64_C(2) * samples  // owner queries
+                    + UINT64_C(2) * samples; // trace assembly
+                if (workload_capture_ != nullptr) {
+                    internal_timer_reads +=
+                        UINT64_C(2)  // workload initialization
+                        + UINT64_C(2) * samples;
+                }
+                phase_profile_->note_timer_reads(
+                    internal_timer_reads);
+                phase_profile_->add(
+                    PhaseProfileKind3D::RestrictOwnerGeometryPreprocessing,
+                    timing->construction_seconds + timing->query_seconds,
+                    1);
                 phase_profile_->add(
                     PhaseProfileKind3D::TraceOwnerTemplateAssembly,
-                    nonnegative_profile_remainder_3d(
-                        trace_seconds, preprocess_seconds,
-                        "trace-template assembly"),
+                    preparation_seconds + timing->assembly_seconds,
                     1);
             }
             crossing_owner_templates_built_ = true;
@@ -1422,6 +1903,19 @@ public:
                 "crossing-owner normal restrict was not initialized");
         }
         return restrict_owner_preprocessor_->diagnostics();
+    }
+
+    double restrict_owner_correction_linf() const
+    {
+        double result = 0.0;
+        for (const HarmonicTraceSample3D& sample : trace_samples_) {
+            for (const HarmonicTraceCorrectionTerm3D& term
+                 : sample.owner_corrections) {
+                result = std::max(
+                    result, term.evaluation.lpNorm<Eigen::Infinity>());
+            }
+        }
+        return result;
     }
 
     double restrict_owner_correction_linf_difference(
@@ -1802,7 +2296,7 @@ private:
         int center,
         int side,
         int layer,
-        RestrictOwnerPreparedTraceSample3D* prepared = nullptr)
+        RestrictOwnerTraceSeed3D* prepared = nullptr)
     {
         if (side < 0 || side >= 2
             || layer < 0
@@ -1841,6 +2335,7 @@ private:
             prepared->target_dof = center;
             prepared->side = side;
             prepared->layer = layer;
+            prepared->query = query;
             prepared->lower_stencil_index = lo;
         }
 
@@ -1898,12 +2393,12 @@ private:
         return result;
     }
 
-    std::vector<RestrictOwnerPreparedTraceSample3D>
+    std::vector<RestrictOwnerTraceSeed3D>
     prepare_restrict_owner_trace_templates()
     {
         const std::size_t sample_count = static_cast<std::size_t>(
             surface_size() * 2 * normal_layers_.size());
-        std::vector<RestrictOwnerPreparedTraceSample3D> prepared;
+        std::vector<RestrictOwnerTraceSeed3D> prepared;
         prepared.reserve(sample_count);
         trace_samples_.reserve(sample_count);
         for (int center = 0; center < surface_size(); ++center) {
@@ -1911,7 +2406,7 @@ private:
                 for (int layer = 0;
                      layer < static_cast<int>(normal_layers_.size());
                      ++layer) {
-                    RestrictOwnerPreparedTraceSample3D item;
+                    RestrictOwnerTraceSeed3D item;
                     HarmonicTraceSample3D sample =
                         build_trace_sample(
                             center, side, layer, &item);
@@ -1923,110 +2418,11 @@ private:
         return prepared;
     }
 
-    app3d::RestrictOwnerSampleInput3D
-    reconstruct_restrict_owner_sample_input(
-        std::size_t sample_index,
-        const RestrictOwnerPreparedTraceSample3D& prepared) const
-    {
-        if (sample_index >= trace_samples_.size()) {
-            throw std::logic_error(
-                "restrict-owner prepared sample index is invalid");
-        }
-        const SurfaceDof& dof = cloud_.dofs[
-            static_cast<std::size_t>(prepared.target_dof)];
-        const bool desired_inside = prepared.side == 0;
-        const double sign = desired_inside ? -1.0 : 1.0;
-        const double signed_layer =
-            sign * normal_layers_[static_cast<std::size_t>(
-                prepared.layer)];
-
-        app3d::RestrictOwnerSampleInput3D input;
-        input.target_dof = prepared.target_dof;
-        input.query =
-            dof.point + signed_layer * h_ * dof.normal;
-        const HarmonicTraceSample3D& sample =
-            trace_samples_[sample_index];
-        for (int q = 0; q < 64; ++q) {
-            const std::size_t slot = static_cast<std::size_t>(q);
-            const int node = sample.grid_ids[slot];
-            input.support_points[slot] = grid_point(grid_, node);
-            input.wrong_side[slot] =
-                (prepared.wrong_side_mask
-                 & (UINT64_C(1) << static_cast<unsigned>(q)))
-                != 0;
-        }
-        return input;
-    }
-
-    void stage_restrict_owner_sample_result(
-        std::size_t sample_index,
-        RestrictOwnerPreparedTraceSample3D& prepared,
-        const app3d::RestrictOwnerSampleInput3D& input,
-        app3d::RestrictOwnerSampleResult3D owner_result)
-    {
-        HarmonicTraceSample3D& sample =
-            trace_samples_[sample_index];
-        prepared.decisions.clear();
-        prepared.foreign_crossings.clear();
-        prepared.decisions.reserve(
-            static_cast<std::size_t>(
-                sample.wrong_side_node_count));
-
-        for (int q = 0; q < 64; ++q) {
-            const std::size_t slot = static_cast<std::size_t>(q);
-            if (!input.wrong_side[slot]) {
-                if (owner_result.nodes[slot].has_value()) {
-                    throw std::logic_error(
-                        "restrict-owner preprocessing classified a "
-                        "same-side support node");
-                }
-                continue;
-            }
-            if (!owner_result.nodes[slot].has_value()) {
-                throw std::logic_error(
-                    "restrict-owner preprocessing omitted a wrong-side "
-                    "support node");
-            }
-
-            app3d::RestrictOwnerPreprocessResult3D& source =
-                owner_result.nodes[slot].value();
-            RestrictOwnerStagedDecision3D decision;
-            decision.slot = static_cast<std::uint8_t>(q);
-            decision.owner_dof = source.owner_dof;
-            decision.owner_class = source.owner_class;
-            decision.fallback_cause = source.fallback_cause;
-            if (source.legacy_decision_kind.has_value()) {
-                decision.legacy_decision_kind = static_cast<int>(
-                    *source.legacy_decision_kind);
-            }
-            if (source.owner_class
-                == app3d::RestrictOwnerNormalizedClass3D::
-                    UniqueForeign) {
-                if (!source.foreign_crossing.has_value()) {
-                    throw std::logic_error(
-                        "foreign restrict-owner decision has no crossing");
-                }
-                decision.foreign_crossing_index =
-                    static_cast<int>(
-                        prepared.foreign_crossings.size());
-                prepared.foreign_crossings.push_back(
-                    std::move(*source.foreign_crossing));
-            } else if (source.foreign_crossing.has_value()) {
-                throw std::logic_error(
-                    "target restrict-owner decision has a foreign crossing");
-            }
-            prepared.decisions.push_back(std::move(decision));
-        }
-        if (prepared.decisions.size()
-            != static_cast<std::size_t>(
-                sample.wrong_side_node_count)) {
-            throw std::logic_error(
-                "restrict-owner compact result count is inconsistent");
-        }
-    }
-
-    void preprocess_restrict_owner_trace_templates(
-        std::vector<RestrictOwnerPreparedTraceSample3D>& prepared)
+    void stream_restrict_owner_trace_templates(
+        const std::vector<RestrictOwnerTraceSeed3D>& prepared,
+        RestrictOwnerPreparedTraceSample3D& scratch,
+        RestrictOwnerPipelinePreprocessTiming3D* preprocess_timing,
+        WorkingSetPeakSampler3D* memory_sampler)
     {
         if (!restrict_owner_preprocessor_
             || prepared.size() != trace_samples_.size()) {
@@ -2035,12 +2431,45 @@ private:
         }
         for (std::size_t sample = 0;
              sample < prepared.size(); ++sample) {
-            const app3d::RestrictOwnerSampleInput3D input =
-                reconstruct_restrict_owner_sample_input(
-                    sample, prepared[sample]);
-            stage_restrict_owner_sample_result(
-                sample, prepared[sample], input,
-                restrict_owner_preprocessor_->preprocess_sample(input));
+            static_cast<RestrictOwnerTraceSeed3D&>(scratch) =
+                prepared[sample];
+            prepare_restrict_owner_result_sink_3d(scratch);
+            if (preprocess_timing != nullptr) {
+                preprocess_timing->query_seconds +=
+                    run_restrict_owner_timed_sample_3d(
+                        grid_, *restrict_owner_preprocessor_, scratch,
+                        memory_sampler);
+                restrict_owner_fingerprint_append(
+                    preprocess_timing->output_digest,
+                    scratch.output_digest);
+            } else {
+                run_restrict_owner_sample_core_3d(
+                    grid_, *restrict_owner_preprocessor_, scratch);
+            }
+            if (preprocess_timing != nullptr) {
+                const auto assembly_start =
+                    std::chrono::steady_clock::now();
+                assemble_restrict_owner_trace_sample(sample, scratch);
+                preprocess_timing->assembly_seconds +=
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now()
+                        - assembly_start).count();
+            } else {
+                assemble_restrict_owner_trace_sample(sample, scratch);
+            }
+            if (workload_capture_ != nullptr) {
+                if (preprocess_timing != nullptr) {
+                    const auto capture_start =
+                        std::chrono::steady_clock::now();
+                    capture_restrict_owner_workload_sample(scratch);
+                    preprocess_timing->workload_capture_seconds +=
+                        std::chrono::duration<double>(
+                            std::chrono::steady_clock::now()
+                            - capture_start).count();
+                } else {
+                    capture_restrict_owner_workload_sample(scratch);
+                }
+            }
         }
     }
 
@@ -2061,24 +2490,6 @@ private:
                 FullIntersectionReference;
         std::map<int, Eigen::VectorXd> owner_evaluations;
         int normalized_foreign_count = 0;
-        RestrictOwnerWorkloadSample3D workload;
-        if (workload_capture_ != nullptr) {
-            const SurfaceDof& dof = cloud_.dofs[
-                static_cast<std::size_t>(prepared.target_dof)];
-            const double sign = desired_inside ? -1.0 : 1.0;
-            const double signed_layer =
-                sign * normal_layers_[static_cast<std::size_t>(
-                    prepared.layer)];
-            workload.target_dof = prepared.target_dof;
-            workload.side = prepared.side;
-            workload.layer = prepared.layer;
-            workload.query =
-                dof.point + signed_layer * h_ * dof.normal;
-            workload.lower_stencil_index =
-                prepared.lower_stencil_index;
-            workload.oracle_nodes.reserve(
-                prepared.decisions.size());
-        }
 
         std::size_t decision_index = 0;
         for (int q = 0; q < 64; ++q) {
@@ -2137,7 +2548,6 @@ private:
                 }
             }
 
-            int crossing_patch = -1;
             if (decision.owner_class
                 == app3d::RestrictOwnerNormalizedClass3D::
                     UniqueForeign) {
@@ -2152,7 +2562,6 @@ private:
                 const auto& root = prepared.foreign_crossings[
                     static_cast<std::size_t>(
                         decision.foreign_crossing_index)];
-                crossing_patch = root.patch_index;
                 HarmonicTraceOwnerAuditTerm3D audit;
                 audit.grid_node = result.grid_ids[slot];
                 audit.interpolation_weight = weight;
@@ -2168,15 +2577,6 @@ private:
             } else if (decision.foreign_crossing_index >= 0) {
                 throw std::logic_error(
                     "target restrict-owner decision has a crossing index");
-            }
-
-            if (workload_capture_ != nullptr) {
-                RestrictOwnerOracleNode3D oracle;
-                oracle.slot = static_cast<std::uint8_t>(q);
-                oracle.owner_dof = owner;
-                oracle.owner_class = decision.owner_class;
-                oracle.crossing_patch = crossing_patch;
-                workload.oracle_nodes.push_back(std::move(oracle));
             }
 
             const Eigen::Vector3d node_point =
@@ -2199,9 +2599,6 @@ private:
             throw std::logic_error(
                 "restrict-owner compact decisions were not consumed");
         }
-        if (workload_capture_ != nullptr)
-            workload_capture_->push_back(std::move(workload));
-
         result.owner_corrections.reserve(owner_evaluations.size());
         for (auto& owner_evaluation : owner_evaluations) {
             HarmonicTraceCorrectionTerm3D term;
@@ -2233,19 +2630,56 @@ private:
         }
     }
 
-    void assemble_restrict_owner_trace_templates(
-        const std::vector<RestrictOwnerPreparedTraceSample3D>& prepared)
+    void capture_restrict_owner_workload_sample(
+        const RestrictOwnerPreparedTraceSample3D& source)
     {
-        if (!restrict_owner_preprocessor_
-            || prepared.size() != trace_samples_.size()) {
+        if (workload_capture_ == nullptr)
+            return;
+        RestrictOwnerWorkloadSample3D workload;
+        workload.target_dof = source.target_dof;
+        workload.side = source.side;
+        workload.layer = source.layer;
+        workload.query = source.query;
+        workload.lower_stencil_index = source.lower_stencil_index;
+        workload.wrong_side_mask = source.wrong_side_mask;
+        workload.oracle_nodes.reserve(source.decisions.size());
+        for (const RestrictOwnerStagedDecision3D& decision
+             : source.decisions) {
+            if (decision.owner_dof < 0
+                || decision.owner_dof >= surface_size()) {
+                throw std::logic_error(
+                    "restrict-owner workload owner DOF is invalid");
+            }
+            RestrictOwnerOracleNode3D oracle;
+            oracle.slot = decision.slot;
+            oracle.owner_dof = decision.owner_dof;
+            oracle.owner_class = decision.owner_class;
+            if (decision.foreign_crossing_index >= 0) {
+                if (decision.foreign_crossing_index
+                    >= static_cast<int>(
+                        source.foreign_crossings.size())) {
+                    throw std::logic_error(
+                        "restrict-owner workload crossing is invalid");
+                }
+                oracle.crossing_patch = source.foreign_crossings[
+                    static_cast<std::size_t>(
+                        decision.foreign_crossing_index)].patch_index;
+            }
+            if (decision.legacy_decision_kind >= 0) {
+                oracle.legacy_decision_kind =
+                    static_cast<app3d::RestrictOwnerDecisionKind3D>(
+                        decision.legacy_decision_kind);
+            }
+            workload.oracle_nodes.push_back(std::move(oracle));
+        }
+        if (workload.oracle_nodes.size()
+            != static_cast<std::size_t>(
+                restrict_owner_mask_count_3d(
+                    workload.wrong_side_mask))) {
             throw std::logic_error(
-                "restrict-owner assembly batch is invalid");
+                "restrict-owner workload count is inconsistent");
         }
-        for (std::size_t sample = 0;
-             sample < prepared.size(); ++sample) {
-            assemble_restrict_owner_trace_sample(
-                sample, prepared[sample]);
-        }
+        workload_capture_->push_back(std::move(workload));
     }
 
     void build_trace_templates()
@@ -4834,19 +5268,28 @@ int run_normal_restrict_causal_probe(std::vector<int> levels,
                 profile->note_timer_reads(1);
             const auto pipeline_start = std::chrono::steady_clock::now();
             RestrictOwnerWorkload3D workload_capture;
+            RestrictOwnerPipelinePreprocessTiming3D
+                phase_pipeline_timing;
             PanelCenterHarmonicJetKFBI3D pipeline(
                 grid, grid_pair, geometry.native_surface,
                 geometry.correction_triangles,
                 geometry.geometry_triangles,
                 surface_dofs, cauchy_stencils, !owner_only,
                 owner_preprocess_mode,
-                profile, &workload_capture);
+                profile, &workload_capture,
+                profile != nullptr
+                    ? std::addressof(phase_pipeline_timing) : nullptr);
             if (profile != nullptr)
                 profile->note_timer_reads(1);
             const auto pipeline_end = std::chrono::steady_clock::now();
-            const double pipeline_setup_seconds =
+            const double pipeline_wall_seconds =
                 std::chrono::duration<double>(
                     pipeline_end - pipeline_start).count();
+            const double pipeline_setup_seconds =
+                profile != nullptr
+                    ? production_pipeline_setup_seconds_3d(
+                        pipeline_wall_seconds, phase_pipeline_timing)
+                    : pipeline_wall_seconds;
             if (profile != nullptr) {
                 const double child_seconds =
                     profile->record(
@@ -5191,6 +5634,1263 @@ int run_normal_restrict_causal_probe(std::vector<int> levels,
     return 0;
 }
 
+using OwnerMode3D = app3d::RestrictOwnerPreprocessMode3D;
+using OwnerClass3D = app3d::RestrictOwnerNormalizedClass3D;
+using OwnerPath3D = app3d::RestrictOwnerQueryPath3D;
+using OwnerFallback3D = app3d::RestrictOwnerFallbackCause3D;
+
+struct OwnerPreprocessStudyCase3D {
+    std::string case_id;
+    std::string geometry;
+    std::string pose;
+    GeometryKind kind = GeometryKind::Torus;
+    app3d::RigidTransform3D transform;
+};
+
+struct PreprocessTimingRepeatRow3D {
+    std::string case_id, geometry, pose, mode;
+    int N = 0, repetition = 0, run_order = 0;
+    double h = 0.0;
+    std::uint64_t wrong_side_queries = 0;
+    double construction_seconds = 0.0, query_seconds = 0.0;
+    double total_preprocess_seconds = 0.0, queries_per_second = 0.0;
+    std::uint64_t peak_working_set_bytes = 0;
+    std::uint64_t working_set_increase_bytes = 0;
+};
+
+struct PreprocessSummaryRow3D {
+    std::string case_id, geometry, pose, mode;
+    int N = 0, repetitions = 0;
+    double h = 0.0;
+    std::uint64_t wrong_side_queries = 0;
+    double construction_seconds_median = 0.0;
+    double query_seconds_median = 0.0, query_seconds_p95 = 0.0;
+    double total_seconds_median = 0.0, total_seconds_p95 = 0.0;
+    double queries_per_second_median = 0.0, speedup_vs_full = 0.0;
+    std::uint64_t peak_working_set_bytes_max = 0;
+    bool accepted = false;
+};
+
+struct PreprocessAccuracyRow3D {
+    std::string case_id, geometry, pose, mode;
+    int N = 0;
+    double h = 0.0;
+    std::uint64_t query_count = 0, oracle_target = 0, oracle_foreign = 0;
+    std::uint64_t owner_mismatch = 0, foreign_true_positive = 0;
+    std::uint64_t foreign_false_positive = 0, foreign_false_negative = 0;
+    std::uint64_t foreign_wrong_owner = 0;
+    double foreign_precision = 0.0, foreign_recall = 0.0;
+    double max_mismatched_abs_weight = 0.0;
+    double max_owner_correction_abs_difference = 0.0;
+    std::uint64_t legacy_reason_mismatch = 0;
+    bool pass = false;
+};
+
+struct PreprocessPathCountRow3D {
+    std::string case_id, geometry, pose, mode, path;
+    int N = 0;
+    double h = 0.0;
+    std::uint64_t count = 0;
+    double fraction = 0.0;
+    app3d::RestrictOwnerPreprocessDiagnostics3D diagnostics;
+};
+
+struct PreprocessMismatchRow3D {
+    std::string case_id, geometry, pose, mode;
+    int N = 0, target_dof = -1, target_patch = -1, side = -1, layer = -1;
+    double h = 0.0;
+    int grid_node = -1;
+    double weight = 0.0;
+    Eigen::Vector3d query = Eigen::Vector3d::Zero();
+    Eigen::Vector3d support = Eigen::Vector3d::Zero();
+    int oracle_owner_dof = -1, oracle_owner_patch = -1;
+    int candidate_owner_dof = -1, candidate_owner_patch = -1;
+    std::string oracle_class, candidate_class, candidate_path;
+    int oracle_crossing_patch = -1, candidate_crossing_patch = -1;
+};
+
+struct KfbiNumericalResultRow3D {
+    std::string case_id, geometry, pose, mode;
+    int N = 0, dofs = 0;
+    double h = 0.0, preprocess_seconds = 0.0;
+    double pipeline_setup_seconds = 0.0, pipeline_speedup_vs_full = 0.0;
+    SolveMetrics3D solve;
+    double interior_order = std::numeric_limits<double>::quiet_NaN();
+    double exact_grid_linf = 0.0, exact_equation_linf = 0.0;
+    double interior_relative_difference_vs_full = 0.0;
+    double exact_grid_relative_difference_vs_full = 0.0;
+    double exact_equation_relative_difference_vs_full = 0.0;
+    std::uint64_t geometry_queries_before_gmres = 0;
+    std::uint64_t geometry_queries_after_gmres = 0;
+    bool pass = false;
+};
+
+struct OwnerPreprocessStudyRows3D {
+    std::vector<PreprocessTimingRepeatRow3D> timing;
+    std::vector<PreprocessSummaryRow3D> summary;
+    std::vector<PreprocessAccuracyRow3D> accuracy;
+    std::vector<PreprocessPathCountRow3D> paths;
+    std::vector<PreprocessMismatchRow3D> mismatches;
+    std::vector<KfbiNumericalResultRow3D> numerical;
+};
+
+struct RestrictOwnerAccuracyComparison3D {
+    PreprocessAccuracyRow3D accuracy;
+    std::vector<PreprocessMismatchRow3D> mismatches;
+};
+
+struct RestrictOwnerReplayResult3D {
+    std::optional<RestrictOwnerAccuracyComparison3D> comparison;
+    app3d::RestrictOwnerPreprocessDiagnostics3D diagnostics;
+    double construction_seconds = 0.0, query_seconds = 0.0;
+    std::uint64_t peak_working_set_bytes = 0;
+    std::uint64_t max_active_increase_bytes = 0;
+    std::uint64_t output_digest = UINT64_C(14695981039346656037);
+};
+
+std::string owner_class_name_3d(OwnerClass3D value)
+{
+    if (value == OwnerClass3D::Target)
+        return "target";
+    if (value == OwnerClass3D::UniqueForeign)
+        return "unique_foreign";
+    return "fail_closed_target";
+}
+
+std::string owner_path_name_3d(OwnerPath3D value)
+{
+    if (value == OwnerPath3D::FullIntersection)
+        return "full_intersection";
+    if (value == OwnerPath3D::SweepTargetOnly)
+        return "sweep_target_only";
+    if (value == OwnerPath3D::SegmentTargetOnly)
+        return "segment_target_only";
+    if (value == OwnerPath3D::ClosestCertifiedMiss)
+        return "closest_certified_miss";
+    if (value == OwnerPath3D::ClosestCertifiedRoot)
+        return "closest_certified_root";
+    if (value == OwnerPath3D::OptimizedIntersection)
+        return "optimized_intersection";
+    return "full_intersection_fallback";
+}
+
+std::string owner_fallback_name_3d(OwnerFallback3D value)
+{
+    if (value == OwnerFallback3D::MultipleCrossings)
+        return "multiple_crossings";
+    if (value == OwnerFallback3D::Unresolved)
+        return "unresolved";
+    if (value == OwnerFallback3D::Overlap)
+        return "overlap";
+    if (value == OwnerFallback3D::Endpoint)
+        return "endpoint";
+    if (value == OwnerFallback3D::NearTangent)
+        return "near_tangent";
+    if (value == OwnerFallback3D::FeatureContact)
+        return "feature_contact";
+    if (value == OwnerFallback3D::ParameterBoundary)
+        return "parameter_boundary";
+    if (value == OwnerFallback3D::Seam)
+        return "seam";
+    if (value == OwnerFallback3D::Coincidence)
+        return "coincidence";
+    return "none";
+}
+
+app3d::DirichletRigidStudyCase3D rigid_case_by_id_3d(
+    std::vector<app3d::DirichletRigidStudyCase3D> cases,
+    std::string id)
+{
+    for (std::size_t index = 0; index not_eq cases.size(); index += 1) {
+        if (cases[index].id == id)
+            return cases[index];
+    }
+    throw std::logic_error("missing rigid study case " + id);
+}
+
+std::vector<OwnerPreprocessStudyCase3D> owner_study_cases_3d()
+{
+    const auto rigid = app3d::make_l_prism_dirichlet_rigid_study_cases_3d();
+    const auto identity = rigid_case_by_id_3d(rigid, "baseline");
+    const auto rotation = rigid_case_by_id_3d(
+        rigid, "rot_axis123_17deg");
+    const auto translated = rigid_case_by_id_3d(
+        rigid, "rot_axis123_17deg_t_xyz_1");
+    std::vector<OwnerPreprocessStudyCase3D> result;
+    result.reserve(7);
+    result.push_back({"torus_identity", "torus", "identity",
+        GeometryKind::Torus, identity.transform});
+    result.push_back({"hollow_cylinder_identity", "hollow_cylinder",
+        "identity", GeometryKind::HollowCylinder, identity.transform});
+    result.push_back({"l_prism_identity", "l_prism", "identity",
+        GeometryKind::LPrism, identity.transform});
+    result.push_back({"torus_rot_axis123_17deg", "torus",
+        "rot_axis123_17deg", GeometryKind::Torus, rotation.transform});
+    result.push_back({"hollow_cylinder_rot_axis123_17deg",
+        "hollow_cylinder", "rot_axis123_17deg",
+        GeometryKind::HollowCylinder, rotation.transform});
+    result.push_back({"l_prism_rot_axis123_17deg", "l_prism",
+        "rot_axis123_17deg", GeometryKind::LPrism, rotation.transform});
+    result.push_back({"l_prism_rot_axis123_17deg_t_xyz_1", "l_prism",
+        "rot_axis123_17deg_t_xyz_1", GeometryKind::LPrism,
+        translated.transform});
+    return result;
+}
+
+bool owner_case_selected_for_level_3d(
+    OwnerPreprocessStudyCase3D study_case, int N)
+{
+    if (N == 16)
+        return study_case.pose == "identity";
+    if (N == 32 or N == 64)
+        return true;
+    return N == 128
+        and study_case.case_id == "l_prism_rot_axis123_17deg";
+}
+
+int owner_candidate_repetitions_3d(int N)
+{
+    if (N <= 32) return 5;
+    if (N == 64) return 3;
+    return 1;
+}
+
+double sorted_median_3d(std::vector<double> values)
+{
+    if (values.empty())
+        return std::numeric_limits<double>::quiet_NaN();
+    std::sort(values.begin(), values.end());
+    const std::size_t middle = values.size() / 2;
+    if (values.size() % 2 == 0)
+        return 0.5 * (values[middle - 1] + values[middle]);
+    return values[middle];
+}
+
+double sorted_nearest_rank_p95_3d(std::vector<double> values)
+{
+    if (values.empty())
+        return std::numeric_limits<double>::quiet_NaN();
+    std::sort(values.begin(), values.end());
+    const std::size_t rank = static_cast<std::size_t>(
+        std::ceil(0.95 * static_cast<double>(values.size())));
+    return values[std::max<std::size_t>(1, rank) - 1];
+}
+
+double symmetric_relative_difference_3d(double a, double b)
+{
+    return std::abs(a - b)
+         / std::max({1.0e-300, std::abs(a), std::abs(b)});
+}
+
+
+double production_pipeline_setup_seconds_3d(
+    double outer_constructor_seconds,
+    const RestrictOwnerPipelinePreprocessTiming3D& timing)
+{
+    if (!std::isfinite(outer_constructor_seconds)
+        || !std::isfinite(timing.workload_capture_seconds)
+        || outer_constructor_seconds <= 0.0
+        || timing.workload_capture_seconds < 0.0
+        || timing.workload_capture_seconds > outer_constructor_seconds) {
+        throw std::logic_error(
+            "invalid production-equivalent pipeline setup timing");
+    }
+    const double result =
+        outer_constructor_seconds - timing.workload_capture_seconds;
+    if (result <= 0.0)
+        throw std::logic_error(
+            "nonpositive production-equivalent pipeline setup timing");
+    return result;
+}
+
+RestrictOwnerAccuracyComparison3D make_owner_accuracy_comparison_3d(
+    const CartesianGrid3D& grid,
+    OwnerPreprocessStudyCase3D study_case,
+    int N,
+    OwnerMode3D mode)
+{
+    RestrictOwnerAccuracyComparison3D result;
+    result.accuracy.case_id = study_case.case_id;
+    result.accuracy.geometry = study_case.geometry;
+    result.accuracy.pose = study_case.pose;
+    result.accuracy.N = N;
+    result.accuracy.h = grid.spacing()[0];
+    result.accuracy.mode =
+        app3d::restrict_owner_preprocess_mode_name_3d(mode);
+    return result;
+}
+
+void accumulate_owner_accuracy_sample_3d(
+    RestrictOwnerAccuracyComparison3D& result,
+    const SurfaceDofCloud& cloud,
+    const RestrictOwnerWorkloadSample3D& sample,
+    const RestrictOwnerTraceStencil3D& trace,
+    const RestrictOwnerPreparedTraceSample3D& candidate_sink)
+{
+    if (candidate_sink.decisions.size() != sample.oracle_nodes.size())
+        throw std::logic_error("candidate replay is incomplete");
+    for (std::size_t index = 0; index < sample.oracle_nodes.size(); ++index) {
+        const RestrictOwnerOracleNode3D& oracle = sample.oracle_nodes[index];
+        const RestrictOwnerStagedDecision3D& candidate =
+            candidate_sink.decisions[index];
+        const std::size_t slot = oracle.slot;
+        if (candidate.slot != oracle.slot)
+            throw std::logic_error("candidate replay slot mismatch");
+        result.accuracy.query_count += 1;
+        const bool oracle_foreign = oracle.owner_class
+            == OwnerClass3D::UniqueForeign;
+        const bool candidate_foreign = candidate.owner_class
+            == OwnerClass3D::UniqueForeign;
+        if (oracle_foreign)
+            result.accuracy.oracle_foreign += 1;
+        else
+            result.accuracy.oracle_target += 1;
+        if (oracle_foreign and candidate_foreign
+            and oracle.owner_dof == candidate.owner_dof) {
+            result.accuracy.foreign_true_positive += 1;
+        } else if (oracle_foreign and candidate_foreign) {
+            result.accuracy.foreign_wrong_owner += 1;
+        } else if (oracle_foreign) {
+            result.accuracy.foreign_false_negative += 1;
+        } else if (candidate_foreign) {
+            result.accuracy.foreign_false_positive += 1;
+        }
+        if (oracle.legacy_decision_kind.has_value()
+            and candidate.legacy_decision_kind >= 0
+            and oracle.legacy_decision_kind.value()
+                not_eq static_cast<app3d::RestrictOwnerDecisionKind3D>(
+                    candidate.legacy_decision_kind)) {
+            result.accuracy.legacy_reason_mismatch += 1;
+        }
+        if (oracle.owner_dof not_eq candidate.owner_dof) {
+            result.accuracy.owner_mismatch += 1;
+            result.accuracy.max_mismatched_abs_weight = std::max(
+                result.accuracy.max_mismatched_abs_weight,
+                std::abs(trace.weights[slot]));
+            PreprocessMismatchRow3D mismatch;
+            mismatch.case_id = result.accuracy.case_id;
+            mismatch.geometry = result.accuracy.geometry;
+            mismatch.pose = result.accuracy.pose;
+            mismatch.mode = result.accuracy.mode;
+            mismatch.N = result.accuracy.N;
+            mismatch.h = result.accuracy.h;
+            mismatch.target_dof = sample.target_dof;
+            mismatch.target_patch = cloud.dofs[
+                static_cast<std::size_t>(sample.target_dof)].patch_id;
+            mismatch.side = sample.side;
+            mismatch.layer = sample.layer;
+            mismatch.grid_node = trace.grid_nodes[slot];
+            mismatch.weight = trace.weights[slot];
+            mismatch.query = sample.query;
+            mismatch.support = trace.owner_input.support_points[slot];
+            mismatch.oracle_owner_dof = oracle.owner_dof;
+            mismatch.candidate_owner_dof = candidate.owner_dof;
+            mismatch.oracle_owner_patch = cloud.dofs[
+                static_cast<std::size_t>(oracle.owner_dof)].patch_id;
+            mismatch.candidate_owner_patch = cloud.dofs[
+                static_cast<std::size_t>(candidate.owner_dof)].patch_id;
+            mismatch.oracle_class = owner_class_name_3d(
+                oracle.owner_class);
+            mismatch.candidate_class = owner_class_name_3d(
+                candidate.owner_class);
+            mismatch.candidate_path = owner_path_name_3d(
+                candidate.query_path);
+            mismatch.oracle_crossing_patch = oracle.crossing_patch;
+            if (candidate.foreign_crossing_index >= 0) {
+                mismatch.candidate_crossing_patch =
+                    candidate_sink.foreign_crossings[
+                        static_cast<std::size_t>(
+                            candidate.foreign_crossing_index)].patch_index;
+            }
+            result.mismatches.push_back(std::move(mismatch));
+        }
+    }
+}
+
+void finalize_owner_accuracy_comparison_3d(
+    RestrictOwnerAccuracyComparison3D& result)
+{
+    const std::uint64_t precision_denominator =
+        result.accuracy.foreign_true_positive
+        + result.accuracy.foreign_false_positive
+        + result.accuracy.foreign_wrong_owner;
+    const std::uint64_t recall_denominator =
+        result.accuracy.foreign_true_positive
+        + result.accuracy.foreign_false_negative
+        + result.accuracy.foreign_wrong_owner;
+    result.accuracy.foreign_precision = precision_denominator == 0
+        ? 1.0
+        : static_cast<double>(result.accuracy.foreign_true_positive)
+          / static_cast<double>(precision_denominator);
+    result.accuracy.foreign_recall = recall_denominator == 0
+        ? 1.0
+        : static_cast<double>(result.accuracy.foreign_true_positive)
+          / static_cast<double>(recall_denominator);
+    result.accuracy.pass = result.accuracy.owner_mismatch == 0
+        and result.accuracy.foreign_false_positive == 0
+        and result.accuracy.foreign_false_negative == 0
+        and result.accuracy.foreign_wrong_owner == 0;
+}
+
+std::uint64_t restrict_owner_oracle_query_count_3d(
+    const RestrictOwnerWorkload3D& workload)
+{
+    return std::accumulate(
+        workload.begin(), workload.end(), std::uint64_t{0},
+        [](std::uint64_t count, const RestrictOwnerWorkloadSample3D& sample) {
+            return count
+                + static_cast<std::uint64_t>(sample.oracle_nodes.size());
+        });
+}
+
+RestrictOwnerReplayResult3D replay_restrict_owner_workload_3d(
+    const CartesianGrid3D& grid,
+    const GridPair3D& grid_pair,
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud& cloud,
+    const RestrictOwnerWorkload3D& workload,
+    OwnerMode3D mode,
+    app3d::RestrictOwnerPreprocessOptions3D options,
+    bool measure_benchmark,
+    const OwnerPreprocessStudyCase3D* study_case = nullptr,
+    int N = 0)
+{
+    RestrictOwnerReplayResult3D result;
+    if (study_case != nullptr) {
+        result.comparison = make_owner_accuracy_comparison_3d(
+            grid, *study_case, N, mode);
+    }
+    const std::uint64_t expected_queries =
+        restrict_owner_oracle_query_count_3d(workload);
+    RestrictOwnerPreparedTraceSample3D candidate_sink;
+    candidate_sink.decisions.reserve(64);
+    candidate_sink.foreign_crossings.reserve(64);
+    std::unique_ptr<WorkingSetPeakSampler3D> memory_sampler;
+    if (measure_benchmark) {
+        memory_sampler = std::make_unique<WorkingSetPeakSampler3D>();
+        memory_sampler->resume();
+        memory_sampler->checkpoint();
+    }
+    std::unique_ptr<app3d::RestrictOwnerGeometryPreprocessor3D>
+        preprocessor;
+    try {
+        const auto construction_start =
+            std::chrono::steady_clock::now();
+        preprocessor = std::make_unique<
+            app3d::RestrictOwnerGeometryPreprocessor3D>(
+                surface, cloud, grid.spacing()[0], mode, options);
+        const auto construction_end =
+            std::chrono::steady_clock::now();
+        if (measure_benchmark) {
+            memory_sampler->checkpoint();
+            memory_sampler->pause();
+            result.construction_seconds =
+                std::chrono::duration<double>(
+                    construction_end - construction_start).count();
+        }
+    } catch (...) {
+        if (memory_sampler != nullptr)
+            memory_sampler->pause();
+        throw;
+    }
+    for (const RestrictOwnerWorkloadSample3D& sample : workload) {
+        candidate_sink.target_dof = sample.target_dof;
+        candidate_sink.side = sample.side;
+        candidate_sink.layer = sample.layer;
+        candidate_sink.query = sample.query;
+        candidate_sink.lower_stencil_index = sample.lower_stencil_index;
+        candidate_sink.wrong_side_mask = sample.wrong_side_mask;
+        prepare_restrict_owner_result_sink_3d(candidate_sink);
+        if (measure_benchmark) {
+            result.query_seconds += run_restrict_owner_timed_sample_3d(
+                grid, *preprocessor, candidate_sink,
+                memory_sampler.get());
+        } else {
+            run_restrict_owner_sample_core_3d(
+                grid, *preprocessor, candidate_sink);
+        }
+        restrict_owner_fingerprint_append(
+            result.output_digest, candidate_sink.output_digest);
+        if (result.comparison.has_value()) {
+            const RestrictOwnerTraceStencil3D trace =
+                build_restrict_owner_trace_stencil_3d(
+                    grid, grid_pair, sample.target_dof,
+                    sample.side == 0, sample.query,
+                    sample.lower_stencil_index);
+            std::uint64_t trace_mask = 0;
+            for (std::size_t slot = 0; slot < 64; ++slot) {
+                if (trace.owner_input.wrong_side[slot]) {
+                    trace_mask |= UINT64_C(1)
+                        << static_cast<unsigned>(slot);
+                }
+            }
+            if (trace_mask != sample.wrong_side_mask)
+                throw std::logic_error(
+                    "candidate replay seed mask mismatch");
+            accumulate_owner_accuracy_sample_3d(
+                result.comparison.value(), cloud, sample, trace,
+                candidate_sink);
+        }
+    }
+    if (measure_benchmark) {
+        memory_sampler->finish();
+        result.peak_working_set_bytes = memory_sampler->peak_bytes();
+        result.max_active_increase_bytes =
+            memory_sampler->max_active_increase_bytes();
+    }
+    result.diagnostics = preprocessor->diagnostics();
+    validate_restrict_owner_preprocess_diagnostics(
+        result.diagnostics, expected_queries);
+    if (result.comparison.has_value()) {
+        if (result.comparison->accuracy.query_count != expected_queries)
+            throw std::logic_error("candidate comparison query count mismatch");
+        finalize_owner_accuracy_comparison_3d(
+            result.comparison.value());
+    }
+    return result;
+}
+
+void write_owner_study_checkpoints_3d(
+    const std::filesystem::path& output_dir,
+    const OwnerPreprocessStudyRows3D& rows)
+{
+    std::filesystem::create_directories(output_dir);
+    std::ofstream timing = open_output_file(
+        output_dir / "preprocess_timing_repeats.csv");
+    timing << std::setprecision(17)
+        << "case_id,geometry,pose,N,h,mode,repetition,run_order,"
+           "wrong_side_queries,construction_seconds,query_seconds,"
+           "total_preprocess_seconds,queries_per_second,"
+           "peak_working_set_bytes,working_set_increase_bytes"
+        << std::endl;
+    for (const auto& row : rows.timing) {
+        timing << row.case_id << ',' << row.geometry << ',' << row.pose << ','
+               << row.N << ',' << row.h << ',' << row.mode << ','
+               << row.repetition << ',' << row.run_order << ','
+               << row.wrong_side_queries << ',' << row.construction_seconds
+               << ',' << row.query_seconds << ','
+               << row.total_preprocess_seconds << ','
+               << row.queries_per_second << ','
+               << row.peak_working_set_bytes << ','
+               << row.working_set_increase_bytes << '\n';
+    }
+    std::ofstream summary = open_output_file(
+        output_dir / "preprocess_summary.csv");
+    summary << std::setprecision(17)
+        << "case_id,geometry,pose,N,h,mode,repetitions,wrong_side_queries,"
+           "construction_seconds_median,query_seconds_median,"
+           "query_seconds_p95,total_seconds_median,total_seconds_p95,"
+           "queries_per_second_median,speedup_vs_full,"
+           "peak_working_set_bytes_max,accepted" << std::endl;
+    for (const auto& row : rows.summary) {
+        summary << row.case_id << ',' << row.geometry << ',' << row.pose << ','
+                << row.N << ',' << row.h << ',' << row.mode << ','
+                << row.repetitions << ',' << row.wrong_side_queries << ','
+                << row.construction_seconds_median << ','
+                << row.query_seconds_median << ',' << row.query_seconds_p95
+                << ',' << row.total_seconds_median << ','
+                << row.total_seconds_p95 << ','
+                << row.queries_per_second_median << ',' << row.speedup_vs_full
+                << ',' << row.peak_working_set_bytes_max << ','
+                << row.accepted << '\n';
+    }
+    std::ofstream accuracy = open_output_file(
+        output_dir / "preprocess_accuracy.csv");
+    accuracy << std::setprecision(17)
+        << "case_id,geometry,pose,N,h,mode,query_count,oracle_target,"
+           "oracle_foreign,owner_mismatch,foreign_true_positive,"
+           "foreign_false_positive,foreign_false_negative,"
+           "foreign_wrong_owner,foreign_precision,foreign_recall,"
+           "max_mismatched_abs_weight,max_owner_correction_abs_difference,"
+           "legacy_reason_mismatch,pass" << std::endl;
+    for (const auto& row : rows.accuracy) {
+        accuracy << row.case_id << ',' << row.geometry << ',' << row.pose << ','
+                 << row.N << ',' << row.h << ',' << row.mode << ','
+                 << row.query_count << ',' << row.oracle_target << ','
+                 << row.oracle_foreign << ',' << row.owner_mismatch << ','
+                 << row.foreign_true_positive << ','
+                 << row.foreign_false_positive << ','
+                 << row.foreign_false_negative << ','
+                 << row.foreign_wrong_owner << ',' << row.foreign_precision
+                 << ',' << row.foreign_recall << ','
+                 << row.max_mismatched_abs_weight << ','
+                 << row.max_owner_correction_abs_difference << ','
+                 << row.legacy_reason_mismatch << ',' << row.pass << '\n';
+    }
+    std::ofstream paths = open_output_file(
+        output_dir / "preprocess_path_counts.csv");
+    paths << std::setprecision(17)
+        << "case_id,geometry,pose,N,h,mode,path,count,fraction,"
+           "compatible_aabb_candidates,foreign_aabb_candidates,"
+           "control_hull_rejections,closest_attempts,closest_converged,"
+           "closest_iterations,closest_certified_misses,"
+           "closest_certified_roots,closest_unresolved,optimized_calls,"
+           "full_fallback_calls,region_seconds,closest_seconds,"
+           "optimized_seconds,full_fallback_seconds" << std::endl;
+    for (const auto& row : rows.paths) {
+        const auto& d = row.diagnostics;
+        paths << row.case_id << ',' << row.geometry << ',' << row.pose << ','
+              << row.N << ',' << row.h << ',' << row.mode << ',' << row.path
+              << ',' << row.count << ',' << row.fraction << ','
+              << d.compatible_aabb_candidates << ','
+              << d.foreign_aabb_candidates << ','
+              << d.control_hull_rejections << ','
+              << d.closest_point_attempts << ',' << d.closest_point_converged
+              << ',' << d.closest_point_iterations << ','
+              << d.closest_certified_misses << ','
+              << d.closest_certified_roots << ',' << d.closest_unresolved
+              << ',' << d.optimized_intersection_calls << ','
+              << d.full_fallback_calls << ',' << d.region_seconds << ','
+              << d.closest_point_seconds << ','
+              << d.optimized_intersection_seconds << ','
+              << d.full_fallback_seconds << '\n';
+    }
+    std::ofstream mismatches = open_output_file(
+        output_dir / "preprocess_mismatches.csv");
+    mismatches << std::setprecision(17)
+        << "case_id,geometry,pose,N,h,mode,target_dof,target_patch,side,layer,"
+           "grid_node,weight,query_x,query_y,query_z,support_x,support_y,"
+           "support_z,oracle_owner_dof,oracle_owner_patch,"
+           "candidate_owner_dof,candidate_owner_patch,oracle_class,"
+           "candidate_class,candidate_path,oracle_crossing_patch,"
+           "candidate_crossing_patch" << std::endl;
+    for (const auto& row : rows.mismatches) {
+        mismatches << row.case_id << ',' << row.geometry << ',' << row.pose
+                   << ',' << row.N << ',' << row.h << ',' << row.mode << ','
+                   << row.target_dof << ',' << row.target_patch << ','
+                   << row.side << ',' << row.layer << ',' << row.grid_node
+                   << ',' << row.weight << ',' << row.query.x() << ','
+                   << row.query.y() << ',' << row.query.z() << ','
+                   << row.support.x() << ',' << row.support.y() << ','
+                   << row.support.z() << ',' << row.oracle_owner_dof << ','
+                   << row.oracle_owner_patch << ','
+                   << row.candidate_owner_dof << ','
+                   << row.candidate_owner_patch << ',' << row.oracle_class
+                   << ',' << row.candidate_class << ',' << row.candidate_path
+                   << ',' << row.oracle_crossing_patch << ','
+                   << row.candidate_crossing_patch << '\n';
+    }
+    std::ofstream numerical = open_output_file(
+        output_dir / "kfbi_numerical_results.csv");
+    numerical << std::setprecision(17)
+        << "case_id,geometry,pose,N,h,mode,dofs,preprocess_seconds,"
+           "pipeline_setup_seconds,pipeline_speedup_vs_full,solve_seconds,"
+           "converged,iterations,final_residual,operator_residual_linf,"
+           "exterior_condition_linf,boundary_residual_linf,"
+           "route_mismatch_linf,interior_linf,interior_order,"
+           "exact_grid_linf,exact_equation_linf,"
+           "interior_relative_difference_vs_full,"
+           "exact_grid_relative_difference_vs_full,"
+           "exact_equation_relative_difference_vs_full,"
+           "geometry_queries_before_gmres,geometry_queries_after_gmres,pass"
+        << std::endl;
+    for (const auto& row : rows.numerical) {
+        numerical << row.case_id << ',' << row.geometry << ',' << row.pose
+                  << ',' << row.N << ',' << row.h << ',' << row.mode << ','
+                  << row.dofs << ',' << row.preprocess_seconds << ','
+                  << row.pipeline_setup_seconds << ','
+                  << row.pipeline_speedup_vs_full << ',' << row.solve.seconds
+                  << ',' << row.solve.converged << ',' << row.solve.iterations
+                  << ',' << row.solve.gmres_relative_residual << ','
+                  << row.solve.operator_residual_linf << ','
+                  << row.solve.exterior_condition_linf << ','
+                  << row.solve.boundary_residual_linf << ','
+                  << row.solve.route_mismatch_linf << ','
+                  << row.solve.interior_linf << ',' << row.interior_order << ','
+                  << row.exact_grid_linf << ',' << row.exact_equation_linf
+                  << ',' << row.interior_relative_difference_vs_full << ','
+                  << row.exact_grid_relative_difference_vs_full << ','
+                  << row.exact_equation_relative_difference_vs_full << ','
+                  << row.geometry_queries_before_gmres << ','
+                  << row.geometry_queries_after_gmres << ',' << row.pass
+                  << '\n';
+    }
+}
+
+struct OwnerNumericalEvaluation3D {
+    SolveMetrics3D solve;
+    double exact_grid_linf = 0.0;
+    double exact_equation_linf = 0.0;
+    std::uint64_t geometry_queries_before_gmres = 0;
+    std::uint64_t geometry_queries_after_gmres = 0;
+};
+
+OwnerNumericalEvaluation3D evaluate_owner_pipeline_numerics_3d(
+    const CartesianGrid3D& grid,
+    const GridPair3D& grid_pair,
+    const PanelCenterHarmonicJetKFBI3D& pipeline,
+    const app3d::RigidTransform3D& transform,
+    int gmres_max_iterations)
+{
+    const int size = pipeline.surface_size();
+    Eigen::VectorXd value_data(size), exact_normal(size);
+    for (int q = 0; q < size; q += 1) {
+        const SurfaceDof& dof = pipeline.surface().dofs[
+            static_cast<std::size_t>(q)];
+        value_data[q] = app3d::transformed_manufactured_harmonic_value_3d(
+            transform, dof.point);
+        exact_normal[q] =
+            app3d::transformed_manufactured_harmonic_gradient_3d(
+                transform, dof.point).dot(dof.normal);
+    }
+    Eigen::VectorXd piecewise_exact(grid.num_dofs());
+    for (int node = 0; node < grid.num_dofs(); node += 1) {
+        const double value =
+            app3d::transformed_manufactured_harmonic_value_3d(
+                transform, grid_point(grid, node));
+        piecewise_exact[node] = grid_pair.domain_label(node) > 0
+            ? value : 0.0;
+    }
+    const HarmonicJetField3D field = pipeline.field_from_grid_and_jumps(
+        piecewise_exact, value_data, exact_normal);
+    const auto restrict_mode =
+        ExteriorNormalRestrictMode3D::JointTricubicCrossingOwner;
+    const Eigen::VectorXd exact_grid = pipeline.exterior_normal_trace(
+        field, value_data, exact_normal, restrict_mode);
+    ExteriorNormalTraceOperator3D op(pipeline, restrict_mode);
+    Eigen::VectorXd applied;
+    op.apply(exact_normal, applied);
+    const Eigen::VectorXd exact_equation =
+        applied - op.right_hand_side(value_data);
+
+    OwnerNumericalEvaluation3D result;
+    result.exact_grid_linf = vector_linf(exact_grid);
+    result.exact_equation_linf = vector_linf(exact_equation);
+    const auto before = pipeline.restrict_owner_preprocess_diagnostics();
+    result.geometry_queries_before_gmres =
+        pipeline.restrict_owner_geometry_query_count();
+    result.solve = run_dirichlet_normal_case(
+        grid, grid_pair, pipeline, transform, gmres_max_iterations,
+        restrict_mode);
+    const auto after = pipeline.restrict_owner_preprocess_diagnostics();
+    result.geometry_queries_after_gmres =
+        pipeline.restrict_owner_geometry_query_count();
+    if (restrict_owner_preprocess_diagnostics_equal(before, after) == false)
+        throw std::logic_error("GMRES changed owner preprocessing diagnostics");
+    return result;
+}
+
+void append_owner_path_rows_3d(
+    OwnerPreprocessStudyRows3D& rows,
+    OwnerPreprocessStudyCase3D study_case,
+    int N,
+    double h,
+    OwnerMode3D mode,
+    app3d::RestrictOwnerPreprocessDiagnostics3D diagnostics)
+{
+    const std::string mode_name =
+        app3d::restrict_owner_preprocess_mode_name_3d(mode);
+    for (std::size_t index = 0;
+         index not_eq diagnostics.path_counts.size(); index += 1) {
+        PreprocessPathCountRow3D row;
+        row.case_id = study_case.case_id;
+        row.geometry = study_case.geometry;
+        row.pose = study_case.pose;
+        row.mode = mode_name;
+        row.N = N;
+        row.h = h;
+        row.path = owner_path_name_3d(static_cast<OwnerPath3D>(index));
+        row.count = diagnostics.path_counts[index];
+        row.fraction = diagnostics.wrong_side_queries == 0 ? 0.0
+            : static_cast<double>(row.count)
+              / static_cast<double>(diagnostics.wrong_side_queries);
+        row.diagnostics = diagnostics;
+        rows.paths.push_back(std::move(row));
+    }
+    for (std::size_t index = 1;
+         index not_eq diagnostics.fallback_counts.size(); index += 1) {
+        PreprocessPathCountRow3D row;
+        row.case_id = study_case.case_id;
+        row.geometry = study_case.geometry;
+        row.pose = study_case.pose;
+        row.mode = mode_name;
+        row.N = N;
+        row.h = h;
+        row.path = "full_intersection_fallback:"
+            + owner_fallback_name_3d(static_cast<OwnerFallback3D>(index));
+        row.count = diagnostics.fallback_counts[index];
+        row.fraction = diagnostics.wrong_side_queries == 0 ? 0.0
+            : static_cast<double>(row.count)
+              / static_cast<double>(diagnostics.wrong_side_queries);
+        row.diagnostics = diagnostics;
+        rows.paths.push_back(std::move(row));
+    }
+}
+
+void append_owner_summary_row_3d(
+    OwnerPreprocessStudyRows3D& rows,
+    OwnerPreprocessStudyCase3D study_case,
+    int N,
+    double h,
+    OwnerMode3D mode,
+    bool accepted,
+    double full_total_median)
+{
+    const std::string mode_name =
+        app3d::restrict_owner_preprocess_mode_name_3d(mode);
+    std::vector<double> construction, query, total, throughput;
+    std::uint64_t queries = 0, peak = 0;
+    for (const auto& timing : rows.timing) {
+        if (timing.case_id == study_case.case_id
+            and timing.N == N and timing.mode == mode_name) {
+            construction.push_back(timing.construction_seconds);
+            query.push_back(timing.query_seconds);
+            total.push_back(timing.total_preprocess_seconds);
+            throughput.push_back(timing.queries_per_second);
+            queries = timing.wrong_side_queries;
+            peak = std::max(peak, timing.peak_working_set_bytes);
+        }
+    }
+    if (total.empty())
+        throw std::logic_error("missing owner timing rows");
+    PreprocessSummaryRow3D row;
+    row.case_id = study_case.case_id;
+    row.geometry = study_case.geometry;
+    row.pose = study_case.pose;
+    row.mode = mode_name;
+    row.N = N;
+    row.h = h;
+    row.repetitions = static_cast<int>(total.size());
+    row.wrong_side_queries = queries;
+    row.construction_seconds_median = sorted_median_3d(construction);
+    row.query_seconds_median = sorted_median_3d(query);
+    row.query_seconds_p95 = sorted_nearest_rank_p95_3d(query);
+    row.total_seconds_median = sorted_median_3d(total);
+    row.total_seconds_p95 = sorted_nearest_rank_p95_3d(total);
+    row.queries_per_second_median = sorted_median_3d(throughput);
+    row.speedup_vs_full = full_total_median / row.total_seconds_median;
+    row.peak_working_set_bytes_max = peak;
+    row.accepted = accepted;
+    rows.summary.push_back(std::move(row));
+}
+
+void append_owner_timing_row_3d(
+    OwnerPreprocessStudyRows3D& rows,
+    OwnerPreprocessStudyCase3D study_case,
+    int N,
+    OwnerMode3D mode,
+    int repetition,
+    int run_order,
+    std::uint64_t queries,
+    double construction_seconds,
+    double query_seconds,
+    std::uint64_t peak_bytes,
+    std::uint64_t max_active_increase_bytes)
+{
+    PreprocessTimingRepeatRow3D row;
+    row.case_id = study_case.case_id;
+    row.geometry = study_case.geometry;
+    row.pose = study_case.pose;
+    row.mode = app3d::restrict_owner_preprocess_mode_name_3d(mode);
+    row.N = N;
+    row.h = kBoxSide / static_cast<double>(N);
+    row.repetition = repetition;
+    row.run_order = run_order;
+    row.wrong_side_queries = queries;
+    row.construction_seconds = construction_seconds;
+    row.query_seconds = query_seconds;
+    row.total_preprocess_seconds = construction_seconds + query_seconds;
+    row.queries_per_second = query_seconds > 0.0
+        ? static_cast<double>(queries) / query_seconds : 0.0;
+    row.peak_working_set_bytes = peak_bytes;
+    row.working_set_increase_bytes =
+        max_active_increase_bytes;
+    rows.timing.push_back(std::move(row));
+}
+
+KfbiNumericalResultRow3D make_owner_numerical_row_3d(
+    OwnerPreprocessStudyCase3D study_case,
+    int N,
+    OwnerMode3D mode,
+    const CartesianGrid3D& grid,
+    const GridPair3D& grid_pair,
+    const PanelCenterHarmonicJetKFBI3D& pipeline,
+    double preprocess_seconds,
+    double pipeline_setup_seconds,
+    double full_pipeline_setup_seconds,
+    int gmres_max_iterations)
+{
+    const OwnerNumericalEvaluation3D evaluated =
+        evaluate_owner_pipeline_numerics_3d(
+            grid, grid_pair, pipeline, study_case.transform,
+            gmres_max_iterations);
+    KfbiNumericalResultRow3D row;
+    row.case_id = study_case.case_id;
+    row.geometry = study_case.geometry;
+    row.pose = study_case.pose;
+    row.mode = app3d::restrict_owner_preprocess_mode_name_3d(mode);
+    row.N = N;
+    row.h = grid.spacing()[0];
+    row.dofs = pipeline.surface_size();
+    row.preprocess_seconds = preprocess_seconds;
+    row.pipeline_setup_seconds = pipeline_setup_seconds;
+    row.pipeline_speedup_vs_full =
+        full_pipeline_setup_seconds / pipeline_setup_seconds;
+    row.solve = evaluated.solve;
+    row.exact_grid_linf = evaluated.exact_grid_linf;
+    row.exact_equation_linf = evaluated.exact_equation_linf;
+    row.geometry_queries_before_gmres =
+        evaluated.geometry_queries_before_gmres;
+    row.geometry_queries_after_gmres =
+        evaluated.geometry_queries_after_gmres;
+    row.pass = row.solve.converged
+        and row.solve.gmres_relative_residual <= 2.0e-10
+        and row.geometry_queries_before_gmres
+            == row.geometry_queries_after_gmres;
+    return row;
+}
+
+void assign_owner_interior_order_3d(
+    KfbiNumericalResultRow3D& row,
+    const std::vector<KfbiNumericalResultRow3D>& previous_rows)
+{
+    const KfbiNumericalResultRow3D* previous = nullptr;
+    for (const auto& candidate : previous_rows) {
+        if (candidate.case_id == row.case_id and candidate.mode == row.mode
+            and candidate.N < row.N
+            and (previous == nullptr or candidate.N > previous->N)) {
+            previous = std::addressof(candidate);
+        }
+    }
+    if (previous != nullptr) {
+        row.interior_order = observed_order(
+            previous->solve.interior_linf, row.solve.interior_linf,
+            previous->h, row.h);
+    }
+}
+
+bool run_owner_preprocess_case_3d(
+    OwnerPreprocessStudyCase3D study_case,
+    int N,
+    int gmres_max_iterations,
+    OwnerPreprocessStudyRows3D& rows)
+{
+    const double h = kBoxSide / static_cast<double>(N);
+    CartesianGrid3D grid({kBoxMin, kBoxMin, kBoxMin},
+                         {h, h, h}, {N, N, N}, DofLayout3D::Node);
+    GeometryBundle geometry = make_geometry(
+        study_case.kind, h, study_case.transform);
+    const auto domain = std::make_shared<const
+        geometry3d::NurbsCartesianDomain3D>(
+            grid, geometry.native_surface.geometry_model());
+    const SurfaceDofCloud surface_dofs =
+        app3d::make_native_surface_dofs_3d(geometry.native_surface, h);
+    validate_surface_dofs(surface_dofs, h);
+    const CauchyStencilSet cauchy_stencils = build_cauchy_stencils(
+        geometry.native_surface, surface_dofs, h,
+        kCauchyValueNeighborCount, kCauchyDerivativeNeighborCount,
+        CauchyStencilPolicy3D::G1Nearest);
+    GridPair3D grid_pair(grid, geometry.correction_interface,
+                         geometry.crossing_interface, domain);
+    for (int node = 0; node < grid.num_dofs(); node += 1) {
+        const bool numerical_inside = grid_pair.domain_label(node) > 0;
+        if (numerical_inside
+            not_eq geometry.exact_inside(grid_point(grid, node))) {
+            throw std::runtime_error("owner study native NURBS label mismatch");
+        }
+    }
+
+    RestrictOwnerWorkload3D workload;
+    RestrictOwnerPipelinePreprocessTiming3D full_preprocess_timing;
+    const auto full_pipeline_start = std::chrono::steady_clock::now();
+    PanelCenterHarmonicJetKFBI3D full_pipeline(
+        grid, grid_pair, geometry.native_surface,
+        geometry.correction_triangles, geometry.geometry_triangles,
+        surface_dofs, cauchy_stencils, false,
+        OwnerMode3D::FullIntersectionReference, nullptr, &workload,
+        &full_preprocess_timing);
+    const double full_pipeline_wall_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - full_pipeline_start).count();
+    const double full_pipeline_seconds =
+        production_pipeline_setup_seconds_3d(
+            full_pipeline_wall_seconds, full_preprocess_timing);
+    const auto full_diagnostics =
+        full_pipeline.restrict_owner_preprocess_diagnostics();
+    if (workload.empty())
+        throw std::logic_error("owner study captured an empty workload");
+    const std::uint64_t expected_queries =
+        restrict_owner_oracle_query_count_3d(workload);
+    validate_restrict_owner_preprocess_diagnostics(
+        full_diagnostics, expected_queries);
+    if (full_pipeline.restrict_owner_geometry_query_count()
+        != expected_queries) {
+        throw std::logic_error(
+            "full pipeline geometry query count mismatch");
+    }
+    append_owner_timing_row_3d(
+        rows, study_case, N, OwnerMode3D::FullIntersectionReference,
+        0, 0, full_diagnostics.wrong_side_queries,
+        full_preprocess_timing.construction_seconds,
+        full_preprocess_timing.query_seconds,
+        full_preprocess_timing.peak_working_set_bytes,
+        full_preprocess_timing.max_active_increase_bytes);
+    const std::array<OwnerMode3D, 2> candidates{{
+        OwnerMode3D::OptimizedIntersection,
+        OwnerMode3D::RegionClosestHybrid}};
+    std::array<std::uint64_t, 2> candidate_output_digests{};
+    for (std::size_t index = 0; index < candidates.size(); ++index) {
+        const RestrictOwnerReplayResult3D warmup =
+            replay_restrict_owner_workload_3d(
+            grid, grid_pair, geometry.native_surface, surface_dofs,
+            workload, candidates[index], {}, false);
+        candidate_output_digests[index] = warmup.output_digest;
+    }
+    const int repetitions = owner_candidate_repetitions_3d(N);
+    for (int repetition = 0; repetition < repetitions; repetition += 1) {
+        std::array<OwnerMode3D, 2> order = candidates;
+        if (repetition % 2 == 1)
+            std::reverse(order.begin(), order.end());
+        for (int position = 0; position < 2; position += 1) {
+            const OwnerMode3D mode = order[static_cast<std::size_t>(position)];
+            const RestrictOwnerReplayResult3D replay =
+                replay_restrict_owner_workload_3d(
+                    grid, grid_pair, geometry.native_surface, surface_dofs,
+                    workload, mode, {}, true);
+            const std::size_t mode_index = mode == candidates[0] ? 0 : 1;
+            if (replay.output_digest
+                != candidate_output_digests[mode_index]) {
+                throw std::logic_error(
+                    "candidate timed replay output is nondeterministic");
+            }
+            append_owner_timing_row_3d(
+                rows, study_case, N, mode, repetition,
+                repetition * 2 + position + 1,
+                replay.diagnostics.wrong_side_queries,
+                replay.construction_seconds, replay.query_seconds,
+                replay.peak_working_set_bytes,
+                replay.max_active_increase_bytes);
+        }
+    }
+    std::array<bool, 2> candidate_pass{{false, false}};
+    std::array<std::size_t, 2> accuracy_row_indices{};
+    for (std::size_t index = 0; index not_eq candidates.size(); index += 1) {
+        app3d::RestrictOwnerPreprocessOptions3D instrumented_options;
+        instrumented_options.collect_stage_timings = true;
+        RestrictOwnerReplayResult3D replay =
+            replay_restrict_owner_workload_3d(
+                grid, grid_pair, geometry.native_surface, surface_dofs,
+                workload, candidates[index], instrumented_options, false,
+                std::addressof(study_case), N);
+        if (!replay.comparison.has_value())
+            throw std::logic_error("instrumented replay omitted accuracy");
+        if (replay.output_digest != candidate_output_digests[index])
+            throw std::logic_error(
+                "candidate instrumented replay output is nondeterministic");
+        RestrictOwnerAccuracyComparison3D comparison =
+            std::move(replay.comparison.value());
+        candidate_pass[index] = comparison.accuracy.pass;
+        accuracy_row_indices[index] = rows.accuracy.size();
+        rows.accuracy.push_back(std::move(comparison.accuracy));
+        rows.mismatches.insert(
+            rows.mismatches.end(),
+            std::make_move_iterator(comparison.mismatches.begin()),
+            std::make_move_iterator(comparison.mismatches.end()));
+        append_owner_path_rows_3d(
+            rows, study_case, N, h, candidates[index], replay.diagnostics);
+    }
+    append_owner_path_rows_3d(
+        rows, study_case, N, h, OwnerMode3D::FullIntersectionReference,
+        full_diagnostics);
+    const double full_total = full_preprocess_timing.construction_seconds
+                            + full_preprocess_timing.query_seconds;
+    const bool numerical_gate_required = N >= 32;
+    const std::size_t full_summary_row_index = rows.summary.size();
+    append_owner_summary_row_3d(
+        rows, study_case, N, h, OwnerMode3D::FullIntersectionReference,
+        !numerical_gate_required, full_total);
+    std::array<std::size_t, 2> candidate_summary_row_indices{};
+    for (std::size_t index = 0; index not_eq candidates.size(); index += 1) {
+        candidate_summary_row_indices[index] = rows.summary.size();
+        append_owner_summary_row_3d(
+            rows, study_case, N, h, candidates[index],
+            !numerical_gate_required && candidate_pass[index], full_total);
+    }
+    const bool all_candidates_pass = candidate_pass[0] and candidate_pass[1];
+    if (N < 32 or all_candidates_pass == false)
+        return all_candidates_pass;
+    RestrictOwnerWorkload3D{}.swap(workload);
+    KfbiNumericalResultRow3D full_numerical = make_owner_numerical_row_3d(
+        study_case, N, OwnerMode3D::FullIntersectionReference,
+        grid, grid_pair, full_pipeline, full_total, full_pipeline_seconds,
+        full_pipeline_seconds, gmres_max_iterations);
+    assign_owner_interior_order_3d(full_numerical, rows.numerical);
+    const KfbiNumericalResultRow3D full_reference_numerical = full_numerical;
+    rows.numerical.push_back(std::move(full_numerical));
+    rows.summary[full_summary_row_index].accepted =
+        full_reference_numerical.pass;
+    bool numerical_pass = full_reference_numerical.pass;
+    const double correction_tolerance =
+        64.0 * std::numeric_limits<double>::epsilon()
+        * std::max(1.0, full_pipeline.restrict_owner_correction_linf());
+    for (std::size_t index = 0; index not_eq candidates.size(); index += 1) {
+        RestrictOwnerPipelinePreprocessTiming3D candidate_preprocess_timing;
+        const auto pipeline_start = std::chrono::steady_clock::now();
+        PanelCenterHarmonicJetKFBI3D candidate_pipeline(
+            grid, grid_pair, geometry.native_surface,
+            geometry.correction_triangles, geometry.geometry_triangles,
+            surface_dofs, cauchy_stencils, false, candidates[index], nullptr,
+            nullptr, &candidate_preprocess_timing);
+        const double pipeline_wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - pipeline_start).count();
+        const double pipeline_seconds =
+            production_pipeline_setup_seconds_3d(
+                pipeline_wall_seconds, candidate_preprocess_timing);
+        if (candidate_preprocess_timing.output_digest
+            != candidate_output_digests[index]) {
+            throw std::logic_error(
+                "candidate pipeline output is nondeterministic");
+        }
+        if (candidate_pipeline.restrict_owner_workload_fingerprint()
+            not_eq full_pipeline.restrict_owner_workload_fingerprint()) {
+            throw std::logic_error("owner pipeline workload fingerprint mismatch");
+        }
+        const double correction_difference =
+            full_pipeline.restrict_owner_correction_linf_difference(
+                candidate_pipeline);
+        PreprocessAccuracyRow3D& accuracy = rows.accuracy[
+            accuracy_row_indices[index]];
+        accuracy.max_owner_correction_abs_difference = correction_difference;
+        accuracy.pass = accuracy.pass
+            and correction_difference <= correction_tolerance;
+        const double preprocess_seconds =
+            candidate_preprocess_timing.construction_seconds
+            + candidate_preprocess_timing.query_seconds;
+        KfbiNumericalResultRow3D numerical = make_owner_numerical_row_3d(
+            study_case, N, candidates[index], grid, grid_pair,
+            candidate_pipeline, preprocess_seconds, pipeline_seconds,
+            full_pipeline_seconds, gmres_max_iterations);
+        assign_owner_interior_order_3d(numerical, rows.numerical);
+        numerical.interior_relative_difference_vs_full =
+            symmetric_relative_difference_3d(
+                numerical.solve.interior_linf,
+                full_reference_numerical.solve.interior_linf);
+        numerical.exact_grid_relative_difference_vs_full =
+            symmetric_relative_difference_3d(
+                numerical.exact_grid_linf,
+                full_reference_numerical.exact_grid_linf);
+        numerical.exact_equation_relative_difference_vs_full =
+            symmetric_relative_difference_3d(
+                numerical.exact_equation_linf,
+                full_reference_numerical.exact_equation_linf);
+        numerical.pass = numerical.pass and accuracy.pass
+            and numerical.solve.converged
+                == full_reference_numerical.solve.converged
+            and numerical.solve.iterations
+                == full_reference_numerical.solve.iterations
+            and numerical.interior_relative_difference_vs_full <= 1.0e-12
+            and numerical.exact_grid_relative_difference_vs_full <= 1.0e-12
+            and numerical.exact_equation_relative_difference_vs_full
+                <= 1.0e-12;
+        if (std::isfinite(numerical.interior_order)
+            and std::isfinite(full_reference_numerical.interior_order)) {
+            numerical.pass = numerical.pass
+                and numerical.interior_order + 1.0e-12
+                    >= full_reference_numerical.interior_order;
+        }
+        numerical_pass = numerical_pass and numerical.pass;
+        rows.summary[candidate_summary_row_indices[index]].accepted =
+            numerical.pass;
+        rows.numerical.push_back(std::move(numerical));
+    }
+    return numerical_pass;
+}
+
+std::string owner_preprocess_failure_mode_3d(
+    const OwnerPreprocessStudyRows3D& rows,
+    const OwnerPreprocessStudyCase3D& study_case,
+    int N)
+{
+    for (auto row = rows.numerical.rbegin(); row != rows.numerical.rend();
+         ++row) {
+        if (row->case_id == study_case.case_id && row->N == N
+            && !row->pass) {
+            return row->mode;
+        }
+    }
+    for (auto row = rows.accuracy.rbegin(); row != rows.accuracy.rend();
+         ++row) {
+        if (row->case_id == study_case.case_id && row->N == N
+            && !row->pass) {
+            return row->mode;
+        }
+    }
+    return "unknown";
+}
+
+int run_owner_preprocess_study_3d(std::vector<int> levels)
+{
+    std::sort(levels.begin(), levels.end());
+    levels.erase(std::unique(levels.begin(), levels.end()), levels.end());
+    for (int N : levels) {
+        if (N < 16 or is_power_of_two(N) == false)
+            throw std::invalid_argument(
+                "owner-preprocess-study N must be a power of two and at least 16");
+        if (N > 128)
+            throw std::invalid_argument(
+                "owner-preprocess-study supports levels through 128");
+    }
+    const bool requests_128 = std::binary_search(
+        levels.begin(), levels.end(), 128);
+    if (requests_128) {
+        const bool has_32 = std::binary_search(levels.begin(), levels.end(), 32);
+        const bool has_64 = std::binary_search(levels.begin(), levels.end(), 64);
+        if (has_32 == false or has_64 == false)
+            throw std::invalid_argument(
+                "N=128 requires selected N=32 and N=64 accuracy gates");
+    }
+#ifdef KFBIM_APP_OUTPUT_DIR
+    std::filesystem::path output_dir =
+        std::filesystem::path(KFBIM_APP_OUTPUT_DIR)
+        / "restrict_owner_preprocess_study";
+#else
+    std::filesystem::path output_dir =
+        "output/restrict_owner_preprocess_study";
+#endif
+    const char* output_override = std::getenv(
+        "KFBIM_3D_RESTRICT_OWNER_STUDY_OUTPUT_DIR");
+    if (output_override != nullptr)
+        output_dir = output_override;
+    OwnerPreprocessStudyRows3D rows;
+    write_owner_study_checkpoints_3d(output_dir, rows);
+    const auto cases = owner_study_cases_3d();
+    const int gmres_max_iterations = positive_environment_integer(
+        "KFBIM_3D_GMRES_MAX_ITERATIONS", 160);
+    bool smaller_accuracy_pass = true;
+    bool completed_smaller_level = false;
+    for (int N : levels) {
+        if (N == 128
+            and (completed_smaller_level == false
+                 or smaller_accuracy_pass == false)) {
+            std::cerr << "error: N=128 blocked by smaller accuracy gate" << '\n';
+            return 1;
+        }
+        for (const auto& study_case : cases) {
+            if (owner_case_selected_for_level_3d(study_case, N) == false)
+                continue;
+            std::cout << "[owner-preprocess-study] case="
+                      << study_case.case_id << " N=" << N << '\n';
+            const bool pass = run_owner_preprocess_case_3d(
+                study_case, N, gmres_max_iterations, rows);
+            write_owner_study_checkpoints_3d(output_dir, rows);
+            if (N < 128) {
+                completed_smaller_level = true;
+                smaller_accuracy_pass = smaller_accuracy_pass and pass;
+            }
+            if (pass == false) {
+                std::cerr << "error: owner preprocessing gate failed: case="
+                          << study_case.case_id << " mode="
+                          << owner_preprocess_failure_mode_3d(
+                                 rows, study_case, N)
+                          << " N=" << N << '\n';
+                return 1;
+            }
+        }
+    }
+    std::cout << "Owner preprocessing study output: "
+              << output_dir.string() << '\n';
+    return 0;
+}
+
 void print_usage(const char* executable)
 {
     std::cout
@@ -5200,10 +6900,12 @@ void print_usage(const char* executable)
         << "       " << executable << " --restrict-probe [N ...]\n"
         << "       " << executable << " --restrict-probe-owner [N ...]\n"
         << "       " << executable << " --restrict-profile-owner [N]\n"
+        << "       " << executable << " --owner-preprocess-study [N ...]\n"
         << "  Each N must be a power of two and at least 16 (default: 32).\n"
         << "  Rigid-study default levels: 32, 64, 128.\n"
         << "  Restrict-probe default levels: 32, 64.\n"
         << "  Restrict-profile default level: 128 (one level only).\n"
+        << "  Owner-preprocess-study default levels: 16, 32, 64.\n"
         << "  This stage builds native NURBS parameter-cell-center surface\n"
         << "  unknowns, topology-filtered 48/28 Cauchy stencils, validates\n"
         << "  fixed transfer routes, and executes the Neumann value-jump and\n"
@@ -5235,16 +6937,21 @@ int main(int argc, char** argv)
             && std::string(argv[1]) == "--restrict-probe-owner";
         const bool restrict_profile_owner = argc >= 2
             && std::string(argv[1]) == "--restrict-profile-owner";
+        const bool owner_preprocess_study = argc >= 2
+            && std::string(argv[1]) == "--owner-preprocess-study";
         std::string selection = "all";
         std::vector<int> levels = rigid_study
             ? std::vector<int>{32, 64, 128}
+            : owner_preprocess_study
+                ? std::vector<int>{16, 32, 64}
             : restrict_profile_owner
                 ? std::vector<int>{128}
                 : (restrict_probe || restrict_probe_owner)
                 ? std::vector<int>{32, 64}
                 : std::vector<int>{32};
         if (argc >= 2 && !rigid_study && !restrict_probe
-            && !restrict_probe_owner && !restrict_profile_owner)
+            && !restrict_probe_owner && !restrict_profile_owner
+            && !owner_preprocess_study)
             selection = argv[1];
         if (selection == "--help" || selection == "-h") {
             print_usage(argv[0]);
@@ -5261,6 +6968,8 @@ int main(int argc, char** argv)
                 restrict_probe_owner || restrict_profile_owner,
                 restrict_profile_owner);
         }
+        if (owner_preprocess_study)
+            return run_owner_preprocess_study_3d(levels);
         const CauchyStencilPolicy3D cauchy_policy = selected_cauchy_policy();
         const int cauchy_value_count = positive_environment_integer(
             "KFBIM_3D_CAUCHY_VALUE_COUNT", kCauchyValueNeighborCount);

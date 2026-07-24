@@ -27,6 +27,8 @@ add_executable(dirichlet_harmonic_jet_python_compatible_2d
 )
 
 if(KFBIM_BUILD_3D)
+    find_package(Threads REQUIRED)
+
     add_library(kfbim_3d_app_geometry STATIC
         crossing_owner_restrict_3d.cpp
         exterior_only_cubic_normal_restrict_3d.cpp
@@ -147,7 +149,11 @@ if(KFBIM_BUILD_3D)
         kfbim_3d_app_geometry
         kfbim_core
         kfbim_phase_profile_3d
+        Threads::Threads
     )
+    if(WIN32)
+        target_link_libraries(neumann_exterior_zero_trace_3d PRIVATE Psapi)
+    endif()
 endif()
 
 target_compile_definitions(shape_opt_transmission_2d PRIVATE
