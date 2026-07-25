@@ -4,8 +4,11 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <map>
+#include <set>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 #include <Eigen/SparseQR>
@@ -427,4 +430,270 @@ Eigen::VectorXd NeumannEdgeProjectedAugmentedOperator3D::project_right_hand_side
     return projected_rhs;
 }
 
+namespace {
+
+using EdgeStatus = RigidStudyCriterionStatus3D;
+using EdgeKey = std::tuple<std::string, int, NeumannDensitySpace3D>;
+
+EdgeStatus edge_status(bool pass)
+{
+    return pass ? EdgeStatus::Pass : EdgeStatus::Fail;
+}
+
+double edge_order(double coarse_error, double fine_error, double coarse_h, double fine_h)
+{
+    if (!std::isfinite(coarse_error) || !std::isfinite(fine_error)
+        || !std::isfinite(coarse_h) || !std::isfinite(fine_h)
+        || coarse_error <= 0.0 || fine_error <= 0.0 || coarse_h <= fine_h || fine_h <= 0.0)
+        return std::numeric_limits<double>::quiet_NaN();
+    return std::log(coarse_error / fine_error) / std::log(coarse_h / fine_h);
+}
+
+bool edge_measurement_finite(const NeumannEdgeContinuityMeasurement3D& row)
+{
+    return row.finite_metrics && row.N > 0 && std::isfinite(row.h) && row.h > 0.0
+        && std::isfinite(row.gmres_relative_residual) && std::isfinite(row.density_linf)
+        && std::isfinite(row.density_l2) && std::isfinite(row.interior_linf)
+        && std::isfinite(row.interior_l2) && std::isfinite(row.edge_mismatch_linf)
+        && std::isfinite(row.edge_mismatch_weighted_rms)
+        && std::isfinite(row.exact_edge_mismatch_linf);
+}
+
+bool topology_ok(const NeumannEdgeContinuityMeasurement3D& row)
+{
+    return row.expected_non_g1_connections > 0
+        && row.covered_non_g1_connections == row.expected_non_g1_connections
+        && row.duplicate_connection_intervals == 0 && row.g1_constraint_rows == 0
+        && row.unrelated_constraint_rows == 0 && row.constraint_rows > 0
+        && row.constraint_rank > 0 && row.constraint_rank <= row.constraint_rows
+        && row.reduced_order_rows >= 0;
+}
+
+bool projector_ok(const NeumannEdgeContinuityMeasurement3D& row)
+{
+    constexpr double tolerance = 1.0e-11;
+    return std::isfinite(row.constant_constraint_defect)
+        && std::isfinite(row.projected_constraint_defect)
+        && std::isfinite(row.projection_idempotence_defect)
+        && std::isfinite(row.constant_projection_defect)
+        && std::abs(row.constant_constraint_defect) <= tolerance
+        && std::abs(row.projected_constraint_defect) <= tolerance
+        && std::abs(row.projection_idempotence_defect) <= tolerance
+        && std::abs(row.constant_projection_defect) <= tolerance;
+}
+
+bool gmres_row_ok(const NeumannEdgeContinuityMeasurement3D& row)
+{
+    return row.gmres_converged && row.gmres_iterations >= 0
+        && row.gmres_iterations <= 80 && std::isfinite(row.gmres_relative_residual)
+        && row.gmres_relative_residual <= 2.0e-10;
+}
+
+bool geometry_owner_ok(const NeumannEdgeContinuityMeasurement3D& row)
+{
+    return row.geometry_diagnostics_pass && row.owner_invariants_pass
+        && row.shared_preprocess_pass;
+}
+
+const NeumannEdgeContinuityMeasurement3D* edge_measurement(
+    const std::map<EdgeKey, const NeumannEdgeContinuityMeasurement3D*>& rows,
+    const std::string& case_id, int N, NeumannDensitySpace3D density_space)
+{
+    const auto found = rows.find({case_id, N, density_space});
+    return found == rows.end() ? nullptr : found->second;
+}
+
+bool all_pair_rows_available(
+    const std::map<EdgeKey, const NeumannEdgeContinuityMeasurement3D*>& rows,
+    const std::vector<std::string>& case_ids)
+{
+    for (const std::string& case_id : case_ids) {
+        for (int N : {32, 64}) {
+            const bool any = edge_measurement(rows, case_id, N, NeumannDensitySpace3D::PatchIndependent)
+                || edge_measurement(rows, case_id, N, NeumannDensitySpace3D::NonG1EdgeProjected);
+            if (any && (!edge_measurement(rows, case_id, N, NeumannDensitySpace3D::PatchIndependent)
+                        || !edge_measurement(rows, case_id, N, NeumannDensitySpace3D::NonG1EdgeProjected)))
+                return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+std::vector<int> normalize_neumann_edge_continuity_levels_3d(std::vector<int> levels)
+{
+    if (levels.empty()) levels = {32, 64};
+    std::sort(levels.begin(), levels.end());
+    levels.erase(std::unique(levels.begin(), levels.end()), levels.end());
+    for (int N : levels)
+        if (N != 32 && N != 64 && N != 128)
+            throw std::invalid_argument("Neumann edge-continuity study N must be 32, 64, or 128");
+    const bool has32 = std::binary_search(levels.begin(), levels.end(), 32);
+    const bool has64 = std::binary_search(levels.begin(), levels.end(), 64);
+    const bool has128 = std::binary_search(levels.begin(), levels.end(), 128);
+    if (has64 && !has32)
+        throw std::invalid_argument("Neumann edge-continuity study N=64 requires N=32");
+    if (has128 && (!has32 || !has64))
+        throw std::invalid_argument("Neumann edge-continuity study N=128 requires N=32 and N=64");
+    return levels;
+}
+
+NeumannEdgeContinuityEvaluation3D evaluate_neumann_edge_continuity_study_3d(
+    const std::vector<NeumannEdgeContinuityMeasurement3D>& measurements,
+    const std::vector<std::string>& case_ids, bool require_complete_pilot)
+{
+    std::set<std::string> known_cases;
+    for (const std::string& case_id : case_ids)
+        if (case_id.empty() || !known_cases.insert(case_id).second)
+            throw std::invalid_argument("Neumann edge-continuity study case IDs must be nonempty and unique");
+
+    std::map<EdgeKey, const NeumannEdgeContinuityMeasurement3D*> keyed;
+    for (const auto& row : measurements) {
+        if (known_cases.count(row.case_id) == 0)
+            throw std::invalid_argument("Neumann edge-continuity study measurement has an unknown case ID");
+        if (row.N != 32 && row.N != 64 && row.N != 128)
+            throw std::invalid_argument("Neumann edge-continuity study measurement has an invalid level");
+        if (row.density_space != NeumannDensitySpace3D::PatchIndependent
+            && row.density_space != NeumannDensitySpace3D::NonG1EdgeProjected)
+            throw std::invalid_argument("Neumann edge-continuity study measurement has an invalid density space");
+        if (!keyed.emplace(EdgeKey{row.case_id, row.N, row.density_space}, std::addressof(row)).second)
+            throw std::invalid_argument("Neumann edge-continuity study measurement key is duplicated");
+    }
+
+    NeumannEdgeContinuityEvaluation3D result;
+    result.rows.reserve(measurements.size());
+    for (const auto& measurement : measurements) {
+        NeumannEdgeContinuityDerivedRow3D derived;
+        derived.measurement = measurement;
+        const NeumannEdgeContinuityMeasurement3D* previous = nullptr;
+        for (const auto& candidate : measurements) {
+            if (candidate.case_id == measurement.case_id
+                && candidate.density_space == measurement.density_space
+                && candidate.N < measurement.N
+                && (previous == nullptr || candidate.N > previous->N))
+                previous = std::addressof(candidate);
+        }
+        if (previous != nullptr) {
+            derived.density_linf_order = edge_order(previous->density_linf, measurement.density_linf, previous->h, measurement.h);
+            derived.density_l2_order = edge_order(previous->density_l2, measurement.density_l2, previous->h, measurement.h);
+            derived.interior_linf_order = edge_order(previous->interior_linf, measurement.interior_linf, previous->h, measurement.h);
+            derived.interior_l2_order = edge_order(previous->interior_l2, measurement.interior_l2, previous->h, measurement.h);
+            derived.exact_edge_mismatch_order = edge_order(previous->exact_edge_mismatch_linf, measurement.exact_edge_mismatch_linf, previous->h, measurement.h);
+        }
+        const auto* unconstrained = edge_measurement(keyed, measurement.case_id, measurement.N,
+            NeumannDensitySpace3D::PatchIndependent);
+        if (measurement.density_space == NeumannDensitySpace3D::NonG1EdgeProjected
+            && unconstrained != nullptr) {
+            const auto ratio = [](double numerator, double denominator) {
+                return std::isfinite(numerator) && std::isfinite(denominator) && denominator > 0.0
+                    ? numerator / denominator : std::numeric_limits<double>::quiet_NaN();
+            };
+            derived.density_linf_ratio_to_unconstrained = ratio(measurement.density_linf, unconstrained->density_linf);
+            derived.density_l2_ratio_to_unconstrained = ratio(measurement.density_l2, unconstrained->density_l2);
+            derived.interior_linf_ratio_to_unconstrained = ratio(measurement.interior_linf, unconstrained->interior_linf);
+            derived.interior_l2_ratio_to_unconstrained = ratio(measurement.interior_l2, unconstrained->interior_l2);
+            derived.edge_reduction_ratio = ratio(unconstrained->edge_mismatch_linf, measurement.edge_mismatch_linf);
+        }
+        derived.row_pass = edge_status(edge_measurement_finite(measurement)
+            && gmres_row_ok(measurement) && topology_ok(measurement)
+            && projector_ok(measurement) && geometry_owner_ok(measurement));
+        result.rows.push_back(std::move(derived));
+    }
+
+    const bool complete = std::all_of(case_ids.begin(), case_ids.end(), [&](const std::string& case_id) {
+        for (int N : {32, 64})
+            for (NeumannDensitySpace3D mode : {NeumannDensitySpace3D::PatchIndependent,
+                                               NeumannDensitySpace3D::NonG1EdgeProjected})
+                if (edge_measurement(keyed, case_id, N, mode) == nullptr) return false;
+        return true;
+    });
+    const bool pairs_available = all_pair_rows_available(keyed, case_ids);
+    const bool rows_finite = std::all_of(measurements.begin(), measurements.end(), edge_measurement_finite);
+    const bool topology = std::all_of(measurements.begin(), measurements.end(), topology_ok);
+    const bool projector = std::all_of(measurements.begin(), measurements.end(), projector_ok);
+    const bool geometry_owner = std::all_of(measurements.begin(), measurements.end(), geometry_owner_ok);
+    result.acceptance.completeness_pass = complete ? EdgeStatus::Pass : EdgeStatus::NotEvaluated;
+    result.acceptance.topology_pass = measurements.empty() ? EdgeStatus::NotEvaluated : edge_status(topology);
+    result.acceptance.projector_pass = measurements.empty() ? EdgeStatus::NotEvaluated : edge_status(projector);
+    result.acceptance.geometry_owner_pass = measurements.empty() ? EdgeStatus::NotEvaluated : edge_status(geometry_owner);
+
+    bool gmres_ok = rows_finite && std::all_of(measurements.begin(), measurements.end(), gmres_row_ok);
+    if (!gmres_ok) result.acceptance.gmres_pass = EdgeStatus::Fail;
+    else if (!pairs_available || measurements.empty()) result.acceptance.gmres_pass = EdgeStatus::NotEvaluated;
+    else {
+        int projected_max = 0, unconstrained_max = 0, projected_ty_max = 0, unconstrained_ty_max = 0;
+        for (const auto& row : measurements) {
+            int* maximum = row.density_space == NeumannDensitySpace3D::NonG1EdgeProjected
+                ? &projected_max : &unconstrained_max;
+            *maximum = std::max(*maximum, row.gmres_iterations);
+            if (row.case_id == "ty_m0083") {
+                maximum = row.density_space == NeumannDensitySpace3D::NonG1EdgeProjected
+                    ? &projected_ty_max : &unconstrained_ty_max;
+                *maximum = std::max(*maximum, row.gmres_iterations);
+            }
+        }
+        result.acceptance.gmres_pass = edge_status(projected_max <= unconstrained_max
+            && projected_ty_max < unconstrained_ty_max);
+    }
+
+    const auto ratio32 = [&](const std::string& case_id, NeumannDensitySpace3D mode) {
+        const auto* coarse = edge_measurement(keyed, case_id, 32, mode);
+        const auto* fine = edge_measurement(keyed, case_id, 64, mode);
+        if (coarse == nullptr || fine == nullptr) return std::numeric_limits<double>::quiet_NaN();
+        return coarse->exact_edge_mismatch_linf / fine->exact_edge_mismatch_linf;
+    };
+    bool exact_ready = complete;
+    bool exact_ok = exact_ready;
+    for (const std::string& case_id : case_ids) {
+        const double value = ratio32(case_id, NeumannDensitySpace3D::NonG1EdgeProjected);
+        exact_ok = exact_ok && std::isfinite(value) && value >= 6.0;
+    }
+    result.acceptance.exact_trace_order_pass = exact_ready ? edge_status(exact_ok) : EdgeStatus::NotEvaluated;
+
+    if (!pairs_available || measurements.empty()) {
+        result.acceptance.error_guard_pass = EdgeStatus::NotEvaluated;
+        result.acceptance.edge_reduction_pass = EdgeStatus::NotEvaluated;
+    } else {
+        bool error_ok = true, edge_ok = true;
+        for (const auto& row : measurements) if (row.density_space == NeumannDensitySpace3D::NonG1EdgeProjected) {
+            const auto* base = edge_measurement(keyed, row.case_id, row.N, NeumannDensitySpace3D::PatchIndependent);
+            error_ok = error_ok && base != nullptr && row.density_linf <= 1.10 * base->density_linf
+                && row.density_l2 <= 1.10 * base->density_l2 && row.interior_linf <= 1.10 * base->interior_linf
+                && row.interior_l2 <= 1.10 * base->interior_l2;
+            edge_ok = edge_ok && base != nullptr && base->edge_mismatch_linf / row.edge_mismatch_linf >= 1.0e4;
+        }
+        result.acceptance.error_guard_pass = edge_status(error_ok);
+        result.acceptance.edge_reduction_pass = edge_status(edge_ok);
+    }
+
+    if (!complete) result.acceptance.trend_pass = EdgeStatus::NotEvaluated;
+    else {
+        constexpr double roundoff = 64.0 * std::numeric_limits<double>::epsilon();
+        bool trend_ok = true;
+        for (const std::string& case_id : case_ids) {
+            const auto* u32 = edge_measurement(keyed, case_id, 32, NeumannDensitySpace3D::PatchIndependent);
+            const auto* u64 = edge_measurement(keyed, case_id, 64, NeumannDensitySpace3D::PatchIndependent);
+            const auto* p32 = edge_measurement(keyed, case_id, 32, NeumannDensitySpace3D::NonG1EdgeProjected);
+            const auto* p64 = edge_measurement(keyed, case_id, 64, NeumannDensitySpace3D::NonG1EdgeProjected);
+            const auto no_worse = [roundoff](double p_fine, double p_coarse, double u_fine, double u_coarse) {
+                return p_coarse > 0.0 && u_coarse > 0.0 && p_fine / p_coarse <= (u_fine / u_coarse) * (1.0 + roundoff);
+            };
+            trend_ok = trend_ok && no_worse(p64->density_linf, p32->density_linf, u64->density_linf, u32->density_linf)
+                && no_worse(p64->density_l2, p32->density_l2, u64->density_l2, u32->density_l2)
+                && no_worse(p64->interior_linf, p32->interior_linf, u64->interior_linf, u32->interior_linf)
+                && no_worse(p64->interior_l2, p32->interior_l2, u64->interior_l2, u32->interior_l2);
+        }
+        result.acceptance.trend_pass = edge_status(trend_ok);
+    }
+
+    result.acceptance.overall_pass = combine_rigid_study_criteria_3d(
+        {result.acceptance.completeness_pass, result.acceptance.topology_pass,
+         result.acceptance.projector_pass, result.acceptance.exact_trace_order_pass,
+         result.acceptance.gmres_pass, result.acceptance.error_guard_pass,
+         result.acceptance.edge_reduction_pass, result.acceptance.trend_pass,
+         result.acceptance.geometry_owner_pass}, !measurements.empty(), require_complete_pilot);
+    result.all_pass = result.acceptance.overall_pass == EdgeStatus::Pass;
+    return result;
+}
 } // namespace kfbim::app3d

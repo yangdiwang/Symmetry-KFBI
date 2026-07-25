@@ -4,10 +4,12 @@
 
 #include <array>
 #include <cmath>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 using namespace kfbim::app3d;
@@ -316,6 +318,157 @@ void test_projected_augmented_operator()
 }
 }
 
+namespace {
+NeumannEdgeContinuityMeasurement3D passing_measurement(
+    const std::string& case_id, int N, NeumannDensitySpace3D density_space)
+{
+    const bool projected = density_space == NeumannDensitySpace3D::NonG1EdgeProjected;
+    const double coarse = N == 32 ? 1.0 : 0.5;
+    NeumannEdgeContinuityMeasurement3D row;
+    row.case_id = case_id;
+    row.N = N;
+    row.h = 1.0 / static_cast<double>(N);
+    row.density_space = density_space;
+    row.finite_metrics = true;
+    row.gmres_converged = true;
+    row.gmres_iterations = projected ? (case_id == "ty_m0083" ? 37 : 31) : (case_id == "ty_m0083" ? 48 : 42);
+    row.gmres_relative_residual = 1.0e-11;
+    const double error_scale = projected ? 0.8 : 1.0;
+    row.density_linf = error_scale * coarse;
+    row.density_l2 = error_scale * 2.0 * coarse;
+    row.interior_linf = error_scale * 3.0 * coarse;
+    row.interior_l2 = error_scale * 4.0 * coarse;
+    row.edge_mismatch_linf = projected ? 1.0e-8 * coarse : 1.0e-3 * coarse;
+    row.edge_mismatch_weighted_rms = projected ? 2.0e-8 * coarse : 2.0e-3 * coarse;
+    row.exact_edge_mismatch_linf = coarse * coarse * coarse;
+    row.expected_non_g1_connections = 4;
+    row.covered_non_g1_connections = 4;
+    row.constraint_rows = 12;
+    row.constraint_rank = 10;
+    row.constant_constraint_defect = 1.0e-12;
+    row.projected_constraint_defect = 1.0e-12;
+    row.projection_idempotence_defect = 1.0e-12;
+    row.constant_projection_defect = 1.0e-12;
+    row.geometry_diagnostics_pass = true;
+    row.owner_invariants_pass = true;
+    row.shared_preprocess_pass = true;
+    return row;
+}
+
+std::vector<NeumannEdgeContinuityMeasurement3D> passing_measurements(bool include_64 = true)
+{
+    std::vector<NeumannEdgeContinuityMeasurement3D> rows;
+    for (const std::string& case_id : {std::string("baseline"), std::string("ty_m0083"), std::string("rot_axis123_17deg")}) {
+        for (int N : {32, 64}) {
+            if (!include_64 && N == 64) continue;
+            rows.push_back(passing_measurement(case_id, N, NeumannDensitySpace3D::PatchIndependent));
+            rows.push_back(passing_measurement(case_id, N, NeumannDensitySpace3D::NonG1EdgeProjected));
+        }
+    }
+    return rows;
+}
+
+const NeumannEdgeContinuityDerivedRow3D& find_evaluation_row(
+    const NeumannEdgeContinuityEvaluation3D& evaluation, const std::string& case_id,
+    int N, NeumannDensitySpace3D density_space)
+{
+    for (const auto& row : evaluation.rows)
+        if (row.measurement.case_id == case_id && row.measurement.N == N && row.measurement.density_space == density_space) return row;
+    throw std::runtime_error("missing evaluated measurement");
+}
+
+void require_throws(const std::function<void()>& work, const std::string& message)
+{
+    bool threw = false;
+    try { work(); } catch (const std::invalid_argument&) { threw = true; }
+    require(threw, message);
+}
+
+void test_edge_study_level_prefixes()
+{
+    require(normalize_neumann_edge_continuity_levels_3d({}) == std::vector<int>({32, 64}), "empty edge-study levels did not select the pilot default");
+    require(normalize_neumann_edge_continuity_levels_3d({32}) == std::vector<int>({32}), "N=32 edge-study prefix was rejected");
+    require(normalize_neumann_edge_continuity_levels_3d({32, 64}) == std::vector<int>({32, 64}), "N=32,64 edge-study prefix was rejected");
+    require(normalize_neumann_edge_continuity_levels_3d({32, 64, 128}) == std::vector<int>({32, 64, 128}), "N=128 prefix was rejected");
+    require_throws([] { normalize_neumann_edge_continuity_levels_3d({64}); }, "N=64 did not require N=32");
+    require_throws([] { normalize_neumann_edge_continuity_levels_3d({32, 128}); }, "N=128 did not require N=64");
+    require_throws([] { normalize_neumann_edge_continuity_levels_3d({16, 32}); }, "invalid edge-study level was accepted");
+}
+
+void test_edge_study_acceptance_and_failure_gates()
+{
+    using Status = RigidStudyCriterionStatus3D;
+    const std::vector<std::string> cases = {"baseline", "ty_m0083", "rot_axis123_17deg"};
+    const auto passing = passing_measurements();
+    const auto evaluation = evaluate_neumann_edge_continuity_study_3d(passing, cases, true);
+    require(evaluation.all_pass, "complete paired edge study did not pass");
+    for (Status status : {evaluation.acceptance.completeness_pass, evaluation.acceptance.topology_pass, evaluation.acceptance.projector_pass, evaluation.acceptance.exact_trace_order_pass, evaluation.acceptance.gmres_pass, evaluation.acceptance.error_guard_pass, evaluation.acceptance.edge_reduction_pass, evaluation.acceptance.trend_pass, evaluation.acceptance.geometry_owner_pass, evaluation.acceptance.overall_pass})
+        require(status == Status::Pass, "passing edge-study gate was not pass");
+    const auto& projected64 = find_evaluation_row(evaluation, "baseline", 64, NeumannDensitySpace3D::NonG1EdgeProjected);
+    require(std::abs(projected64.density_linf_order - 1.0) <= 1.0e-14 && std::abs(projected64.exact_edge_mismatch_order - 3.0) <= 1.0e-14 && std::abs(projected64.edge_reduction_ratio - 1.0e5) <= 1.0e-5, "paired edge-study derived values are incorrect");
+
+    auto missing = passing;
+    missing.pop_back();
+    const auto incomplete = evaluate_neumann_edge_continuity_study_3d(missing, cases, true);
+    require(incomplete.acceptance.completeness_pass == Status::NotEvaluated && incomplete.acceptance.overall_pass == Status::NotEvaluated && !incomplete.all_pass, "missing case/level/mode row was hidden");
+    auto duplicate = passing;
+    duplicate.push_back(duplicate.front());
+    require_throws([&] { evaluate_neumann_edge_continuity_study_3d(duplicate, cases, true); }, "duplicate case/N/density-space row was accepted");
+
+    auto topology = passing;
+    topology.front().covered_non_g1_connections = 3;
+    require(evaluate_neumann_edge_continuity_study_3d(topology, cases, true).acceptance.topology_pass == Status::Fail, "missing non-G1 interval was hidden");
+    topology = passing;
+    topology.front().duplicate_connection_intervals = 1;
+    require(evaluate_neumann_edge_continuity_study_3d(topology, cases, true).acceptance.topology_pass == Status::Fail, "duplicate non-G1 interval was hidden");
+    topology = passing;
+    topology.front().g1_constraint_rows = 1;
+    require(evaluate_neumann_edge_continuity_study_3d(topology, cases, true).acceptance.topology_pass == Status::Fail, "G1 constraint row was hidden");
+    topology = passing;
+    topology.front().unrelated_constraint_rows = 1;
+    require(evaluate_neumann_edge_continuity_study_3d(topology, cases, true).acceptance.topology_pass == Status::Fail, "unrelated constraint row was hidden");
+
+    auto projector = passing;
+    projector.front().projection_idempotence_defect = 1.1e-11;
+    require(evaluate_neumann_edge_continuity_study_3d(projector, cases, true).acceptance.projector_pass == Status::Fail, "normalized projector defect was hidden");
+    auto exact = passing;
+    for (auto& row : exact) if (row.case_id == "baseline" && row.N == 64) row.exact_edge_mismatch_linf *= 2.0;
+    require(evaluate_neumann_edge_continuity_study_3d(exact, cases, true).acceptance.exact_trace_order_pass == Status::Fail, "sub-six exact mismatch ratio was hidden");
+    exact = passing;
+    for (auto& row : exact) if (row.case_id == "baseline" && row.N == 64) row.exact_edge_mismatch_linf = 0.0;
+    require(evaluate_neumann_edge_continuity_study_3d(exact, cases, true).acceptance.exact_trace_order_pass == Status::Fail,
+            "zero fine exact mismatch was treated as a passing ratio");
+
+    auto gmres = passing;
+    for (auto& row : gmres) if (row.density_space == NeumannDensitySpace3D::NonG1EdgeProjected) row.gmres_iterations = 60;
+    require(evaluate_neumann_edge_continuity_study_3d(gmres, cases, true).acceptance.gmres_pass == Status::Fail, "projected worst GMRES increase was hidden");
+    gmres = passing;
+    for (auto& row : gmres) if (row.case_id == "ty_m0083") row.gmres_iterations = 48;
+    require(evaluate_neumann_edge_continuity_study_3d(gmres, cases, true).acceptance.gmres_pass == Status::Fail, "missing ty_m0083 GMRES decrease was hidden");
+
+    auto errors = passing;
+    for (auto& row : errors) if (row.case_id == "baseline" && row.N == 32 && row.density_space == NeumannDensitySpace3D::NonG1EdgeProjected) row.interior_l2 = 4.5;
+    require(evaluate_neumann_edge_continuity_study_3d(errors, cases, true).acceptance.error_guard_pass == Status::Fail, "projected error guard was hidden");
+    auto edge = passing;
+    for (auto& row : edge) if (row.case_id == "baseline" && row.N == 32 && row.density_space == NeumannDensitySpace3D::NonG1EdgeProjected) row.edge_mismatch_linf = 1.1e-7;
+    require(evaluate_neumann_edge_continuity_study_3d(edge, cases, true).acceptance.edge_reduction_pass == Status::Fail, "insufficient edge mismatch reduction was hidden");
+    auto trend = passing;
+    for (auto& row : trend) if (row.case_id == "baseline" && row.N == 64 && row.density_space == NeumannDensitySpace3D::NonG1EdgeProjected) row.density_linf = 0.45;
+    require(evaluate_neumann_edge_continuity_study_3d(trend, cases, true).acceptance.trend_pass == Status::Fail, "worse projected refinement trend was hidden");
+    auto geometry = passing;
+    geometry.front().shared_preprocess_pass = false;
+    require(evaluate_neumann_edge_continuity_study_3d(geometry, cases, true).acceptance.geometry_owner_pass == Status::Fail, "changed geometry/owner/shared-preprocess invariant was hidden");
+}
+
+void test_edge_study_n32_smoke_keeps_two_level_gates_not_evaluated()
+{
+    using Status = RigidStudyCriterionStatus3D;
+    const auto evaluation = evaluate_neumann_edge_continuity_study_3d(passing_measurements(false), {"baseline", "ty_m0083", "rot_axis123_17deg"}, false);
+    require(evaluation.all_pass && evaluation.acceptance.overall_pass == Status::Pass, "valid N=32 edge smoke was not execution-clean");
+    require(evaluation.acceptance.exact_trace_order_pass == Status::NotEvaluated && evaluation.acceptance.trend_pass == Status::NotEvaluated, "N=32 edge smoke falsely passed two-level numerical criteria");
+}
+}
+
 int main()
 {
     try {
@@ -323,6 +476,9 @@ int main()
         test_fallback_and_order();
         test_surface_mass_projector();
         test_projected_augmented_operator();
+        test_edge_study_level_prefixes();
+        test_edge_study_acceptance_and_failure_gates();
+        test_edge_study_n32_smoke_keeps_two_level_gates_not_evaluated();
         std::cout << "3D Neumann edge-continuity tests passed\n";
         return 0;
     } catch (const std::exception& error) {
