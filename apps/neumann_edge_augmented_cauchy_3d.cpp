@@ -1,4 +1,3 @@
-#define EIGEN_RUNTIME_NO_MALLOC
 #include "neumann_edge_augmented_cauchy_3d.hpp"
 #include "neumann_edge_augmented_cauchy_3d_detail.hpp"
 
@@ -19,6 +18,50 @@
 
 namespace kfbim::app3d {
 namespace detail {
+
+NeumannEdgeSampleCountPlan3D plan_neumann_edge_sample_count_3d(
+    double requested_sample_count,
+    int minimum_edge_samples,
+    int cumulative_sample_count,
+    int reserved_factorization_count,
+    int connection_index)
+{
+    const std::string context = " at connection "
+        + std::to_string(connection_index);
+    if (minimum_edge_samples <= 0 || cumulative_sample_count < 0
+        || reserved_factorization_count < 0) {
+        throw std::invalid_argument(
+            "Neumann auxiliary edge sample count planner has invalid input"
+            + context);
+    }
+    if (!std::isfinite(requested_sample_count)
+        || requested_sample_count < 0.0
+        || requested_sample_count
+            >= static_cast<double>(std::numeric_limits<int>::max())) {
+        throw std::overflow_error(
+            "Neumann auxiliary edge sample count exceeds int range"
+            + context);
+    }
+
+    const int connection_sample_count = std::max(
+        minimum_edge_samples,
+        static_cast<int>(requested_sample_count));
+    constexpr int factorization_limit =
+        std::numeric_limits<int>::max() / 2;
+    if (reserved_factorization_count > factorization_limit
+        || cumulative_sample_count
+            > factorization_limit - reserved_factorization_count
+        || connection_sample_count
+            > factorization_limit - reserved_factorization_count
+                - cumulative_sample_count) {
+        throw std::overflow_error(
+            "Neumann auxiliary cumulative sample count exceeds int-backed "
+            "factorization range" + context);
+    }
+    return {
+        connection_sample_count,
+        cumulative_sample_count + connection_sample_count};
+}
 
 std::vector<int> select_neumann_edge_distance_candidates_3d(
     std::vector<NeumannEdgeDistanceCandidate3D> candidates,
@@ -1052,9 +1095,10 @@ build_neumann_edge_auxiliary_value_map_3d(
 
     NeumannEdgeAuxiliaryValueMap3D result;
     result.surface_size = static_cast<int>(cloud.dofs.size());
-    std::vector<Eigen::Triplet<double>> value_entries;
-    std::vector<Eigen::Triplet<double>> normal_entries;
-
+    std::vector<int> connection_sample_counts(
+        surface.geometric_connections.size(), 0);
+    int cumulative_sample_count = 0;
+    // Preflight every count before constructing any auxiliary sample.
     for (int c = 0; c < static_cast<int>(surface.geometric_connections.size()); ++c) {
         const auto& connection = surface.geometric_connections[static_cast<std::size_t>(c)];
         if (connection.g1)
@@ -1066,18 +1110,26 @@ build_neumann_edge_auxiliary_value_map_3d(
         if (std::abs(first_length - second_length) > 1.0e-11 * length_scale)
             throw std::runtime_error("Neumann auxiliary mapped edge lengths disagree at connection " + std::to_string(c));
         const double length = 0.5 * (first_length + second_length);
-        const double requested_sample_count = std::ceil(length / h);
-        if (!std::isfinite(requested_sample_count)
-            || requested_sample_count
-                > static_cast<double>(std::numeric_limits<int>::max())) {
-            throw std::overflow_error(
-                "Neumann auxiliary edge sample count exceeds int range at connection "
-                + std::to_string(c));
-        }
-        const int sample_count = std::max(
+        const auto plan = detail::plan_neumann_edge_sample_count_3d(
+            std::ceil(length / h),
             options.minimum_edge_samples,
-            static_cast<int>(requested_sample_count));
+            cumulative_sample_count,
+            result.surface_size,
+            c);
+        connection_sample_counts[static_cast<std::size_t>(c)] =
+            plan.connection_sample_count;
+        cumulative_sample_count = plan.cumulative_sample_count;
+    }
 
+    std::vector<Eigen::Triplet<double>> value_entries;
+    std::vector<Eigen::Triplet<double>> normal_entries;
+    for (int c = 0; c < static_cast<int>(surface.geometric_connections.size()); ++c) {
+        const int sample_count = connection_sample_counts[
+            static_cast<std::size_t>(c)];
+        if (sample_count == 0)
+            continue;
+        const auto& connection = surface.geometric_connections[
+            static_cast<std::size_t>(c)];
         for (int q = 0; q < sample_count; ++q) {
             const double s = (static_cast<double>(q) + 0.5)
                 / static_cast<double>(sample_count);

@@ -13,6 +13,18 @@ struct NeumannEdgeDistanceCandidate3D {
     int certified_symmetric_partner = -1;
 };
 
+struct NeumannEdgeSampleCountPlan3D {
+    int connection_sample_count = 0;
+    int cumulative_sample_count = 0;
+};
+
+NeumannEdgeSampleCountPlan3D plan_neumann_edge_sample_count_3d(
+    double requested_sample_count,
+    int minimum_edge_samples,
+    int cumulative_sample_count,
+    int reserved_factorization_count,
+    int connection_index);
+
 std::vector<int> select_neumann_edge_distance_candidates_3d(
     std::vector<NeumannEdgeDistanceCandidate3D> candidates,
     double radius_squared,

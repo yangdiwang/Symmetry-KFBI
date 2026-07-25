@@ -1,4 +1,3 @@
-#define EIGEN_RUNTIME_NO_MALLOC
 #include "neumann_edge_augmented_cauchy_3d.hpp"
 #include "neumann_edge_augmented_cauchy_3d_detail.hpp"
 #include "native_nurbs_surface_transform_3d.hpp"
@@ -20,21 +19,170 @@
 #include <tuple>
 #include <vector>
 
+#if defined(_MSC_VER)
+#include <malloc.h>
+#if defined(_DEBUG)
+#include <crtdbg.h>
+#endif
+#endif
+
 namespace {
 bool track_runtime_allocations=false;
 std::size_t runtime_allocation_count=0;
+
+void record_runtime_allocation() noexcept
+{
+    if(track_runtime_allocations) ++runtime_allocation_count;
+}
+
+void* allocate_runtime_memory(std::size_t size) noexcept
+{
+    return std::malloc(size==0?1:size);
+}
+
+void* allocate_aligned_runtime_memory(
+    std::size_t size,std::size_t alignment) noexcept
+{
+#if defined(_MSC_VER)
+    return _aligned_malloc(size==0?1:size,alignment);
+#else
+    const std::size_t requested=size==0?1:size;
+    const std::size_t remainder=requested%alignment;
+    if(remainder!=0
+        && requested>std::numeric_limits<std::size_t>::max()
+            -(alignment-remainder)) return nullptr;
+    const std::size_t rounded=remainder==0
+        ?requested:requested+(alignment-remainder);
+    return std::aligned_alloc(alignment,rounded);
+#endif
+}
+
+void release_aligned_runtime_memory(void* memory) noexcept
+{
+#if defined(_MSC_VER)
+    _aligned_free(memory);
+#else
+    std::free(memory);
+#endif
+}
+
+#if defined(_MSC_VER) && defined(_DEBUG)
+_CRT_ALLOC_HOOK previous_crt_allocation_hook=nullptr;
+
+int __cdecl runtime_crt_allocation_hook(
+    int allocation_type,
+    void* user_data,
+    std::size_t size,
+    int block_type,
+    long request_number,
+    const unsigned char* filename,
+    int line_number)
+{
+    if(track_runtime_allocations
+        && (allocation_type==_HOOK_ALLOC
+            || allocation_type==_HOOK_REALLOC)) {
+        ++runtime_allocation_count;
+    }
+    if(previous_crt_allocation_hook) {
+        return previous_crt_allocation_hook(
+            allocation_type,user_data,size,block_type,request_number,
+            filename,line_number);
+    }
+    return 1;
+}
+#endif
+
+class ScopedRuntimeAllocationCounter {
+public:
+    ScopedRuntimeAllocationCounter()
+    {
+#if defined(_MSC_VER) && defined(_DEBUG)
+        previous_crt_allocation_hook=
+            _CrtSetAllocHook(runtime_crt_allocation_hook);
+#endif
+        runtime_allocation_count=0;
+        track_runtime_allocations=true;
+    }
+
+    ~ScopedRuntimeAllocationCounter()
+    {
+        track_runtime_allocations=false;
+#if defined(_MSC_VER) && defined(_DEBUG)
+        _CrtSetAllocHook(previous_crt_allocation_hook);
+        previous_crt_allocation_hook=nullptr;
+#endif
+    }
+
+    ScopedRuntimeAllocationCounter(
+        const ScopedRuntimeAllocationCounter&)=delete;
+    ScopedRuntimeAllocationCounter& operator=(
+        const ScopedRuntimeAllocationCounter&)=delete;
+
+    std::size_t count() const noexcept
+    {
+        return runtime_allocation_count;
+    }
+};
 }
 
 void* operator new(std::size_t size)
 {
-    if(track_runtime_allocations) ++runtime_allocation_count;
-    if(void* memory=std::malloc(size==0?1:size)) return memory;
+    record_runtime_allocation();
+    if(void* memory=allocate_runtime_memory(size)) return memory;
     throw std::bad_alloc();
 }
 
 void* operator new[](std::size_t size)
 {
-    return ::operator new(size);
+    record_runtime_allocation();
+    if(void* memory=allocate_runtime_memory(size)) return memory;
+    throw std::bad_alloc();
+}
+
+void* operator new(std::size_t size,const std::nothrow_t&) noexcept
+{
+    record_runtime_allocation();
+    return allocate_runtime_memory(size);
+}
+
+void* operator new[](std::size_t size,const std::nothrow_t&) noexcept
+{
+    record_runtime_allocation();
+    return allocate_runtime_memory(size);
+}
+
+void* operator new(std::size_t size,std::align_val_t alignment)
+{
+    record_runtime_allocation();
+    if(void* memory=allocate_aligned_runtime_memory(
+            size,static_cast<std::size_t>(alignment))) return memory;
+    throw std::bad_alloc();
+}
+
+void* operator new[](std::size_t size,std::align_val_t alignment)
+{
+    record_runtime_allocation();
+    if(void* memory=allocate_aligned_runtime_memory(
+            size,static_cast<std::size_t>(alignment))) return memory;
+    throw std::bad_alloc();
+}
+
+void* operator new(
+    std::size_t size,std::align_val_t alignment,
+    const std::nothrow_t&) noexcept
+{
+    record_runtime_allocation();
+    return allocate_aligned_runtime_memory(
+        size,static_cast<std::size_t>(alignment));
+}
+
+void* operator new[](
+    std::size_t size,std::align_val_t alignment,
+    const std::nothrow_t&) noexcept
+{
+    record_runtime_allocation();
+    return allocate_aligned_runtime_memory(
+        size,static_cast<std::size_t>(alignment));
 }
 
 void operator delete(void* memory) noexcept
@@ -55,6 +203,50 @@ void operator delete(void* memory,std::size_t) noexcept
 void operator delete[](void* memory,std::size_t) noexcept
 {
     std::free(memory);
+}
+
+void operator delete(void* memory,const std::nothrow_t&) noexcept
+{
+    std::free(memory);
+}
+
+void operator delete[](void* memory,const std::nothrow_t&) noexcept
+{
+    std::free(memory);
+}
+
+void operator delete(void* memory,std::align_val_t) noexcept
+{
+    release_aligned_runtime_memory(memory);
+}
+
+void operator delete[](void* memory,std::align_val_t) noexcept
+{
+    release_aligned_runtime_memory(memory);
+}
+
+void operator delete(
+    void* memory,std::size_t,std::align_val_t) noexcept
+{
+    release_aligned_runtime_memory(memory);
+}
+
+void operator delete[](
+    void* memory,std::size_t,std::align_val_t) noexcept
+{
+    release_aligned_runtime_memory(memory);
+}
+
+void operator delete(
+    void* memory,std::align_val_t,const std::nothrow_t&) noexcept
+{
+    release_aligned_runtime_memory(memory);
+}
+
+void operator delete[](
+    void* memory,std::align_val_t,const std::nothrow_t&) noexcept
+{
+    release_aligned_runtime_memory(memory);
 }
 
 namespace {
@@ -465,6 +657,39 @@ void test_geometric_symmetry_certificate()
         "metadata-preserving bilinear control net was certified");
 }
 
+void test_sample_count_integer_boundaries()
+{
+    using kfbim::app3d::detail::plan_neumann_edge_sample_count_3d;
+    constexpr int factorization_limit =
+        std::numeric_limits<int>::max() / 2;
+
+    require_throws<std::overflow_error>([]{
+        (void)plan_neumann_edge_sample_count_3d(
+            static_cast<double>(std::numeric_limits<int>::max()),
+            4,0,0,17);
+    },"connection 17");
+
+    const auto exact_cumulative_limit =
+        plan_neumann_edge_sample_count_3d(
+            4.0,4,factorization_limit-4,0,18);
+    require(exact_cumulative_limit.connection_sample_count==4
+            && exact_cumulative_limit.cumulative_sample_count
+                ==factorization_limit,
+        "sample count planner rejected the last safe cumulative count");
+
+    require_throws<std::overflow_error>([=]{
+        (void)plan_neumann_edge_sample_count_3d(
+            4.0,4,factorization_limit-3,0,19);
+    },"cumulative sample count");
+
+    const auto reserved_limit =
+        plan_neumann_edge_sample_count_3d(
+            4.0,4,factorization_limit-9,5,20);
+    require(reserved_limit.cumulative_sample_count
+            ==factorization_limit-5,
+        "sample count planner did not reserve downstream factorizations");
+}
+
 std::vector<NeumannEdgeFaceStencil3D> exact_face_stencils(
     const NativeNurbsSurface3D& surface,
     const SurfaceDofCloud3D& cloud)
@@ -851,25 +1076,14 @@ void test_runtime_overwrite_has_no_per_center_heap_path()
         affected[static_cast<std::size_t>(local.center_dof)]=true;
     const int factorizations=augmented.diagnostics().factorization_count;
 
-    struct NoAllocationScope {
-        NoAllocationScope()
-        {
-            runtime_allocation_count=0;
-            Eigen::internal::set_is_malloc_allowed(false);
-            track_runtime_allocations=true;
-        }
-        ~NoAllocationScope()
-        {
-            track_runtime_allocations=false;
-            Eigen::internal::set_is_malloc_allowed(true);
-        }
-    };
+    std::size_t observed_allocations=0;
     {
-        NoAllocationScope scope;
+        ScopedRuntimeAllocationCounter scope;
         augmented.overwrite_affected_coefficients(
             values,normals,edges,coefficients);
+        observed_allocations=scope.count();
     }
-    require(runtime_allocation_count==0,
+    require(observed_allocations==0,
         "runtime overwrite used a validation/workspace heap allocation path");
     require(augmented.diagnostics().factorization_count==factorizations,
         "runtime overwrite performed setup work or factorization");
@@ -1485,11 +1699,17 @@ int main(int argc,char** argv)
             std::cout<<"3D Neumann runtime no-allocation test passed\n";
             return 0;
         }
+        if(argc==2 && std::string(argv[1])=="--sample-count-boundaries") {
+            test_sample_count_integer_boundaries();
+            std::cout<<"3D Neumann sample-count boundary tests passed\n";
+            return 0;
+        }
         test_l_prism_geometry_topology_reproduction_and_direct_map();
         test_rigid_covariance();
         test_runtime_overwrite_has_no_per_center_heap_path();
         test_exact_distance_selection_boundaries();
         test_geometric_symmetry_certificate();
+        test_sample_count_integer_boundaries();
         test_local_attachment_groups_and_overwrite();
         test_local_harmonic_reproduction_and_rigid_covariance();
         test_local_map_rejections();
