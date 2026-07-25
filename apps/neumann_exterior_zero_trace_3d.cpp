@@ -8198,42 +8198,9 @@ run_neumann_edge_continuity_pair_3d(
     const double constant_constraint_defect = vector_linf(
         app3d::apply_neumann_edge_constraints_3d(constraints, ones));
 
-    int expected_non_g1_connections = 0;
-    int duplicate_connection_intervals = 0;
-    using EdgeIntervalKey3D = std::tuple<int, int, double, double>;
-    using ConnectionIntervalKey3D =
-        std::pair<EdgeIntervalKey3D, EdgeIntervalKey3D>;
-    std::set<ConnectionIntervalKey3D> unique_connection_intervals;
-    for (const auto& connection : geometry.native_surface.geometric_connections) {
-        if (connection.g1)
-            continue;
-        ++expected_non_g1_connections;
-        EdgeIntervalKey3D first{connection.first.patch,
-            static_cast<int>(connection.first.edge),
-            connection.first.begin, connection.first.end};
-        EdgeIntervalKey3D second{connection.second.patch,
-            static_cast<int>(connection.second.edge),
-            connection.second.begin, connection.second.end};
-        if (second < first)
-            std::swap(first, second);
-        if (!unique_connection_intervals.insert({first, second}).second)
-            ++duplicate_connection_intervals;
-    }
-    std::set<int> covered_connections;
-    int g1_constraint_rows = 0;
-    int unrelated_constraint_rows = 0;
-    for (const auto& sample : constraints.samples) {
-        if (sample.connection_index < 0
-            || sample.connection_index >= static_cast<int>(
-                geometry.native_surface.geometric_connections.size())) {
-            ++unrelated_constraint_rows;
-            continue;
-        }
-        const auto& connection = geometry.native_surface.geometric_connections[
-            static_cast<std::size_t>(sample.connection_index)];
-        if (connection.g1) ++g1_constraint_rows;
-        else covered_connections.insert(sample.connection_index);
-    }
+    const app3d::NeumannEdgeConstraintAudit3D constraint_audit =
+        app3d::audit_neumann_edge_constraints_3d(
+            geometry.native_surface, surface_dofs, h, constraints);
 
     const auto setup_diagnostics = pipeline.restrict_owner_preprocess_diagnostics();
     const std::uint64_t setup_queries = static_cast<std::uint64_t>(
@@ -8288,14 +8255,18 @@ run_neumann_edge_continuity_pair_3d(
         row.geometry_setup_seconds = geometry_setup_seconds;
         row.pipeline_setup_seconds = pipeline_setup_seconds;
         row.projector_setup_seconds = projector_setup_seconds;
-        row.expected_non_g1_connections = expected_non_g1_connections;
-        row.covered_non_g1_connections = static_cast<int>(covered_connections.size());
-        row.duplicate_connection_intervals = duplicate_connection_intervals;
-        row.g1_constraint_rows = g1_constraint_rows;
-        row.unrelated_constraint_rows = unrelated_constraint_rows;
-        row.constraint_rows = static_cast<int>(constraints.matrix.rows());
+        row.expected_non_g1_connections =
+            constraint_audit.expected_non_g1_connections;
+        row.covered_non_g1_connections =
+            constraint_audit.covered_non_g1_connections;
+        row.duplicate_connection_intervals =
+            constraint_audit.duplicate_connection_intervals;
+        row.g1_constraint_rows = constraint_audit.g1_constraint_rows;
+        row.unrelated_constraint_rows =
+            constraint_audit.unrelated_constraint_rows;
+        row.constraint_rows = constraint_audit.constraint_rows;
         row.constraint_rank = projector.retained_rank();
-        row.reduced_order_rows = constraints.reduced_order_row_count;
+        row.reduced_order_rows = constraint_audit.reduced_order_rows;
         row.constant_constraint_defect = constant_constraint_defect;
         row.projected_constraint_defect = projected_constraint_defect;
         row.projection_idempotence_defect = projection_idempotence_defect;
@@ -8582,7 +8553,7 @@ void write_neumann_edge_continuity_checkpoints_3d(
     std::ofstream acceptance = open_output_file(output_dir / "acceptance.csv");
     acceptance << "completeness_pass,topology_pass,projector_pass,exact_trace_order_pass,"
                   "gmres_pass,error_guard_pass,edge_reduction_pass,trend_pass,"
-                  "geometry_owner_pass,overall_pass\n"
+                  "geometry_owner_pass,extended_evidence_pass,overall_pass\n"
         << criterion_status_name(evaluation.acceptance.completeness_pass) << ','
         << criterion_status_name(evaluation.acceptance.topology_pass) << ','
         << criterion_status_name(evaluation.acceptance.projector_pass) << ','
@@ -8592,6 +8563,7 @@ void write_neumann_edge_continuity_checkpoints_3d(
         << criterion_status_name(evaluation.acceptance.edge_reduction_pass) << ','
         << criterion_status_name(evaluation.acceptance.trend_pass) << ','
         << criterion_status_name(evaluation.acceptance.geometry_owner_pass) << ','
+        << criterion_status_name(evaluation.acceptance.extended_evidence_pass) << ','
         << criterion_status_name(evaluation.acceptance.overall_pass) << '\n';
 }
 
@@ -8687,9 +8659,10 @@ int run_neumann_edge_continuity_study_3d(std::vector<int> levels)
                     << " pass=" << row_pass << '\n';
             }
             if (!pair_pass) {
-                std::cerr << "error: Neumann edge-continuity structural or GMRES row gate "
-                             "failed: case=" << study_case.id << " N=" << N << '\n';
-                return 1;
+                std::cerr << (N == 128 ? "warning: " : "error: ")
+                    << "Neumann edge-continuity structural or GMRES row gate "
+                       "failed: case=" << study_case.id << " N=" << N << '\n';
+                if (N != 128) return 1;
             }
         }
     }
@@ -8707,23 +8680,13 @@ int run_neumann_edge_continuity_study_3d(std::vector<int> levels)
         << " edge_reduction=" << criterion_status_name(evaluation.acceptance.edge_reduction_pass)
         << " trend=" << criterion_status_name(evaluation.acceptance.trend_pass)
         << " geometry_owner=" << criterion_status_name(evaluation.acceptance.geometry_owner_pass)
+        << " extended_evidence="
+        << criterion_status_name(evaluation.acceptance.extended_evidence_pass)
         << " overall=" << criterion_status_name(evaluation.acceptance.overall_pass) << '\n';
     std::cout << "Neumann edge-continuity study output: " << output_dir.string() << '\n';
-    const bool prefix_execution_pass = std::all_of(
-        evaluation.rows.begin(), evaluation.rows.end(),
-        [](const app3d::NeumannEdgeContinuityDerivedRow3D& row) {
-            return row.row_pass == app3d::RigidStudyCriterionStatus3D::Pass;
-        })
-        && evaluation.acceptance.topology_pass
-            == app3d::RigidStudyCriterionStatus3D::Pass
-        && evaluation.acceptance.projector_pass
-            == app3d::RigidStudyCriterionStatus3D::Pass
-        && evaluation.acceptance.edge_reduction_pass
-            == app3d::RigidStudyCriterionStatus3D::Pass
-        && evaluation.acceptance.geometry_owner_pass
-            == app3d::RigidStudyCriterionStatus3D::Pass;
-    const bool exit_pass = require_complete_pilot
-        ? evaluation.all_pass : prefix_execution_pass;
+    const bool exit_pass =
+        app3d::neumann_edge_continuity_study_exit_pass_3d(
+            evaluation, require_complete_pilot);
     if (!exit_pass) {
         std::cerr << "error: Neumann edge-continuity study acceptance failed\n";
         return 1;

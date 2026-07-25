@@ -44,6 +44,23 @@ struct NeumannEdgeConstraintSet3D {
     std::vector<NeumannEdgeConstraintSample3D> samples;
 };
 
+struct NeumannEdgeConstraintAudit3D {
+    int expected_non_g1_connections = 0;
+    int covered_non_g1_connections = 0;
+    int duplicate_connection_intervals = 0;
+    int g1_constraint_rows = 0;
+    int unrelated_constraint_rows = 0;
+    int constraint_rows = 0;
+    int reduced_order_rows = 0;
+    bool pass = false;
+};
+
+NeumannEdgeConstraintAudit3D audit_neumann_edge_constraints_3d(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud3D& cloud,
+    double h,
+    const NeumannEdgeConstraintSet3D& constraints);
+
 NeumannEdgeConstraintSet3D build_neumann_edge_constraints_3d(
     const NativeNurbsSurface3D& surface,
     const SurfaceDofCloud3D& cloud,
@@ -188,6 +205,7 @@ struct NeumannEdgeContinuityAcceptance3D {
     RigidStudyCriterionStatus3D edge_reduction_pass = RigidStudyCriterionStatus3D::NotEvaluated;
     RigidStudyCriterionStatus3D trend_pass = RigidStudyCriterionStatus3D::NotEvaluated;
     RigidStudyCriterionStatus3D geometry_owner_pass = RigidStudyCriterionStatus3D::NotEvaluated;
+    RigidStudyCriterionStatus3D extended_evidence_pass = RigidStudyCriterionStatus3D::NotEvaluated;
     RigidStudyCriterionStatus3D overall_pass = RigidStudyCriterionStatus3D::NotEvaluated;
 };
 
@@ -202,6 +220,10 @@ std::vector<int> normalize_neumann_edge_continuity_levels_3d(std::vector<int> le
 NeumannEdgeContinuityEvaluation3D evaluate_neumann_edge_continuity_study_3d(
     const std::vector<NeumannEdgeContinuityMeasurement3D>& measurements,
     const std::vector<std::string>& case_ids,
+    bool require_complete_pilot);
+
+bool neumann_edge_continuity_study_exit_pass_3d(
+    const NeumannEdgeContinuityEvaluation3D& evaluation,
     bool require_complete_pilot);
 
 } // namespace kfbim::app3d

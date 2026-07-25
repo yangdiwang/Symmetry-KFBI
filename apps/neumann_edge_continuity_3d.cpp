@@ -223,6 +223,199 @@ NeumannEdgeConstraintSet3D build_neumann_edge_constraints_3d(
     return result;
 }
 
+NeumannEdgeConstraintAudit3D audit_neumann_edge_constraints_3d(
+    const NativeNurbsSurface3D& surface, const SurfaceDofCloud3D& cloud,
+    double h, const NeumannEdgeConstraintSet3D& constraints)
+{
+    if (!std::isfinite(h) || h <= 0.0)
+        throw std::invalid_argument("edge constraint audit requires positive h");
+    if (cloud.patches.size() != surface.patches.size())
+        throw std::invalid_argument(
+            "edge constraint audit patch grids do not match the surface");
+
+    NeumannEdgeConstraintAudit3D result;
+    result.constraint_rows = static_cast<int>(constraints.matrix.rows());
+    bool dimensions_ok = constraints.density_size
+            == static_cast<int>(cloud.dofs.size())
+        && constraints.matrix.cols() == constraints.density_size
+        && constraints.matrix.rows()
+            == static_cast<Eigen::Index>(constraints.samples.size())
+        && constraints.quadrature_weights.size()
+            == static_cast<Eigen::Index>(constraints.samples.size());
+    if (constraints.matrix.rows()
+        > static_cast<Eigen::Index>(constraints.samples.size())) {
+        result.unrelated_constraint_rows += static_cast<int>(
+            constraints.matrix.rows() - constraints.samples.size());
+    }
+    if (constraints.quadrature_weights.size()
+        > static_cast<Eigen::Index>(constraints.samples.size())) {
+        result.unrelated_constraint_rows += static_cast<int>(
+            constraints.quadrature_weights.size()
+            - constraints.samples.size());
+    }
+    if (constraints.density_size != static_cast<int>(cloud.dofs.size())
+        || constraints.matrix.cols() != constraints.density_size) {
+        result.unrelated_constraint_rows +=
+            std::max(1, result.constraint_rows);
+    }
+
+    const auto nearly_equal = [](double actual, double expected) {
+        const double scale = std::max(
+            {1.0, std::abs(actual), std::abs(expected)});
+        return std::isfinite(actual) && std::isfinite(expected)
+            && std::abs(actual - expected)
+                <= 128.0 * std::numeric_limits<double>::epsilon() * scale;
+    };
+    std::vector<int> expected_counts(
+        surface.geometric_connections.size(), -1);
+    std::vector<std::vector<int>> occurrences(
+        surface.geometric_connections.size());
+    std::vector<bool> connection_valid(
+        surface.geometric_connections.size(), true);
+    std::vector<bool> connection_has_duplicate(
+        surface.geometric_connections.size(), false);
+    using EdgeIntervalKey = std::tuple<int, int, double, double>;
+    using ConnectionIntervalKey =
+        std::pair<EdgeIntervalKey, EdgeIntervalKey>;
+    std::set<ConnectionIntervalKey> declared_intervals;
+    for (std::size_t c = 0; c < surface.geometric_connections.size(); ++c) {
+        const auto& connection = surface.geometric_connections[c];
+        if (connection.g1) continue;
+        ++result.expected_non_g1_connections;
+        EdgeIntervalKey first{connection.first.patch,
+            static_cast<int>(connection.first.edge),
+            connection.first.begin, connection.first.end};
+        EdgeIntervalKey second{connection.second.patch,
+            static_cast<int>(connection.second.edge),
+            connection.second.begin, connection.second.end};
+        if (second < first) std::swap(first, second);
+        if (!declared_intervals.insert({first, second}).second)
+            ++result.duplicate_connection_intervals;
+        const int expected = std::max(2, static_cast<int>(std::ceil(
+            edge_length(surface, connection.first) / h)));
+        expected_counts[c] = expected;
+        occurrences[c].assign(static_cast<std::size_t>(expected), 0);
+    }
+
+    for (std::size_t row_index = 0;
+         row_index < constraints.samples.size(); ++row_index) {
+        const auto& sample = constraints.samples[row_index];
+        if (sample.first_reduced_order || sample.second_reduced_order)
+            ++result.reduced_order_rows;
+        if (sample.connection_index < 0
+            || sample.connection_index >= static_cast<int>(
+                surface.geometric_connections.size())) {
+            ++result.unrelated_constraint_rows;
+            continue;
+        }
+        const std::size_t connection_index =
+            static_cast<std::size_t>(sample.connection_index);
+        const auto& connection =
+            surface.geometric_connections[connection_index];
+        if (connection.g1) {
+            ++result.g1_constraint_rows;
+            continue;
+        }
+
+        bool row_valid = true;
+        const int expected_count = expected_counts[connection_index];
+        if (sample.sample_index < 0
+            || sample.sample_index >= expected_count) {
+            row_valid = false;
+        } else {
+            int& count = occurrences[connection_index][
+                static_cast<std::size_t>(sample.sample_index)];
+            ++count;
+            if (count > 1)
+                connection_has_duplicate[connection_index] = true;
+        }
+        row_valid = row_valid && sample.sample_count == expected_count
+            && sample.first_patch == connection.first.patch
+            && sample.second_patch == connection.second.patch
+            && sample.first_edge == connection.first.edge
+            && sample.second_edge == connection.second.edge;
+        if (sample.sample_index >= 0
+            && sample.sample_index < expected_count) {
+            const double s = (sample.sample_index + 0.5)
+                / static_cast<double>(expected_count);
+            const double expected_first = edge_parameter(connection.first, s);
+            const double expected_second = edge_parameter(
+                connection.second, connection.reversed ? 1.0 - s : s);
+            row_valid = row_valid
+                && nearly_equal(sample.normalized_parameter, s)
+                && nearly_equal(sample.first_parameter, expected_first)
+                && nearly_equal(sample.second_parameter, expected_second);
+        }
+
+        if (row_index >= static_cast<std::size_t>(
+                constraints.quadrature_weights.size())
+            || !nearly_equal(sample.quadrature_weight,
+                constraints.quadrature_weights[
+                    static_cast<Eigen::Index>(row_index)])
+            || sample.quadrature_weight <= 0.0) {
+            row_valid = false;
+        }
+
+        if (row_index >= static_cast<std::size_t>(
+                constraints.matrix.rows())
+            || connection.first.patch < 0
+            || connection.second.patch < 0
+            || connection.first.patch >= static_cast<int>(cloud.patches.size())
+            || connection.second.patch >= static_cast<int>(cloud.patches.size())) {
+            row_valid = false;
+        } else {
+            const auto& first_patch = cloud.patches[
+                static_cast<std::size_t>(connection.first.patch)];
+            const auto& second_patch = cloud.patches[
+                static_cast<std::size_t>(connection.second.patch)];
+            const auto in_patch = [](int column, const SurfaceDofPatch3D& patch) {
+                return column >= patch.first_dof
+                    && column < patch.first_dof + patch.dof_count();
+            };
+            bool has_first_support = false;
+            bool has_second_support = false;
+            for (Eigen::SparseMatrix<double, Eigen::RowMajor>::InnerIterator it(
+                     constraints.matrix, static_cast<int>(row_index));
+                 it; ++it) {
+                if (!std::isfinite(it.value())) {
+                    row_valid = false;
+                    continue;
+                }
+                if (it.value() == 0.0) continue;
+                const bool first_support = in_patch(it.col(), first_patch);
+                const bool second_support = in_patch(it.col(), second_patch);
+                if (!first_support && !second_support) row_valid = false;
+                has_first_support = has_first_support || first_support;
+                has_second_support = has_second_support || second_support;
+            }
+            row_valid = row_valid && has_first_support && has_second_support;
+        }
+        if (!row_valid) {
+            connection_valid[connection_index] = false;
+            ++result.unrelated_constraint_rows;
+        }
+    }
+
+    for (std::size_t c = 0; c < surface.geometric_connections.size(); ++c) {
+        if (expected_counts[c] < 0) continue;
+        for (int count : occurrences[c])
+            if (count != 1) connection_valid[c] = false;
+        if (connection_has_duplicate[c])
+            ++result.duplicate_connection_intervals;
+        if (connection_valid[c])
+            ++result.covered_non_g1_connections;
+    }
+    result.pass = dimensions_ok
+        && result.expected_non_g1_connections > 0
+        && result.covered_non_g1_connections
+            == result.expected_non_g1_connections
+        && result.duplicate_connection_intervals == 0
+        && result.g1_constraint_rows == 0
+        && result.unrelated_constraint_rows == 0
+        && result.constraint_rows > 0;
+    return result;
+}
+
 Eigen::VectorXd apply_neumann_edge_constraints_3d(const NeumannEdgeConstraintSet3D& constraints,
                                                    const Eigen::VectorXd& density)
 {
@@ -581,6 +774,18 @@ NeumannEdgeContinuityEvaluation3D evaluate_neumann_edge_continuity_study_3d(
             throw std::invalid_argument("Neumann edge-continuity study measurement key is duplicated");
     }
 
+    std::vector<const NeumannEdgeContinuityMeasurement3D*> coarse_measurements;
+    std::vector<const NeumannEdgeContinuityMeasurement3D*> extended_measurements;
+    for (const auto& row : measurements) {
+        (row.N == 128 ? extended_measurements : coarse_measurements)
+            .push_back(std::addressof(row));
+    }
+
+    const auto all_rows_satisfy = [](const auto& rows, const auto& predicate) {
+        return std::all_of(rows.begin(), rows.end(),
+            [&](const auto* row) { return predicate(*row); });
+    };
+
     NeumannEdgeContinuityEvaluation3D result;
     result.rows.reserve(measurements.size());
     for (const auto& measurement : measurements) {
@@ -629,21 +834,23 @@ NeumannEdgeContinuityEvaluation3D evaluate_neumann_edge_continuity_study_3d(
         return true;
     });
     const bool pairs_available = all_pair_rows_available(keyed, case_ids);
-    const bool rows_finite = std::all_of(measurements.begin(), measurements.end(), edge_measurement_finite);
-    const bool topology = std::all_of(measurements.begin(), measurements.end(), topology_ok);
-    const bool projector = std::all_of(measurements.begin(), measurements.end(), projector_ok);
-    const bool geometry_owner = std::all_of(measurements.begin(), measurements.end(), geometry_owner_ok);
-    result.acceptance.completeness_pass = complete ? EdgeStatus::Pass : EdgeStatus::NotEvaluated;
-    result.acceptance.topology_pass = measurements.empty() ? EdgeStatus::NotEvaluated : edge_status(topology);
-    result.acceptance.projector_pass = measurements.empty() ? EdgeStatus::NotEvaluated : edge_status(projector);
-    result.acceptance.geometry_owner_pass = measurements.empty() ? EdgeStatus::NotEvaluated : edge_status(geometry_owner);
+    const bool rows_finite = all_rows_satisfy(coarse_measurements, edge_measurement_finite);
+    const bool topology = all_rows_satisfy(coarse_measurements, topology_ok);
+    const bool projector = all_rows_satisfy(coarse_measurements, projector_ok);
+    const bool geometry_owner = all_rows_satisfy(coarse_measurements, geometry_owner_ok);
+    result.acceptance.completeness_pass = complete ? EdgeStatus::Pass
+        : require_complete_pilot ? EdgeStatus::Fail : EdgeStatus::NotEvaluated;
+    result.acceptance.topology_pass = coarse_measurements.empty() ? EdgeStatus::NotEvaluated : edge_status(topology);
+    result.acceptance.projector_pass = coarse_measurements.empty() ? EdgeStatus::NotEvaluated : edge_status(projector);
+    result.acceptance.geometry_owner_pass = coarse_measurements.empty() ? EdgeStatus::NotEvaluated : edge_status(geometry_owner);
 
-    bool gmres_ok = rows_finite && std::all_of(measurements.begin(), measurements.end(), gmres_row_ok);
+    bool gmres_ok = rows_finite && all_rows_satisfy(coarse_measurements, gmres_row_ok);
     if (!gmres_ok) result.acceptance.gmres_pass = EdgeStatus::Fail;
-    else if (!pairs_available || measurements.empty()) result.acceptance.gmres_pass = EdgeStatus::NotEvaluated;
+    else if (!pairs_available || coarse_measurements.empty()) result.acceptance.gmres_pass = EdgeStatus::NotEvaluated;
     else {
         int projected_max = 0, unconstrained_max = 0, projected_ty_max = 0, unconstrained_ty_max = 0;
-        for (const auto& row : measurements) {
+        for (const auto* row_pointer : coarse_measurements) {
+            const auto& row = *row_pointer;
             int* maximum = row.density_space == NeumannDensitySpace3D::NonG1EdgeProjected
                 ? &projected_max : &unconstrained_max;
             *maximum = std::max(*maximum, row.gmres_iterations);
@@ -671,12 +878,14 @@ NeumannEdgeContinuityEvaluation3D evaluate_neumann_edge_continuity_study_3d(
     }
     result.acceptance.exact_trace_order_pass = exact_ready ? edge_status(exact_ok) : EdgeStatus::NotEvaluated;
 
-    if (!pairs_available || measurements.empty()) {
+    if (!pairs_available || coarse_measurements.empty()) {
         result.acceptance.error_guard_pass = EdgeStatus::NotEvaluated;
         result.acceptance.edge_reduction_pass = EdgeStatus::NotEvaluated;
     } else {
         bool error_ok = true, edge_ok = true;
-        for (const auto& row : measurements) if (row.density_space == NeumannDensitySpace3D::NonG1EdgeProjected) {
+        for (const auto* row_pointer : coarse_measurements) {
+            const auto& row = *row_pointer;
+            if (row.density_space != NeumannDensitySpace3D::NonG1EdgeProjected) continue;
             const auto* base = edge_measurement(keyed, row.case_id, row.N, NeumannDensitySpace3D::PatchIndependent);
             error_ok = error_ok && base != nullptr && row.density_linf <= 1.10 * base->density_linf
                 && row.density_l2 <= 1.10 * base->density_l2 && row.interior_linf <= 1.10 * base->interior_linf
@@ -707,13 +916,77 @@ NeumannEdgeContinuityEvaluation3D evaluate_neumann_edge_continuity_study_3d(
         result.acceptance.trend_pass = edge_status(trend_ok);
     }
 
+    if (extended_measurements.empty()) {
+        result.acceptance.extended_evidence_pass = EdgeStatus::NotEvaluated;
+    } else {
+        const bool extended_complete = std::all_of(
+            case_ids.begin(), case_ids.end(), [&](const std::string& case_id) {
+                return edge_measurement(keyed, case_id, 128,
+                           NeumannDensitySpace3D::PatchIndependent)
+                    && edge_measurement(keyed, case_id, 128,
+                           NeumannDensitySpace3D::NonG1EdgeProjected);
+            });
+        bool extended_ok = extended_complete
+            && all_rows_satisfy(extended_measurements, edge_measurement_finite)
+            && all_rows_satisfy(extended_measurements, gmres_row_ok)
+            && all_rows_satisfy(extended_measurements, topology_ok)
+            && all_rows_satisfy(extended_measurements, projector_ok)
+            && all_rows_satisfy(extended_measurements, geometry_owner_ok);
+        int projected_max = 0;
+        int unconstrained_max = 0;
+        int projected_ty_max = 0;
+        int unconstrained_ty_max = 0;
+        if (extended_complete) {
+            for (const std::string& case_id : case_ids) {
+                const auto* base = edge_measurement(keyed, case_id, 128,
+                    NeumannDensitySpace3D::PatchIndependent);
+                const auto* projected = edge_measurement(keyed, case_id, 128,
+                    NeumannDensitySpace3D::NonG1EdgeProjected);
+                unconstrained_max = std::max(
+                    unconstrained_max, base->gmres_iterations);
+                projected_max = std::max(
+                    projected_max, projected->gmres_iterations);
+                if (case_id == "ty_m0083") {
+                    unconstrained_ty_max = base->gmres_iterations;
+                    projected_ty_max = projected->gmres_iterations;
+                }
+                extended_ok = extended_ok
+                    && projected->density_linf <= 1.10 * base->density_linf
+                    && projected->density_l2 <= 1.10 * base->density_l2
+                    && projected->interior_linf <= 1.10 * base->interior_linf
+                    && projected->interior_l2 <= 1.10 * base->interior_l2
+                    && base->edge_mismatch_linf
+                           / projected->edge_mismatch_linf >= 1.0e4;
+            }
+            extended_ok = extended_ok
+                && projected_max <= unconstrained_max
+                && projected_ty_max < unconstrained_ty_max;
+        }
+        result.acceptance.extended_evidence_pass = edge_status(extended_ok);
+    }
+
     result.acceptance.overall_pass = combine_rigid_study_criteria_3d(
         {result.acceptance.completeness_pass, result.acceptance.topology_pass,
          result.acceptance.projector_pass, result.acceptance.exact_trace_order_pass,
          result.acceptance.gmres_pass, result.acceptance.error_guard_pass,
          result.acceptance.edge_reduction_pass, result.acceptance.trend_pass,
-         result.acceptance.geometry_owner_pass}, !measurements.empty(), require_complete_pilot);
+         result.acceptance.geometry_owner_pass}, !coarse_measurements.empty(), require_complete_pilot);
     result.all_pass = result.acceptance.overall_pass == EdgeStatus::Pass;
     return result;
+}
+
+bool neumann_edge_continuity_study_exit_pass_3d(
+    const NeumannEdgeContinuityEvaluation3D& evaluation,
+    bool require_complete_pilot)
+{
+    if (require_complete_pilot) return evaluation.all_pass;
+    return std::all_of(evaluation.rows.begin(), evaluation.rows.end(),
+               [](const NeumannEdgeContinuityDerivedRow3D& row) {
+                   return row.row_pass == EdgeStatus::Pass;
+               })
+        && evaluation.acceptance.topology_pass == EdgeStatus::Pass
+        && evaluation.acceptance.projector_pass == EdgeStatus::Pass
+        && evaluation.acceptance.edge_reduction_pass == EdgeStatus::Pass
+        && evaluation.acceptance.geometry_owner_pass == EdgeStatus::Pass;
 }
 } // namespace kfbim::app3d

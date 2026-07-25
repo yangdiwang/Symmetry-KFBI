@@ -2,6 +2,7 @@
 
 #include "../src/operators/i_kfbi_operator.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <functional>
@@ -147,6 +148,71 @@ void test_non_g1_topology_and_rows()
     require(apply_neumann_edge_constraints_3d(constraints,
                 Eigen::VectorXd::Ones(constraints.density_size)).lpNorm<Eigen::Infinity>() <= 5.0e-13,
             "constant partition of unity");
+}
+
+void test_constraint_topology_audit_mutations()
+{
+    const auto surface = make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
+    const double h = 3.0 / 32.0;
+    const auto cloud = make_native_surface_dofs_3d(surface, h);
+    const auto constraints = build_neumann_edge_constraints_3d(
+        surface, cloud, h);
+    const auto valid = audit_neumann_edge_constraints_3d(
+        surface, cloud, h, constraints);
+    require(valid.pass
+                && valid.expected_non_g1_connections
+                    == constraints.non_g1_connection_count
+                && valid.covered_non_g1_connections
+                    == valid.expected_non_g1_connections
+                && valid.duplicate_connection_intervals == 0
+                && valid.g1_constraint_rows == 0
+                && valid.unrelated_constraint_rows == 0
+                && valid.constraint_rows == constraints.matrix.rows(),
+            "valid constraint topology audit failed");
+
+    auto duplicate = constraints;
+    duplicate.samples[1].sample_index = duplicate.samples[0].sample_index;
+    const auto duplicate_audit = audit_neumann_edge_constraints_3d(
+        surface, cloud, h, duplicate);
+    require(!duplicate_audit.pass
+                && duplicate_audit.duplicate_connection_intervals > 0
+                && duplicate_audit.covered_non_g1_connections
+                    < duplicate_audit.expected_non_g1_connections,
+            "duplicate edge sample was hidden");
+
+    auto missing = constraints;
+    missing.samples.erase(missing.samples.begin());
+    const auto missing_audit = audit_neumann_edge_constraints_3d(
+        surface, cloud, h, missing);
+    require(!missing_audit.pass
+                && missing_audit.covered_non_g1_connections
+                    < missing_audit.expected_non_g1_connections,
+            "missing edge sample was hidden");
+
+    auto metadata = constraints;
+    metadata.samples.front().second_parameter += 0.125;
+    const auto metadata_audit = audit_neumann_edge_constraints_3d(
+        surface, cloud, h, metadata);
+    require(!metadata_audit.pass
+                && metadata_audit.unrelated_constraint_rows > 0,
+            "edge sample metadata mismatch was hidden");
+
+    auto support = constraints;
+    const auto& first_sample = support.samples.front();
+    int unrelated_patch = 0;
+    while (unrelated_patch == first_sample.first_patch
+           || unrelated_patch == first_sample.second_patch) {
+        ++unrelated_patch;
+    }
+    support.matrix.coeffRef(
+        0, cloud.patches[static_cast<std::size_t>(unrelated_patch)].first_dof)
+        = 0.25;
+    support.matrix.makeCompressed();
+    const auto support_audit = audit_neumann_edge_constraints_3d(
+        surface, cloud, h, support);
+    require(!support_audit.pass
+                && support_audit.unrelated_constraint_rows > 0,
+            "unrelated sparse matrix support was hidden");
 }
 
 void test_fallback_and_order()
@@ -447,7 +513,16 @@ void test_edge_study_acceptance_and_failure_gates()
     auto missing = passing;
     missing.pop_back();
     const auto incomplete = evaluate_neumann_edge_continuity_study_3d(missing, cases, true);
-    require(incomplete.acceptance.completeness_pass == Status::NotEvaluated && incomplete.acceptance.overall_pass == Status::NotEvaluated && !incomplete.all_pass, "missing case/level/mode row was hidden");
+    require(incomplete.acceptance.completeness_pass == Status::Fail
+                && incomplete.acceptance.overall_pass == Status::Fail
+                && !incomplete.all_pass,
+            "final complete pilot did not fail a missing case/level/mode row");
+    require(incomplete.rows.size() == missing.size()
+                && std::all_of(incomplete.rows.begin(), incomplete.rows.end(),
+                    [](const auto& row) {
+                        return row.row_pass == Status::Pass;
+                    }),
+            "in-progress final checkpoint lost completed execution rows");
     auto duplicate = passing;
     duplicate.push_back(duplicate.front());
     require_throws([&] { evaluate_neumann_edge_continuity_study_3d(duplicate, cases, true); }, "duplicate case/N/density-space row was accepted");
@@ -503,6 +578,67 @@ void test_edge_study_acceptance_and_failure_gates()
     require(evaluate_neumann_edge_continuity_study_3d(geometry, cases, true).acceptance.geometry_owner_pass == Status::Fail, "changed shared-preprocess invariant was hidden");
 }
 
+void test_n128_extended_evidence_does_not_change_coarse_acceptance()
+{
+    using Status = RigidStudyCriterionStatus3D;
+    const std::vector<std::string> cases = {
+        "baseline", "ty_m0083", "rot_axis123_17deg"};
+    auto rows = passing_measurements();
+    for (const std::string& case_id : cases) {
+        rows.push_back(passing_measurement(
+            case_id, 128, NeumannDensitySpace3D::PatchIndependent));
+        rows.push_back(passing_measurement(
+            case_id, 128, NeumannDensitySpace3D::NonG1EdgeProjected));
+    }
+    const auto clean_extended = evaluate_neumann_edge_continuity_study_3d(
+        rows, cases, true);
+    require(clean_extended.acceptance.extended_evidence_pass == Status::Pass
+                && clean_extended.acceptance.overall_pass == Status::Pass,
+            "valid N=128 extended evidence was not reported as pass");
+    for (auto& row : rows) {
+        if (row.N != 128
+            || row.density_space
+                != NeumannDensitySpace3D::NonG1EdgeProjected) {
+            continue;
+        }
+        const auto unconstrained = std::find_if(
+            rows.begin(), rows.end(), [&](const auto& candidate) {
+                return candidate.case_id == row.case_id
+                    && candidate.N == 128
+                    && candidate.density_space
+                        == NeumannDensitySpace3D::PatchIndependent;
+            });
+        require(unconstrained != rows.end(),
+                "missing N=128 unconstrained mutation fixture");
+        row.gmres_iterations = 80;
+        row.density_linf = 2.0 * unconstrained->density_linf;
+        row.density_l2 = 2.0 * unconstrained->density_l2;
+        row.interior_linf = 2.0 * unconstrained->interior_linf;
+        row.interior_l2 = 2.0 * unconstrained->interior_l2;
+        row.edge_mismatch_linf = unconstrained->edge_mismatch_linf;
+    }
+    const auto evaluation = evaluate_neumann_edge_continuity_study_3d(
+        rows, cases, true);
+    for (Status status : {evaluation.acceptance.completeness_pass,
+                          evaluation.acceptance.topology_pass,
+                          evaluation.acceptance.projector_pass,
+                          evaluation.acceptance.exact_trace_order_pass,
+                          evaluation.acceptance.gmres_pass,
+                          evaluation.acceptance.error_guard_pass,
+                          evaluation.acceptance.edge_reduction_pass,
+                          evaluation.acceptance.trend_pass,
+                          evaluation.acceptance.geometry_owner_pass,
+                          evaluation.acceptance.overall_pass}) {
+        require(status == Status::Pass,
+                "N=128 evidence changed a passing N=32/64 coarse gate");
+    }
+    require(evaluation.all_pass
+                && evaluation.acceptance.extended_evidence_pass == Status::Fail,
+            "failing N=128 numerical evidence was not reported separately");
+    require(neumann_edge_continuity_study_exit_pass_3d(evaluation, true),
+            "failing N=128 evidence remained a process-exit gate");
+}
+
 void test_edge_study_n32_smoke_keeps_two_level_gates_not_evaluated()
 {
     using Status = RigidStudyCriterionStatus3D;
@@ -516,12 +652,14 @@ int main()
 {
     try {
         test_non_g1_topology_and_rows();
+        test_constraint_topology_audit_mutations();
         test_fallback_and_order();
         test_surface_mass_projector();
         test_projected_augmented_operator();
         test_shared_preprocess_snapshot_mutations();
         test_edge_study_level_prefixes();
         test_edge_study_acceptance_and_failure_gates();
+        test_n128_extended_evidence_does_not_change_coarse_acceptance();
         test_edge_study_n32_smoke_keeps_two_level_gates_not_evaluated();
         std::cout << "3D Neumann edge-continuity tests passed\n";
         return 0;
