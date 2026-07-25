@@ -1,4 +1,5 @@
 #include "neumann_edge_augmented_cauchy_3d.hpp"
+#include "neumann_edge_augmented_cauchy_3d_detail.hpp"
 #include "native_nurbs_surface_transform_3d.hpp"
 
 #include <algorithm>
@@ -16,19 +17,6 @@
 #include <tuple>
 #include <vector>
 
-namespace kfbim::app3d::detail {
-struct NeumannEdgeDistanceCandidate3D {
-    double squared_distance = 0.0;
-    int sample_index = -1;
-    int edge_sample_index = -1;
-    int certified_symmetric_partner = -1;
-};
-
-std::vector<int> select_neumann_edge_distance_candidates_3d(
-    std::vector<NeumannEdgeDistanceCandidate3D> candidates,
-    double radius_squared,
-    int count);
-} // namespace kfbim::app3d::detail
 
 namespace {
 using namespace kfbim::app3d;
@@ -326,6 +314,103 @@ void test_exact_distance_selection_boundaries()
                 certified_tie,2.0,4)
             ==std::vector<int>({101,102,103,100}),
         "certified parameter-symmetric tie did not use sample index");
+}
+
+void test_geometric_symmetry_certificate()
+{
+    using Connection=kfbim::geometry3d::NurbsPatchEdgeConnection3D;
+    using kfbim::app3d::detail::certified_l_prism_symmetric_partner_3d;
+    const double h=3.0/32.0;
+    const auto source=make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
+    std::vector<NativeNurbsSurface3D> rigid_poses;
+    rigid_poses.push_back(source);
+    rigid_poses.push_back(transform_native_nurbs_surface_3d(
+        source,RigidTransform3D::from_axis_angle(
+            Eigen::Vector3d(1.0,-2.0,0.7),0.61,
+            Eigen::Vector3d(0.04,-0.03,0.08),
+            Eigen::Vector3d(0.23,-0.17,0.31))));
+
+    const Connection full{
+        {0,PatchEdge3D::UMin,0.0,1.0},
+        {6,PatchEdge3D::VMin,0.0,1.0},false,false};
+    const Connection partial{
+        {0,PatchEdge3D::UMin,0.0,0.5},
+        {6,PatchEdge3D::VMin,0.0,1.0},false,false};
+    const Connection reversed{
+        {6,PatchEdge3D::VMin,0.0,1.0},
+        {0,PatchEdge3D::UMin,0.0,1.0},true,false};
+    const Connection partial_reversed{
+        {6,PatchEdge3D::VMin,0.0,1.0},
+        {0,PatchEdge3D::UMin,0.0,0.5},true,false};
+
+    auto require_pair=[&](const NativeNurbsSurface3D& surface,
+                          const SurfaceDofCloud3D& cloud,
+                          const Connection& connection,
+                          int first,int second,const std::string& context) {
+        const auto& tensor=cloud.patches.at(0);
+        const auto& center=cloud.dofs.at(static_cast<std::size_t>(
+            tensor.dof_index(0,2)));
+        NeumannEdgeAuxiliarySample3D sample;
+        sample.sample_count=7;
+        sample.sample_index=first;
+        require(certified_l_prism_symmetric_partner_3d(
+                    surface,cloud,center,connection,sample)==second,
+            context+" did not certify its first partner");
+        sample.sample_index=second;
+        require(certified_l_prism_symmetric_partner_3d(
+                    surface,cloud,center,connection,sample)==first,
+            context+" did not certify its reciprocal partner");
+    };
+    for(const auto& surface:rigid_poses) {
+        const auto cloud=make_native_surface_dofs_3d(surface,h);
+        require_pair(surface,cloud,full,0,4,"full interval");
+        require_pair(surface,cloud,partial,3,6,"partial interval");
+        require_pair(surface,cloud,reversed,2,6,"reversed interval");
+        require_pair(surface,cloud,partial_reversed,0,3,
+            "partial reversed interval");
+    }
+
+    auto replace_patch_zero=[](NativeNurbsSurface3D& surface,
+                               std::vector<std::vector<Eigen::Vector3d>> net) {
+        const auto& patch=surface.patches.at(0);
+        surface.patches[0]=kfbim::geometry3d::NurbsSurfacePatch3D(
+            patch.basis_u(),patch.basis_v(),std::move(net),patch.weights());
+    };
+    auto rejected_partner=[&](const NativeNurbsSurface3D& surface) {
+        const auto cloud=make_native_surface_dofs_3d(surface,h);
+        const auto& tensor=cloud.patches.at(0);
+        const auto& center=cloud.dofs.at(static_cast<std::size_t>(
+            tensor.dof_index(0,2)));
+        NeumannEdgeAuxiliarySample3D sample;
+        sample.sample_count=7;
+        sample.sample_index=0;
+        return certified_l_prism_symmetric_partner_3d(
+            surface,cloud,center,full,sample);
+    };
+
+    auto sheared=source;
+    auto sheared_net=sheared.patches.at(0).control_net();
+    const Eigen::Vector3d along=
+        sheared_net[0][1]-sheared_net[0][0];
+    sheared_net[1][0]+=0.25*along;
+    sheared_net[1][1]+=0.25*along;
+    replace_patch_zero(sheared,std::move(sheared_net));
+    require(sheared.name==source.name && sheared.description==source.description,
+        "sheared fixture did not retain native metadata");
+    require(rejected_partner(sheared)==-1,
+        "metadata-preserving sheared control net was certified");
+
+    auto bilinear=source;
+    auto bilinear_net=bilinear.patches.at(0).control_net();
+    const Eigen::Vector3d transverse=
+        bilinear_net[1][0]-bilinear_net[0][0];
+    const Eigen::Vector3d normal=along.cross(transverse).normalized();
+    bilinear_net[1][1]+=0.1*normal;
+    replace_patch_zero(bilinear,std::move(bilinear_net));
+    require(bilinear.name==source.name && bilinear.description==source.description,
+        "bilinear fixture did not retain native metadata");
+    require(rejected_partner(bilinear)==-1,
+        "metadata-preserving bilinear control net was certified");
 }
 
 std::vector<NeumannEdgeFaceStencil3D> exact_face_stencils(
@@ -1223,6 +1308,7 @@ int main()
         test_l_prism_geometry_topology_reproduction_and_direct_map();
         test_rigid_covariance();
         test_exact_distance_selection_boundaries();
+        test_geometric_symmetry_certificate();
         test_local_attachment_groups_and_overwrite();
         test_local_harmonic_reproduction_and_rigid_covariance();
         test_local_map_rejections();

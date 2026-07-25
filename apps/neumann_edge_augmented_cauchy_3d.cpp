@@ -1,4 +1,5 @@
 #include "neumann_edge_augmented_cauchy_3d.hpp"
+#include "neumann_edge_augmented_cauchy_3d_detail.hpp"
 
 #include <Eigen/SVD>
 
@@ -16,13 +17,6 @@
 
 namespace kfbim::app3d {
 namespace detail {
-
-struct NeumannEdgeDistanceCandidate3D {
-    double squared_distance = 0.0;
-    int sample_index = -1;
-    int edge_sample_index = -1;
-    int certified_symmetric_partner = -1;
-};
 
 std::vector<int> select_neumann_edge_distance_candidates_3d(
     std::vector<NeumannEdgeDistanceCandidate3D> candidates,
@@ -571,6 +565,13 @@ Eigen::Vector3d center_coordinate(
             displacement.dot(center.normal)};
 }
 
+double forward_error_gamma(int operation_count)
+{
+    const double product = operation_count
+        * std::numeric_limits<double>::epsilon();
+    return product / (1.0 - product);
+}
+
 bool native_l_prism_affine_patch(const NativeNurbsSurface3D& surface, int patch_id)
 {
     if (surface.name != "l_prism"
@@ -591,7 +592,68 @@ bool native_l_prism_affine_patch(const NativeNurbsSurface3D& surface, int patch_
     for (const auto& row : patch.weights())
         for (const double weight : row)
             if (weight != 1.0) return false;
-    return true;
+
+    const auto& net = patch.control_net();
+    const Eigen::Vector3d& p00 = net[0][0];
+    const Eigen::Vector3d& p01 = net[0][1];
+    const Eigen::Vector3d& p10 = net[1][0];
+    const Eigen::Vector3d& p11 = net[1][1];
+    // One transformed control coordinate uses fewer than 16 elementary
+    // operations in R*(p-center)+center+translation. Gamma(64) also covers
+    // the native corner construction and leaves a conservative forward-error
+    // envelope without introducing a geometry-scale-independent tolerance.
+    const double transform_gamma = forward_error_gamma(64);
+    const double closure_arithmetic_gamma = forward_error_gamma(3);
+    const double geometry_scale = p00.norm() + p01.norm()
+        + p10.norm() + p11.norm()
+        + (p10 - p00).norm() + (p01 - p00).norm();
+    for (int axis = 0; axis < 3; ++axis) {
+        const double closure = (p00[axis] - p01[axis])
+            - p10[axis] + p11[axis];
+        const double closure_bound =
+            (transform_gamma + closure_arithmetic_gamma
+                + transform_gamma * closure_arithmetic_gamma)
+            * geometry_scale;
+        if (std::abs(closure) > closure_bound)
+            return false;
+    }
+
+    // A degree-one, unit-weight patch is affine after closure. Reflection in
+    // its edge parameter preserves Euclidean distance from an interior point
+    // exactly only when its physical U and V directions are orthogonal.
+    const Eigen::Vector3d u = p10 - p00;
+    const Eigen::Vector3d v = p01 - p00;
+    Eigen::Vector3d u_error;
+    Eigen::Vector3d v_error;
+    const double subtraction_gamma = forward_error_gamma(1);
+    const double direction_gamma = transform_gamma + subtraction_gamma
+        + transform_gamma * subtraction_gamma;
+    for (int axis = 0; axis < 3; ++axis) {
+        u_error[axis] = direction_gamma
+            * (std::abs(p10[axis]) + std::abs(p00[axis])
+                + geometry_scale);
+        v_error[axis] = direction_gamma
+            * (std::abs(p01[axis]) + std::abs(p00[axis])
+                + geometry_scale);
+    }
+    const double u_norm = u.norm();
+    const double v_norm = v.norm();
+    if (!std::isfinite(u_norm) || !std::isfinite(v_norm)
+        || u_norm <= u_error.norm() || v_norm <= v_error.norm()) {
+        return false;
+    }
+    double input_error_bound = 0.0;
+    double dot_product_scale = 0.0;
+    for (int axis = 0; axis < 3; ++axis) {
+        input_error_bound += std::abs(u[axis]) * v_error[axis]
+            + std::abs(v[axis]) * u_error[axis]
+            + u_error[axis] * v_error[axis];
+        dot_product_scale += std::abs(u[axis] * v[axis]);
+    }
+    const double dot_arithmetic_bound = forward_error_gamma(5)
+        * dot_product_scale;
+    return std::abs(u.dot(v))
+        <= input_error_bound + dot_arithmetic_bound;
 }
 
 bool twice_dyadic_endpoint(double parameter, long long& twice)
@@ -749,7 +811,7 @@ std::vector<int> attached_edge_samples(
             candidate.sample_index = sample.sample_index;
             candidate.edge_sample_index = sample_index;
             candidate.certified_symmetric_partner =
-                certified_l_prism_symmetric_partner(
+                detail::certified_l_prism_symmetric_partner_3d(
                     surface, cloud, center_dof, connection, sample);
             nearest.push_back(candidate);
         }
@@ -828,6 +890,21 @@ void append_local_normal_rows(
     }
 }
 } // namespace
+
+namespace detail {
+
+int certified_l_prism_symmetric_partner_3d(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud3D& cloud,
+    const SurfaceDof3D& center,
+    const geometry3d::NurbsPatchEdgeConnection3D& connection,
+    const NeumannEdgeAuxiliarySample3D& sample)
+{
+    return certified_l_prism_symmetric_partner(
+        surface, cloud, center, connection, sample);
+}
+
+} // namespace detail
 
 const char* neumann_edge_cauchy_mode_name_3d(NeumannEdgeCauchyMode3D mode)
 {

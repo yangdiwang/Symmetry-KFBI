@@ -1,0 +1,28 @@
+#pragma once
+
+#include "neumann_edge_augmented_cauchy_3d.hpp"
+
+#include <vector>
+
+namespace kfbim::app3d::detail {
+
+struct NeumannEdgeDistanceCandidate3D {
+    double squared_distance = 0.0;
+    int sample_index = -1;
+    int edge_sample_index = -1;
+    int certified_symmetric_partner = -1;
+};
+
+std::vector<int> select_neumann_edge_distance_candidates_3d(
+    std::vector<NeumannEdgeDistanceCandidate3D> candidates,
+    double radius_squared,
+    int count);
+
+int certified_l_prism_symmetric_partner_3d(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud3D& cloud,
+    const SurfaceDof3D& center,
+    const geometry3d::NurbsPatchEdgeConnection3D& connection,
+    const NeumannEdgeAuxiliarySample3D& sample);
+
+} // namespace kfbim::app3d::detail
