@@ -1060,19 +1060,43 @@ public:
                                    const Eigen::VectorXd& value_jump,
                                    const Eigen::VectorXd& normal_jump) const
     {
+        return exterior_trace(
+            field, value_jump, normal_jump,
+            app3d::ExteriorValueRestrictMode3D::JointTricubicCauchy);
+    }
+    Eigen::VectorXd exterior_trace(
+        const HarmonicJetField3D& field,
+        const Eigen::VectorXd& value_jump,
+        const Eigen::VectorXd& normal_jump,
+        app3d::ExteriorValueRestrictMode3D mode) const
+    {
         return recover_trace(
-            continued_samples(field, value_jump, normal_jump, false),
+            continued_samples(field, value_jump, normal_jump, false,
+                              app3d::exterior_value_restrict_correction_mode_3d(mode)),
             c0_weights_, 1.0);
     }
+
 
     Eigen::VectorXd interior_trace(const HarmonicJetField3D& field,
                                    const Eigen::VectorXd& value_jump,
                                    const Eigen::VectorXd& normal_jump) const
     {
+        return interior_trace(
+            field, value_jump, normal_jump,
+            app3d::ExteriorValueRestrictMode3D::JointTricubicCauchy);
+    }
+    Eigen::VectorXd interior_trace(
+        const HarmonicJetField3D& field,
+        const Eigen::VectorXd& value_jump,
+        const Eigen::VectorXd& normal_jump,
+        app3d::ExteriorValueRestrictMode3D mode) const
+    {
         return recover_trace(
-            continued_samples(field, value_jump, normal_jump, true),
+            continued_samples(field, value_jump, normal_jump, true,
+                              app3d::exterior_value_restrict_correction_mode_3d(mode)),
             c0_weights_, 1.0);
     }
+
 
     Eigen::VectorXd exterior_normal_trace(
         const HarmonicJetField3D& field,
@@ -1097,9 +1121,12 @@ public:
             }
             return exterior_only_restrict_->apply(field.potential);
         }
-        return recover_trace(
-            continued_samples(field, value_jump, normal_jump, false, mode),
-            c1_weights_, 1.0 / h_);
+        const app3d::HarmonicTraceCorrectionMode3D correction_mode =
+            mode == ExteriorNormalRestrictMode3D::JointTricubicCrossingOwner
+            ? app3d::HarmonicTraceCorrectionMode3D::CrossingOwned
+            : app3d::HarmonicTraceCorrectionMode3D::CenterOwned;
+        return recover_trace(continued_samples(field, value_jump, normal_jump, false,
+                                                correction_mode), c1_weights_, 1.0 / h_);
     }
 
     Eigen::VectorXd interior_normal_trace(
@@ -1116,13 +1143,12 @@ private:
     Eigen::MatrixXd continued_samples(const HarmonicJetField3D& field,
                                       const Eigen::VectorXd& value_jump,
                                       const Eigen::VectorXd& normal_jump,
-                                      bool interior_continuation,
-                                      ExteriorNormalRestrictMode3D mode =
-                                          ExteriorNormalRestrictMode3D::
-                                              JointTricubicCauchy) const
+                                       bool interior_continuation,
+                                       app3d::HarmonicTraceCorrectionMode3D correction_mode =
+                                           app3d::HarmonicTraceCorrectionMode3D::CenterOwned) const
     {
-        const bool use_crossing_owner =
-            mode == ExteriorNormalRestrictMode3D::JointTricubicCrossingOwner;
+        const bool use_crossing_owner = correction_mode
+            == app3d::HarmonicTraceCorrectionMode3D::CrossingOwned;
         if (use_crossing_owner && !crossing_owner_templates_built_) {
             throw std::runtime_error(
                 "crossing-owner normal restrict was not initialized");
@@ -1152,9 +1178,7 @@ private:
                         center, field.coefficients,
                         sample.legacy_correction_evaluation,
                         sample.owner_corrections,
-                        use_crossing_owner
-                            ? app3d::HarmonicTraceCorrectionMode3D::CrossingOwned
-                            : app3d::HarmonicTraceCorrectionMode3D::CenterOwned);
+                        correction_mode);
                     samples(center, 4 * side + layer) = value;
                 }
             }
@@ -1558,8 +1582,11 @@ private:
 class ExteriorZeroTraceOperator3D final : public IKFBIOperator {
 public:
     explicit ExteriorZeroTraceOperator3D(
-        const PanelCenterHarmonicJetKFBI3D& pipeline)
+        const PanelCenterHarmonicJetKFBI3D& pipeline,
+        app3d::ExteriorValueRestrictMode3D mode =
+            app3d::ExteriorValueRestrictMode3D::JointTricubicCauchy)
         : pipeline_(pipeline)
+        , mode_(mode)
     {}
 
     int problem_size() const override
@@ -1578,7 +1605,7 @@ public:
         const HarmonicJetField3D field =
             pipeline_.evaluate(value_jump, zero_normal);
         const Eigen::VectorXd trace =
-            pipeline_.exterior_trace(field, value_jump, zero_normal);
+            pipeline_.exterior_trace(field, value_jump, zero_normal, mode_);
         result.resize(size + 1);
         result.head(size) = trace.array() + unknown[size];
         double weighted_mean = 0.0;
@@ -1600,11 +1627,12 @@ public:
             pipeline_.evaluate(zero_value, prescribed_normal_jump);
         Eigen::VectorXd result = Eigen::VectorXd::Zero(size + 1);
         result.head(size) = -pipeline_.exterior_trace(
-            field, zero_value, prescribed_normal_jump);
+            field, zero_value, prescribed_normal_jump, mode_);
         return result;
     }
 
 private:
+    app3d::ExteriorValueRestrictMode3D mode_;
     const PanelCenterHarmonicJetKFBI3D& pipeline_;
 };
 
@@ -1624,9 +1652,10 @@ ExteriorZeroTraceSolution3D solve_exterior_zero_trace_neumann_3d(
     const Eigen::VectorXd& prescribed_normal_jump,
     double tolerance,
     int restart,
-    int max_iterations)
+    int max_iterations,
+    app3d::ExteriorValueRestrictMode3D mode = app3d::ExteriorValueRestrictMode3D::JointTricubicCauchy)
 {
-    ExteriorZeroTraceOperator3D op(pipeline);
+    ExteriorZeroTraceOperator3D op(pipeline, mode);
     const Eigen::VectorXd rhs = op.right_hand_side(prescribed_normal_jump);
     Eigen::VectorXd augmented_unknown = Eigen::VectorXd::Zero(op.problem_size());
     GMRES gmres(max_iterations, tolerance, restart);
@@ -1792,7 +1821,8 @@ SolveMetrics3D run_neumann_case(
     const GridPair3D& grid_pair,
     const PanelCenterHarmonicJetKFBI3D& pipeline,
     const app3d::RigidTransform3D& transform,
-    int gmres_max_iterations)
+    int gmres_max_iterations,
+    app3d::ExteriorValueRestrictMode3D mode = app3d::ExteriorValueRestrictMode3D::JointTricubicCauchy)
 {
     const int size = pipeline.surface_size();
     Eigen::VectorXd exact_trace(size);
@@ -1815,16 +1845,16 @@ SolveMetrics3D run_neumann_case(
     const auto solve_start = std::chrono::steady_clock::now();
     const ExteriorZeroTraceSolution3D solution =
         solve_exterior_zero_trace_neumann_3d(
-            pipeline, normal_data, 2.0e-10, 80, gmres_max_iterations);
+            pipeline, normal_data, 2.0e-10, 80, gmres_max_iterations, mode);
     const double seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - solve_start).count();
 
     const HarmonicJetField3D field{
         solution.potential, solution.coefficients};
     const Eigen::VectorXd direct_exterior = pipeline.exterior_trace(
-        field, solution.value_jump, normal_data);
+        field, solution.value_jump, normal_data, mode);
     const Eigen::VectorXd exterior_from_jump = pipeline.interior_trace(
-        field, solution.value_jump, normal_data) - solution.value_jump;
+        field, solution.value_jump, normal_data, mode) - solution.value_jump;
 
     SolveMetrics3D result;
     result.formulation = "neumann_exterior_zero_value_trace";

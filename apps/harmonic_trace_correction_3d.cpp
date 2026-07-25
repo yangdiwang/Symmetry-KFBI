@@ -21,6 +21,19 @@ void validate_evaluation(const Eigen::VectorXd& evaluation,
 
 } // namespace
 
+HarmonicTraceCorrectionMode3D
+exterior_value_restrict_correction_mode_3d(
+    ExteriorValueRestrictMode3D mode)
+{
+    switch (mode) {
+    case ExteriorValueRestrictMode3D::JointTricubicCauchy:
+        return HarmonicTraceCorrectionMode3D::CenterOwned;
+    case ExteriorValueRestrictMode3D::JointTricubicCrossingOwner:
+        return HarmonicTraceCorrectionMode3D::CrossingOwned;
+    }
+    throw std::invalid_argument("unknown exterior value restrict mode");
+}
+
 double apply_harmonic_trace_correction_3d(
     int center_dof,
     const Eigen::MatrixXd& coefficients,

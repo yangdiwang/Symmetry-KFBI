@@ -10,6 +10,8 @@ namespace {
 using kfbim::app3d::HarmonicTraceCorrectionMode3D;
 using kfbim::app3d::HarmonicTraceOwnerTerm3D;
 using kfbim::app3d::apply_harmonic_trace_correction_3d;
+using kfbim::app3d::ExteriorValueRestrictMode3D;
+using kfbim::app3d::exterior_value_restrict_correction_mode_3d;
 
 void require(bool value, const std::string& message)
 {
@@ -35,6 +37,18 @@ Eigen::MatrixXd literal_coefficients()
                     4.0, 1.0,
                     2.0, 5.0;
     return coefficients;
+}
+
+void test_maps_value_restrict_modes_to_owner_correction_modes()
+{
+    require(exterior_value_restrict_correction_mode_3d(
+                ExteriorValueRestrictMode3D::JointTricubicCauchy)
+                == HarmonicTraceCorrectionMode3D::CenterOwned,
+            "Cauchy value restrict uses center-owned correction");
+    require(exterior_value_restrict_correction_mode_3d(
+                ExteriorValueRestrictMode3D::JointTricubicCrossingOwner)
+                == HarmonicTraceCorrectionMode3D::CrossingOwned,
+            "crossing-owner value restrict uses crossing-owned correction");
 }
 
 void test_selects_center_or_precomputed_crossing_owner_rows()
@@ -127,6 +141,7 @@ int main()
 {
     try {
         test_selects_center_or_precomputed_crossing_owner_rows();
+        test_maps_value_restrict_modes_to_owner_correction_modes();
         test_rejects_invalid_owner_indices();
         test_rejects_incompatible_evaluation_dimensions();
         std::cout << "harmonic trace correction 3D tests passed\n";

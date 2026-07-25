@@ -10,6 +10,15 @@ enum class HarmonicTraceCorrectionMode3D {
     CenterOwned,
     CrossingOwned,
 };
+enum class ExteriorValueRestrictMode3D {
+    JointTricubicCauchy,
+    JointTricubicCrossingOwner,
+};
+
+[[nodiscard]] HarmonicTraceCorrectionMode3D
+exterior_value_restrict_correction_mode_3d(
+    ExteriorValueRestrictMode3D mode);
+
 
 struct HarmonicTraceOwnerTerm3D {
     int owner_dof = -1;
