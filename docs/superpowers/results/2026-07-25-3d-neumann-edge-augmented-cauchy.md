@@ -7,9 +7,12 @@ failed the fixed error guard and rigid-pose spread gates, so the
 application correctly stopped before `N=128`. No weights, thresholds, or
 other algorithm parameters were changed.
 
-The augmented route substantially reduced every measured incident-edge
-discrepancy and reduced the worst GMRES count from 42 to 27, but its
-baseline `N=64` density L2 error ratio was
+The augmented route substantially reduced each of the six reported
+per-case/N global incident-edge Linf discrepancies and reduced the worst
+GMRES count from 42 to 27. It did not improve every finer-grained edge
+comparison: 3 of 132 connection-level Linf comparisons and 72 of 1716
+sample-level discrepancies increased. Its baseline `N=64` density L2
+error ratio was
 `1.1047788080297003`, above the fixed `1.10` guard. At `N=64`, the
 augmented pose spreads were also worse for density Linf, density L2, and
 interior Linf.
@@ -61,8 +64,10 @@ verification was repeated after writing this report.
 - Shared density space and geometry/FFT/crossing/owner preprocessing
 - Face fit: harmonic degree 3, `G1Nearest`, 48 value and 28 normal rows
 - Edge auxiliary fit: 24 value and 14 normal rows per incident side
-- Four nearest midpoint edge samples per incident non-G1 connection,
-  soft value-row scale exactly `1.0`
+- Each physical non-G1 connection uses
+  `max(4, ceil(connection_length / h))` midpoint samples; each eligible
+  local patch-centered fit attaches the nearest four samples from every
+  incident connection, with soft value-row scale exactly `1.0`
 - Route: `JointTricubicCrossingOwner`
 - Owner policy: `RegionClosestHybrid`
 - GMRES tolerance `2e-10`, restart 80, cap 80
@@ -143,7 +148,24 @@ All twelve augmented orders are above `1.8`; their range is
 | rot_axis123_17deg | 64 | 0.490081 | 0.860023 | 0.527312 | 0.999025 | 0.131138 |
 
 The bold baseline `N=64` density L2 ratio is the sole individual error
-guard failure. Every edge-discrepancy ratio is strictly below one.
+guard failure. Every reported per-case/N global edge-discrepancy ratio is
+strictly below one.
+
+That global Linf improvement is not uniform at connection or sample
+resolution. Independent grouping of `edge_values.csv` found three
+connection-level Linf regressions:
+
+| Case | N | Connection | Legacy Linf | Augmented Linf |
+|---|---:|---:|---:|---:|
+| baseline | 32 | 21 | 6.005300416112025e-7 | 6.583339985759273e-7 |
+| baseline | 32 | 23 | 1.0550447701596077e-7 | 2.3727588181754466e-7 |
+| ty_m0083 | 32 | 23 | 2.495042298322758e-7 | 2.687349273250428e-7 |
+
+Thus 3 of 132 connection comparisons regress, and direct comparison of
+matched physical samples finds 72 regressions among 1716 sample pairs.
+The acceptance gate remains `pass` because its specified statistic is
+the per-case/N global incident-edge Linf, which improves in all six
+comparisons.
 
 ## Rigid-pose spreads
 
@@ -224,13 +246,14 @@ exact-trace-sharing, and normal-jump-sharing flags pass.
 | error guard | **fail** | **fail** | baseline `N=64` density L2 ratio `1.1047788080 > 1.10` |
 | order | pass | pass | all augmented orders at least `2.5114` |
 | rigid spread | **fail** | **fail** | three `N=64` error spreads worsen |
-| edge discrepancy | pass | pass | every augmented value is strictly below legacy |
+| edge discrepancy | pass | pass | all six augmented per-case/N global Linf values are strictly below legacy |
 | geometry/owner | pass | pass | all snapshots and flags stable |
 | extended evidence | not evaluated | not evaluated | coarse failure prevented `N=128` |
 | overall | **fail** | **fail** | conjunction of coarse gates |
 
 The numerical mechanism is therefore mixed: the auxiliary edge values
-improve edge continuity and solver iteration behavior, but do not meet
-the fixed accuracy guard or rigid-pose robustness requirement at
-`N=64`. Under the prescribed adoption rule, this is a valid coarse
-negative and the mode is not adopted.
+improve the specified global edge-continuity metric and solver iteration
+behavior, despite the disclosed local regressions, but do not meet the
+fixed accuracy guard or rigid-pose robustness requirement at `N=64`.
+Under the prescribed adoption rule, this is a valid coarse negative and
+the mode is not adopted.
