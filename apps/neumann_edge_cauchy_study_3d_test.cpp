@@ -48,6 +48,7 @@ NeumannEdgeCauchyMeasurement3D passing_measurement(
     row.N = N;
     row.h = 1.0 / N;
     row.mode = mode;
+    row.pair_completed = true;
     row.finite_metrics = true;
     row.gmres_converged = true;
     const int pose = case_index(case_id);
@@ -325,16 +326,16 @@ void test_exact_thresholds_and_ratio_allowance()
 
 void test_failed_n128_evidence_is_isolated()
 {
-    auto rows = passing_measurements();
-    auto legacy = passing_measurement(
-        "baseline", 128, NeumannEdgeCauchyMode3D::None);
-    auto augmented = passing_measurement(
-        "baseline", 128,
-        NeumannEdgeCauchyMode3D::NonG1AuxiliaryValues);
-    legacy.finite_metrics = false;
-    augmented.finite_metrics = false;
-    rows.push_back(legacy);
-    rows.push_back(augmented);
+    auto rows = passing_measurements(true, true);
+    int failed_pair_rows = 0;
+    for (auto& row : rows) {
+        if (row.case_id != "baseline" || row.N != 128) continue;
+        row.pair_completed = false;
+        row.finite_metrics = false;
+        ++failed_pair_rows;
+    }
+    require(failed_pair_rows == 2,
+            "complete N=128 failure fixture did not mutate one pair");
     const auto evaluation = evaluate_neumann_edge_cauchy_study_3d(
         rows, kCases, true);
     require(evaluation.acceptance.extended_evidence_pass == Status::Fail

@@ -40,7 +40,8 @@ bool finite_nonnegative(double value)
 
 bool measurement_finite(const NeumannEdgeCauchyMeasurement3D& row)
 {
-    return row.finite_metrics && row.N > 0 && std::isfinite(row.h)
+    return row.pair_completed && row.finite_metrics && row.N > 0
+        && std::isfinite(row.h)
         && row.h > 0.0 && finite_nonnegative(row.gmres_relative_residual)
         && finite_nonnegative(row.density_linf)
         && finite_nonnegative(row.density_l2)

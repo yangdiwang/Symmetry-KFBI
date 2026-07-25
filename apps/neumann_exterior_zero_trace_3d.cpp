@@ -8694,7 +8694,6 @@ struct NeumannEdgeCauchyEdgeValueRow3D {
 };
 
 struct NeumannEdgeCauchyPairRun3D {
-    bool completed = true;
     std::array<app3d::NeumannEdgeCauchyMeasurement3D, 2> measurements;
     std::array<std::vector<double>, 2> residual_histories;
     std::array<std::vector<NeumannEdgeCauchyEdgeValueRow3D>, 2>
@@ -9007,6 +9006,7 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
         measurement.N = N;
         measurement.h = h;
         measurement.mode = modes[index];
+        measurement.pair_completed = true;
         measurement.expected_non_g1_connections =
             augmented_diagnostics.edge.expected_non_g1_connections;
         measurement.covered_non_g1_connections =
@@ -9055,6 +9055,12 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
             &solved_value_jumps[index], &solved_coefficients[index],
             &solved_normal_jumps[index], &used_exact_traces[index],
             &shared_exact_trace, &prescribed_normal_jump);
+        const auto route_end = std::chrono::steady_clock::now();
+        const PhaseRecordArray3D phase_after_children =
+            capture_phase_records_3d(profile);
+        const double mode_wall_seconds = std::chrono::duration<double>(
+            route_end - route_start).count();
+
         result.shared_exact_trace_bitwise[index] =
             bitwise_equal_vector_3d(
                 used_exact_traces[index], shared_exact_trace);
@@ -9076,8 +9082,6 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
             throw std::logic_error(
                 "Neumann edge-Cauchy modes did not share manufactured data bitwise");
         }
-        const double mode_wall_seconds = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - route_start).count();
         after_snapshots[index] =
             capture_neumann_edge_preprocess_snapshot_3d(pipeline);
         result.factorization_counts_after[index] =
@@ -9090,8 +9094,6 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
                 "Neumann edge-Cauchy GMRES changed factorization count");
         }
 
-        const PhaseRecordArray3D phase_after_children =
-            capture_phase_records_3d(profile);
         const PhaseRecordArray3D child_deltas =
             subtract_phase_records_3d(
                 phase_after_children, phase_before,
@@ -9235,7 +9237,6 @@ NeumannEdgeCauchyPairRun3D failed_neumann_edge_cauchy_pair_3d(
         app3d::NeumannEdgeCauchyMode3D::None,
         app3d::NeumannEdgeCauchyMode3D::NonG1AuxiliaryValues}};
     NeumannEdgeCauchyPairRun3D result;
-    result.completed = false;
     result.owner_snapshots.resize(6);
     for (std::size_t index = 0; index < modes.size(); ++index) {
         auto& measurement = result.measurements[index];
@@ -9340,7 +9341,7 @@ void write_neumann_edge_cauchy_checkpoints_3d(
                 << ',' << measurement.h << ','
                 << app3d::neumann_edge_cauchy_mode_name_3d(
                        measurement.mode)
-                << ',' << pair.completed
+                << ',' << measurement.pair_completed
                 << ',' << pair.shared_exact_trace_bitwise[mode_index]
                 << ',' << pair.shared_normal_jump_bitwise[mode_index]
                 << ',' << measurement.finite_metrics
@@ -9468,7 +9469,7 @@ void write_neumann_edge_cauchy_checkpoints_3d(
             owners << measurement.case_id << ',' << measurement.N
                 << ',' << app3d::neumann_edge_cauchy_mode_name_3d(
                        measurement.mode)
-                << ',' << pair.completed
+                << ',' << measurement.pair_completed
                 << ',' << pair.shared_exact_trace_bitwise[mode_index]
                 << ',' << pair.shared_normal_jump_bitwise[mode_index]
                 << ',' << stable.workload_fingerprint

@@ -15,6 +15,7 @@ struct NeumannEdgeCauchyMeasurement3D {
     int N = 0;
     double h = 0.0;
     NeumannEdgeCauchyMode3D mode = NeumannEdgeCauchyMode3D::None;
+    bool pair_completed = false;
     bool finite_metrics = false;
     bool gmres_converged = false;
     int gmres_iterations = 0;
