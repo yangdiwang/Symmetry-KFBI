@@ -1906,6 +1906,11 @@ public:
         return restrict_owner_workload_fingerprint_;
     }
 
+    std::uint64_t restrict_owner_output_digest() const noexcept
+    {
+        return restrict_owner_output_digest_;
+    }
+
     const app3d::RestrictOwnerPreprocessDiagnostics3D&
     restrict_owner_preprocess_diagnostics() const
     {
@@ -2486,14 +2491,16 @@ private:
                     run_restrict_owner_timed_sample_3d(
                         grid_, *restrict_owner_preprocessor_, scratch,
                         memory_sampler);
-                restrict_owner_fingerprint_append(
-                    preprocess_timing->output_digest,
-                    scratch.output_digest);
             } else {
                 run_restrict_owner_sample_core_3d(
                     grid_, *restrict_owner_preprocessor_, scratch);
             }
+            restrict_owner_fingerprint_append(
+                restrict_owner_output_digest_, scratch.output_digest);
             if (preprocess_timing != nullptr) {
+                restrict_owner_fingerprint_append(
+                    preprocess_timing->output_digest,
+                    scratch.output_digest);
                 const auto assembly_start =
                     std::chrono::steady_clock::now();
                 assemble_restrict_owner_trace_sample(sample, scratch);
@@ -2779,6 +2786,8 @@ private:
         restrict_owner_preprocessor_;
     bool crossing_owner_templates_built_ = false;
     std::uint64_t restrict_owner_workload_fingerprint_ =
+        UINT64_C(14695981039346656037);
+    std::uint64_t restrict_owner_output_digest_ =
         UINT64_C(14695981039346656037);
     double h_ = 0.0;
     PanelCenterCauchyFit3D fit_;
@@ -8027,6 +8036,12 @@ struct NeumannEdgeStudyRow3D {
     std::uint64_t workload_fingerprint = 0;
     std::uint64_t output_digest = 0;
     std::uint64_t wrong_side_queries = 0;
+    std::uint64_t workload_fingerprint_before_gmres = 0;
+    std::uint64_t workload_fingerprint_after_gmres = 0;
+    std::uint64_t output_digest_before_gmres = 0;
+    std::uint64_t output_digest_after_gmres = 0;
+    std::uint64_t wrong_side_queries_before_gmres = 0;
+    std::uint64_t wrong_side_queries_after_gmres = 0;
     std::uint64_t geometry_queries_before_gmres = 0;
     std::uint64_t geometry_queries_after_gmres = 0;
     bool diagnostics_unchanged = false;
@@ -8051,6 +8066,55 @@ bool finite_neumann_edge_row_3d(const NeumannEdgeStudyRow3D& row)
         && std::all_of(values.begin(), values.end(), [](double value) {
                return std::isfinite(value);
            });
+}
+
+struct NeumannEdgePreprocessSnapshot3D {
+    std::uint64_t workload_fingerprint = 0;
+    std::uint64_t output_digest = 0;
+    std::uint64_t wrong_side_queries = 0;
+    std::uint64_t geometry_queries = 0;
+    app3d::RestrictOwnerPreprocessDiagnostics3D diagnostics;
+};
+
+NeumannEdgePreprocessSnapshot3D capture_neumann_edge_preprocess_snapshot_3d(
+    const PanelCenterHarmonicJetKFBI3D& pipeline)
+{
+    NeumannEdgePreprocessSnapshot3D result;
+    result.workload_fingerprint =
+        pipeline.restrict_owner_workload_fingerprint();
+    result.output_digest = pipeline.restrict_owner_output_digest();
+    result.diagnostics = pipeline.restrict_owner_preprocess_diagnostics();
+    result.wrong_side_queries = result.diagnostics.wrong_side_queries;
+    result.geometry_queries = static_cast<std::uint64_t>(
+        pipeline.restrict_owner_geometry_query_count());
+    return result;
+}
+
+bool neumann_edge_preprocess_snapshot_equal_3d(
+    const NeumannEdgePreprocessSnapshot3D& lhs,
+    const NeumannEdgePreprocessSnapshot3D& rhs)
+{
+    return lhs.workload_fingerprint == rhs.workload_fingerprint
+        && lhs.output_digest == rhs.output_digest
+        && lhs.wrong_side_queries == rhs.wrong_side_queries
+        && lhs.geometry_queries == rhs.geometry_queries
+        && restrict_owner_preprocess_diagnostics_equal(
+               lhs.diagnostics, rhs.diagnostics);
+}
+app3d::NeumannEdgePreprocessInvariantSnapshot3D
+neumann_edge_preprocess_invariant_snapshot_3d(
+    const NeumannEdgePreprocessSnapshot3D& snapshot,
+    const NeumannEdgePreprocessSnapshot3D& reference)
+{
+    app3d::NeumannEdgePreprocessInvariantSnapshot3D result;
+    result.workload_fingerprint = snapshot.workload_fingerprint;
+    result.output_digest = snapshot.output_digest;
+    result.wrong_side_queries = snapshot.wrong_side_queries;
+    result.geometry_queries = snapshot.geometry_queries;
+    result.diagnostics_match_reference =
+        restrict_owner_preprocess_diagnostics_equal(
+            snapshot.diagnostics, reference.diagnostics);
+    return result;
 }
 
 std::array<NeumannEdgeStudyRow3D, 2>
@@ -8204,7 +8268,17 @@ run_neumann_edge_continuity_pair_3d(
     rows[0].density_space = app3d::NeumannDensitySpace3D::PatchIndependent;
     rows[1].density_space = app3d::NeumannDensitySpace3D::NonG1EdgeProjected;
     std::array<Eigen::VectorXd, 2> solved_densities;
-    const auto stable_diagnostics = pipeline.restrict_owner_preprocess_diagnostics();
+    const NeumannEdgePreprocessSnapshot3D stable_snapshot =
+        capture_neumann_edge_preprocess_snapshot_3d(pipeline);
+    if (stable_snapshot.output_digest != preprocess_timing.output_digest
+        || stable_snapshot.wrong_side_queries
+            != setup_diagnostics.wrong_side_queries
+        || stable_snapshot.geometry_queries != setup_queries) {
+        throw std::logic_error(
+            "Neumann edge-continuity setup snapshot mismatch");
+    }
+    std::array<NeumannEdgePreprocessSnapshot3D, 2> before_snapshots;
+    std::array<NeumannEdgePreprocessSnapshot3D, 2> after_snapshots;
     for (std::size_t index = 0; index < rows.size(); ++index) {
         NeumannEdgeStudyRow3D& row = rows[index];
         row.study_case = study_case;
@@ -8233,31 +8307,51 @@ run_neumann_edge_continuity_pair_3d(
         row.triangle_fallback_crossings = geometry_diagnostics.triangle_fallback_crossings;
         row.preprocess_mode = app3d::restrict_owner_preprocess_mode_name_3d(
             OwnerMode3D::RegionClosestHybrid);
-        row.workload_fingerprint = pipeline.restrict_owner_workload_fingerprint();
-        row.output_digest = preprocess_timing.output_digest;
-        row.wrong_side_queries = setup_diagnostics.wrong_side_queries;
         row.default_route_bitwise_equal = default_route_bitwise_equal;
         row.probe_invariants_pass = probe_invariants_pass;
-        row.geometry_queries_before_gmres = static_cast<std::uint64_t>(
-            pipeline.restrict_owner_geometry_query_count());
-        const auto before = pipeline.restrict_owner_preprocess_diagnostics();
+        before_snapshots[index] =
+            capture_neumann_edge_preprocess_snapshot_3d(pipeline);
+        const NeumannEdgePreprocessSnapshot3D& before =
+            before_snapshots[index];
+        row.workload_fingerprint_before_gmres =
+            before.workload_fingerprint;
+        row.output_digest_before_gmres = before.output_digest;
+        row.wrong_side_queries_before_gmres =
+            before.wrong_side_queries;
+        row.geometry_queries_before_gmres = before.geometry_queries;
         const app3d::NeumannEdgeContinuityProjector3D* solve_projector =
             row.density_space == app3d::NeumannDensitySpace3D::NonG1EdgeProjected
                 ? std::addressof(projector) : nullptr;
         row.solve = run_neumann_case(grid, grid_pair, pipeline,
             study_case.transform, gmres_max_iterations, mode,
             &row.residual_history, solve_projector, &solved_densities[index]);
-        const auto after = pipeline.restrict_owner_preprocess_diagnostics();
-        row.geometry_queries_after_gmres = static_cast<std::uint64_t>(
-            pipeline.restrict_owner_geometry_query_count());
-        row.diagnostics_unchanged = restrict_owner_preprocess_diagnostics_equal(before, after)
-            && restrict_owner_preprocess_diagnostics_equal(stable_diagnostics, after);
+        after_snapshots[index] =
+            capture_neumann_edge_preprocess_snapshot_3d(pipeline);
+        const NeumannEdgePreprocessSnapshot3D& after =
+            after_snapshots[index];
+        row.workload_fingerprint_after_gmres =
+            after.workload_fingerprint;
+        row.output_digest_after_gmres = after.output_digest;
+        row.wrong_side_queries_after_gmres =
+            after.wrong_side_queries;
+        row.geometry_queries_after_gmres = after.geometry_queries;
+        row.workload_fingerprint = after.workload_fingerprint;
+        row.output_digest = after.output_digest;
+        row.wrong_side_queries = after.wrong_side_queries;
+        row.diagnostics_unchanged =
+            restrict_owner_preprocess_diagnostics_equal(
+                before.diagnostics, after.diagnostics)
+            && restrict_owner_preprocess_diagnostics_equal(
+                stable_snapshot.diagnostics, after.diagnostics);
         row.geometry_diagnostics_pass = row.label_mismatches == 0
             && row.unsafe_label_changing_edges == 0 && row.gap_crossings == 0
             && row.endpoint_crossings == 0 && row.triangle_fallback_crossings == 0;
         row.owner_invariants_pass = row.probe_invariants_pass
-            && row.default_route_bitwise_equal && row.diagnostics_unchanged
-            && row.geometry_queries_before_gmres == row.geometry_queries_after_gmres;
+            && row.default_route_bitwise_equal
+            && row.diagnostics_unchanged
+            && neumann_edge_preprocess_snapshot_equal_3d(before, after)
+            && neumann_edge_preprocess_snapshot_equal_3d(
+                   stable_snapshot, after);
         row.edge_mismatch_linf = app3d::neumann_edge_mismatch_linf_3d(
             constraints, solved_densities[index]);
         row.edge_mismatch_weighted_rms = app3d::neumann_edge_mismatch_weighted_rms_3d(
@@ -8268,16 +8362,25 @@ run_neumann_edge_continuity_pair_3d(
             + row.projector_setup_seconds + row.solve.seconds;
     }
 
+    const NeumannEdgePreprocessSnapshot3D final_snapshot =
+        capture_neumann_edge_preprocess_snapshot_3d(pipeline);
+    const std::vector<app3d::NeumannEdgePreprocessInvariantSnapshot3D>
+        invariant_snapshots{
+            neumann_edge_preprocess_invariant_snapshot_3d(
+                stable_snapshot, stable_snapshot),
+            neumann_edge_preprocess_invariant_snapshot_3d(
+                before_snapshots[0], stable_snapshot),
+            neumann_edge_preprocess_invariant_snapshot_3d(
+                after_snapshots[0], stable_snapshot),
+            neumann_edge_preprocess_invariant_snapshot_3d(
+                before_snapshots[1], stable_snapshot),
+            neumann_edge_preprocess_invariant_snapshot_3d(
+                after_snapshots[1], stable_snapshot),
+            neumann_edge_preprocess_invariant_snapshot_3d(
+                final_snapshot, stable_snapshot)};
     const bool shared_preprocess_pass =
-        rows[0].workload_fingerprint == rows[1].workload_fingerprint
-        && rows[0].output_digest == rows[1].output_digest
-        && rows[0].wrong_side_queries == rows[1].wrong_side_queries
-        && rows[0].geometry_queries_before_gmres == rows[1].geometry_queries_before_gmres
-        && rows[0].geometry_queries_after_gmres == rows[1].geometry_queries_after_gmres
-        && rows[0].geometry_queries_before_gmres == setup_queries
-        && rows[0].geometry_queries_after_gmres == setup_queries
-        && restrict_owner_preprocess_diagnostics_equal(stable_diagnostics,
-            pipeline.restrict_owner_preprocess_diagnostics());
+        app3d::neumann_edge_shared_preprocess_pass_3d(
+            invariant_snapshots);
     rows[0].shared_preprocess_pass = shared_preprocess_pass;
     rows[1].shared_preprocess_pass = shared_preprocess_pass;
 
@@ -8447,7 +8550,11 @@ void write_neumann_edge_continuity_checkpoints_3d(
     std::ofstream owners = open_output_file(output_dir / "owner_diagnostics.csv");
     owners << std::setprecision(17) << std::boolalpha
         << "case_id,N,density_space,preprocess_mode,workload_fingerprint,output_digest,"
-           "wrong_side_queries,label_mismatches,unsafe_label_changing_edges,gap_crossings,"
+           "wrong_side_queries,workload_fingerprint_before_gmres,"
+           "workload_fingerprint_after_gmres,output_digest_before_gmres,"
+           "output_digest_after_gmres,wrong_side_queries_before_gmres,"
+           "wrong_side_queries_after_gmres,label_mismatches,"
+           "unsafe_label_changing_edges,gap_crossings,"
            "endpoint_crossings,triangle_fallback_crossings,geometry_queries_before_gmres,"
            "geometry_queries_after_gmres,diagnostics_unchanged,default_route_bitwise_equal,"
            "probe_invariants_pass,geometry_diagnostics_pass,owner_invariants_pass,"
@@ -8457,6 +8564,12 @@ void write_neumann_edge_continuity_checkpoints_3d(
             << app3d::neumann_density_space_name_3d(row.density_space) << ','
             << row.preprocess_mode << ',' << row.workload_fingerprint << ','
             << row.output_digest << ',' << row.wrong_side_queries << ','
+            << row.workload_fingerprint_before_gmres << ','
+            << row.workload_fingerprint_after_gmres << ','
+            << row.output_digest_before_gmres << ','
+            << row.output_digest_after_gmres << ','
+            << row.wrong_side_queries_before_gmres << ','
+            << row.wrong_side_queries_after_gmres << ','
             << row.label_mismatches << ',' << row.unsafe_label_changing_edges << ','
             << row.gap_crossings << ',' << row.endpoint_crossings << ','
             << row.triangle_fallback_crossings << ',' << row.geometry_queries_before_gmres << ','

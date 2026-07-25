@@ -147,6 +147,26 @@ std::vector<std::pair<int, double>> edge_trace_coefficients(
 
 } // namespace
 
+bool neumann_edge_shared_preprocess_pass_3d(
+    const std::vector<NeumannEdgePreprocessInvariantSnapshot3D>& snapshots)
+{
+    if (snapshots.size() != 6)
+        return false;
+    const NeumannEdgePreprocessInvariantSnapshot3D& reference =
+        snapshots.front();
+    return std::all_of(
+        snapshots.begin(), snapshots.end(),
+        [&](const NeumannEdgePreprocessInvariantSnapshot3D& item) {
+            return item.diagnostics_match_reference
+                && item.workload_fingerprint
+                    == reference.workload_fingerprint
+                && item.output_digest == reference.output_digest
+                && item.wrong_side_queries
+                    == reference.wrong_side_queries
+                && item.geometry_queries == reference.geometry_queries;
+        });
+}
+
 const char* neumann_density_space_name_3d(NeumannDensitySpace3D mode)
 {
     switch (mode) {

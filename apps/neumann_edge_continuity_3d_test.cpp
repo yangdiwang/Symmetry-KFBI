@@ -384,6 +384,43 @@ void require_throws(const std::function<void()>& work, const std::string& messag
     require(threw, message);
 }
 
+void test_shared_preprocess_snapshot_mutations()
+{
+    NeumannEdgePreprocessInvariantSnapshot3D reference;
+    reference.workload_fingerprint = UINT64_C(101);
+    reference.output_digest = UINT64_C(202);
+    reference.wrong_side_queries = UINT64_C(303);
+    reference.geometry_queries = UINT64_C(303);
+    reference.diagnostics_match_reference = true;
+    std::vector<NeumannEdgePreprocessInvariantSnapshot3D> snapshots(6, reference);
+    require(neumann_edge_shared_preprocess_pass_3d(snapshots),
+            "unchanged preprocess snapshot chain did not pass");
+
+    const auto require_mutation_fails = [&](const auto& mutate,
+                                            const std::string& message) {
+        auto changed = snapshots;
+        mutate(changed[4]);
+        require(!neumann_edge_shared_preprocess_pass_3d(changed), message);
+    };
+    require_mutation_fails(
+        [](auto& item) { ++item.workload_fingerprint; },
+        "workload fingerprint mutation was hidden");
+    require_mutation_fails(
+        [](auto& item) { ++item.output_digest; },
+        "output digest mutation was hidden");
+    require_mutation_fails(
+        [](auto& item) { ++item.wrong_side_queries; },
+        "wrong-side query mutation was hidden");
+    require_mutation_fails(
+        [](auto& item) { ++item.geometry_queries; },
+        "geometry query mutation was hidden");
+    require_mutation_fails(
+        [](auto& item) { item.diagnostics_match_reference = false; },
+        "preprocess diagnostics mutation was hidden");
+    snapshots.pop_back();
+    require(!neumann_edge_shared_preprocess_pass_3d(snapshots),
+            "incomplete preprocess snapshot chain was accepted");
+}
 void test_edge_study_level_prefixes()
 {
     require(normalize_neumann_edge_continuity_levels_3d({}) == std::vector<int>({32, 64}), "empty edge-study levels did not select the pilot default");
@@ -456,8 +493,14 @@ void test_edge_study_acceptance_and_failure_gates()
     for (auto& row : trend) if (row.case_id == "baseline" && row.N == 64 && row.density_space == NeumannDensitySpace3D::NonG1EdgeProjected) row.density_linf = 0.45;
     require(evaluate_neumann_edge_continuity_study_3d(trend, cases, true).acceptance.trend_pass == Status::Fail, "worse projected refinement trend was hidden");
     auto geometry = passing;
+    geometry.front().geometry_diagnostics_pass = false;
+    require(evaluate_neumann_edge_continuity_study_3d(geometry, cases, true).acceptance.geometry_owner_pass == Status::Fail, "changed geometry diagnostic invariant was hidden");
+    geometry = passing;
+    geometry.front().owner_invariants_pass = false;
+    require(evaluate_neumann_edge_continuity_study_3d(geometry, cases, true).acceptance.geometry_owner_pass == Status::Fail, "changed owner invariant was hidden");
+    geometry = passing;
     geometry.front().shared_preprocess_pass = false;
-    require(evaluate_neumann_edge_continuity_study_3d(geometry, cases, true).acceptance.geometry_owner_pass == Status::Fail, "changed geometry/owner/shared-preprocess invariant was hidden");
+    require(evaluate_neumann_edge_continuity_study_3d(geometry, cases, true).acceptance.geometry_owner_pass == Status::Fail, "changed shared-preprocess invariant was hidden");
 }
 
 void test_edge_study_n32_smoke_keeps_two_level_gates_not_evaluated()
@@ -476,6 +519,7 @@ int main()
         test_fallback_and_order();
         test_surface_mass_projector();
         test_projected_augmented_operator();
+        test_shared_preprocess_snapshot_mutations();
         test_edge_study_level_prefixes();
         test_edge_study_acceptance_and_failure_gates();
         test_edge_study_n32_smoke_keeps_two_level_gates_not_evaluated();

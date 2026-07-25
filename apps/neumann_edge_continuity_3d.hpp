@@ -7,6 +7,7 @@
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
 
+#include <cstdint>
 #include <limits>
 #include <string>
 #include <vector>
@@ -117,6 +118,17 @@ private:
     const kfbim::IKFBIOperator& base_;
     const NeumannEdgeContinuityProjector3D& projector_;
 };
+
+struct NeumannEdgePreprocessInvariantSnapshot3D {
+    std::uint64_t workload_fingerprint = 0;
+    std::uint64_t output_digest = 0;
+    std::uint64_t wrong_side_queries = 0;
+    std::uint64_t geometry_queries = 0;
+    bool diagnostics_match_reference = false;
+};
+
+bool neumann_edge_shared_preprocess_pass_3d(
+    const std::vector<NeumannEdgePreprocessInvariantSnapshot3D>& snapshots);
 
 struct NeumannEdgeContinuityMeasurement3D {
     std::string case_id;
