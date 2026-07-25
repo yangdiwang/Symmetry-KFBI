@@ -277,10 +277,11 @@ SurfaceDofCloud3D restricted_cloud(const SurfaceDofCloud3D& dense)
     for(int patch=0;patch<static_cast<int>(dense.patches.size());++patch) {
         SurfaceDofPatch3D tensor=dense.patches[static_cast<std::size_t>(patch)];
         tensor.first_dof=static_cast<int>(result.dofs.size());
-        const int wanted=patch<6?8:24; tensor.nu=wanted; tensor.nv=1;
+        const int wanted=patch<6?7:24; tensor.nu=wanted; tensor.nv=1;
         int copied=0;
         for(const auto& dof:dense.dofs) if(dof.patch_id==patch && copied<wanted) {
-            result.dofs.push_back(dof); ++copied;
+            auto copy=dof; copy.i=copied; copy.j=0;
+            result.dofs.push_back(copy); ++copied;
         }
         require(copied==wanted,"restricted fixture lacked source DOFs");
         result.patches.push_back(std::move(tensor));
@@ -301,6 +302,93 @@ NativeNurbsSurface3D degenerate_normal_surface()
     return surface;
 }
 
+template<class Exception, class Function>
+void record_required_rejection(std::vector<std::string>& failures,
+                               const std::string& label,
+                               Function function,
+                               const std::string& required_text)
+{
+    try {
+        function();
+        failures.push_back(label + ": malformed input was accepted");
+    } catch(const Exception& error) {
+        if(std::string(error.what()).find(required_text)==std::string::npos)
+            failures.push_back(label + ": missing context in '" + error.what() + "'");
+    } catch(const std::exception& error) {
+        failures.push_back(label + ": wrong exception type: " + error.what());
+    }
+}
+
+void test_review_rejection_paths()
+{
+    const auto surface=make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
+    const double h=3.0/32.0;
+    const auto cloud=make_native_surface_dofs_3d(surface,h);
+    std::vector<std::string> failures;
+
+    auto smooth_asymmetric=surface;
+    bool removed_smooth=false;
+    for(auto& slot:smooth_asymmetric.smooth_neighbors[1]) {
+        if(slot && slot->patch==0) {
+            slot.reset();
+            removed_smooth=true;
+            break;
+        }
+    }
+    require(removed_smooth,"smooth-asymmetry fixture relation missing");
+    record_required_rejection<std::invalid_argument>(failures,"asymmetric smooth topology",[&]{
+        (void)build_neumann_edge_auxiliary_value_map_3d(smooth_asymmetric,cloud,h);
+    },"patch 0");
+
+    auto topological_asymmetric=surface;
+    auto& patch_zero_neighbors=topological_asymmetric.topological_patch_neighbors[0];
+    patch_zero_neighbors.erase(std::remove(patch_zero_neighbors.begin(),patch_zero_neighbors.end(),1),
+                               patch_zero_neighbors.end());
+    record_required_rejection<std::invalid_argument>(failures,"asymmetric topological adjacency",[&]{
+        (void)build_neumann_edge_auxiliary_value_map_3d(topological_asymmetric,cloud,h);
+    },"patch 0");
+
+    auto unrelated_connection=surface;
+    const int connection_index=4;
+    const auto& unrelated=unrelated_connection.geometric_connections[connection_index];
+    require(unrelated.first.patch==6 && unrelated.second.patch==7 && !unrelated.g1,
+            "unrelated-connection fixture changed");
+    auto erase_neighbor=[](std::vector<int>& neighbors,int patch) {
+        neighbors.erase(std::remove(neighbors.begin(),neighbors.end(),patch),neighbors.end());
+    };
+    erase_neighbor(unrelated_connection.topological_patch_neighbors[6],7);
+    erase_neighbor(unrelated_connection.topological_patch_neighbors[7],6);
+    record_required_rejection<std::invalid_argument>(failures,"unrelated geometric connection",[&]{
+        (void)build_neumann_edge_auxiliary_value_map_3d(unrelated_connection,cloud,h);
+    },"connection 4");
+
+    const RigidTransform3D translation(Eigen::Matrix3d::Identity(),Eigen::Vector3d::Zero(),
+                                       Eigen::Vector3d(0.19,-0.13,0.07));
+    const auto translated_surface=transform_native_nurbs_surface_3d(surface,translation);
+    const auto translated_cloud=make_native_surface_dofs_3d(translated_surface,h);
+    record_required_rejection<std::invalid_argument>(failures,"foreign translated cloud",[&]{
+        (void)build_neumann_edge_auxiliary_value_map_3d(surface,translated_cloud,h);
+    },"DOF 0 patch 0");
+
+    auto restricted_surface=surface;
+    std::size_t chosen=0;
+    for(;chosen<restricted_surface.geometric_connections.size();++chosen) {
+        const auto& connection=restricted_surface.geometric_connections[chosen];
+        if(!connection.g1 && connection.first.patch==6 && connection.second.patch==0) break;
+    }
+    require(chosen<restricted_surface.geometric_connections.size(),"side-label fixture connection missing");
+    restricted_surface.geometric_connections={restricted_surface.geometric_connections[chosen]};
+    const auto small=restricted_cloud(make_native_surface_dofs_3d(surface,0.08));
+    record_required_rejection<std::runtime_error>(failures,"insufficient side label",[&]{
+        (void)build_neumann_edge_auxiliary_value_map_3d(restricted_surface,small,h);
+    },"second-value side");
+
+    if(!failures.empty()) {
+        std::string message="review rejection failures";
+        for(const auto& failure:failures) message += "\n - " + failure;
+        throw std::runtime_error(message);
+    }
+}
 void test_rejections_and_shared_values()
 {
     const auto surface=make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
@@ -329,11 +417,7 @@ void test_rejections_and_shared_values()
     const auto connection=restricted_surface.geometric_connections[chosen];
     restricted_surface.geometric_connections={connection};
     const auto small=restricted_cloud(make_native_surface_dofs_3d(surface,0.08));
-    (void)build_neumann_edge_auxiliary_value_map_3d(restricted_surface,small,h);
-    bool erased=false;
-    for(auto& slot:restricted_surface.smooth_neighbors[0]) if(slot && slot->patch==1) { slot.reset(); erased=true; break; }
-    require(erased,"restricted fixture smooth relation missing");
-    require_throws<std::runtime_error>([&]{(void)build_neumann_edge_auxiliary_value_map_3d(restricted_surface,small,h);},"insufficient");
+    require_throws<std::runtime_error>([&]{(void)build_neumann_edge_auxiliary_value_map_3d(restricted_surface,small,h);},"second-value side");
     const auto degenerate=degenerate_normal_surface(); const auto degenerate_cloud=make_native_surface_dofs_3d(degenerate,0.1);
     require_throws<std::runtime_error>([&]{(void)build_neumann_edge_auxiliary_value_map_3d(degenerate,degenerate_cloud,0.1);},"connection 0 sample 0");
     const auto map=build_neumann_edge_auxiliary_value_map_3d(surface,cloud,h);
@@ -347,6 +431,7 @@ int main()
     try {
         test_l_prism_geometry_topology_reproduction_and_direct_map();
         test_rigid_covariance();
+        test_review_rejection_paths();
         test_rejections_and_shared_values();
         std::cout<<"3D Neumann auxiliary edge-value tests passed\n";
         return 0;

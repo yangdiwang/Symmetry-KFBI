@@ -72,6 +72,130 @@ void validate_interval(const NativeNurbsSurface3D& surface,
     }
 }
 
+bool has_topological_neighbor(const NativeNurbsSurface3D& surface,
+                              int patch,
+                              int neighbor)
+{
+    const auto& neighbors = surface.topological_patch_neighbors.at(
+        static_cast<std::size_t>(patch));
+    return std::find(neighbors.begin(), neighbors.end(), neighbor)
+        != neighbors.end();
+}
+
+void validate_surface_topology(const NativeNurbsSurface3D& surface)
+{
+    const int patch_count = static_cast<int>(surface.patches.size());
+    if (patch_count == 0
+        || surface.patch_names.size() != surface.patches.size()
+        || surface.smooth_neighbors.size() != surface.patches.size()
+        || surface.topological_patch_neighbors.size() != surface.patches.size()
+        || surface.patch_components.size() != surface.patches.size()) {
+        throw std::invalid_argument(
+            "Neumann auxiliary surface topology metadata is inconsistent");
+    }
+
+    for (int patch = 0; patch < patch_count; ++patch) {
+        std::set<int> unique_neighbors;
+        for (const int neighbor : surface.topological_patch_neighbors[
+                 static_cast<std::size_t>(patch)]) {
+            if (neighbor < 0 || neighbor >= patch_count || neighbor == patch
+                || !unique_neighbors.insert(neighbor).second) {
+                throw std::invalid_argument(
+                    "Neumann auxiliary topological patch "
+                    + std::to_string(patch) + " has invalid neighbor patch "
+                    + std::to_string(neighbor));
+            }
+            if (!has_topological_neighbor(surface, neighbor, patch)) {
+                throw std::invalid_argument(
+                    "Neumann auxiliary topological patch "
+                    + std::to_string(patch) + " neighbor patch "
+                    + std::to_string(neighbor) + " is not reciprocal");
+            }
+        }
+    }
+
+    for (int patch = 0; patch < patch_count; ++patch) {
+        for (int edge_index = 0; edge_index < 4; ++edge_index) {
+            const auto& slot = surface.smooth_neighbors[
+                static_cast<std::size_t>(patch)]
+                [static_cast<std::size_t>(edge_index)];
+            if (!slot)
+                continue;
+            const int neighbor_edge = static_cast<int>(slot->edge);
+            if (slot->patch < 0 || slot->patch >= patch_count
+                || slot->patch == patch
+                || neighbor_edge < 0 || neighbor_edge >= 4) {
+                throw std::invalid_argument(
+                    "Neumann auxiliary smooth topology patch "
+                    + std::to_string(patch) + " edge "
+                    + std::to_string(edge_index) + " is invalid");
+            }
+            const auto& reciprocal = surface.smooth_neighbors[
+                static_cast<std::size_t>(slot->patch)]
+                [static_cast<std::size_t>(neighbor_edge)];
+            if (!reciprocal || reciprocal->patch != patch
+                || static_cast<int>(reciprocal->edge) != edge_index
+                || reciprocal->reversed != slot->reversed) {
+                throw std::invalid_argument(
+                    "Neumann auxiliary smooth topology patch "
+                    + std::to_string(patch) + " edge "
+                    + std::to_string(edge_index) + " and patch "
+                    + std::to_string(slot->patch) + " edge "
+                    + std::to_string(neighbor_edge)
+                    + " are not reciprocal");
+            }
+            if (!has_topological_neighbor(surface, patch, slot->patch)
+                || !has_topological_neighbor(surface, slot->patch, patch)) {
+                throw std::invalid_argument(
+                    "Neumann auxiliary smooth topology patch "
+                    + std::to_string(patch) + " and patch "
+                    + std::to_string(slot->patch)
+                    + " are not mutual topological neighbors");
+            }
+        }
+    }
+
+    for (int connection_index = 0;
+         connection_index < static_cast<int>(surface.geometric_connections.size());
+         ++connection_index) {
+        const auto& connection = surface.geometric_connections[
+            static_cast<std::size_t>(connection_index)];
+        validate_interval(surface, connection.first, connection_index, "first");
+        validate_interval(surface, connection.second, connection_index, "second");
+        if (connection.first.patch == connection.second.patch
+            || !has_topological_neighbor(
+                surface, connection.first.patch, connection.second.patch)
+            || !has_topological_neighbor(
+                surface, connection.second.patch, connection.first.patch)) {
+            throw std::invalid_argument(
+                "Neumann auxiliary edge connection "
+                + std::to_string(connection_index) + " patches "
+                + std::to_string(connection.first.patch) + " and "
+                + std::to_string(connection.second.patch)
+                + " are not mutual topological neighbors");
+        }
+        if (connection.g1) {
+            const auto& first_slot = surface.smooth_neighbors[
+                static_cast<std::size_t>(connection.first.patch)]
+                [static_cast<std::size_t>(connection.first.edge)];
+            const auto& second_slot = surface.smooth_neighbors[
+                static_cast<std::size_t>(connection.second.patch)]
+                [static_cast<std::size_t>(connection.second.edge)];
+            if (!first_slot || !second_slot
+                || first_slot->patch != connection.second.patch
+                || first_slot->edge != connection.second.edge
+                || second_slot->patch != connection.first.patch
+                || second_slot->edge != connection.first.edge
+                || first_slot->reversed != connection.reversed
+                || second_slot->reversed != connection.reversed) {
+                throw std::invalid_argument(
+                    "Neumann auxiliary G1 edge connection "
+                    + std::to_string(connection_index)
+                    + " does not match reciprocal smooth topology");
+            }
+        }
+    }
+}
 std::pair<double, double> edge_uv(
     const geometry3d::NurbsSurfacePatch3D& patch,
     PatchEdge3D edge,
@@ -221,22 +345,80 @@ std::vector<int> nearest_g1_side_dofs(
 }
 
 void validate_cloud(const NativeNurbsSurface3D& surface,
-                    const SurfaceDofCloud3D& cloud)
+                    const SurfaceDofCloud3D& cloud,
+                    double geometry_diameter)
 {
-    if (surface.patches.empty()
-        || surface.patch_names.size() != surface.patches.size()
-        || surface.smooth_neighbors.size() != surface.patches.size()
-        || cloud.patches.size() != surface.patches.size()
+    if (cloud.patches.size() != surface.patches.size()
         || cloud.dofs.empty()) {
-        throw std::invalid_argument("Neumann auxiliary surface/cloud metadata is inconsistent");
+        throw std::invalid_argument(
+            "Neumann auxiliary surface/cloud metadata is inconsistent");
     }
-    for (const auto& dof : cloud.dofs) {
-        if (dof.patch_id < 0
-            || dof.patch_id >= static_cast<int>(surface.patches.size())
-            || !dof.point.allFinite() || !dof.normal.allFinite()) {
-            throw std::invalid_argument("Neumann auxiliary cloud contains an invalid DOF");
+    const double point_tolerance = 1.0e-11 * geometry_diameter;
+    const double normal_tolerance = 1.0e-11;
+    int expected_first_dof = 0;
+    for (int patch_id = 0;
+         patch_id < static_cast<int>(surface.patches.size());
+         ++patch_id) {
+        const auto& tensor = cloud.patches[static_cast<std::size_t>(patch_id)];
+        const auto& patch = surface.patches[static_cast<std::size_t>(patch_id)];
+        const long long dof_count = static_cast<long long>(tensor.nu)
+            * static_cast<long long>(tensor.nv);
+        if (tensor.name != surface.patch_names[static_cast<std::size_t>(patch_id)]
+            || tensor.nu <= 0 || tensor.nv <= 0
+            || tensor.first_dof != expected_first_dof
+            || dof_count <= 0
+            || dof_count > static_cast<long long>(cloud.dofs.size())
+            || expected_first_dof + dof_count
+                > static_cast<long long>(cloud.dofs.size())) {
+            throw std::invalid_argument(
+                "Neumann auxiliary cloud tensor layout is invalid at patch "
+                + std::to_string(patch_id));
         }
+        const double parameter_scale = std::max(
+            {1.0,
+             patch.domain_end_u() - patch.domain_start_u(),
+             patch.domain_end_v() - patch.domain_start_v()});
+        const double parameter_tolerance = 1.0e-12 * parameter_scale;
+        for (int local = 0; local < static_cast<int>(dof_count); ++local) {
+            const int dof_id = expected_first_dof + local;
+            const auto& dof = cloud.dofs[static_cast<std::size_t>(dof_id)];
+            const int expected_i = local / tensor.nv;
+            const int expected_j = local % tensor.nv;
+            const std::string context = "Neumann auxiliary cloud DOF "
+                + std::to_string(dof_id) + " patch "
+                + std::to_string(patch_id);
+            if (dof.patch_id != patch_id || dof.i != expected_i
+                || dof.j != expected_j) {
+                throw std::invalid_argument(context
+                    + " is inconsistent with tensor layout");
+            }
+            if (!std::isfinite(dof.u) || !std::isfinite(dof.v)
+                || dof.u < patch.domain_start_u() - parameter_tolerance
+                || dof.u > patch.domain_end_u() + parameter_tolerance
+                || dof.v < patch.domain_start_v() - parameter_tolerance
+                || dof.v > patch.domain_end_v() + parameter_tolerance) {
+                throw std::invalid_argument(context
+                    + " has out-of-domain parameters");
+            }
+            if (!dof.point.allFinite() || !dof.normal.allFinite())
+                throw std::invalid_argument(context + " is non-finite");
+            const Eigen::Vector3d expected_point = patch.evaluate(dof.u, dof.v);
+            const Eigen::Vector3d expected_normal = patch.normal(dof.u, dof.v);
+            if ((dof.point - expected_point).norm() > point_tolerance)
+                throw std::invalid_argument(context
+                    + " does not lie on the supplied NURBS patch");
+            if (!expected_normal.allFinite()
+                || expected_normal.norm() <= 1.0e-12
+                || (dof.normal - expected_normal).norm() > normal_tolerance) {
+                throw std::invalid_argument(context
+                    + " has the wrong physical normal");
+            }
+        }
+        expected_first_dof += static_cast<int>(dof_count);
     }
+    if (expected_first_dof != static_cast<int>(cloud.dofs.size()))
+        throw std::invalid_argument(
+            "Neumann auxiliary cloud tensor layout does not cover all DOFs");
 }
 
 void append_side_rows(Eigen::MatrixXd& design,
@@ -289,15 +471,11 @@ build_neumann_edge_auxiliary_value_map_3d(
     validate_options(options);
     if (!std::isfinite(h) || h <= 0.0)
         throw std::invalid_argument("Neumann auxiliary edge map requires positive h");
-    validate_cloud(surface, cloud);
-    for (int c = 0; c < static_cast<int>(surface.geometric_connections.size()); ++c) {
-        validate_interval(surface, surface.geometric_connections[static_cast<std::size_t>(c)].first, c, "first");
-        validate_interval(surface, surface.geometric_connections[static_cast<std::size_t>(c)].second, c, "second");
-    }
-
+    validate_surface_topology(surface);
     const double geometry_diameter = surface.geometry_model().control_bounds().diameter();
     if (!std::isfinite(geometry_diameter) || geometry_diameter <= 0.0)
         throw std::invalid_argument("Neumann auxiliary surface has invalid diameter");
+    validate_cloud(surface, cloud, geometry_diameter);
     const double gap_limit = 1.0e-11 * geometry_diameter;
     HarmonicPolynomialSpace3D space(options.degree);
     const Eigen::VectorXd origin_basis = space.basis(0.0, 0.0, 0.0);
@@ -384,22 +562,33 @@ build_neumann_edge_auxiliary_value_map_3d(
             if (!sample.frame.allFinite() || sample.frame.determinant() <= 1.0e-12)
                 throw std::runtime_error(sample_context(c, q, "degenerate edge frame"));
 
-            try {
-                sample.first_value_dofs = nearest_g1_side_dofs(
-                    surface, cloud, sample.first_patch, sample.second_patch,
-                    sample.point, options.value_samples_per_side);
-                sample.first_normal_dofs = nearest_g1_side_dofs(
-                    surface, cloud, sample.first_patch, sample.second_patch,
-                    sample.point, options.normal_samples_per_side);
-                sample.second_value_dofs = nearest_g1_side_dofs(
-                    surface, cloud, sample.second_patch, sample.first_patch,
-                    sample.point, options.value_samples_per_side);
-                sample.second_normal_dofs = nearest_g1_side_dofs(
-                    surface, cloud, sample.second_patch, sample.first_patch,
-                    sample.point, options.normal_samples_per_side);
-            } catch (const std::exception& error) {
-                throw std::runtime_error(sample_context(c, q, error.what()));
-            }
+            auto select_side = [&](int incident_patch,
+                                   int forbidden_patch,
+                                   int count,
+                                   const char* side) {
+                try {
+                    return nearest_g1_side_dofs(
+                        surface, cloud, incident_patch, forbidden_patch,
+                        sample.point, count);
+                } catch (const std::exception& error) {
+                    const std::string detail = std::string(side)
+                        + " side: " + error.what();
+                    throw std::runtime_error(
+                        sample_context(c, q, detail.c_str()));
+                }
+            };
+            sample.first_value_dofs = select_side(
+                sample.first_patch, sample.second_patch,
+                options.value_samples_per_side, "first-value");
+            sample.first_normal_dofs = select_side(
+                sample.first_patch, sample.second_patch,
+                options.normal_samples_per_side, "first-normal");
+            sample.second_value_dofs = select_side(
+                sample.second_patch, sample.first_patch,
+                options.value_samples_per_side, "second-value");
+            sample.second_normal_dofs = select_side(
+                sample.second_patch, sample.first_patch,
+                options.normal_samples_per_side, "second-normal");
             sample.first_owner_dof = sample.first_value_dofs.front();
             sample.second_owner_dof = sample.second_value_dofs.front();
 
