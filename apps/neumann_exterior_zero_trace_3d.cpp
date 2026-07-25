@@ -52,6 +52,7 @@
 #include "kfbi_phase_profile_3d.hpp"
 #include "native_nurbs_surface_3d.hpp"
 #include "neumann_edge_augmented_cauchy_3d.hpp"
+#include "neumann_edge_cauchy_study_3d.hpp"
 #include "neumann_edge_continuity_3d.hpp"
 #include "neumann_rigid_transform_study_3d.hpp"
 #include "restrict_owner_geometry_preprocessor_3d.hpp"
@@ -8650,6 +8651,503 @@ void write_neumann_edge_continuity_checkpoints_3d(
         << criterion_status_name(evaluation.acceptance.overall_pass) << '\n';
 }
 
+using PhaseRecordArray3D = std::array<
+    app3d::PhaseProfileRecord3D,
+    app3d::phase_profile_kind_count_3d()>;
+
+struct NeumannEdgeCauchyEdgeValueRow3D {
+    int connection_index = -1;
+    int sample_index = -1;
+    int sample_count = 0;
+    int first_owner_dof = -1;
+    int second_owner_dof = -1;
+    double first_value = 0.0;
+    double second_value = 0.0;
+    double shared_auxiliary_value = 0.0;
+    double first_second_difference = 0.0;
+    double first_shared_difference = 0.0;
+    double second_shared_difference = 0.0;
+};
+
+struct NeumannEdgeCauchyPairRun3D {
+    std::array<app3d::NeumannEdgeCauchyMeasurement3D, 2> measurements;
+    std::array<std::vector<double>, 2> residual_histories;
+    std::array<std::vector<NeumannEdgeCauchyEdgeValueRow3D>, 2>
+        edge_value_rows;
+    PhaseRecordArray3D shared_setup_phases{};
+    std::array<PhaseRecordArray3D, 2> runtime_phase_deltas{};
+    std::vector<app3d::NeumannEdgePreprocessInvariantSnapshot3D>
+        owner_snapshots;
+    int setup_factorization_count = 0;
+    std::array<int, 2> factorization_counts_before{};
+    std::array<int, 2> factorization_counts_after{};
+};
+
+PhaseRecordArray3D capture_phase_records_3d(
+    const app3d::PhaseProfile3D& profile)
+{
+    PhaseRecordArray3D result{};
+    for (std::size_t q = 0; q < result.size(); ++q) {
+        result[q] = profile.record(static_cast<PhaseProfileKind3D>(q));
+    }
+    return result;
+}
+
+PhaseRecordArray3D subtract_phase_records_3d(
+    const PhaseRecordArray3D& after,
+    const PhaseRecordArray3D& before,
+    const char* context)
+{
+    PhaseRecordArray3D result{};
+    for (std::size_t q = 0; q < result.size(); ++q) {
+        if (after[q].calls < before[q].calls
+            || after[q].seconds < before[q].seconds) {
+            throw std::logic_error(
+                std::string(context) + " phase counters decreased");
+        }
+        result[q].seconds = after[q].seconds - before[q].seconds;
+        result[q].calls = after[q].calls - before[q].calls;
+        if (!std::isfinite(result[q].seconds)
+            || result[q].seconds < 0.0) {
+            throw std::logic_error(
+                std::string(context) + " has invalid phase delta");
+        }
+    }
+    return result;
+}
+
+double phase_record_sum_3d(const PhaseRecordArray3D& records)
+{
+    double result = 0.0;
+    for (const auto& record : records) result += record.seconds;
+    return result;
+}
+
+void require_phase_wall_match_3d(double phase_seconds,
+                                 double wall_seconds,
+                                 const char* context)
+{
+    const double tolerance = std::max(1.0e-9, 1.0e-8 * wall_seconds);
+    if (!std::isfinite(phase_seconds) || !std::isfinite(wall_seconds)
+        || wall_seconds < 0.0
+        || std::abs(phase_seconds - wall_seconds) > tolerance) {
+        throw std::logic_error(
+            std::string(context) + " phase sum does not match wall time");
+    }
+}
+
+bool bitwise_equal_double_3d(double lhs, double rhs) noexcept
+{
+    return std::memcmp(&lhs, &rhs, sizeof(double)) == 0;
+}
+
+bool far_cauchy_rows_bitwise_equal_3d(
+    const Eigen::MatrixXd& legacy,
+    const Eigen::MatrixXd& augmented,
+    const std::vector<bool>& affected)
+{
+    if (legacy.rows() != augmented.rows()
+        || legacy.cols() != augmented.cols()
+        || legacy.rows() != static_cast<Eigen::Index>(affected.size())) {
+        return false;
+    }
+    for (Eigen::Index row = 0; row < legacy.rows(); ++row) {
+        if (affected[static_cast<std::size_t>(row)]) continue;
+        for (Eigen::Index column = 0; column < legacy.cols(); ++column) {
+            if (!bitwise_equal_double_3d(
+                    legacy(row, column), augmented(row, column))) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+double evaluate_edge_owner_value_3d(
+    const SurfaceDofCloud& surface,
+    int owner_dof,
+    const Eigen::Vector3d& point,
+    double h,
+    const Eigen::MatrixXd& coefficients)
+{
+    if (owner_dof < 0
+        || owner_dof >= static_cast<int>(surface.dofs.size())
+        || owner_dof >= coefficients.rows()) {
+        throw std::logic_error("invalid edge owner DOF");
+    }
+    const SurfaceDof& owner =
+        surface.dofs[static_cast<std::size_t>(owner_dof)];
+    const Eigen::Vector3d d = (point - owner.point) / h;
+    const Eigen::Vector3d xi(
+        d.dot(owner.tangent1), d.dot(owner.tangent2),
+        d.dot(owner.normal));
+    const app3d::HarmonicPolynomialSpace3D polynomial_space(3);
+    return polynomial_space.basis(xi.x(), xi.y(), xi.z()).dot(
+        coefficients.row(owner_dof).transpose());
+}
+
+NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
+    int N, const app3d::LPrismRigidStudyCase3D& study_case)
+{
+    constexpr int gmres_max_iterations = 80;
+    constexpr ExteriorValueRestrictMode3D restrict_mode =
+        ExteriorValueRestrictMode3D::JointTricubicCrossingOwner;
+    const std::array<app3d::NeumannEdgeCauchyMode3D, 2> modes{{
+        app3d::NeumannEdgeCauchyMode3D::None,
+        app3d::NeumannEdgeCauchyMode3D::NonG1AuxiliaryValues}};
+    const double h = kBoxSide / static_cast<double>(N);
+    app3d::PhaseProfile3D profile;
+    const auto setup_start = std::chrono::steady_clock::now();
+
+    auto phase_start = std::chrono::steady_clock::now();
+    CartesianGrid3D grid({kBoxMin, kBoxMin, kBoxMin}, {h, h, h},
+                         {N, N, N}, DofLayout3D::Node);
+    GeometryBundle geometry = make_geometry(
+        GeometryKind::LPrism, h, study_case.transform);
+    const auto domain = std::make_shared<const
+        geometry3d::NurbsCartesianDomain3D>(
+            grid, geometry.native_surface.geometry_model());
+    profile.add(PhaseProfileKind3D::GeometryAndDomain,
+        std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - phase_start).count(), 1);
+
+    phase_start = std::chrono::steady_clock::now();
+    const SurfaceDofCloud surface_dofs =
+        app3d::make_native_surface_dofs_3d(
+            geometry.native_surface, h);
+    validate_surface_dofs(surface_dofs, h);
+    const CauchyStencilSet cauchy_stencils = build_cauchy_stencils(
+        geometry.native_surface, surface_dofs, h,
+        kCauchyValueNeighborCount, kCauchyDerivativeNeighborCount,
+        CauchyStencilPolicy3D::G1Nearest);
+    profile.add(PhaseProfileKind3D::SurfaceDofsAndStencils,
+        std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - phase_start).count(), 1);
+
+    phase_start = std::chrono::steady_clock::now();
+    GridPair3D grid_pair(grid, geometry.correction_interface,
+                         geometry.crossing_interface, domain);
+    int label_mismatches = 0;
+    for (int node = 0; node < grid.num_dofs(); ++node) {
+        const bool numerical_inside = grid_pair.domain_label(node) > 0;
+        if (numerical_inside
+            != geometry.exact_inside(grid_point(grid, node))) {
+            ++label_mismatches;
+        }
+    }
+    profile.add(PhaseProfileKind3D::GridPairAndLabelValidation,
+        std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - phase_start).count(), 1);
+
+    const std::array<PhaseProfileKind3D, 4> pipeline_children{{
+        PhaseProfileKind3D::CrossingRows,
+        PhaseProfileKind3D::NurbsSegmentIntersections,
+        PhaseProfileKind3D::RestrictOwnerGeometryPreprocessing,
+        PhaseProfileKind3D::TraceOwnerTemplateAssembly}};
+    std::array<double, 4> pipeline_child_before{};
+    for (std::size_t q = 0; q < pipeline_children.size(); ++q) {
+        pipeline_child_before[q] =
+            profile.record(pipeline_children[q]).seconds;
+    }
+    RestrictOwnerPipelinePreprocessTiming3D preprocess_timing;
+    const auto pipeline_start = std::chrono::steady_clock::now();
+    PanelCenterHarmonicJetKFBI3D pipeline(
+        grid, grid_pair, geometry.native_surface,
+        geometry.correction_triangles, geometry.geometry_triangles,
+        surface_dofs, cauchy_stencils, false,
+        OwnerMode3D::RegionClosestHybrid, &profile, nullptr,
+        &preprocess_timing, true);
+    const double pipeline_wall_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - pipeline_start).count();
+    double pipeline_child_seconds = 0.0;
+    for (std::size_t q = 0; q < pipeline_children.size(); ++q) {
+        pipeline_child_seconds += profile.record(pipeline_children[q]).seconds
+            - pipeline_child_before[q];
+    }
+    profile.add(PhaseProfileKind3D::PipelineFixedInitialization,
+        nonnegative_profile_remainder_3d(
+            pipeline_wall_seconds, pipeline_child_seconds,
+            "Neumann edge-Cauchy pipeline setup"), 1);
+
+    const double setup_wall_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - setup_start).count();
+    const double setup_recorded_before_remainder = phase_record_sum_3d(
+        capture_phase_records_3d(profile));
+    profile.add(PhaseProfileKind3D::ExactFieldsAndOtherSetup,
+        nonnegative_profile_remainder_3d(
+            setup_wall_seconds, setup_recorded_before_remainder,
+            "Neumann edge-Cauchy shared setup"), 1);
+
+    NeumannEdgeCauchyPairRun3D result;
+    result.shared_setup_phases = capture_phase_records_3d(profile);
+    require_phase_wall_match_3d(
+        phase_record_sum_3d(result.shared_setup_phases),
+        setup_wall_seconds, "Neumann edge-Cauchy shared setup");
+
+    const auto& augmented_cauchy =
+        pipeline.neumann_edge_augmented_cauchy();
+    const auto& augmented_diagnostics = augmented_cauchy.diagnostics();
+    result.setup_factorization_count =
+        augmented_diagnostics.factorization_count;
+    const NeumannRigidGeometryDiagnostics3D geometry_diagnostics =
+        neumann_rigid_geometry_diagnostics_3d(
+            grid_pair, pipeline.correction_support());
+    const auto setup_diagnostics =
+        pipeline.restrict_owner_preprocess_diagnostics();
+    const std::uint64_t setup_queries = static_cast<std::uint64_t>(
+        pipeline.restrict_owner_geometry_query_count());
+    if (setup_queries != setup_diagnostics.wrong_side_queries) {
+        throw std::logic_error(
+            "Neumann edge-Cauchy setup query-count mismatch");
+    }
+
+    const int surface_size = pipeline.surface_size();
+    Eigen::VectorXd value_probe(surface_size);
+    Eigen::VectorXd prescribed_normal_jump(surface_size);
+    for (int q = 0; q < surface_size; ++q) {
+        value_probe[q] = std::sin(0.37 * (q + 1))
+                       + 0.2 * std::cos(0.11 * (q + 1));
+        const SurfaceDof& dof =
+            pipeline.surface().dofs[static_cast<std::size_t>(q)];
+        prescribed_normal_jump[q] =
+            app3d::transformed_manufactured_harmonic_gradient_3d(
+                study_case.transform, dof.point).dot(dof.normal);
+    }
+    prescribed_normal_jump.array() -= surface_weighted_mean(
+        pipeline.surface(), prescribed_normal_jump);
+    const Eigen::VectorXd zero_grid =
+        Eigen::VectorXd::Zero(grid.num_dofs());
+    const HarmonicJetField3D legacy_probe =
+        pipeline.field_from_grid_and_jumps(
+            zero_grid, value_probe, prescribed_normal_jump,
+            modes[0]);
+    const HarmonicJetField3D augmented_probe =
+        pipeline.field_from_grid_and_jumps(
+            zero_grid, value_probe, prescribed_normal_jump,
+            modes[1]);
+    std::vector<bool> affected(
+        static_cast<std::size_t>(surface_size), false);
+    for (const auto& local_map : augmented_cauchy.local_maps()) {
+        if (local_map.center_dof < 0
+            || local_map.center_dof >= surface_size) {
+            throw std::logic_error(
+                "Neumann edge-Cauchy local map has invalid center");
+        }
+        affected[static_cast<std::size_t>(local_map.center_dof)] = true;
+    }
+    const bool far_centers_bitwise_legacy =
+        far_cauchy_rows_bitwise_equal_3d(
+            legacy_probe.coefficients, augmented_probe.coefficients,
+            affected);
+    if (!far_centers_bitwise_legacy) {
+        throw std::logic_error(
+            "Neumann edge-Cauchy structural probe changed a far center");
+    }
+
+    const NeumannEdgePreprocessSnapshot3D stable_snapshot =
+        capture_neumann_edge_preprocess_snapshot_3d(pipeline);
+    if (stable_snapshot.output_digest != preprocess_timing.output_digest
+        || stable_snapshot.wrong_side_queries
+            != setup_diagnostics.wrong_side_queries
+        || stable_snapshot.geometry_queries != setup_queries) {
+        throw std::logic_error(
+            "Neumann edge-Cauchy stable setup snapshot mismatch");
+    }
+
+    std::array<NeumannEdgePreprocessSnapshot3D, 2> before_snapshots;
+    std::array<NeumannEdgePreprocessSnapshot3D, 2> after_snapshots;
+    std::array<Eigen::VectorXd, 2> solved_value_jumps;
+    std::array<Eigen::MatrixXd, 2> solved_coefficients;
+    std::array<Eigen::VectorXd, 2> solved_normal_jumps;
+    for (std::size_t index = 0; index < modes.size(); ++index) {
+        auto& measurement = result.measurements[index];
+        measurement.case_id = study_case.id;
+        measurement.N = N;
+        measurement.h = h;
+        measurement.mode = modes[index];
+        measurement.expected_non_g1_connections =
+            augmented_diagnostics.edge.expected_non_g1_connections;
+        measurement.covered_non_g1_connections =
+            augmented_diagnostics.edge.covered_non_g1_connections;
+        measurement.edge_sample_count =
+            augmented_cauchy.edge_sample_count();
+        measurement.affected_center_count =
+            augmented_diagnostics.affected_center_count;
+        measurement.corner_center_count =
+            augmented_diagnostics.corner_center_count;
+        measurement.unrelated_sample_or_attachment_count =
+            augmented_diagnostics.edge.unrelated_sample_count
+            + augmented_diagnostics.unrelated_attachment_count;
+        measurement.rank_deficient_fit_count =
+            augmented_diagnostics.edge.rank_deficient_fit_count
+            + augmented_diagnostics.rank_deficient_local_fit_count;
+        measurement.harmonic_cubic_reproduction_defect = std::max(
+            augmented_diagnostics.edge.
+                harmonic_cubic_reproduction_defect_max,
+            augmented_diagnostics.
+                harmonic_cubic_reproduction_defect_max);
+        measurement.edge_condition_max =
+            augmented_diagnostics.edge.condition_max;
+        measurement.local_condition_max =
+            augmented_diagnostics.local_condition_max;
+        measurement.shared_setup_seconds = setup_wall_seconds;
+        measurement.far_centers_bitwise_legacy =
+            far_centers_bitwise_legacy;
+        measurement.geometry_diagnostics_pass = label_mismatches == 0
+            && geometry_diagnostics.unsafe_label_changing_edges == 0
+            && geometry_diagnostics.gap_crossings == 0
+            && geometry_diagnostics.endpoint_crossings == 0
+            && geometry_diagnostics.triangle_fallback_crossings == 0;
+
+        before_snapshots[index] =
+            capture_neumann_edge_preprocess_snapshot_3d(pipeline);
+        result.factorization_counts_before[index] =
+            augmented_cauchy.diagnostics().factorization_count;
+        const PhaseRecordArray3D phase_before =
+            capture_phase_records_3d(profile);
+        const auto route_start = std::chrono::steady_clock::now();
+        const SolveMetrics3D solve = run_neumann_case(
+            grid, grid_pair, pipeline, study_case.transform,
+            gmres_max_iterations, restrict_mode, modes[index],
+            &result.residual_histories[index], nullptr,
+            &solved_value_jumps[index], &solved_coefficients[index],
+            &solved_normal_jumps[index]);
+        const double mode_wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - route_start).count();
+        after_snapshots[index] =
+            capture_neumann_edge_preprocess_snapshot_3d(pipeline);
+        result.factorization_counts_after[index] =
+            augmented_cauchy.diagnostics().factorization_count;
+        if (result.factorization_counts_after[index]
+                != result.factorization_counts_before[index]
+            || result.factorization_counts_before[index]
+                != result.setup_factorization_count) {
+            throw std::logic_error(
+                "Neumann edge-Cauchy GMRES changed factorization count");
+        }
+
+        const PhaseRecordArray3D phase_after_children =
+            capture_phase_records_3d(profile);
+        const PhaseRecordArray3D child_deltas =
+            subtract_phase_records_3d(
+                phase_after_children, phase_before,
+                "Neumann edge-Cauchy route children");
+        const std::array<PhaseProfileKind3D, 6> route_children{{
+            PhaseProfileKind3D::EdgeAuxiliaryValues,
+            PhaseProfileKind3D::CauchyCoefficients,
+            PhaseProfileKind3D::SpreadRhsAssembly,
+            PhaseProfileKind3D::FftBulkSolve,
+            PhaseProfileKind3D::RestrictContinuedSamples,
+            PhaseProfileKind3D::RestrictRecovery}};
+        double child_seconds = 0.0;
+        for (PhaseProfileKind3D kind : route_children) {
+            child_seconds += child_deltas[static_cast<std::size_t>(kind)].seconds;
+        }
+        profile.add(PhaseProfileKind3D::GmresAndOtherRoute,
+            nonnegative_profile_remainder_3d(
+                mode_wall_seconds, child_seconds,
+                "Neumann edge-Cauchy mode runtime"), 1);
+        const PhaseRecordArray3D phase_after =
+            capture_phase_records_3d(profile);
+        result.runtime_phase_deltas[index] =
+            subtract_phase_records_3d(
+                phase_after, phase_before,
+                "Neumann edge-Cauchy mode runtime");
+        require_phase_wall_match_3d(
+            phase_record_sum_3d(result.runtime_phase_deltas[index]),
+            mode_wall_seconds,
+            "Neumann edge-Cauchy mode runtime");
+
+        measurement.gmres_converged = solve.converged;
+        measurement.gmres_iterations = solve.iterations;
+        measurement.gmres_relative_residual =
+            solve.gmres_relative_residual;
+        measurement.density_linf = solve.density_linf;
+        measurement.density_l2 = solve.density_l2;
+        measurement.interior_linf = solve.interior_linf;
+        measurement.interior_l2 = solve.interior_l2;
+        measurement.mode_runtime_seconds = mode_wall_seconds;
+        measurement.total_seconds =
+            measurement.shared_setup_seconds
+            + measurement.mode_runtime_seconds;
+
+        const Eigen::VectorXd shared_edge_values =
+            augmented_cauchy.edge_values(
+                solved_value_jumps[index], solved_normal_jumps[index]);
+        const auto& samples =
+            augmented_cauchy.edge_value_map().samples;
+        if (shared_edge_values.size()
+            != static_cast<Eigen::Index>(samples.size())) {
+            throw std::logic_error(
+                "Neumann edge-Cauchy edge-value output has wrong size");
+        }
+        double discrepancy = 0.0;
+        for (std::size_t q = 0; q < samples.size(); ++q) {
+            const auto& sample = samples[q];
+            NeumannEdgeCauchyEdgeValueRow3D edge_row;
+            edge_row.connection_index = sample.connection_index;
+            edge_row.sample_index = sample.sample_index;
+            edge_row.sample_count = sample.sample_count;
+            edge_row.first_owner_dof = sample.first_owner_dof;
+            edge_row.second_owner_dof = sample.second_owner_dof;
+            edge_row.first_value = evaluate_edge_owner_value_3d(
+                pipeline.surface(), sample.first_owner_dof,
+                sample.point, h, solved_coefficients[index]);
+            edge_row.second_value = evaluate_edge_owner_value_3d(
+                pipeline.surface(), sample.second_owner_dof,
+                sample.point, h, solved_coefficients[index]);
+            edge_row.shared_auxiliary_value =
+                shared_edge_values[static_cast<Eigen::Index>(q)];
+            edge_row.first_second_difference = std::abs(
+                edge_row.first_value - edge_row.second_value);
+            edge_row.first_shared_difference = std::abs(
+                edge_row.first_value - edge_row.shared_auxiliary_value);
+            edge_row.second_shared_difference = std::abs(
+                edge_row.second_value - edge_row.shared_auxiliary_value);
+            discrepancy = std::max(
+                discrepancy, edge_row.first_second_difference);
+            result.edge_value_rows[index].push_back(edge_row);
+        }
+        measurement.incident_edge_discrepancy_linf = discrepancy;
+        measurement.finite_metrics = finite_neumann_owner_metrics_3d(solve)
+            && std::isfinite(measurement.shared_setup_seconds)
+            && std::isfinite(measurement.mode_runtime_seconds)
+            && std::isfinite(measurement.total_seconds)
+            && std::isfinite(measurement.incident_edge_discrepancy_linf)
+            && std::isfinite(measurement.edge_condition_max)
+            && std::isfinite(measurement.local_condition_max);
+        measurement.owner_invariants_pass =
+            neumann_edge_preprocess_snapshot_equal_3d(
+                stable_snapshot, before_snapshots[index])
+            && neumann_edge_preprocess_snapshot_equal_3d(
+                stable_snapshot, after_snapshots[index]);
+    }
+
+    const NeumannEdgePreprocessSnapshot3D final_snapshot =
+        capture_neumann_edge_preprocess_snapshot_3d(pipeline);
+    result.owner_snapshots = {
+        neumann_edge_preprocess_invariant_snapshot_3d(
+            stable_snapshot, stable_snapshot),
+        neumann_edge_preprocess_invariant_snapshot_3d(
+            before_snapshots[0], stable_snapshot),
+        neumann_edge_preprocess_invariant_snapshot_3d(
+            after_snapshots[0], stable_snapshot),
+        neumann_edge_preprocess_invariant_snapshot_3d(
+            before_snapshots[1], stable_snapshot),
+        neumann_edge_preprocess_invariant_snapshot_3d(
+            after_snapshots[1], stable_snapshot),
+        neumann_edge_preprocess_invariant_snapshot_3d(
+            final_snapshot, stable_snapshot)};
+    const bool shared_preprocess_pass =
+        app3d::neumann_edge_shared_preprocess_pass_3d(
+            result.owner_snapshots);
+    for (auto& measurement : result.measurements) {
+        measurement.owner_invariants_pass =
+            measurement.owner_invariants_pass && shared_preprocess_pass;
+        measurement.shared_preprocess_pass = shared_preprocess_pass;
+    }
+    return result;
+}
 std::vector<app3d::LPrismRigidStudyCase3D> neumann_edge_pilot_cases_3d()
 {
     const std::array<std::string, 3> wanted{{
@@ -8666,8 +9164,451 @@ std::vector<app3d::LPrismRigidStudyCase3D> neumann_edge_pilot_cases_3d()
     return result;
 }
 
-int run_neumann_edge_continuity_study_3d(std::vector<int> levels)
+std::vector<app3d::NeumannEdgeCauchyMeasurement3D>
+neumann_edge_cauchy_measurements_3d(
+    const std::vector<NeumannEdgeCauchyPairRun3D>& pairs)
 {
+    std::vector<app3d::NeumannEdgeCauchyMeasurement3D> result;
+    result.reserve(2 * pairs.size());
+    for (const auto& pair : pairs) {
+        result.push_back(pair.measurements[0]);
+        result.push_back(pair.measurements[1]);
+    }
+    return result;
+}
+
+const app3d::NeumannEdgeCauchyDerivedRow3D*
+find_neumann_edge_cauchy_derived_row_3d(
+    const app3d::NeumannEdgeCauchyEvaluation3D& evaluation,
+    const app3d::NeumannEdgeCauchyMeasurement3D& measurement)
+{
+    const auto found = std::find_if(
+        evaluation.rows.begin(), evaluation.rows.end(),
+        [&](const app3d::NeumannEdgeCauchyDerivedRow3D& row) {
+            return row.measurement.case_id == measurement.case_id
+                && row.measurement.N == measurement.N
+                && row.measurement.mode == measurement.mode;
+        });
+    return found == evaluation.rows.end()
+        ? nullptr : std::addressof(*found);
+}
+
+void write_neumann_edge_cauchy_checkpoints_3d(
+    const std::filesystem::path& output_dir,
+    const std::vector<NeumannEdgeCauchyPairRun3D>& pairs,
+    const app3d::NeumannEdgeCauchyEvaluation3D& evaluation)
+{
+    std::filesystem::create_directories(output_dir);
+    std::ofstream summary = open_output_file(output_dir / "summary.csv");
+    summary << std::setprecision(17) << std::boolalpha
+        << "case_id,N,h,mode,finite_metrics,gmres_converged,gmres_iterations,"
+           "gmres_relative_residual,density_linf,density_l2,interior_linf,"
+           "interior_l2,incident_edge_discrepancy_linf,"
+           "expected_non_g1_connections,covered_non_g1_connections,"
+           "edge_sample_count,affected_center_count,corner_center_count,"
+           "unrelated_sample_or_attachment_count,rank_deficient_fit_count,"
+           "harmonic_cubic_reproduction_defect,edge_condition_max,"
+           "local_condition_max,far_centers_bitwise_legacy,"
+           "geometry_diagnostics_pass,owner_invariants_pass,"
+           "shared_preprocess_pass,density_linf_order,density_l2_order,"
+           "interior_linf_order,interior_l2_order,"
+           "density_linf_ratio_to_legacy,density_l2_ratio_to_legacy,"
+           "interior_linf_ratio_to_legacy,interior_l2_ratio_to_legacy,"
+           "edge_discrepancy_ratio_to_legacy,row_pass,"
+           "shared_setup_seconds,edge_auxiliary_values_seconds,"
+           "cauchy_coefficients_seconds,spread_rhs_assembly_seconds,"
+           "fft_bulk_solve_seconds,restrict_continued_samples_seconds,"
+           "restrict_recovery_seconds,gmres_and_other_route_seconds,"
+           "mode_runtime_seconds,total_seconds\n";
+    for (const auto& pair : pairs) {
+        for (std::size_t mode_index = 0; mode_index < 2; ++mode_index) {
+            const auto& measurement = pair.measurements[mode_index];
+            const auto* derived =
+                find_neumann_edge_cauchy_derived_row_3d(
+                    evaluation, measurement);
+            if (derived == nullptr) {
+                throw std::logic_error(
+                    "missing Neumann edge-Cauchy derived row");
+            }
+            const auto& phases = pair.runtime_phase_deltas[mode_index];
+            const auto seconds = [&](PhaseProfileKind3D kind) {
+                return phases[static_cast<std::size_t>(kind)].seconds;
+            };
+            summary << measurement.case_id << ',' << measurement.N
+                << ',' << measurement.h << ','
+                << app3d::neumann_edge_cauchy_mode_name_3d(
+                       measurement.mode)
+                << ',' << measurement.finite_metrics
+                << ',' << measurement.gmres_converged
+                << ',' << measurement.gmres_iterations
+                << ',' << measurement.gmres_relative_residual
+                << ',' << measurement.density_linf
+                << ',' << measurement.density_l2
+                << ',' << measurement.interior_linf
+                << ',' << measurement.interior_l2
+                << ',' << measurement.incident_edge_discrepancy_linf
+                << ',' << measurement.expected_non_g1_connections
+                << ',' << measurement.covered_non_g1_connections
+                << ',' << measurement.edge_sample_count
+                << ',' << measurement.affected_center_count
+                << ',' << measurement.corner_center_count
+                << ',' << measurement.unrelated_sample_or_attachment_count
+                << ',' << measurement.rank_deficient_fit_count
+                << ',' << measurement.harmonic_cubic_reproduction_defect
+                << ',' << measurement.edge_condition_max
+                << ',' << measurement.local_condition_max
+                << ',' << measurement.far_centers_bitwise_legacy
+                << ',' << measurement.geometry_diagnostics_pass
+                << ',' << measurement.owner_invariants_pass
+                << ',' << measurement.shared_preprocess_pass
+                << ',' << derived->density_linf_order
+                << ',' << derived->density_l2_order
+                << ',' << derived->interior_linf_order
+                << ',' << derived->interior_l2_order
+                << ',' << derived->density_linf_ratio_to_legacy
+                << ',' << derived->density_l2_ratio_to_legacy
+                << ',' << derived->interior_linf_ratio_to_legacy
+                << ',' << derived->interior_l2_ratio_to_legacy
+                << ',' << derived->edge_discrepancy_ratio_to_legacy
+                << ',' << criterion_status_name(derived->row_pass)
+                << ',' << measurement.shared_setup_seconds
+                << ',' << seconds(PhaseProfileKind3D::EdgeAuxiliaryValues)
+                << ',' << seconds(PhaseProfileKind3D::CauchyCoefficients)
+                << ',' << seconds(PhaseProfileKind3D::SpreadRhsAssembly)
+                << ',' << seconds(PhaseProfileKind3D::FftBulkSolve)
+                << ',' << seconds(PhaseProfileKind3D::RestrictContinuedSamples)
+                << ',' << seconds(PhaseProfileKind3D::RestrictRecovery)
+                << ',' << seconds(PhaseProfileKind3D::GmresAndOtherRoute)
+                << ',' << measurement.mode_runtime_seconds
+                << ',' << measurement.total_seconds << '\n';
+        }
+    }
+
+    std::ofstream edges = open_output_file(
+        output_dir / "edge_values.csv");
+    edges << std::setprecision(17)
+        << "case_id,N,mode,connection_index,sample_index,sample_count,"
+           "first_owner_dof,second_owner_dof,first_value,second_value,"
+           "shared_auxiliary_value,first_second_difference,"
+           "first_shared_difference,second_shared_difference\n";
+    for (const auto& pair : pairs) {
+        for (std::size_t mode_index = 0; mode_index < 2; ++mode_index) {
+            const auto& measurement = pair.measurements[mode_index];
+            for (const auto& row : pair.edge_value_rows[mode_index]) {
+                edges << measurement.case_id << ',' << measurement.N
+                    << ',' << app3d::neumann_edge_cauchy_mode_name_3d(
+                           measurement.mode)
+                    << ',' << row.connection_index
+                    << ',' << row.sample_index
+                    << ',' << row.sample_count
+                    << ',' << row.first_owner_dof
+                    << ',' << row.second_owner_dof
+                    << ',' << row.first_value
+                    << ',' << row.second_value
+                    << ',' << row.shared_auxiliary_value
+                    << ',' << row.first_second_difference
+                    << ',' << row.first_shared_difference
+                    << ',' << row.second_shared_difference << '\n';
+            }
+        }
+    }
+
+    std::ofstream residuals = open_output_file(
+        output_dir / "gmres_residuals.csv");
+    residuals << std::setprecision(17)
+              << "case_id,N,mode,iteration,residual\n";
+    for (const auto& pair : pairs) {
+        for (std::size_t mode_index = 0; mode_index < 2; ++mode_index) {
+            const auto& measurement = pair.measurements[mode_index];
+            for (std::size_t iteration = 0;
+                 iteration < pair.residual_histories[mode_index].size();
+                 ++iteration) {
+                residuals << measurement.case_id << ',' << measurement.N
+                    << ',' << app3d::neumann_edge_cauchy_mode_name_3d(
+                           measurement.mode)
+                    << ',' << iteration << ','
+                    << pair.residual_histories[mode_index][iteration]
+                    << '\n';
+            }
+        }
+    }
+
+    std::ofstream owners = open_output_file(
+        output_dir / "owner_diagnostics.csv");
+    owners << std::boolalpha
+        << "case_id,N,mode,stable_workload_fingerprint,"
+           "stable_output_digest,stable_wrong_side_queries,"
+           "stable_geometry_queries,before_workload_fingerprint,"
+           "after_workload_fingerprint,before_output_digest,"
+           "after_output_digest,before_wrong_side_queries,"
+           "after_wrong_side_queries,before_geometry_queries,"
+           "after_geometry_queries,final_workload_fingerprint,"
+           "final_output_digest,final_wrong_side_queries,"
+           "final_geometry_queries,diagnostics_match_reference,"
+           "setup_factorization_count,factorization_count_before_gmres,"
+           "factorization_count_after_gmres,geometry_diagnostics_pass,"
+           "owner_invariants_pass,shared_preprocess_pass\n";
+    for (const auto& pair : pairs) {
+        if (pair.owner_snapshots.size() != 6) {
+            throw std::logic_error(
+                "Neumann edge-Cauchy owner snapshot chain is incomplete");
+        }
+        const auto& stable = pair.owner_snapshots[0];
+        const auto& final = pair.owner_snapshots[5];
+        for (std::size_t mode_index = 0; mode_index < 2; ++mode_index) {
+            const auto& measurement = pair.measurements[mode_index];
+            const auto& before = pair.owner_snapshots[1 + 2 * mode_index];
+            const auto& after = pair.owner_snapshots[2 + 2 * mode_index];
+            owners << measurement.case_id << ',' << measurement.N
+                << ',' << app3d::neumann_edge_cauchy_mode_name_3d(
+                       measurement.mode)
+                << ',' << stable.workload_fingerprint
+                << ',' << stable.output_digest
+                << ',' << stable.wrong_side_queries
+                << ',' << stable.geometry_queries
+                << ',' << before.workload_fingerprint
+                << ',' << after.workload_fingerprint
+                << ',' << before.output_digest
+                << ',' << after.output_digest
+                << ',' << before.wrong_side_queries
+                << ',' << after.wrong_side_queries
+                << ',' << before.geometry_queries
+                << ',' << after.geometry_queries
+                << ',' << final.workload_fingerprint
+                << ',' << final.output_digest
+                << ',' << final.wrong_side_queries
+                << ',' << final.geometry_queries
+                << ',' << (stable.diagnostics_match_reference
+                    && before.diagnostics_match_reference
+                    && after.diagnostics_match_reference
+                    && final.diagnostics_match_reference)
+                << ',' << pair.setup_factorization_count
+                << ',' << pair.factorization_counts_before[mode_index]
+                << ',' << pair.factorization_counts_after[mode_index]
+                << ',' << measurement.geometry_diagnostics_pass
+                << ',' << measurement.owner_invariants_pass
+                << ',' << measurement.shared_preprocess_pass << '\n';
+        }
+    }
+
+    std::ofstream phases = open_output_file(
+        output_dir / "phase_profile.csv");
+    phases << std::setprecision(17)
+        << "case_id,N,mode,scope,phase,seconds,calls\n";
+    for (const auto& pair : pairs) {
+        const auto& first = pair.measurements[0];
+        for (std::size_t q = 0;
+             q < app3d::phase_profile_kind_count_3d(); ++q) {
+            const auto kind = static_cast<PhaseProfileKind3D>(q);
+            phases << first.case_id << ',' << first.N
+                << ",shared,shared_setup,"
+                << app3d::phase_profile_name_3d(kind) << ','
+                << pair.shared_setup_phases[q].seconds << ','
+                << pair.shared_setup_phases[q].calls << '\n';
+        }
+        for (std::size_t mode_index = 0; mode_index < 2; ++mode_index) {
+            const auto& measurement = pair.measurements[mode_index];
+            for (std::size_t q = 0;
+                 q < app3d::phase_profile_kind_count_3d(); ++q) {
+                const auto kind = static_cast<PhaseProfileKind3D>(q);
+                phases << measurement.case_id << ',' << measurement.N
+                    << ',' << app3d::neumann_edge_cauchy_mode_name_3d(
+                           measurement.mode)
+                    << ",mode_runtime,"
+                    << app3d::phase_profile_name_3d(kind) << ','
+                    << pair.runtime_phase_deltas[mode_index][q].seconds
+                    << ',' << pair.runtime_phase_deltas[mode_index][q].calls
+                    << '\n';
+            }
+        }
+    }
+
+    std::ofstream acceptance = open_output_file(
+        output_dir / "acceptance.csv");
+    acceptance
+        << "completeness_pass,structure_pass,reproduction_pass,gmres_pass,"
+           "error_guard_pass,order_pass,rigid_spread_pass,"
+           "edge_discrepancy_pass,geometry_owner_pass,"
+           "extended_evidence_pass,overall_pass\n"
+        << criterion_status_name(
+               evaluation.acceptance.completeness_pass) << ','
+        << criterion_status_name(
+               evaluation.acceptance.structure_pass) << ','
+        << criterion_status_name(
+               evaluation.acceptance.reproduction_pass) << ','
+        << criterion_status_name(
+               evaluation.acceptance.gmres_pass) << ','
+        << criterion_status_name(
+               evaluation.acceptance.error_guard_pass) << ','
+        << criterion_status_name(
+               evaluation.acceptance.order_pass) << ','
+        << criterion_status_name(
+               evaluation.acceptance.rigid_spread_pass) << ','
+        << criterion_status_name(
+               evaluation.acceptance.edge_discrepancy_pass) << ','
+        << criterion_status_name(
+               evaluation.acceptance.geometry_owner_pass) << ','
+        << criterion_status_name(
+               evaluation.acceptance.extended_evidence_pass) << ','
+        << criterion_status_name(
+               evaluation.acceptance.overall_pass) << '\n';
+}
+
+int run_neumann_edge_cauchy_study_3d(std::vector<int> levels)
+{
+    try {
+        levels = app3d::normalize_neumann_edge_cauchy_levels_3d(
+            std::move(levels));
+    } catch (const std::invalid_argument& error) {
+        throw std::invalid_argument(std::string(error.what())
+            + "; accepted prefixes: 32; 32 64; 32 64 128");
+    }
+    const auto cases = neumann_edge_pilot_cases_3d();
+    std::vector<std::string> case_ids;
+    for (const auto& study_case : cases)
+        case_ids.push_back(study_case.id);
+#ifdef KFBIM_APP_OUTPUT_DIR
+    std::filesystem::path output_dir =
+        std::filesystem::path(KFBIM_APP_OUTPUT_DIR)
+        / "neumann_edge_cauchy_3d";
+#else
+    std::filesystem::path output_dir =
+        "output/neumann_edge_cauchy_3d";
+#endif
+    const char* output_override = std::getenv(
+        "KFBIM_3D_NEUMANN_EDGE_CAUCHY_OUTPUT_DIR");
+    if (output_override != nullptr) output_dir = output_override;
+
+    const bool require_complete_pilot =
+        std::find(levels.begin(), levels.end(), 64) != levels.end();
+    std::vector<NeumannEdgeCauchyPairRun3D> pairs;
+    app3d::NeumannEdgeCauchyEvaluation3D evaluation =
+        app3d::evaluate_neumann_edge_cauchy_study_3d(
+            {}, case_ids, require_complete_pilot);
+    std::cout << "KFBI3D Neumann non-G1 edge-Cauchy A/B study\n"
+              << "  route=joint_tricubic_crossing_owner"
+                 " owner=region_closest_hybrid"
+                 " cauchy=g1_nearest/degree3/48/28\n"
+              << "  modes=none,non_g1_auxiliary_values"
+                 " gmres_tolerance=2e-10 restart=80 cap=80 levels=";
+    for (std::size_t index = 0; index < levels.size(); ++index) {
+        if (index != 0) std::cout << ',';
+        std::cout << levels[index];
+    }
+    std::cout << " cases=" << cases.size() << '\n';
+
+    for (int N : levels) {
+        if (N == 128) {
+            evaluation = app3d::evaluate_neumann_edge_cauchy_study_3d(
+                neumann_edge_cauchy_measurements_3d(pairs),
+                case_ids, true);
+            write_neumann_edge_cauchy_checkpoints_3d(
+                output_dir, pairs, evaluation);
+            if (!evaluation.all_pass) {
+                std::cerr
+                    << "error: N=128 gated off because the completed N=32/64 "
+                       "Neumann edge-Cauchy pilot did not pass\n";
+                return 1;
+            }
+        }
+        for (const auto& study_case : cases) {
+            std::cout << "[neumann-edge-cauchy-study] case="
+                << study_case.id << " N=" << N << " setup\n";
+            pairs.push_back(run_neumann_edge_cauchy_pair_3d(
+                N, study_case));
+            evaluation = app3d::evaluate_neumann_edge_cauchy_study_3d(
+                neumann_edge_cauchy_measurements_3d(pairs),
+                case_ids, require_complete_pilot);
+            write_neumann_edge_cauchy_checkpoints_3d(
+                output_dir, pairs, evaluation);
+
+            bool pair_execution_pass = true;
+            const auto& pair = pairs.back();
+            for (const auto& measurement : pair.measurements) {
+                const auto* derived =
+                    find_neumann_edge_cauchy_derived_row_3d(
+                        evaluation, measurement);
+                const bool row_pass = derived != nullptr
+                    && derived->row_pass
+                        == app3d::RigidStudyCriterionStatus3D::Pass;
+                pair_execution_pass = pair_execution_pass && row_pass;
+                std::cout << "[neumann-edge-cauchy-study] case="
+                    << measurement.case_id << " N=" << measurement.N
+                    << " mode="
+                    << app3d::neumann_edge_cauchy_mode_name_3d(
+                           measurement.mode)
+                    << " iter=" << measurement.gmres_iterations
+                    << " residual="
+                    << measurement.gmres_relative_residual
+                    << " edge_linf="
+                    << measurement.incident_edge_discrepancy_linf
+                    << " setup_s=" << measurement.shared_setup_seconds
+                    << " runtime_s=" << measurement.mode_runtime_seconds
+                    << " pass=" << row_pass << '\n';
+            }
+            if (!pair_execution_pass) {
+                std::cerr << (N == 128 ? "warning: " : "error: ")
+                    << "Neumann edge-Cauchy structural or GMRES row gate "
+                       "failed: case=" << study_case.id
+                    << " N=" << N << '\n';
+                if (N != 128) return 1;
+            }
+        }
+    }
+
+    evaluation = app3d::evaluate_neumann_edge_cauchy_study_3d(
+        neumann_edge_cauchy_measurements_3d(pairs),
+        case_ids, require_complete_pilot);
+    write_neumann_edge_cauchy_checkpoints_3d(
+        output_dir, pairs, evaluation);
+    std::cout << "[neumann-edge-cauchy-acceptance] completeness="
+        << criterion_status_name(evaluation.acceptance.completeness_pass)
+        << " structure="
+        << criterion_status_name(evaluation.acceptance.structure_pass)
+        << " reproduction="
+        << criterion_status_name(evaluation.acceptance.reproduction_pass)
+        << " gmres="
+        << criterion_status_name(evaluation.acceptance.gmres_pass)
+        << " error_guard="
+        << criterion_status_name(evaluation.acceptance.error_guard_pass)
+        << " order="
+        << criterion_status_name(evaluation.acceptance.order_pass)
+        << " rigid_spread="
+        << criterion_status_name(evaluation.acceptance.rigid_spread_pass)
+        << " edge_discrepancy="
+        << criterion_status_name(
+               evaluation.acceptance.edge_discrepancy_pass)
+        << " geometry_owner="
+        << criterion_status_name(evaluation.acceptance.geometry_owner_pass)
+        << " extended_evidence="
+        << criterion_status_name(
+               evaluation.acceptance.extended_evidence_pass)
+        << " overall="
+        << criterion_status_name(evaluation.acceptance.overall_pass)
+        << '\n';
+    std::cout << "Neumann edge-Cauchy study output: "
+              << output_dir.string() << '\n';
+
+    if (evaluation.acceptance.extended_evidence_pass
+        == app3d::RigidStudyCriterionStatus3D::Fail) {
+        std::cerr << "warning: N=128 Neumann edge-Cauchy extended evidence "
+                     "failed; coarse process acceptance is unchanged\n";
+    }
+    const bool exit_pass =
+        app3d::neumann_edge_cauchy_study_exit_pass_3d(
+            evaluation, require_complete_pilot);
+    if (!exit_pass) {
+        std::cerr << "error: Neumann edge-Cauchy study acceptance failed\n";
+        return 1;
+    }
+    if (!require_complete_pilot) {
+        std::cout << "Neumann edge-Cauchy N=32 prefix completed; two-level "
+                     "comparisons and order remain non-gating\n";
+    }
+    return 0;
+}
+
+int run_neumann_edge_continuity_study_3d(std::vector<int> levels){
     try {
         levels = app3d::normalize_neumann_edge_continuity_levels_3d(std::move(levels));
     } catch (const std::invalid_argument& error) {
@@ -8793,6 +9734,7 @@ void print_usage(const char* executable)
         << "       " << executable << " --neumann-owner-study [N ...]\n"
         << "       " << executable << " --neumann-rigid-study [N ...]\n"
         << "       " << executable << " --neumann-edge-continuity-study [N ...]\n"
+        << "       " << executable << " --neumann-edge-cauchy-study [N ...]\n"
         << "  Each N must be a power of two and at least 16 (default: 32).\n"
         << "  Rigid-study default levels: 32, 64, 128.\n"
         << "  Restrict-probe default levels: 32, 64.\n"
@@ -8802,6 +9744,8 @@ void print_usage(const char* executable)
         << "  Neumann-rigid-study levels are the refinement prefixes "
            "32; 32,64; or 32,64,128 (default: 32,64,128).\n"
         << "  Neumann-edge-continuity-study levels are the refinement prefixes "
+           "32; 32,64; or 32,64,128 (default: 32,64).\n"
+        << "  Neumann-edge-cauchy-study levels are the refinement prefixes "
            "32; 32,64; or 32,64,128 (default: 32,64).\n"
         << "  This stage builds native NURBS parameter-cell-center surface\n"
         << "  unknowns, topology-filtered 48/28 Cauchy stencils, validates\n"
@@ -8842,6 +9786,8 @@ int main(int argc, char** argv)
             && std::string(argv[1]) == "--neumann-rigid-study";
         const bool neumann_edge_continuity_study = argc >= 2
             && std::string(argv[1]) == "--neumann-edge-continuity-study";
+        const bool neumann_edge_cauchy_study = argc >= 2
+            && std::string(argv[1]) == "--neumann-edge-cauchy-study";
         std::string selection = "all";
         std::vector<int> levels = rigid_study
             ? std::vector<int>{32, 64, 128}
@@ -8849,7 +9795,7 @@ int main(int argc, char** argv)
                 ? std::vector<int>{32, 64, 128}
             : neumann_rigid_study
                 ? std::vector<int>{32, 64, 128}
-            : neumann_edge_continuity_study
+            : (neumann_edge_continuity_study || neumann_edge_cauchy_study)
                 ? std::vector<int>{32, 64}
             : owner_preprocess_study
                 ? std::vector<int>{16, 32, 64}
@@ -8861,7 +9807,8 @@ int main(int argc, char** argv)
         if (argc >= 2 && !rigid_study && !restrict_probe
             && !restrict_probe_owner && !restrict_profile_owner
             && !owner_preprocess_study && !neumann_owner_study
-            && !neumann_rigid_study && !neumann_edge_continuity_study)
+            && !neumann_rigid_study && !neumann_edge_continuity_study
+            && !neumann_edge_cauchy_study)
             selection = argv[1];
         if (selection == "--help" || selection == "-h") {
             print_usage(argv[0]);
@@ -8886,6 +9833,8 @@ int main(int argc, char** argv)
             return run_neumann_rigid_study_3d(levels);
         if (neumann_edge_continuity_study)
             return run_neumann_edge_continuity_study_3d(levels);
+        if (neumann_edge_cauchy_study)
+            return run_neumann_edge_cauchy_study_3d(levels);
         const CauchyStencilPolicy3D cauchy_policy = selected_cauchy_policy();
         const int cauchy_value_count = positive_environment_integer(
             "KFBIM_3D_CAUCHY_VALUE_COUNT", kCauchyValueNeighborCount);
