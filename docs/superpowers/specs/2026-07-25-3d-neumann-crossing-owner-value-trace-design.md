@@ -124,4 +124,3 @@ must remain green.
   same owner fingerprint and numerical solution.
 - The final report compares interior/density errors, observed orders, GMRES
   counts and setup/solve time without requiring the new route to win.
-
