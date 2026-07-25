@@ -24,6 +24,11 @@ struct DirichletRigidStudyCase3D {
     double rotation_angle_degrees = 0.0;
 };
 
+using LPrismRigidStudyCase3D = DirichletRigidStudyCase3D;
+
+std::vector<LPrismRigidStudyCase3D>
+make_l_prism_rigid_study_cases_3d();
+
 std::vector<DirichletRigidStudyCase3D>
 make_l_prism_dirichlet_rigid_study_cases_3d();
 

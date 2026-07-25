@@ -65,8 +65,8 @@ DirichletRigidStudyCase3D make_rotation_case(
 
 } // namespace
 
-std::vector<DirichletRigidStudyCase3D>
-make_l_prism_dirichlet_rigid_study_cases_3d()
+std::vector<LPrismRigidStudyCase3D>
+make_l_prism_rigid_study_cases_3d()
 {
     return {
         make_translation_case("baseline", Eigen::Vector3d::Zero()),
@@ -78,6 +78,12 @@ make_l_prism_dirichlet_rigid_study_cases_3d()
         make_rotation_case("rot_axis123_17deg", Eigen::Vector3d::Zero()),
         make_rotation_case("rot_axis123_17deg_t_xyz_1", kTranslationXYZ1),
     };
+}
+
+std::vector<DirichletRigidStudyCase3D>
+make_l_prism_dirichlet_rigid_study_cases_3d()
+{
+    return make_l_prism_rigid_study_cases_3d();
 }
 
 double manufactured_harmonic_value_3d(const Eigen::Vector3d& point)
