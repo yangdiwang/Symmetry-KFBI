@@ -34,7 +34,8 @@ including iteration zero.  For every row:
 
 - owner queries before and after GMRES were identical;
 - the hexadecimal owner fingerprint before and after GMRES was identical;
-- decision count sum equaled wrong-side count and geometry-query count;
+- decision-plus-legal-fallback partition equaled wrong-side count and
+  geometry-query count;
 - foreign non-G1 decisions equaled reroute audit terms;
 - paired routes had identical geometry, setup, Cauchy, query, and fingerprint
   metadata because they used the same pipeline.
@@ -69,3 +70,13 @@ single solve, so this is the main remaining optimization target.
 
 The formal `N=32,64,128` matrix is intentionally left to the final full-run
 stage; the same CLI and CSV gates apply without changing the implementation.
+
+## Review correction
+
+The `correction_panels` and `crossing_panels` summary columns now report
+`Interface3D::num_panels()` rather than interpolation-point counts.  The
+`N=16` L-prism audit gives `110/132`.  Owner diagnostics separately report
+`decision_count_sum`, `exception_fallback_count_sum`, and their
+`classified_or_fallback_count` total, so legal unresolved/coincident
+center-owned fallbacks participate in the complete wrong-side partition
+without being mislabeled as owner decisions.

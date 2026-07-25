@@ -14,6 +14,32 @@ void require(bool condition, const std::string& message)
         throw std::runtime_error(message);
 }
 
+void test_owner_aggregate_accepts_legal_center_owned_fallbacks()
+{
+    RestrictOwnerSampleDiagnostics3D diagnostic;
+    diagnostic.wrong_side_count = 2;
+    diagnostic.geometry_query_count = 2;
+    diagnostic.unresolved_fallback_count = 1;
+    diagnostic.unrelated_coincidence_fallback_count = 1;
+    const NeumannOwnerAggregate3D aggregate =
+        aggregate_neumann_owner_diagnostics({diagnostic}, {});
+    const std::size_t decision_count = std::accumulate(
+        aggregate.decision_counts.begin(), aggregate.decision_counts.end(),
+        std::size_t{0});
+    const std::size_t partitioned_count = decision_count
+        + aggregate.unresolved_fallback_count
+        + aggregate.unrelated_coincidence_fallback_count;
+    require(decision_count == 0,
+            "synthetic legal fallbacks do not fabricate owner decisions");
+    require(aggregate.decision_count_sum == 0
+                && aggregate.exception_fallback_count_sum == 2,
+            "synthetic aggregate distinguishes decisions from fallbacks");
+    require(aggregate.classified_or_fallback_count == 2,
+            "synthetic aggregate reports the complete owner partition");
+    require(partitioned_count == 2,
+            "owner decisions and legal fallbacks partition wrong-side queries");
+}
+
 void test_exterior_trace_legacy_and_crossing_owner_routes()
 {
     constexpr int N = 16;
@@ -72,6 +98,7 @@ void test_exterior_trace_legacy_and_crossing_owner_routes()
 int main()
 {
     try {
+        test_owner_aggregate_accepts_legal_center_owned_fallbacks();
         test_exterior_trace_legacy_and_crossing_owner_routes();
         std::cout << "Neumann exterior value route integration test passed\n";
         return 0;

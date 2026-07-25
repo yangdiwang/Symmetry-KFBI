@@ -4030,6 +4030,9 @@ struct NeumannOwnerAggregate3D {
     double unrelated_coincidence_fallback_sum_abs_weight = 0.0;
     std::size_t geometry_query_count = 0;
     std::size_t reroute_terms = 0;
+    std::size_t decision_count_sum = 0;
+    std::size_t exception_fallback_count_sum = 0;
+    std::size_t classified_or_fallback_count = 0;
 };
 
 NeumannOwnerAggregate3D aggregate_neumann_owner_diagnostics(
@@ -4062,15 +4065,21 @@ NeumannOwnerAggregate3D aggregate_neumann_owner_diagnostics(
         }
     }
 
-    const std::size_t classified = std::accumulate(
+    result.decision_count_sum = std::accumulate(
         result.decision_counts.begin(), result.decision_counts.end(),
         std::size_t{0});
+    result.exception_fallback_count_sum =
+        result.unresolved_fallback_count
+        + result.unrelated_coincidence_fallback_count;
+    result.classified_or_fallback_count =
+        result.decision_count_sum + result.exception_fallback_count_sum;
     const std::size_t foreign = result.decision_counts[static_cast<std::size_t>(
         app3d::RestrictOwnerDecisionKind3D::ForeignNonG1SingleCrossing)];
     if (result.wrong_side_count != result.geometry_query_count
-        || classified != result.wrong_side_count) {
+        || result.classified_or_fallback_count != result.wrong_side_count) {
         throw std::runtime_error(
-            "Neumann owner decisions do not partition all wrong-side queries");
+            "Neumann owner decisions and legal fallbacks do not partition "
+            "all wrong-side queries");
     }
     if (foreign != result.reroute_terms) {
         throw std::runtime_error(
@@ -4247,13 +4256,11 @@ void write_neumann_owner_study_outputs(
               "no_crossing_fallback_count,multiple_crossing_fallback_count,"
               "degenerate_crossing_fallback_count,"
               "ambiguous_edge_fallback_count,decision_count_sum,"
+              "exception_fallback_count_sum,classified_or_fallback_count,"
               "reroute_terms,unresolved_fallback_count,"
               "unrelated_coincidence_fallback_count,owner_invariants_hold\n";
     for (const NeumannOwnerStudyRow3D& row : rows) {
         const NeumannOwnerAggregate3D& owner = row.owner;
-        const std::size_t decision_sum = std::accumulate(
-            owner.decision_counts.begin(), owner.decision_counts.end(),
-            std::size_t{0});
         owners << row.case_id << ',' << row.N << ',' << row.route << ','
                << row.setup_mode << ',' << row.surface_dofs << ','
                << owner.samples << ',' << owner.wrong_side_count << ','
@@ -4264,7 +4271,10 @@ void write_neumann_owner_study_outputs(
                << owner_fingerprint_hex(row.owner_fingerprint_after);
         for (std::size_t kind = 0; kind < owner.decision_counts.size(); ++kind)
             owners << ',' << owner.decision_counts[kind];
-        owners << ',' << decision_sum << ',' << owner.reroute_terms << ','
+        owners << ',' << owner.decision_count_sum << ','
+               << owner.exception_fallback_count_sum << ','
+               << owner.classified_or_fallback_count << ','
+               << owner.reroute_terms << ','
                << owner.unresolved_fallback_count << ','
                << owner.unrelated_coincidence_fallback_count << ','
                << row.owner_invariants_hold << '\n';
@@ -4460,8 +4470,9 @@ int run_neumann_owner_study(std::vector<int> levels)
                 row.route = route;
                 row.surface_dofs = pipeline.surface_size();
                 row.correction_panels =
-                    geometry.correction_interface.num_points();
-                row.crossing_panels = geometry.crossing_interface.num_points();
+                    geometry.correction_interface.num_panels();
+                row.crossing_panels =
+                    geometry.crossing_interface.num_panels();
                 row.label_mismatches = label_mismatches;
                 row.setup_seconds = setup_seconds;
                 row.pipeline_setup_seconds = pipeline_setup_seconds;
