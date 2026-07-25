@@ -17,6 +17,7 @@ using kfbim::app3d::NeumannRigidStudyMeasurement3D;
 using kfbim::app3d::RigidStudyCriterionStatus3D;
 using kfbim::app3d::evaluate_neumann_rigid_study_3d;
 using kfbim::app3d::normalize_neumann_rigid_levels_3d;
+using kfbim::app3d::neumann_rigid_study_exit_pass_3d;
 
 using Status = RigidStudyCriterionStatus3D;
 
@@ -157,6 +158,16 @@ void test_orders_are_grouped_by_case_and_baselines_match_levels()
             "shifted overall failure was not reported");
     require(!evaluation.all_pass,
             "study with a failed pose was marked all-pass");
+
+    const NeumannRigidStudyEvaluation3D partial_evaluation =
+        evaluate_neumann_rigid_study_3d(
+            complete_rows(4.0), {"baseline", "shifted"}, false);
+    require(neumann_rigid_study_exit_pass_3d(
+                partial_evaluation, false),
+            "execution-clean prefix was rejected by a numerical ratio");
+    require(!neumann_rigid_study_exit_pass_3d(
+                evaluation, true),
+            "complete failed acceptance received a successful exit");
 }
 
 void test_complete_passing_study()

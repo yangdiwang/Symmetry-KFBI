@@ -51,6 +51,7 @@
 #include "harmonic_polynomial_space_3d.hpp"
 #include "kfbi_phase_profile_3d.hpp"
 #include "native_nurbs_surface_3d.hpp"
+#include "neumann_rigid_transform_study_3d.hpp"
 #include "restrict_owner_geometry_preprocessor_3d.hpp"
 #include "src/bulk_solvers/laplace_zfft_bulk_solver_3d.hpp"
 #include "src/geometry/grid_pair_3d.hpp"
@@ -1769,6 +1770,11 @@ public:
     }
 
     const SurfaceDofCloud& surface() const { return cloud_; }
+
+    const LaplaceCorrectionSupport3D& correction_support() const noexcept
+    {
+        return correction_support_;
+    }
 
     std::vector<double> cauchy_condition_values() const
     {
@@ -6993,11 +6999,19 @@ bool finite_neumann_owner_metrics_3d(const SolveMetrics3D& metrics)
 }
 
 struct NeumannOwnerStudyRow3D {
+    app3d::LPrismRigidStudyCase3D study_case;
     int N = 0;
     double h = 0.0;
     std::string mode;
     int dofs = 0;
+    double setup_seconds = 0.0;
     double pipeline_setup_seconds = 0.0;
+    double total_seconds = 0.0;
+    int label_mismatches = 0;
+    int unsafe_label_changing_edges = 0;
+    int gap_crossings = 0;
+    int endpoint_crossings = 0;
+    int triangle_fallback_crossings = 0;
     SolveMetrics3D solve;
     double interior_order = std::numeric_limits<double>::quiet_NaN();
     std::vector<double> residual_history;
@@ -7009,6 +7023,7 @@ struct NeumannOwnerStudyRow3D {
     std::uint64_t geometry_queries_after_gmres = 0;
     bool diagnostics_unchanged = false;
     bool default_route_bitwise_equal = false;
+    bool probe_invariants_pass = false;
     bool pass = false;
 };
 
@@ -7018,7 +7033,9 @@ void assign_neumann_owner_order_3d(
 {
     const NeumannOwnerStudyRow3D* previous = nullptr;
     for (const NeumannOwnerStudyRow3D& candidate : previous_rows) {
-        if (candidate.mode == row.mode && candidate.N < row.N
+        if (candidate.study_case.id == row.study_case.id
+            && candidate.mode == row.mode
+            && candidate.N < row.N
             && (previous == nullptr || candidate.N > previous->N)) {
             previous = std::addressof(candidate);
         }
@@ -7135,6 +7152,10 @@ int run_neumann_owner_study_3d(std::vector<int> levels)
     if (!selected_case.has_value())
         throw std::logic_error("missing rotated L-prism study case");
 
+    const app3d::LPrismRigidStudyCase3D rigid_case =
+        rigid_case_by_id_3d(
+            app3d::make_l_prism_rigid_study_cases_3d(),
+            selected_case->pose);
     constexpr int gmres_max_iterations = 80;
     constexpr double gmres_tolerance = 2.0e-10;
     const std::array<ExteriorValueRestrictMode3D, 2> modes{{
@@ -7267,6 +7288,7 @@ int run_neumann_owner_study_3d(std::vector<int> levels)
         bool level_pass = true;
         for (ExteriorValueRestrictMode3D mode : modes) {
             NeumannOwnerStudyRow3D row;
+            row.study_case = rigid_case;
             row.N = N;
             row.h = h;
             row.mode = exterior_value_restrict_route_name_3d(mode);
@@ -7282,6 +7304,7 @@ int run_neumann_owner_study_3d(std::vector<int> levels)
                 setup_diagnostics.wrong_side_queries;
             row.default_route_bitwise_equal =
                 default_route_bitwise_equal;
+            row.probe_invariants_pass = probe_invariants_pass;
 
             const auto before =
                 pipeline.restrict_owner_preprocess_diagnostics();
@@ -7346,6 +7369,586 @@ int run_neumann_owner_study_3d(std::vector<int> levels)
     return 0;
 }
 
+struct NeumannRigidGeometryDiagnostics3D {
+    int unsafe_label_changing_edges = 0;
+    int gap_crossings = 0;
+    int endpoint_crossings = 0;
+    int triangle_fallback_crossings = 0;
+};
+
+NeumannRigidGeometryDiagnostics3D
+neumann_rigid_geometry_diagnostics_3d(
+    const GridPair3D& grid_pair,
+    const LaplaceCorrectionSupport3D& support)
+{
+    NeumannRigidGeometryDiagnostics3D result;
+    result.unsafe_label_changing_edges =
+        grid_pair.nurbs_domain_diagnostics()
+            .unsafe_label_changing_edge_count;
+    std::set<std::pair<int, int>> crossing_edges;
+    for (const LaplaceCrossingCorrectionOp& op : support.crossing_ops) {
+        const std::pair<int, int> edge{
+            std::min(op.rhs_node, op.correction_node),
+            std::max(op.rhs_node, op.correction_node)};
+        if (!crossing_edges.insert(edge).second)
+            continue;
+        const P2CrossingOwner3D owner =
+            grid_pair.p2_crossing_owner_between(edge.first, edge.second);
+        if (owner.status == P2CrossingOwnerStatus3D::GapFallback)
+            ++result.gap_crossings;
+        else if (owner.status !=
+                 P2CrossingOwnerStatus3D::ExactIntersection)
+            ++result.endpoint_crossings;
+        if (owner.nurbs_patch_index < 0)
+            ++result.triangle_fallback_crossings;
+    }
+    return result;
+}
+
+bool neumann_rigid_geometry_pass_3d(
+    const NeumannOwnerStudyRow3D& row)
+{
+    return row.label_mismatches == 0
+        && row.unsafe_label_changing_edges == 0
+        && row.gap_crossings == 0
+        && row.endpoint_crossings == 0
+        && row.triangle_fallback_crossings == 0;
+}
+
+bool neumann_rigid_owner_invariants_pass_3d(
+    const NeumannOwnerStudyRow3D& row)
+{
+    return row.probe_invariants_pass
+        && row.default_route_bitwise_equal
+        && row.diagnostics_unchanged
+        && row.geometry_queries_before_gmres
+            == row.geometry_queries_after_gmres;
+}
+
+NeumannOwnerStudyRow3D run_neumann_rigid_pose_3d(
+    int N,
+    const app3d::LPrismRigidStudyCase3D& study_case)
+{
+    constexpr int gmres_max_iterations = 80;
+    constexpr double gmres_tolerance = 2.0e-10;
+    constexpr ExteriorValueRestrictMode3D mode =
+        ExteriorValueRestrictMode3D::JointTricubicCrossingOwner;
+    const auto case_start = std::chrono::steady_clock::now();
+    const double h = kBoxSide / static_cast<double>(N);
+    CartesianGrid3D grid(
+        {kBoxMin, kBoxMin, kBoxMin},
+        {h, h, h},
+        {N, N, N},
+        DofLayout3D::Node);
+    GeometryBundle geometry = make_geometry(
+        GeometryKind::LPrism, h, study_case.transform);
+    const auto domain = std::make_shared<const
+        geometry3d::NurbsCartesianDomain3D>(
+            grid, geometry.native_surface.geometry_model());
+    const SurfaceDofCloud surface_dofs =
+        app3d::make_native_surface_dofs_3d(
+            geometry.native_surface, h);
+    validate_surface_dofs(surface_dofs, h);
+    const CauchyStencilSet cauchy_stencils = build_cauchy_stencils(
+        geometry.native_surface,
+        surface_dofs,
+        h,
+        kCauchyValueNeighborCount,
+        kCauchyDerivativeNeighborCount,
+        CauchyStencilPolicy3D::G1Nearest);
+    GridPair3D grid_pair(
+        grid,
+        geometry.correction_interface,
+        geometry.crossing_interface,
+        domain);
+    int label_mismatches = 0;
+    for (int node = 0; node < grid.num_dofs(); ++node) {
+        const bool numerical_inside =
+            grid_pair.domain_label(node) > 0;
+        if (numerical_inside
+            != geometry.exact_inside(grid_point(grid, node))) {
+            ++label_mismatches;
+        }
+    }
+    if (label_mismatches != 0) {
+        throw std::runtime_error(
+            "Neumann rigid study native NURBS label mismatch: case="
+            + study_case.id + " N=" + std::to_string(N));
+    }
+
+    RestrictOwnerPipelinePreprocessTiming3D preprocess_timing;
+    const auto pipeline_start = std::chrono::steady_clock::now();
+    PanelCenterHarmonicJetKFBI3D pipeline(
+        grid,
+        grid_pair,
+        geometry.native_surface,
+        geometry.correction_triangles,
+        geometry.geometry_triangles,
+        surface_dofs,
+        cauchy_stencils,
+        false,
+        OwnerMode3D::RegionClosestHybrid,
+        nullptr,
+        nullptr,
+        &preprocess_timing);
+    const double setup_wall_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - pipeline_start).count();
+    const double pipeline_setup_seconds =
+        production_pipeline_setup_seconds_3d(
+            setup_wall_seconds, preprocess_timing);
+    const auto setup_diagnostics =
+        pipeline.restrict_owner_preprocess_diagnostics();
+    const std::uint64_t setup_queries = static_cast<std::uint64_t>(
+        pipeline.restrict_owner_geometry_query_count());
+    if (setup_queries != setup_diagnostics.wrong_side_queries) {
+        throw std::logic_error(
+            "Neumann rigid pipeline query-count mismatch");
+    }
+    const NeumannRigidGeometryDiagnostics3D geometry_diagnostics =
+        neumann_rigid_geometry_diagnostics_3d(
+            grid_pair, pipeline.correction_support());
+
+    const int surface_size = pipeline.surface_size();
+    Eigen::VectorXd normal_data(surface_size);
+    for (int q = 0; q < surface_size; ++q) {
+        const SurfaceDof& dof =
+            pipeline.surface().dofs[static_cast<std::size_t>(q)];
+        normal_data[q] =
+            app3d::transformed_manufactured_harmonic_gradient_3d(
+                study_case.transform, dof.point).dot(dof.normal);
+    }
+    normal_data.array() -= surface_weighted_mean(
+        pipeline.surface(), normal_data);
+    const Eigen::VectorXd zero_value =
+        Eigen::VectorXd::Zero(surface_size);
+    const HarmonicJetField3D probe_field =
+        pipeline.field_from_grid_and_jumps(
+            Eigen::VectorXd::Zero(grid.num_dofs()),
+            zero_value,
+            normal_data);
+    const auto probe_before =
+        pipeline.restrict_owner_preprocess_diagnostics();
+    const Eigen::VectorXd default_probe = pipeline.exterior_trace(
+        probe_field, zero_value, normal_data);
+    const Eigen::VectorXd explicit_legacy_probe =
+        pipeline.exterior_trace(
+            probe_field,
+            zero_value,
+            normal_data,
+            ExteriorValueRestrictMode3D::JointTricubicCauchy);
+    const Eigen::VectorXd crossing_probe = pipeline.exterior_trace(
+        probe_field, zero_value, normal_data, mode);
+    const auto probe_after =
+        pipeline.restrict_owner_preprocess_diagnostics();
+    const bool default_route_bitwise_equal =
+        bitwise_equal_vector_3d(default_probe, explicit_legacy_probe);
+    const bool probe_invariants_pass =
+        default_route_bitwise_equal
+        && crossing_probe.allFinite()
+        && restrict_owner_preprocess_diagnostics_equal(
+               probe_before, probe_after)
+        && static_cast<std::uint64_t>(
+               pipeline.restrict_owner_geometry_query_count())
+               == setup_queries;
+
+    NeumannOwnerStudyRow3D row;
+    row.study_case = study_case;
+    row.N = N;
+    row.h = h;
+    row.mode = exterior_value_restrict_route_name_3d(mode);
+    row.dofs = surface_size;
+    row.pipeline_setup_seconds = pipeline_setup_seconds;
+    row.preprocess_mode =
+        app3d::restrict_owner_preprocess_mode_name_3d(
+            OwnerMode3D::RegionClosestHybrid);
+    row.workload_fingerprint =
+        pipeline.restrict_owner_workload_fingerprint();
+    row.output_digest = preprocess_timing.output_digest;
+    row.wrong_side_queries =
+        setup_diagnostics.wrong_side_queries;
+    row.label_mismatches = label_mismatches;
+    row.unsafe_label_changing_edges =
+        geometry_diagnostics.unsafe_label_changing_edges;
+    row.gap_crossings = geometry_diagnostics.gap_crossings;
+    row.endpoint_crossings =
+        geometry_diagnostics.endpoint_crossings;
+    row.triangle_fallback_crossings =
+        geometry_diagnostics.triangle_fallback_crossings;
+    row.default_route_bitwise_equal =
+        default_route_bitwise_equal;
+    row.probe_invariants_pass = probe_invariants_pass;
+    row.setup_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - case_start).count();
+
+    const auto before =
+        pipeline.restrict_owner_preprocess_diagnostics();
+    row.geometry_queries_before_gmres =
+        static_cast<std::uint64_t>(
+            pipeline.restrict_owner_geometry_query_count());
+    row.solve = run_neumann_case(
+        grid,
+        grid_pair,
+        pipeline,
+        study_case.transform,
+        gmres_max_iterations,
+        mode,
+        &row.residual_history);
+    const auto after =
+        pipeline.restrict_owner_preprocess_diagnostics();
+    row.geometry_queries_after_gmres =
+        static_cast<std::uint64_t>(
+            pipeline.restrict_owner_geometry_query_count());
+    row.diagnostics_unchanged =
+        restrict_owner_preprocess_diagnostics_equal(before, after);
+    row.total_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - case_start).count();
+    row.pass = row.probe_invariants_pass
+        && neumann_rigid_geometry_pass_3d(row)
+        && row.solve.converged
+        && row.solve.iterations <= gmres_max_iterations
+        && row.solve.gmres_relative_residual <= gmres_tolerance
+        && !row.residual_history.empty()
+        && std::all_of(
+               row.residual_history.begin(),
+               row.residual_history.end(),
+               [](double value) {
+                   return std::isfinite(value) && value >= 0.0;
+               })
+        && finite_neumann_owner_metrics_3d(row.solve)
+        && neumann_rigid_owner_invariants_pass_3d(row)
+        && std::isfinite(row.setup_seconds)
+        && std::isfinite(row.pipeline_setup_seconds)
+        && std::isfinite(row.total_seconds);
+    return row;
+}
+
+std::vector<app3d::NeumannRigidStudyMeasurement3D>
+neumann_rigid_measurements_3d(
+    const std::vector<NeumannOwnerStudyRow3D>& rows)
+{
+    std::vector<app3d::NeumannRigidStudyMeasurement3D> result;
+    result.reserve(rows.size());
+    for (const NeumannOwnerStudyRow3D& row : rows) {
+        app3d::NeumannRigidStudyMeasurement3D measurement;
+        measurement.case_id = row.study_case.id;
+        measurement.N = row.N;
+        measurement.h = row.h;
+        measurement.finite_metrics =
+            finite_neumann_owner_metrics_3d(row.solve)
+            && std::isfinite(row.setup_seconds)
+            && std::isfinite(row.pipeline_setup_seconds)
+            && std::isfinite(row.total_seconds);
+        measurement.gmres_converged = row.solve.converged;
+        measurement.gmres_iterations = row.solve.iterations;
+        measurement.gmres_relative_residual =
+            row.solve.gmres_relative_residual;
+        measurement.interior_linf = row.solve.interior_linf;
+        measurement.geometry_diagnostics_pass =
+            neumann_rigid_geometry_pass_3d(row);
+        measurement.owner_invariants_pass =
+            neumann_rigid_owner_invariants_pass_3d(row);
+        result.push_back(std::move(measurement));
+    }
+    return result;
+}
+
+const app3d::NeumannRigidStudyDerivedRow3D*
+find_neumann_rigid_derived_row_3d(
+    const app3d::NeumannRigidStudyEvaluation3D& evaluation,
+    const NeumannOwnerStudyRow3D& raw)
+{
+    const auto found = std::find_if(
+        evaluation.rows.begin(),
+        evaluation.rows.end(),
+        [&](const app3d::NeumannRigidStudyDerivedRow3D& row) {
+            return row.measurement.case_id == raw.study_case.id
+                && row.measurement.N == raw.N;
+        });
+    return found == evaluation.rows.end()
+        ? nullptr : std::addressof(*found);
+}
+
+void write_neumann_rigid_study_checkpoints_3d(
+    const std::filesystem::path& output_dir,
+    const std::vector<NeumannOwnerStudyRow3D>& rows,
+    const app3d::NeumannRigidStudyEvaluation3D& evaluation)
+{
+    std::filesystem::create_directories(output_dir);
+    std::ofstream results = open_output_file(
+        output_dir / "rigid_transform_results.csv");
+    results << std::setprecision(17) << std::boolalpha
+        << "case_id,N,h,mode,preprocess_mode,dofs,setup_seconds,"
+           "pipeline_setup_seconds,solve_seconds,total_seconds,"
+           "rotation_axis_x,rotation_axis_y,rotation_axis_z,"
+           "rotation_angle_degrees,rotation_center_x,rotation_center_y,"
+           "rotation_center_z,translation_x,translation_y,translation_z,"
+           "rotation_00,rotation_01,rotation_02,rotation_10,rotation_11,"
+           "rotation_12,rotation_20,rotation_21,rotation_22,"
+           "converged,iterations,final_residual,operator_residual_linf,"
+           "exterior_condition_linf,route_mismatch_linf,density_linf,"
+           "density_l2,interior_linf,interior_l2,interior_order,"
+           "baseline_error_ratio,baseline_iteration_ratio,"
+           "label_mismatches,unsafe_label_changing_edges,gap_crossings,"
+           "endpoint_crossings,triangle_fallback_crossings,"
+           "geometry_queries_before_gmres,geometry_queries_after_gmres,"
+           "diagnostics_unchanged,default_route_bitwise_equal,"
+           "probe_invariants_pass,row_pass\n";
+    for (const NeumannOwnerStudyRow3D& row : rows) {
+        const auto* derived =
+            find_neumann_rigid_derived_row_3d(evaluation, row);
+        if (derived == nullptr)
+            throw std::logic_error("missing Neumann rigid derived row");
+        const auto& transform = row.study_case.transform;
+        const Eigen::Matrix3d& rotation = transform.rotation();
+        results << row.study_case.id << ',' << row.N << ',' << row.h
+                << ',' << row.mode << ',' << row.preprocess_mode
+                << ',' << row.dofs << ',' << row.setup_seconds
+                << ',' << row.pipeline_setup_seconds
+                << ',' << row.solve.seconds << ',' << row.total_seconds
+                << ',' << row.study_case.rotation_axis.x()
+                << ',' << row.study_case.rotation_axis.y()
+                << ',' << row.study_case.rotation_axis.z()
+                << ',' << row.study_case.rotation_angle_degrees
+                << ',' << transform.center().x()
+                << ',' << transform.center().y()
+                << ',' << transform.center().z()
+                << ',' << transform.translation().x()
+                << ',' << transform.translation().y()
+                << ',' << transform.translation().z();
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j)
+                results << ',' << rotation(i, j);
+        }
+        results << ',' << row.solve.converged
+                << ',' << row.solve.iterations
+                << ',' << row.solve.gmres_relative_residual
+                << ',' << row.solve.operator_residual_linf
+                << ',' << row.solve.exterior_condition_linf
+                << ',' << row.solve.route_mismatch_linf
+                << ',' << row.solve.density_linf
+                << ',' << row.solve.density_l2
+                << ',' << row.solve.interior_linf
+                << ',' << row.solve.interior_l2
+                << ',' << derived->interior_order
+                << ',' << derived->baseline_error_ratio
+                << ',' << derived->baseline_iteration_ratio
+                << ',' << row.label_mismatches
+                << ',' << row.unsafe_label_changing_edges
+                << ',' << row.gap_crossings
+                << ',' << row.endpoint_crossings
+                << ',' << row.triangle_fallback_crossings
+                << ',' << row.geometry_queries_before_gmres
+                << ',' << row.geometry_queries_after_gmres
+                << ',' << row.diagnostics_unchanged
+                << ',' << row.default_route_bitwise_equal
+                << ',' << row.probe_invariants_pass
+                << ',' << criterion_status_name(derived->row_pass)
+                << '\n';
+    }
+
+    std::ofstream residuals = open_output_file(
+        output_dir / "gmres_residuals.csv");
+    residuals << std::setprecision(17)
+              << "case_id,N,mode,iteration,residual\n";
+    for (const NeumannOwnerStudyRow3D& row : rows) {
+        for (std::size_t iteration = 0;
+             iteration < row.residual_history.size(); ++iteration) {
+            residuals << row.study_case.id << ',' << row.N << ','
+                      << row.mode << ',' << iteration << ','
+                      << row.residual_history[iteration] << '\n';
+        }
+    }
+
+    std::ofstream owners = open_output_file(
+        output_dir / "owner_diagnostics.csv");
+    owners << std::setprecision(17) << std::boolalpha
+        << "case_id,N,mode,preprocess_mode,workload_fingerprint,"
+           "output_digest,wrong_side_queries,"
+           "geometry_queries_before_gmres,"
+           "geometry_queries_after_gmres,diagnostics_unchanged,"
+           "default_route_bitwise_equal,probe_invariants_pass\n";
+    for (const NeumannOwnerStudyRow3D& row : rows) {
+        owners << row.study_case.id << ',' << row.N << ',' << row.mode
+               << ',' << row.preprocess_mode
+               << ',' << row.workload_fingerprint
+               << ',' << row.output_digest
+               << ',' << row.wrong_side_queries
+               << ',' << row.geometry_queries_before_gmres
+               << ',' << row.geometry_queries_after_gmres
+               << ',' << row.diagnostics_unchanged
+               << ',' << row.default_route_bitwise_equal
+               << ',' << row.probe_invariants_pass << '\n';
+    }
+
+    std::ofstream acceptance = open_output_file(
+        output_dir / "rigid_transform_acceptance.csv");
+    acceptance
+        << "case_id,completeness_pass,row_pass,gmres_pass,"
+           "monotone_error_pass,order_64_128_pass,baseline_ratio_pass,"
+           "geometry_diagnostics_pass,owner_invariants_pass,overall_pass\n";
+    for (const app3d::NeumannRigidStudyAcceptance3D& item
+         : evaluation.cases) {
+        acceptance << item.case_id
+                   << ',' << criterion_status_name(item.completeness_pass)
+                   << ',' << criterion_status_name(item.row_pass)
+                   << ',' << criterion_status_name(item.gmres_pass)
+                   << ',' << criterion_status_name(
+                          item.monotone_error_pass)
+                   << ',' << criterion_status_name(
+                          item.order_64_128_pass)
+                   << ',' << criterion_status_name(
+                          item.baseline_ratio_pass)
+                   << ',' << criterion_status_name(
+                          item.geometry_diagnostics_pass)
+                   << ',' << criterion_status_name(
+                          item.owner_invariants_pass)
+                   << ',' << criterion_status_name(item.overall_pass)
+                   << '\n';
+    }
+}
+
+int run_neumann_rigid_study_3d(std::vector<int> levels)
+{
+    levels = app3d::normalize_neumann_rigid_levels_3d(
+        std::move(levels));
+    const bool require_complete_acceptance =
+        levels == std::vector<int>({32, 64, 128});
+    const std::vector<app3d::LPrismRigidStudyCase3D> cases =
+        app3d::make_l_prism_rigid_study_cases_3d();
+    std::vector<std::string> case_ids;
+    case_ids.reserve(cases.size());
+    for (const auto& study_case : cases)
+        case_ids.push_back(study_case.id);
+
+#ifdef KFBIM_APP_OUTPUT_DIR
+    std::filesystem::path output_dir =
+        std::filesystem::path(KFBIM_APP_OUTPUT_DIR)
+        / "neumann_rigid_transform_stability_3d";
+#else
+    std::filesystem::path output_dir =
+        "output/neumann_rigid_transform_stability_3d";
+#endif
+    const char* output_override = std::getenv(
+        "KFBIM_3D_NEUMANN_RIGID_STUDY_OUTPUT_DIR");
+    if (output_override != nullptr)
+        output_dir = output_override;
+
+    std::vector<NeumannOwnerStudyRow3D> rows;
+    rows.reserve(levels.size() * cases.size());
+    auto evaluation = app3d::evaluate_neumann_rigid_study_3d(
+        neumann_rigid_measurements_3d(rows),
+        case_ids,
+        require_complete_acceptance);
+    write_neumann_rigid_study_checkpoints_3d(
+        output_dir, rows, evaluation);
+
+    std::cout
+        << "KFBI3D Neumann L-prism rigid-transform stability study\n"
+        << "  route=joint_tricubic_crossing_owner"
+           " owner=region_closest_hybrid"
+           " cauchy=g1_nearest/degree3/48/28\n"
+        << "  gmres_tolerance=2e-10 restart=80 cap=80 levels=";
+    for (std::size_t index = 0; index < levels.size(); ++index) {
+        if (index != 0)
+            std::cout << ',';
+        std::cout << levels[index];
+    }
+    std::cout << " cases=" << cases.size() << '\n';
+
+    for (int N : levels) {
+        for (const auto& study_case : cases) {
+            std::cout << "[neumann-rigid-study] case="
+                      << study_case.id << " N=" << N << " setup\n";
+            NeumannOwnerStudyRow3D row =
+                run_neumann_rigid_pose_3d(N, study_case);
+            assign_neumann_owner_order_3d(row, rows);
+            rows.push_back(std::move(row));
+            evaluation = app3d::evaluate_neumann_rigid_study_3d(
+                neumann_rigid_measurements_3d(rows),
+                case_ids,
+                require_complete_acceptance);
+            write_neumann_rigid_study_checkpoints_3d(
+                output_dir, rows, evaluation);
+
+            const NeumannOwnerStudyRow3D& stored = rows.back();
+            const auto* derived =
+                find_neumann_rigid_derived_row_3d(
+                    evaluation, stored);
+            std::cout << "[neumann-rigid-study] case="
+                      << stored.study_case.id
+                      << " N=" << stored.N
+                      << " iter=" << stored.solve.iterations
+                      << " residual="
+                      << stored.solve.gmres_relative_residual
+                      << " interior_linf="
+                      << stored.solve.interior_linf
+                      << " order="
+                      << (derived == nullptr
+                          ? std::numeric_limits<double>::quiet_NaN()
+                          : derived->interior_order)
+                      << " setup_s=" << stored.setup_seconds
+                      << " solve_s=" << stored.solve.seconds
+                      << " total_s=" << stored.total_seconds
+                      << " pass=" << stored.pass << '\n';
+            if (!stored.pass) {
+                std::cerr
+                    << "error: Neumann rigid execution gate failed: case="
+                    << stored.study_case.id
+                    << " N=" << stored.N << '\n';
+                return 1;
+            }
+        }
+    }
+
+    evaluation = app3d::evaluate_neumann_rigid_study_3d(
+        neumann_rigid_measurements_3d(rows),
+        case_ids,
+        require_complete_acceptance);
+    write_neumann_rigid_study_checkpoints_3d(
+        output_dir, rows, evaluation);
+    for (const auto& item : evaluation.cases) {
+        std::cout << "[neumann-rigid-acceptance] case="
+                  << item.case_id
+                  << " complete="
+                  << criterion_status_name(item.completeness_pass)
+                  << " gmres="
+                  << criterion_status_name(item.gmres_pass)
+                  << " monotone="
+                  << criterion_status_name(item.monotone_error_pass)
+                  << " order_64_128="
+                  << criterion_status_name(item.order_64_128_pass)
+                  << " baseline_ratio="
+                  << criterion_status_name(item.baseline_ratio_pass)
+                  << " geometry="
+                  << criterion_status_name(
+                         item.geometry_diagnostics_pass)
+                  << " owner="
+                  << criterion_status_name(item.owner_invariants_pass)
+                  << " overall="
+                  << criterion_status_name(item.overall_pass)
+                  << '\n';
+    }
+    std::cout << "Neumann rigid-transform study output: "
+              << output_dir.string() << '\n';
+    const bool exit_pass =
+        app3d::neumann_rigid_study_exit_pass_3d(
+            evaluation, require_complete_acceptance);
+    if (!exit_pass) {
+        std::cerr
+            << "error: Neumann rigid-study "
+            << (require_complete_acceptance
+                ? "complete numerical acceptance failed\n"
+                : "execution integrity failed\n");
+        return 1;
+    }
+    if (!require_complete_acceptance) {
+        std::cout
+            << "Neumann rigid-study prefix completed; full numerical "
+               "acceptance is not enforced without N=32,64,128\n";
+    }
+    return 0;
+}
+
 void print_usage(const char* executable)
 {
     std::cout
@@ -7357,12 +7960,15 @@ void print_usage(const char* executable)
         << "       " << executable << " --restrict-profile-owner [N]\n"
         << "       " << executable << " --owner-preprocess-study [N ...]\n"
         << "       " << executable << " --neumann-owner-study [N ...]\n"
+        << "       " << executable << " --neumann-rigid-study [N ...]\n"
         << "  Each N must be a power of two and at least 16 (default: 32).\n"
         << "  Rigid-study default levels: 32, 64, 128.\n"
         << "  Restrict-probe default levels: 32, 64.\n"
         << "  Restrict-profile default level: 128 (one level only).\n"
         << "  Owner-preprocess-study default levels: 16, 32, 64.\n"
         << "  Neumann-owner-study default levels: 32, 64, 128.\n"
+        << "  Neumann-rigid-study levels are the refinement prefixes "
+           "32; 32,64; or 32,64,128 (default: 32,64,128).\n"
         << "  This stage builds native NURBS parameter-cell-center surface\n"
         << "  unknowns, topology-filtered 48/28 Cauchy stencils, validates\n"
         << "  fixed transfer routes, and executes the Neumann value-jump and\n"
@@ -7398,10 +8004,14 @@ int main(int argc, char** argv)
             && std::string(argv[1]) == "--owner-preprocess-study";
         const bool neumann_owner_study = argc >= 2
             && std::string(argv[1]) == "--neumann-owner-study";
+        const bool neumann_rigid_study = argc >= 2
+            && std::string(argv[1]) == "--neumann-rigid-study";
         std::string selection = "all";
         std::vector<int> levels = rigid_study
             ? std::vector<int>{32, 64, 128}
             : neumann_owner_study
+                ? std::vector<int>{32, 64, 128}
+            : neumann_rigid_study
                 ? std::vector<int>{32, 64, 128}
             : owner_preprocess_study
                 ? std::vector<int>{16, 32, 64}
@@ -7412,7 +8022,8 @@ int main(int argc, char** argv)
                 : std::vector<int>{32};
         if (argc >= 2 && !rigid_study && !restrict_probe
             && !restrict_probe_owner && !restrict_profile_owner
-            && !owner_preprocess_study && !neumann_owner_study)
+            && !owner_preprocess_study && !neumann_owner_study
+            && !neumann_rigid_study)
             selection = argv[1];
         if (selection == "--help" || selection == "-h") {
             print_usage(argv[0]);
@@ -7433,6 +8044,8 @@ int main(int argc, char** argv)
             return run_owner_preprocess_study_3d(levels);
         if (neumann_owner_study)
             return run_neumann_owner_study_3d(levels);
+        if (neumann_rigid_study)
+            return run_neumann_rigid_study_3d(levels);
         const CauchyStencilPolicy3D cauchy_policy = selected_cauchy_policy();
         const int cauchy_value_count = positive_environment_integer(
             "KFBIM_3D_CAUCHY_VALUE_COUNT", kCauchyValueNeighborCount);

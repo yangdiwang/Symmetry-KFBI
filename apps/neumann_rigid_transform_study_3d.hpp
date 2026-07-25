@@ -76,4 +76,8 @@ NeumannRigidStudyEvaluation3D evaluate_neumann_rigid_study_3d(
     const std::vector<std::string>& case_ids,
     bool require_complete_acceptance);
 
+bool neumann_rigid_study_exit_pass_3d(
+    const NeumannRigidStudyEvaluation3D& evaluation,
+    bool require_complete_acceptance);
+
 } // namespace kfbim::app3d

@@ -253,4 +253,20 @@ NeumannRigidStudyEvaluation3D evaluate_neumann_rigid_study_3d(
     return result;
 }
 
+bool neumann_rigid_study_exit_pass_3d(
+    const NeumannRigidStudyEvaluation3D& evaluation,
+    bool require_complete_acceptance)
+{
+    if (require_complete_acceptance)
+        return evaluation.all_pass;
+    return !evaluation.rows.empty()
+        && std::all_of(
+            evaluation.rows.begin(),
+            evaluation.rows.end(),
+            [](const NeumannRigidStudyDerivedRow3D& row) {
+                return row.row_pass
+                    == RigidStudyCriterionStatus3D::Pass;
+            });
+}
+
 } // namespace kfbim::app3d
