@@ -33,7 +33,7 @@ int run_tests()
 {
     using namespace kfbim::app3d;
 
-    const std::array<const char*, 17> expected_names{{
+    const std::array<const char*, 18> expected_names{{
         "geometry_and_domain",
         "surface_dofs_and_stencils",
         "grid_pair_and_label_validation",
@@ -43,6 +43,7 @@ int run_tests()
         "restrict_owner_geometry_preprocessing",
         "trace_owner_template_assembly",
         "exact_fields_and_other_setup",
+        "edge_auxiliary_values",
         "cauchy_coefficients",
         "spread_rhs_assembly",
         "fft_bulk_solve",
@@ -58,7 +59,7 @@ int run_tests()
         const auto kind = static_cast<PhaseProfileKind3D>(q);
         require(std::string(phase_profile_name_3d(kind)) == expected_names[q],
                 "phase name is wrong");
-        require(phase_profile_is_algorithm_3d(kind) == (q < 15),
+        require(phase_profile_is_algorithm_3d(kind) == (q < 16),
                 "algorithm phase classification is wrong");
     }
 
@@ -68,20 +69,25 @@ int run_tests()
         PhaseProfileKind3D::RestrictOwnerGeometryPreprocessing, 0.25, 1);
     profile.add(
         PhaseProfileKind3D::TraceOwnerTemplateAssembly, 0.5, 1);
+    profile.add(PhaseProfileKind3D::EdgeAuxiliaryValues, 0.125, 3);
     profile.add(PhaseProfileKind3D::FftBulkSolve, 1.0, 2);
     profile.add(PhaseProfileKind3D::DiagnosticOutput, 0.5, 1);
     profile.note_timer_reads(20);
     profile.set_seconds_per_clock_read(1.0e-7);
     profile.finalize(4.5);
 
-    require(std::abs(profile.algorithm_seconds() - 3.75) < 1.0e-14,
+    require(std::abs(profile.algorithm_seconds() - 3.875) < 1.0e-14,
             "algorithm denominator is wrong");
-    require(std::abs(profile.measured_seconds_without_wall_overhead() - 4.25)
+    require(std::abs(profile.measured_seconds_without_wall_overhead() - 4.375)
                 < 1.0e-14,
             "measured denominator is wrong");
     require(std::abs(profile.record(
-                PhaseProfileKind3D::WallOverhead).seconds - 0.25) < 1.0e-14,
+                PhaseProfileKind3D::WallOverhead).seconds - 0.125)
+                < 1.0e-14,
             "wall remainder is wrong");
+    require(profile.record(
+                PhaseProfileKind3D::EdgeAuxiliaryValues).calls == 3,
+            "edge-value phase call count is wrong");
     require(profile.record(
                 PhaseProfileKind3D::RestrictOwnerGeometryPreprocessing).calls
                 == 1

@@ -51,6 +51,7 @@
 #include "harmonic_polynomial_space_3d.hpp"
 #include "kfbi_phase_profile_3d.hpp"
 #include "native_nurbs_surface_3d.hpp"
+#include "neumann_edge_augmented_cauchy_3d.hpp"
 #include "neumann_edge_continuity_3d.hpp"
 #include "neumann_rigid_transform_study_3d.hpp"
 #include "restrict_owner_geometry_preprocessor_3d.hpp"
@@ -1602,7 +1603,8 @@ public:
                                  RestrictOwnerWorkload3D* workload_capture =
                                      nullptr,
                                  RestrictOwnerPipelinePreprocessTiming3D*
-                                     preprocess_timing = nullptr)
+                                     preprocess_timing = nullptr,
+                                 bool build_neumann_edge_augmented_cauchy = false)
         : grid_(grid)
         , grid_pair_(grid_pair)
         , native_surface_(native_surface)
@@ -1622,6 +1624,20 @@ public:
             || std::abs(spacing[0] - spacing[2]) > 1.0e-13) {
             throw std::invalid_argument(
                 "harmonic-jet KFBI3D requires an isotropic Cartesian grid");
+        }
+        if (build_neumann_edge_augmented_cauchy) {
+            std::vector<app3d::NeumannEdgeFaceStencil3D> face_stencils;
+            face_stencils.reserve(stencils.rows.size());
+            for (const CauchyStencil& stencil : stencils.rows) {
+                app3d::NeumannEdgeFaceStencil3D face_stencil;
+                face_stencil.value_dofs = stencil.value_ids;
+                face_stencil.normal_dofs = stencil.derivative_ids;
+                face_stencils.push_back(std::move(face_stencil));
+            }
+            neumann_edge_augmented_cauchy_ = std::make_unique<
+                app3d::NeumannEdgeAugmentedCauchy3D>(
+                    app3d::build_neumann_edge_augmented_cauchy_3d(
+                        native_surface_, cloud_, h_, face_stencils));
         }
         if (build_exterior_only_restrict) {
             exterior_only_restrict_ =
@@ -1780,6 +1796,15 @@ public:
     std::vector<double> cauchy_condition_values() const
     {
         return fit_.condition_values();
+    }
+
+    const app3d::NeumannEdgeAugmentedCauchy3D&
+    neumann_edge_augmented_cauchy() const
+    {
+        if (!neumann_edge_augmented_cauchy_)
+            throw std::runtime_error(
+                "edge-augmented Cauchy was not initialized");
+        return *neumann_edge_augmented_cauchy_;
     }
 
     std::vector<double> exterior_only_restrict_condition_values() const
@@ -1996,15 +2021,15 @@ public:
         return result;
     }
 
-    HarmonicJetField3D evaluate(const Eigen::VectorXd& value_jump,
-                                const Eigen::VectorXd& normal_jump) const
+    HarmonicJetField3D evaluate(
+        const Eigen::VectorXd& value_jump,
+        const Eigen::VectorXd& normal_jump,
+        app3d::NeumannEdgeCauchyMode3D cauchy_mode =
+            app3d::NeumannEdgeCauchyMode3D::None) const
     {
         HarmonicJetField3D result;
-        result.coefficients = profile_phase_3d(
-            phase_profile_, PhaseProfileKind3D::CauchyCoefficients, 1,
-            [&] {
-                return fit_.coefficients(value_jump, normal_jump);
-            });
+        result.coefficients = cauchy_coefficients(
+            value_jump, normal_jump, cauchy_mode);
         Eigen::VectorXd rhs = Eigen::VectorXd::Zero(grid_.num_dofs());
         profile_phase_3d(
             phase_profile_, PhaseProfileKind3D::SpreadRhsAssembly, 1,
@@ -2029,7 +2054,9 @@ public:
     HarmonicJetField3D field_from_grid_and_jumps(
         const Eigen::VectorXd& potential,
         const Eigen::VectorXd& value_jump,
-        const Eigen::VectorXd& normal_jump) const
+        const Eigen::VectorXd& normal_jump,
+        app3d::NeumannEdgeCauchyMode3D cauchy_mode =
+            app3d::NeumannEdgeCauchyMode3D::None) const
     {
         if (potential.size() != grid_.num_dofs()
             || value_jump.size() != surface_size()
@@ -2037,11 +2064,8 @@ public:
             throw std::invalid_argument(
                 "exact-grid field received incompatible sizes");
         }
-        Eigen::MatrixXd coefficients = profile_phase_3d(
-            phase_profile_, PhaseProfileKind3D::CauchyCoefficients, 1,
-            [&] {
-                return fit_.coefficients(value_jump, normal_jump);
-            });
+        Eigen::MatrixXd coefficients = cauchy_coefficients(
+            value_jump, normal_jump, cauchy_mode);
         return {potential, std::move(coefficients)};
     }
 
@@ -2142,6 +2166,39 @@ public:
     }
 
 private:
+    Eigen::MatrixXd cauchy_coefficients(
+        const Eigen::VectorXd& value_jump,
+        const Eigen::VectorXd& normal_jump,
+        app3d::NeumannEdgeCauchyMode3D mode) const
+    {
+        if (mode == app3d::NeumannEdgeCauchyMode3D::None) {
+            return profile_phase_3d(
+                phase_profile_, PhaseProfileKind3D::CauchyCoefficients, 1,
+                [&] {
+                    return fit_.coefficients(value_jump, normal_jump);
+                });
+        }
+        if (!neumann_edge_augmented_cauchy_)
+            throw std::runtime_error(
+                "edge-augmented Cauchy was not initialized");
+        const Eigen::VectorXd edge_values = profile_phase_3d(
+            phase_profile_, PhaseProfileKind3D::EdgeAuxiliaryValues, 1,
+            [&] {
+                return neumann_edge_augmented_cauchy_->edge_values(
+                    value_jump, normal_jump);
+            });
+        return profile_phase_3d(
+            phase_profile_, PhaseProfileKind3D::CauchyCoefficients, 1,
+            [&] {
+                Eigen::MatrixXd coefficients =
+                    fit_.coefficients(value_jump, normal_jump);
+                neumann_edge_augmented_cauchy_->
+                    overwrite_affected_coefficients(
+                        value_jump, normal_jump, edge_values, coefficients);
+                return coefficients;
+            });
+    }
+
     Eigen::MatrixXd continued_samples(const HarmonicJetField3D& field,
                                       const Eigen::VectorXd& value_jump,
                                       const Eigen::VectorXd& normal_jump,
@@ -2791,6 +2848,8 @@ private:
         UINT64_C(14695981039346656037);
     double h_ = 0.0;
     PanelCenterCauchyFit3D fit_;
+    std::unique_ptr<app3d::NeumannEdgeAugmentedCauchy3D>
+        neumann_edge_augmented_cauchy_;
     std::unique_ptr<app3d::ExteriorOnlyCubicNormalRestrict3D>
         exterior_only_restrict_;
     LaplaceFftBulkSolverZfft3D bulk_;
@@ -2807,10 +2866,13 @@ class ExteriorZeroTraceOperator3D final : public IKFBIOperator {
 public:
     explicit ExteriorZeroTraceOperator3D(
         const PanelCenterHarmonicJetKFBI3D& pipeline,
-        ExteriorValueRestrictMode3D mode =
-            ExteriorValueRestrictMode3D::JointTricubicCauchy)
+        ExteriorValueRestrictMode3D restrict_mode =
+            ExteriorValueRestrictMode3D::JointTricubicCauchy,
+        app3d::NeumannEdgeCauchyMode3D cauchy_mode =
+            app3d::NeumannEdgeCauchyMode3D::None)
         : pipeline_(pipeline)
-        , mode_(mode)
+        , restrict_mode_(restrict_mode)
+        , cauchy_mode_(cauchy_mode)
     {}
 
     int problem_size() const override
@@ -2827,10 +2889,10 @@ public:
         const Eigen::VectorXd value_jump = unknown.head(size);
         const Eigen::VectorXd zero_normal = Eigen::VectorXd::Zero(size);
         const HarmonicJetField3D field =
-            pipeline_.evaluate(value_jump, zero_normal);
+            pipeline_.evaluate(value_jump, zero_normal, cauchy_mode_);
         const Eigen::VectorXd trace =
             pipeline_.exterior_trace(
-                field, value_jump, zero_normal, mode_);
+                field, value_jump, zero_normal, restrict_mode_);
         result.resize(size + 1);
         result.head(size) = trace.array() + unknown[size];
         double weighted_mean = 0.0;
@@ -2849,16 +2911,18 @@ public:
             throw std::invalid_argument("prescribed Neumann data has wrong size");
         const Eigen::VectorXd zero_value = Eigen::VectorXd::Zero(size);
         const HarmonicJetField3D field =
-            pipeline_.evaluate(zero_value, prescribed_normal_jump);
+            pipeline_.evaluate(
+                zero_value, prescribed_normal_jump, cauchy_mode_);
         Eigen::VectorXd result = Eigen::VectorXd::Zero(size + 1);
         result.head(size) = -pipeline_.exterior_trace(
-            field, zero_value, prescribed_normal_jump, mode_);
+            field, zero_value, prescribed_normal_jump, restrict_mode_);
         return result;
     }
 
 private:
     const PanelCenterHarmonicJetKFBI3D& pipeline_;
-    ExteriorValueRestrictMode3D mode_;
+    ExteriorValueRestrictMode3D restrict_mode_;
+    app3d::NeumannEdgeCauchyMode3D cauchy_mode_;
 };
 
 struct ExteriorZeroTraceSolution3D {
@@ -2878,13 +2942,16 @@ ExteriorZeroTraceSolution3D solve_exterior_zero_trace_neumann_3d(
     double tolerance,
     int restart,
     int max_iterations,
-    ExteriorValueRestrictMode3D mode =
+    ExteriorValueRestrictMode3D restrict_mode =
         ExteriorValueRestrictMode3D::JointTricubicCauchy,
+    app3d::NeumannEdgeCauchyMode3D cauchy_mode =
+        app3d::NeumannEdgeCauchyMode3D::None,
     const app3d::NeumannEdgeContinuityProjector3D*
         edge_projector = nullptr)
 {
     if (edge_projector == nullptr) {
-        ExteriorZeroTraceOperator3D op(pipeline, mode);
+        ExteriorZeroTraceOperator3D op(
+            pipeline, restrict_mode, cauchy_mode);
         const Eigen::VectorXd rhs = op.right_hand_side(prescribed_normal_jump);
         Eigen::VectorXd augmented_unknown = Eigen::VectorXd::Zero(op.problem_size());
         GMRES gmres(max_iterations, tolerance, restart);
@@ -2896,7 +2963,8 @@ ExteriorZeroTraceSolution3D solve_exterior_zero_trace_neumann_3d(
         result.value_jump = augmented_unknown.head(size);
         result.lagrange_multiplier = augmented_unknown[size];
         const HarmonicJetField3D field =
-            pipeline.evaluate(result.value_jump, prescribed_normal_jump);
+            pipeline.evaluate(
+                result.value_jump, prescribed_normal_jump, cauchy_mode);
         result.potential = field.potential;
         result.coefficients = field.coefficients;
         Eigen::VectorXd applied;
@@ -2905,7 +2973,8 @@ ExteriorZeroTraceSolution3D solve_exterior_zero_trace_neumann_3d(
         return result;
     }
 
-    ExteriorZeroTraceOperator3D op(pipeline, mode);
+    ExteriorZeroTraceOperator3D op(
+        pipeline, restrict_mode, cauchy_mode);
     const app3d::NeumannEdgeProjectedAugmentedOperator3D projected_op(
         op, *edge_projector);
     const Eigen::VectorXd rhs = projected_op.project_right_hand_side(
@@ -2922,7 +2991,8 @@ ExteriorZeroTraceSolution3D solve_exterior_zero_trace_neumann_3d(
     augmented_unknown.head(size) = result.value_jump;
     result.lagrange_multiplier = augmented_unknown[size];
     const HarmonicJetField3D field =
-        pipeline.evaluate(result.value_jump, prescribed_normal_jump);
+        pipeline.evaluate(
+            result.value_jump, prescribed_normal_jump, cauchy_mode);
     result.potential = field.potential;
     result.coefficients = field.coefficients;
     Eigen::VectorXd applied;
@@ -3077,12 +3147,16 @@ SolveMetrics3D run_neumann_case(
     const PanelCenterHarmonicJetKFBI3D& pipeline,
     const app3d::RigidTransform3D& transform,
     int gmres_max_iterations,
-    ExteriorValueRestrictMode3D mode =
+    ExteriorValueRestrictMode3D restrict_mode =
         ExteriorValueRestrictMode3D::JointTricubicCauchy,
+    app3d::NeumannEdgeCauchyMode3D cauchy_mode =
+        app3d::NeumannEdgeCauchyMode3D::None,
     std::vector<double>* residual_history = nullptr,
     const app3d::NeumannEdgeContinuityProjector3D*
         edge_projector = nullptr,
-    Eigen::VectorXd* solved_value_jump = nullptr)
+    Eigen::VectorXd* solved_value_jump = nullptr,
+    Eigen::MatrixXd* solved_coefficients = nullptr,
+    Eigen::VectorXd* prescribed_normal_jump_output = nullptr)
 {
     const int size = pipeline.surface_size();
     Eigen::VectorXd exact_trace(size);
@@ -3106,16 +3180,16 @@ SolveMetrics3D run_neumann_case(
     const ExteriorZeroTraceSolution3D solution =
         solve_exterior_zero_trace_neumann_3d(
             pipeline, normal_data, 2.0e-10, 80, gmres_max_iterations,
-            mode, edge_projector);
+            restrict_mode, cauchy_mode, edge_projector);
     const double seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - solve_start).count();
 
     const HarmonicJetField3D field{
         solution.potential, solution.coefficients};
     const Eigen::VectorXd direct_exterior = pipeline.exterior_trace(
-        field, solution.value_jump, normal_data, mode);
+        field, solution.value_jump, normal_data, restrict_mode);
     const Eigen::VectorXd exterior_from_jump = pipeline.interior_trace(
-        field, solution.value_jump, normal_data, mode)
+        field, solution.value_jump, normal_data, restrict_mode)
         - solution.value_jump;
 
     SolveMetrics3D result;
@@ -3181,6 +3255,10 @@ SolveMetrics3D run_neumann_case(
         *residual_history = solution.gmres_residuals;
     if (solved_value_jump != nullptr)
         *solved_value_jump = solution.value_jump;
+    if (solved_coefficients != nullptr)
+        *solved_coefficients = solution.coefficients;
+    if (prescribed_normal_jump_output != nullptr)
+        *prescribed_normal_jump_output = normal_data;
     return result;
 }
 
@@ -3791,7 +3869,9 @@ ReadinessResult run_readiness_case(GeometryKind kind,
     if (solve_selection == SolveSelection3D::Both) {
         result.neumann = run_neumann_case(
             grid, grid_pair, harmonic_pipeline, transform,
-            gmres_max_iterations);
+            gmres_max_iterations,
+            ExteriorValueRestrictMode3D::JointTricubicCauchy,
+            app3d::NeumannEdgeCauchyMode3D::None);
     }
     result.dirichlet_normal = run_dirichlet_normal_case(
         grid, grid_pair, harmonic_pipeline, transform,
@@ -7362,6 +7442,7 @@ int run_neumann_owner_study_3d(std::vector<int> levels)
                 selected_case->transform,
                 gmres_max_iterations,
                 mode,
+                app3d::NeumannEdgeCauchyMode3D::None,
                 &row.residual_history);
             const auto after =
                 pipeline.restrict_owner_preprocess_diagnostics();
@@ -7636,6 +7717,7 @@ NeumannOwnerStudyRow3D run_neumann_rigid_pose_3d(
         study_case.transform,
         gmres_max_iterations,
         mode,
+        app3d::NeumannEdgeCauchyMode3D::None,
         &row.residual_history);
     const auto after =
         pipeline.restrict_owner_preprocess_diagnostics();
@@ -8295,6 +8377,7 @@ run_neumann_edge_continuity_pair_3d(
                 ? std::addressof(projector) : nullptr;
         row.solve = run_neumann_case(grid, grid_pair, pipeline,
             study_case.transform, gmres_max_iterations, mode,
+            app3d::NeumannEdgeCauchyMode3D::None,
             &row.residual_history, solve_projector, &solved_densities[index]);
         after_snapshots[index] =
             capture_neumann_edge_preprocess_snapshot_3d(pipeline);

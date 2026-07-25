@@ -23,6 +23,7 @@ constexpr std::array<const char*, phase_profile_kind_count_3d()>
         "restrict_owner_geometry_preprocessing",
         "trace_owner_template_assembly",
         "exact_fields_and_other_setup",
+        "edge_auxiliary_values",
         "cauchy_coefficients",
         "spread_rhs_assembly",
         "fft_bulk_solve",

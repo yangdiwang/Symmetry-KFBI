@@ -19,6 +19,7 @@ enum class PhaseProfileKind3D {
     RestrictOwnerGeometryPreprocessing,
     TraceOwnerTemplateAssembly,
     ExactFieldsAndOtherSetup,
+    EdgeAuxiliaryValues,
     CauchyCoefficients,
     SpreadRhsAssembly,
     FftBulkSolve,
