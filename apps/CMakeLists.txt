@@ -40,6 +40,7 @@ if(KFBIM_BUILD_3D)
         dirichlet_rigid_transform_study_3d.cpp
         neumann_edge_continuity_3d.cpp
         neumann_rigid_transform_study_3d.cpp
+        neumann_edge_augmented_cauchy_3d.cpp
     )
 
     add_library(kfbim_phase_profile_3d STATIC
@@ -52,6 +53,10 @@ if(KFBIM_BUILD_3D)
 
     add_executable(neumann_edge_continuity_3d_test
         neumann_edge_continuity_3d_test.cpp
+    )
+
+    add_executable(neumann_edge_augmented_cauchy_3d_test
+        neumann_edge_augmented_cauchy_3d_test.cpp
     )
 
     add_executable(native_nurbs_surface_transform_3d_test
@@ -142,6 +147,10 @@ if(KFBIM_BUILD_3D)
     )
 
     target_link_libraries(neumann_edge_continuity_3d_test PRIVATE
+        kfbim_3d_app_geometry
+    )
+
+    target_link_libraries(neumann_edge_augmented_cauchy_3d_test PRIVATE
         kfbim_3d_app_geometry
     )
 
@@ -250,6 +259,7 @@ if(KFBIM_BUILD_3D)
     target_compile_features(kfbim_3d_app_geometry PUBLIC cxx_std_17)
     target_compile_features(kfbim_phase_profile_3d PUBLIC cxx_std_17)
     target_compile_features(neumann_edge_continuity_3d_test PRIVATE cxx_std_17)
+    target_compile_features(neumann_edge_augmented_cauchy_3d_test PRIVATE cxx_std_17)
     target_compile_features(native_nurbs_surface_3d_test PRIVATE cxx_std_17)
     target_compile_features(native_nurbs_surface_transform_3d_test PRIVATE cxx_std_17)
     target_compile_features(dirichlet_rigid_transform_study_3d_test PRIVATE cxx_std_17)
