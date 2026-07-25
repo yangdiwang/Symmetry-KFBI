@@ -27,6 +27,7 @@
 #include "dirichlet_rigid_transform_study_3d.hpp"
 #include "exterior_only_cubic_normal_restrict_3d.hpp"
 #include "harmonic_polynomial_space_3d.hpp"
+#include "harmonic_trace_correction_3d.hpp"
 #include "native_nurbs_surface_3d.hpp"
 #include "src/bulk_solvers/laplace_zfft_bulk_solver_3d.hpp"
 #include "src/geometry/grid_pair_3d.hpp"
@@ -757,11 +758,6 @@ struct HarmonicCrossingRow3D {
     Eigen::VectorXd evaluation;
 };
 
-struct HarmonicTraceCorrectionTerm3D {
-    int owner_dof = -1;
-    Eigen::VectorXd evaluation;
-};
-
 constexpr std::size_t kRestrictOwnerDecisionKindCount =
     static_cast<std::size_t>(
         app3d::RestrictOwnerDecisionKind3D::AmbiguousEdgeFallback)
@@ -783,7 +779,7 @@ struct HarmonicTraceSample3D {
     std::array<int, 64> grid_ids{};
     std::array<double, 64> weights{};
     Eigen::VectorXd legacy_correction_evaluation;
-    std::vector<HarmonicTraceCorrectionTerm3D> owner_corrections;
+    std::vector<app3d::HarmonicTraceOwnerTerm3D> owner_corrections;
     int wrong_side_node_count = 0;
     double wrong_side_sum_abs_weight = 0.0;
     std::array<int, kRestrictOwnerDecisionKindCount> owner_decision_counts{};
@@ -1152,17 +1148,13 @@ private:
                                * field.potential[
                                    sample.grid_ids[static_cast<std::size_t>(q)]];
                     }
-                    if (use_crossing_owner) {
-                        for (const HarmonicTraceCorrectionTerm3D& term
-                             : sample.owner_corrections) {
-                            value += term.evaluation.dot(
-                                field.coefficients.row(
-                                    term.owner_dof).transpose());
-                        }
-                    } else {
-                        value += sample.legacy_correction_evaluation.dot(
-                            field.coefficients.row(center).transpose());
-                    }
+                    value += app3d::apply_harmonic_trace_correction_3d(
+                        center, field.coefficients,
+                        sample.legacy_correction_evaluation,
+                        sample.owner_corrections,
+                        use_crossing_owner
+                            ? app3d::HarmonicTraceCorrectionMode3D::CrossingOwned
+                            : app3d::HarmonicTraceCorrectionMode3D::CenterOwned);
                     samples(center, 4 * side + layer) = value;
                 }
             }
@@ -1470,7 +1462,7 @@ private:
         }
         result.owner_corrections.reserve(owner_evaluations.size());
         for (auto& owner_evaluation : owner_evaluations) {
-            HarmonicTraceCorrectionTerm3D term;
+            app3d::HarmonicTraceOwnerTerm3D term;
             term.owner_dof = owner_evaluation.first;
             term.evaluation = std::move(owner_evaluation.second);
             result.owner_corrections.push_back(std::move(term));

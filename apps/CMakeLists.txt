@@ -31,6 +31,7 @@ if(KFBIM_BUILD_3D)
         crossing_owner_restrict_3d.cpp
         exterior_only_cubic_normal_restrict_3d.cpp
         harmonic_polynomial_space_3d.cpp
+        harmonic_trace_correction_3d.cpp
         native_nurbs_surface_3d.cpp
         native_nurbs_surface_transform_3d.cpp
         dirichlet_rigid_transform_study_3d.cpp
@@ -58,6 +59,10 @@ if(KFBIM_BUILD_3D)
 
     add_executable(crossing_owner_restrict_3d_test
         crossing_owner_restrict_3d_test.cpp
+    )
+
+    add_executable(harmonic_trace_correction_3d_test
+        harmonic_trace_correction_3d_test.cpp
     )
 
     add_executable(nurbs_geometry_preprocess_benchmark_3d_test
@@ -131,6 +136,10 @@ if(KFBIM_BUILD_3D)
         kfbim_3d_app_geometry
     )
 
+    target_link_libraries(harmonic_trace_correction_3d_test PRIVATE
+        kfbim_3d_app_geometry
+    )
+
     target_link_libraries(nurbs_geometry_preprocess_benchmark_3d_test PRIVATE
         kfbim_3d_app_geometry
     )
@@ -199,6 +208,7 @@ if(KFBIM_BUILD_3D)
     target_compile_features(harmonic_polynomial_space_3d_test PRIVATE cxx_std_17)
     target_compile_features(exterior_only_cubic_normal_restrict_3d_test PRIVATE cxx_std_17)
     target_compile_features(crossing_owner_restrict_3d_test PRIVATE cxx_std_17)
+    target_compile_features(harmonic_trace_correction_3d_test PRIVATE cxx_std_17)
     target_compile_features(nurbs_geometry_preprocess_benchmark_3d_test PRIVATE cxx_std_17)
     target_compile_features(nurbs_geometry_preprocess_benchmark_3d PRIVATE cxx_std_17)
     target_compile_features(neumann_exterior_zero_trace_3d PRIVATE cxx_std_17)
