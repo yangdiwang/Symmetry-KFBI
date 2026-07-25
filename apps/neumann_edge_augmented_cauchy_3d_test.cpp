@@ -16,6 +16,20 @@
 #include <tuple>
 #include <vector>
 
+namespace kfbim::app3d::detail {
+struct NeumannEdgeDistanceCandidate3D {
+    double squared_distance = 0.0;
+    int sample_index = -1;
+    int edge_sample_index = -1;
+    int certified_symmetric_partner = -1;
+};
+
+std::vector<int> select_neumann_edge_distance_candidates_3d(
+    std::vector<NeumannEdgeDistanceCandidate3D> candidates,
+    double radius_squared,
+    int count);
+} // namespace kfbim::app3d::detail
+
 namespace {
 using namespace kfbim::app3d;
 using Interval = kfbim::geometry3d::NurbsPatchEdgeInterval3D;
@@ -275,6 +289,45 @@ void test_rigid_covariance()
     std::cout<<"rigid covariance defect "<<defect<<'\n';
 }
 
+void test_exact_distance_selection_boundaries()
+{
+    using Candidate=kfbim::app3d::detail::NeumannEdgeDistanceCandidate3D;
+    using kfbim::app3d::detail::select_neumann_edge_distance_candidates_3d;
+    const double epsilon=std::numeric_limits<double>::epsilon();
+
+    const std::vector<Candidate> radius_candidates{
+        {1.0,4,104,-1},
+        {1.0+32.0*epsilon,0,100,-1},
+        {2.0,1,101,-1},
+        {3.0,2,102,-1}};
+    require(select_neumann_edge_distance_candidates_3d(
+                radius_candidates,1.0+16.0*epsilon,1)
+            ==std::vector<int>({104}),
+        "sub-tolerance lower-index sample narrowed exact radius eligibility");
+
+    const std::vector<Candidate> cutoff_candidates{
+        {0.1,1,101,-1},
+        {0.2,2,102,-1},
+        {0.3,3,103,-1},
+        {1.0,4,104,-1},
+        {1.0+32.0*epsilon,0,100,-1}};
+    require(select_neumann_edge_distance_candidates_3d(
+                cutoff_candidates,2.0,4)
+            ==std::vector<int>({101,102,103,104}),
+        "sub-tolerance fifth sample replaced a strictly nearer fourth sample");
+
+    const std::vector<Candidate> certified_tie{
+        {0.1,1,101,-1},
+        {0.2,2,102,-1},
+        {0.3,3,103,-1},
+        {1.0,4,104,0},
+        {1.0+32.0*epsilon,0,100,4}};
+    require(select_neumann_edge_distance_candidates_3d(
+                certified_tie,2.0,4)
+            ==std::vector<int>({101,102,103,100}),
+        "certified parameter-symmetric tie did not use sample index");
+}
+
 std::vector<NeumannEdgeFaceStencil3D> exact_face_stencils(
     const NativeNurbsSurface3D& surface,
     const SurfaceDofCloud3D& cloud)
@@ -287,6 +340,50 @@ std::vector<NeumannEdgeFaceStencil3D> exact_face_stencils(
             nearest_g1_cauchy_dofs(surface,cloud,center,28)});
     }
     return result;
+}
+
+bool independently_parameter_symmetric(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud3D& cloud,
+    int center_id,
+    const NeumannEdgeAuxiliarySample3D& first,
+    const NeumannEdgeAuxiliarySample3D& second)
+{
+    if(first.connection_index!=second.connection_index
+        || first.sample_count!=second.sample_count
+        || first.sample_count<=0) return false;
+    const auto& center=cloud.dofs.at(static_cast<std::size_t>(center_id));
+    const auto& connection=surface.geometric_connections.at(
+        static_cast<std::size_t>(first.connection_index));
+    const Interval* interval=nullptr;
+    bool reversed=false;
+    if(center.patch_id==connection.first.patch) {
+        interval=&connection.first;
+    } else if(center.patch_id==connection.second.patch) {
+        interval=&connection.second;
+        reversed=connection.reversed;
+    } else {
+        return false;
+    }
+    const auto& tensor=cloud.patches.at(static_cast<std::size_t>(center.patch_id));
+    const bool u_edge=interval->edge==PatchEdge3D::UMin
+        || interval->edge==PatchEdge3D::UMax;
+    const long long index=u_edge?center.j:center.i;
+    const long long count=u_edge?tensor.nv:tensor.nu;
+    const double doubled_begin=2.0*interval->begin;
+    const double doubled_end=2.0*interval->end;
+    const long long begin=static_cast<long long>(std::llround(doubled_begin));
+    const long long end=static_cast<long long>(std::llround(doubled_end));
+    if(doubled_begin!=static_cast<double>(begin)
+        || doubled_end!=static_cast<double>(end)
+        || count<=0 || index<0 || index>=count || begin==end) return false;
+    long long numerator=2LL*index+1LL-begin*count;
+    long long denominator=count*(end-begin);
+    if(denominator<0) {numerator=-numerator;denominator=-denominator;}
+    if(reversed) numerator=denominator-numerator;
+    return static_cast<long long>(first.sample_index+second.sample_index+1)
+            *denominator
+        ==2LL*numerator*first.sample_count;
 }
 
 std::map<int,std::vector<int>> expected_edge_groups(
@@ -359,8 +456,34 @@ double independently_recomputed_local_defect(
     double h)
 {
     const HarmonicPolynomialSpace3D space(3);
-    double defect=augmented.edge_value_map().diagnostics
-        .harmonic_cubic_reproduction_defect_max;
+    double defect=0.0;
+    const auto& edge_map=augmented.edge_value_map();
+    const Eigen::VectorXd origin_basis=space.basis(0.0,0.0,0.0);
+    for(int row=0;row<static_cast<int>(edge_map.samples.size());++row) {
+        const auto& sample=edge_map.samples[static_cast<std::size_t>(row)];
+        for(int column=0;column<16;++column) {
+            double predicted=0.0;
+            for(Eigen::SparseMatrix<double,Eigen::RowMajor>::InnerIterator
+                    it(edge_map.value_map,row);it;++it) {
+                const auto& dof=cloud.dofs[static_cast<std::size_t>(it.col())];
+                const Eigen::Vector3d xi=sample.frame.transpose()
+                    *(dof.point-sample.point)/h;
+                predicted+=it.value()
+                    *space.basis(xi.x(),xi.y(),xi.z())[column];
+            }
+            for(Eigen::SparseMatrix<double,Eigen::RowMajor>::InnerIterator
+                    it(edge_map.normal_map,row);it;++it) {
+                const auto& dof=cloud.dofs[static_cast<std::size_t>(it.col())];
+                const Eigen::Vector3d xi=sample.frame.transpose()
+                    *(dof.point-sample.point)/h;
+                const Eigen::Vector3d nc=sample.frame.transpose()*dof.normal;
+                predicted+=it.value()*nc.dot(
+                    space.gradient(xi.x(),xi.y(),xi.z()).col(column))/h;
+            }
+            defect=std::max(defect,
+                std::abs(predicted-origin_basis[column]));
+        }
+    }
     for(const auto& local:augmented.local_maps()) {
         const auto& center=cloud.dofs[static_cast<std::size_t>(local.center_dof)];
         for(int column=0;column<16;++column) {
@@ -488,22 +611,25 @@ void test_local_attachment_groups_and_overwrite()
                     ==found->second.end()) expected_only.push_back(id);
             require(actual_only.size()==expected_only.size() && !actual_only.empty(),
                 "nearest-four group differs by more than tied samples");
-            std::sort(actual_only.begin(),actual_only.end());
-            std::sort(expected_only.begin(),expected_only.end());
-            for(std::size_t k=0;k<actual_only.size();++k) {
-                const auto& a=augmented.edge_value_map().samples[
-                    static_cast<std::size_t>(actual_only[k])];
-                const auto& e=augmented.edge_value_map().samples[
-                    static_cast<std::size_t>(expected_only[k])];
-                const double da=(a.point-cloud.dofs[static_cast<std::size_t>(center)].point)
-                    .squaredNorm();
-                const double de=(e.point-cloud.dofs[static_cast<std::size_t>(center)].point)
-                    .squaredNorm();
-                const double tolerance=64.0*std::numeric_limits<double>::epsilon()
-                    *std::max({h*h,da,de});
-                require(std::abs(da-de)<=tolerance
-                    && a.sample_index<e.sample_index,
-                    "nearest-four group replaced a strictly nearer sample");
+            std::vector<bool> matched(expected_only.size(),false);
+            for(const int actual_id:actual_only) {
+                const auto& actual_sample=augmented.edge_value_map().samples[
+                    static_cast<std::size_t>(actual_id)];
+                bool found_partner=false;
+                for(std::size_t k=0;k<expected_only.size();++k) {
+                    if(matched[k]) continue;
+                    const auto& exact_sample=augmented.edge_value_map().samples[
+                        static_cast<std::size_t>(expected_only[k])];
+                    if(actual_sample.sample_index<exact_sample.sample_index
+                        && independently_parameter_symmetric(
+                            surface,cloud,center,actual_sample,exact_sample)) {
+                        matched[k]=true;
+                        found_partner=true;
+                        break;
+                    }
+                }
+                require(found_partner,
+                    "nearest-four group replaced a strictly nearer uncertified sample");
             }
         }
         for(const auto& group:actual)
@@ -1096,6 +1222,7 @@ int main()
     try {
         test_l_prism_geometry_topology_reproduction_and_direct_map();
         test_rigid_covariance();
+        test_exact_distance_selection_boundaries();
         test_local_attachment_groups_and_overwrite();
         test_local_harmonic_reproduction_and_rigid_covariance();
         test_local_map_rejections();

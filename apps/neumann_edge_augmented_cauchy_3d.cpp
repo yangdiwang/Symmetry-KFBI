@@ -15,6 +15,56 @@
 #include <utility>
 
 namespace kfbim::app3d {
+namespace detail {
+
+struct NeumannEdgeDistanceCandidate3D {
+    double squared_distance = 0.0;
+    int sample_index = -1;
+    int edge_sample_index = -1;
+    int certified_symmetric_partner = -1;
+};
+
+std::vector<int> select_neumann_edge_distance_candidates_3d(
+    std::vector<NeumannEdgeDistanceCandidate3D> candidates,
+    double radius_squared,
+    int count)
+{
+    if (!std::isfinite(radius_squared) || radius_squared < 0.0)
+        throw std::invalid_argument("Neumann edge attachment radius must be finite and nonnegative");
+    if (count <= 0)
+        throw std::invalid_argument("Neumann edge attachment count must be positive");
+    std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
+        return std::tie(a.squared_distance, a.sample_index, a.edge_sample_index)
+            < std::tie(b.squared_distance, b.sample_index, b.edge_sample_index);
+    });
+    if (candidates.empty() || candidates.front().squared_distance > radius_squared)
+        return {};
+
+    // A certified pair is mathematically equidistant even if floating-point
+    // distance evaluation orders its members differently after a rigid transform.
+    // No uncertified distance difference is ever treated as a tie.
+    for (std::size_t first = 0; first < candidates.size(); ++first) {
+        for (std::size_t second = first + 1; second < candidates.size(); ++second) {
+            if (candidates[first].certified_symmetric_partner
+                    == candidates[second].sample_index
+                && candidates[second].certified_symmetric_partner
+                    == candidates[first].sample_index) {
+                if (candidates[second].sample_index < candidates[first].sample_index)
+                    std::swap(candidates[first], candidates[second]);
+                break;
+            }
+        }
+    }
+    if (candidates.size() < static_cast<std::size_t>(count))
+        throw std::runtime_error("Neumann edge attachment has fewer samples than requested");
+    std::vector<int> selected;
+    selected.reserve(static_cast<std::size_t>(count));
+    for (int index = 0; index < count; ++index)
+        selected.push_back(candidates[static_cast<std::size_t>(index)].edge_sample_index);
+    return selected;
+}
+
+} // namespace detail
 namespace {
 
 using geometry3d::NurbsPatchEdgeInterval3D;
@@ -521,6 +571,110 @@ Eigen::Vector3d center_coordinate(
             displacement.dot(center.normal)};
 }
 
+bool native_l_prism_affine_patch(const NativeNurbsSurface3D& surface, int patch_id)
+{
+    if (surface.name != "l_prism"
+        || surface.description != "twelve native bilinear NURBS L-prism patches"
+        || surface.patches.size() != 12
+        || patch_id < 0
+        || patch_id >= static_cast<int>(surface.patches.size())) {
+        return false;
+    }
+    const auto& patch = surface.patches[static_cast<std::size_t>(patch_id)];
+    if (patch.basis_u().degree() != 1 || patch.basis_v().degree() != 1
+        || patch.basis_u().num_basis_functions() != 2
+        || patch.basis_v().num_basis_functions() != 2
+        || patch.domain_start_u() != 0.0 || patch.domain_end_u() != 1.0
+        || patch.domain_start_v() != 0.0 || patch.domain_end_v() != 1.0) {
+        return false;
+    }
+    for (const auto& row : patch.weights())
+        for (const double weight : row)
+            if (weight != 1.0) return false;
+    return true;
+}
+
+bool twice_dyadic_endpoint(double parameter, long long& twice)
+{
+    if (!std::isfinite(parameter)) return false;
+    const double doubled = 2.0 * parameter;
+    const long long integer = static_cast<long long>(std::llround(doubled));
+    if (doubled != static_cast<double>(integer)) return false;
+    twice = integer;
+    return true;
+}
+
+int certified_l_prism_symmetric_partner(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud3D& cloud,
+    const SurfaceDof3D& center,
+    const geometry3d::NurbsPatchEdgeConnection3D& connection,
+    const NeumannEdgeAuxiliarySample3D& sample)
+{
+    const NurbsPatchEdgeInterval3D* interval = nullptr;
+    bool reverse_to_first = false;
+    if (center.patch_id == connection.first.patch) {
+        interval = &connection.first;
+    } else if (center.patch_id == connection.second.patch) {
+        interval = &connection.second;
+        reverse_to_first = connection.reversed;
+    } else {
+        return -1;
+    }
+    if (!native_l_prism_affine_patch(surface, center.patch_id)
+        || center.patch_id < 0
+        || center.patch_id >= static_cast<int>(cloud.patches.size())
+        || sample.sample_count <= 0) {
+        return -1;
+    }
+
+    const auto& tensor = cloud.patches[static_cast<std::size_t>(center.patch_id)];
+    int lattice_index = -1;
+    int lattice_count = 0;
+    if (interval->edge == PatchEdge3D::UMin
+        || interval->edge == PatchEdge3D::UMax) {
+        lattice_index = center.j;
+        lattice_count = tensor.nv;
+    } else {
+        lattice_index = center.i;
+        lattice_count = tensor.nu;
+    }
+    if (lattice_count <= 0 || lattice_index < 0 || lattice_index >= lattice_count)
+        return -1;
+
+    long long twice_begin = 0;
+    long long twice_end = 0;
+    if (!twice_dyadic_endpoint(interval->begin, twice_begin)
+        || !twice_dyadic_endpoint(interval->end, twice_end)
+        || twice_begin == twice_end) {
+        return -1;
+    }
+    long long numerator = 2LL * lattice_index + 1LL
+        - twice_begin * lattice_count;
+    long long denominator = static_cast<long long>(lattice_count)
+        * (twice_end - twice_begin);
+    if (denominator < 0) {
+        numerator = -numerator;
+        denominator = -denominator;
+    }
+    if (reverse_to_first)
+        numerator = denominator - numerator;
+
+    // Edge samples have s_q=(2q+1)/(2M). Two samples q and q'
+    // are symmetric about the exact center parameter c=num/den iff
+    // (q+q'+1)*den=2*num*M.
+    const long long scaled_center = 2LL * numerator * sample.sample_count;
+    if (denominator == 0 || scaled_center % denominator != 0)
+        return -1;
+    const long long partner = scaled_center / denominator
+        - sample.sample_index - 1LL;
+    if (partner < 0 || partner >= sample.sample_count
+        || partner == sample.sample_index) {
+        return -1;
+    }
+    return static_cast<int>(partner);
+}
+
 std::vector<int> attached_edge_samples(
     const NativeNurbsSurface3D& surface,
     const SurfaceDofCloud3D& cloud,
@@ -575,7 +729,7 @@ std::vector<int> attached_edge_samples(
         if (first == second)
             continue;
 
-        std::vector<std::tuple<double, int, int>> nearest;
+        std::vector<detail::NeumannEdgeDistanceCandidate3D> nearest;
         nearest.reserve(item.second.size());
         for (const int sample_index : item.second) {
             if (sample_index < 0
@@ -589,37 +743,23 @@ std::vector<int> attached_edge_samples(
                 throw std::runtime_error(
                     "Neumann augmented Cauchy edge sample group is inconsistent");
             }
-            nearest.emplace_back(
-                (sample.point - center_dof.point).squaredNorm(),
-                sample.sample_index,
-                sample_index);
-        }
-        // Canonicalize only roundoff-scale mathematical distance ties so a
-        // rigid transform cannot change which endpoint-symmetric sample wins.
-        const double distance_tolerance_scale = 64.0
-            * std::numeric_limits<double>::epsilon();
-        std::sort(nearest.begin(), nearest.end());
-        for (std::size_t begin = 0; begin < nearest.size();) {
-            const double anchor_distance = std::get<0>(nearest[begin]);
-            std::size_t end = begin + 1;
-            while (end < nearest.size()) {
-                const double candidate_distance = std::get<0>(nearest[end]);
-                const double tolerance = distance_tolerance_scale
-                    * std::max({h * h, anchor_distance, candidate_distance});
-                if (candidate_distance - anchor_distance > tolerance)
-                    break;
-                ++end;
-            }
-            std::sort(nearest.begin() + static_cast<std::ptrdiff_t>(begin),
-                      nearest.begin() + static_cast<std::ptrdiff_t>(end),
-                      [](const auto& a, const auto& b) {
-                          return std::get<1>(a) < std::get<1>(b);
-                      });
-            begin = end;
+            detail::NeumannEdgeDistanceCandidate3D candidate;
+            candidate.squared_distance =
+                (sample.point - center_dof.point).squaredNorm();
+            candidate.sample_index = sample.sample_index;
+            candidate.edge_sample_index = sample_index;
+            candidate.certified_symmetric_partner =
+                certified_l_prism_symmetric_partner(
+                    surface, cloud, center_dof, connection, sample);
+            nearest.push_back(candidate);
         }
         if (nearest.empty())
             continue;
-        if (std::get<0>(nearest.front()) > radius_squared)
+        const auto exact_minimum = std::min_element(
+            nearest.begin(), nearest.end(), [](const auto& a, const auto& b) {
+                return a.squared_distance < b.squared_distance;
+            });
+        if (exact_minimum->squared_distance > radius_squared)
             continue;
         if (nearest.size() < static_cast<std::size_t>(samples_per_connection)) {
             throw std::runtime_error(
@@ -627,10 +767,9 @@ std::vector<int> attached_edge_samples(
                 + std::to_string(connection_index)
                 + " has fewer than four edge samples");
         }
-        std::vector<int> selected;
-        selected.reserve(static_cast<std::size_t>(samples_per_connection));
-        for (int k = 0; k < samples_per_connection; ++k)
-            selected.push_back(std::get<2>(nearest[static_cast<std::size_t>(k)]));
+        std::vector<int> selected =
+            detail::select_neumann_edge_distance_candidates_3d(
+                std::move(nearest), radius_squared, samples_per_connection);
         std::sort(selected.begin(), selected.end(), [&](int a, int b) {
             const auto& first_sample = edge_map.samples[static_cast<std::size_t>(a)];
             const auto& second_sample = edge_map.samples[static_cast<std::size_t>(b)];
