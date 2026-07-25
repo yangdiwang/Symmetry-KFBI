@@ -174,13 +174,13 @@ void validate_surface_topology(const NativeNurbsSurface3D& surface)
                 + std::to_string(connection.second.patch)
                 + " are not mutual topological neighbors");
         }
+        const auto& first_slot = surface.smooth_neighbors[
+            static_cast<std::size_t>(connection.first.patch)]
+            [static_cast<std::size_t>(connection.first.edge)];
+        const auto& second_slot = surface.smooth_neighbors[
+            static_cast<std::size_t>(connection.second.patch)]
+            [static_cast<std::size_t>(connection.second.edge)];
         if (connection.g1) {
-            const auto& first_slot = surface.smooth_neighbors[
-                static_cast<std::size_t>(connection.first.patch)]
-                [static_cast<std::size_t>(connection.first.edge)];
-            const auto& second_slot = surface.smooth_neighbors[
-                static_cast<std::size_t>(connection.second.patch)]
-                [static_cast<std::size_t>(connection.second.edge)];
             if (!first_slot || !second_slot
                 || first_slot->patch != connection.second.patch
                 || first_slot->edge != connection.second.edge
@@ -193,6 +193,11 @@ void validate_surface_topology(const NativeNurbsSurface3D& surface)
                     + std::to_string(connection_index)
                     + " does not match reciprocal smooth topology");
             }
+        } else if (first_slot || second_slot) {
+            throw std::invalid_argument(
+                "Neumann auxiliary non-G1 edge connection "
+                + std::to_string(connection_index)
+                + " must be absent from smooth topology");
         }
     }
 }

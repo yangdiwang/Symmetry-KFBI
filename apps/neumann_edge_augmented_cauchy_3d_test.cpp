@@ -277,7 +277,7 @@ SurfaceDofCloud3D restricted_cloud(const SurfaceDofCloud3D& dense)
     for(int patch=0;patch<static_cast<int>(dense.patches.size());++patch) {
         SurfaceDofPatch3D tensor=dense.patches[static_cast<std::size_t>(patch)];
         tensor.first_dof=static_cast<int>(result.dofs.size());
-        const int wanted=patch<6?7:24; tensor.nu=wanted; tensor.nv=1;
+        const int wanted=patch<6?8:24; tensor.nu=wanted; tensor.nv=1;
         int copied=0;
         for(const auto& dof:dense.dofs) if(dof.patch_id==patch && copied<wanted) {
             auto copy=dof; copy.i=copied; copy.j=0;
@@ -319,6 +319,26 @@ void record_required_rejection(std::vector<std::string>& failures,
     }
 }
 
+void remove_reciprocal_g1_relation(NativeNurbsSurface3D& surface,
+                                   int first_patch,
+                                   int second_patch)
+{
+    int removed=0;
+    for(auto& slot:surface.smooth_neighbors[static_cast<std::size_t>(first_patch)]) {
+        if(slot && slot->patch==second_patch) { slot.reset(); ++removed; break; }
+    }
+    for(auto& slot:surface.smooth_neighbors[static_cast<std::size_t>(second_patch)]) {
+        if(slot && slot->patch==first_patch) { slot.reset(); ++removed; break; }
+    }
+    require(removed==2,"reciprocal G1 relation fixture missing");
+    auto erase_neighbor=[](std::vector<int>& neighbors,int patch) {
+        neighbors.erase(std::remove(neighbors.begin(),neighbors.end(),patch),neighbors.end());
+    };
+    erase_neighbor(surface.topological_patch_neighbors[static_cast<std::size_t>(first_patch)],
+                   second_patch);
+    erase_neighbor(surface.topological_patch_neighbors[static_cast<std::size_t>(second_patch)],
+                   first_patch);
+}
 void test_review_rejection_paths()
 {
     const auto surface=make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
@@ -362,6 +382,18 @@ void test_review_rejection_paths()
         (void)build_neumann_edge_auxiliary_value_map_3d(unrelated_connection,cloud,h);
     },"connection 4");
 
+    auto non_g1_marked_smooth=surface;
+    const auto& non_g1=non_g1_marked_smooth.geometric_connections[connection_index];
+    non_g1_marked_smooth.smooth_neighbors[static_cast<std::size_t>(non_g1.first.patch)]
+        [static_cast<std::size_t>(non_g1.first.edge)] =
+        SmoothPatchNeighbor3D{non_g1.second.patch,non_g1.second.edge,non_g1.reversed};
+    non_g1_marked_smooth.smooth_neighbors[static_cast<std::size_t>(non_g1.second.patch)]
+        [static_cast<std::size_t>(non_g1.second.edge)] =
+        SmoothPatchNeighbor3D{non_g1.first.patch,non_g1.first.edge,non_g1.reversed};
+    record_required_rejection<std::invalid_argument>(failures,"non-G1 connection marked smooth",[&]{
+        (void)build_neumann_edge_auxiliary_value_map_3d(non_g1_marked_smooth,cloud,h);
+    },"connection 4");
+
     const RigidTransform3D translation(Eigen::Matrix3d::Identity(),Eigen::Vector3d::Zero(),
                                        Eigen::Vector3d(0.19,-0.13,0.07));
     const auto translated_surface=transform_native_nurbs_surface_3d(surface,translation);
@@ -369,6 +401,24 @@ void test_review_rejection_paths()
     record_required_rejection<std::invalid_argument>(failures,"foreign translated cloud",[&]{
         (void)build_neumann_edge_auxiliary_value_map_3d(surface,translated_cloud,h);
     },"DOF 0 patch 0");
+
+    auto wrong_tensor_index=cloud;
+    wrong_tensor_index.dofs[0].i=1;
+    record_required_rejection<std::invalid_argument>(failures,"wrong tensor index",[&]{
+        (void)build_neumann_edge_auxiliary_value_map_3d(surface,wrong_tensor_index,h);
+    },"DOF 0 patch 0");
+
+    auto wrong_tensor_name=cloud;
+    wrong_tensor_name.patches[0].name="wrong_patch_name";
+    record_required_rejection<std::invalid_argument>(failures,"wrong tensor name",[&]{
+        (void)build_neumann_edge_auxiliary_value_map_3d(surface,wrong_tensor_name,h);
+    },"patch 0");
+
+    auto wrong_normal=cloud;
+    wrong_normal.dofs[0].normal=-wrong_normal.dofs[0].normal;
+    record_required_rejection<std::invalid_argument>(failures,"wrong physical normal",[&]{
+        (void)build_neumann_edge_auxiliary_value_map_3d(surface,wrong_normal,h);
+    },"wrong physical normal");
 
     auto restricted_surface=surface;
     std::size_t chosen=0;
@@ -378,6 +428,7 @@ void test_review_rejection_paths()
     }
     require(chosen<restricted_surface.geometric_connections.size(),"side-label fixture connection missing");
     restricted_surface.geometric_connections={restricted_surface.geometric_connections[chosen]};
+    remove_reciprocal_g1_relation(restricted_surface,0,1);
     const auto small=restricted_cloud(make_native_surface_dofs_3d(surface,0.08));
     record_required_rejection<std::runtime_error>(failures,"insufficient side label",[&]{
         (void)build_neumann_edge_auxiliary_value_map_3d(restricted_surface,small,h);
@@ -416,6 +467,7 @@ void test_rejections_and_shared_values()
     require(chosen<restricted_surface.geometric_connections.size(),"restricted connection missing");
     const auto connection=restricted_surface.geometric_connections[chosen];
     restricted_surface.geometric_connections={connection};
+    remove_reciprocal_g1_relation(restricted_surface,0,1);
     const auto small=restricted_cloud(make_native_surface_dofs_3d(surface,0.08));
     require_throws<std::runtime_error>([&]{(void)build_neumann_edge_auxiliary_value_map_3d(restricted_surface,small,h);},"second-value side");
     const auto degenerate=degenerate_normal_surface(); const auto degenerate_cloud=make_native_surface_dofs_3d(degenerate,0.1);
