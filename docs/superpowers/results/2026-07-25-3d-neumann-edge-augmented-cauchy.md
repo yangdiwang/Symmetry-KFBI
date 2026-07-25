@@ -20,7 +20,8 @@ interior Linf.
 ## Provenance and execution
 
 - Branch: `codex/neumann-rigid-transform-study`
-- Implementation commit: `7fc83d917a50541d1f5061cc0337915f4e6f538d`
+- Authoritative code commit:
+  `e771f6799a969ae54e6cd1670f2cb0b36431297b`
 - Configuration: Visual Studio x64 `Release`
 - Build command: `cmake --build build --config Release -- /m:1`
 - Pilot command:
@@ -32,29 +33,19 @@ interior Linf.
     --neumann-edge-cauchy-study 32 64 128
   ```
 
-- Clean pilot result: application coarse-gate exit `1`; observed
-  end-to-end launcher wall time `124.2 s`. The retry launched at
-  `2026-07-25T23:10:02.7652259+08:00`; the final checkpoint was written
-  at `2026-07-25T23:12:06.6106317+08:00`.
+- Authoritative pilot result: `PILOT_EXIT=1` and
+  `PILOT_WALL_SECONDS=124.706403`. The exact gated Release invocation
+  completed naturally.
+- Console log:
+  `output/neumann_edge_cauchy_3d/final_pilot_console.log`
+- The final checkpoints contain all 12 requested `N=32,64` rows.
 - `N=128` did not run because the complete `N=32,64` acceptance result
   was `fail`.
 
-There was one invalid orchestration attempt before the clean run. A
-60-second shell timeout returned `124` while the healthy application was
-setting up `ty_m0083, N=64`, leaving eight incremental summary rows. The
-solver process was confirmed gone. The exact six generated CSVs and
-their timestamps were inspected, only those incomplete ignored outputs
-were removed, and the identical command was rerun from a clean output
-state. Exit `124` is not used as numerical evidence. On the clean retry,
-the detached wrapper was reaped immediately after the application wrote
-its final checkpoint and before it could persist its separate Stopwatch
-metadata; the reported application exit is the evaluator's coarse-fail
-exit path, corroborated by the complete 12-row checkpoint and
-`overall_pass=fail`.
-
-Before both the invalid attempt and the clean retry, a fresh full Release
-build and all eleven prescribed executables exited zero. The same full
-verification was repeated after writing this report.
+This naturally completed latest-code run supersedes every earlier pilot
+attempt. No earlier timeout, wrapper status, checkpoint, or timing is
+used anywhere in the evidence below. The documentation update did not
+rerun the pilot or tests.
 
 ## Fixed study configuration
 
@@ -85,9 +76,9 @@ It found no audit failures.
 
 | CSV | Rows | Independent checks |
 |---|---:|---|
-| `summary.csv` | 12 | 12 unique coarse keys; three cases and two modes per level; finite raw metrics; all orders and ratios recomputed |
+| `summary.csv` | 12 | 12 unique coarse keys; three cases and two modes per level; finite raw metrics; every `residual_history_valid` flag true; all errors, orders, and ratios recomputed |
 | `edge_values.csv` | 3432 | every connection group complete with literal `0..sample_count-1`; value differences recomputed; group Linf matches summary |
-| `gmres_residuals.csv` | 367 | every history finite and contiguous from zero through the reported terminal iteration; terminal residual matches summary |
+| `gmres_residuals.csv` | 367 | every summary history-valid flag true; every history finite, contiguous, and exactly `iterations + 1` rows; initial residual is one and terminal residual matches summary |
 | `owner_diagnostics.csv` | 12 | keys match summary; stable/before/after/final fingerprints, digests, wrong-side queries, geometry queries, and factorization counts unchanged |
 | `phase_profile.csv` | 324 | 18 phases per scope; phase sums match setup/runtime walls; legacy edge calls are zero; augmented edge calls are positive |
 | `acceptance.csv` | 1 | every recorded status matches the independent recomputation |
@@ -103,18 +94,18 @@ time is shared setup plus the individual mode runtime.
 
 | Case | N | Mode | Density Linf | Order | Interior Linf | Order | Edge discrepancy | GMRES iters | Residual | Total s |
 |---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| baseline | 32 | none | 1.7497e-5 | — | 1.3972e-5 | — | 3.626e-6 | 33 | 1.976e-10 | 9.960 |
-| baseline | 32 | augmented | 7.8786e-6 | — | 6.9076e-6 | — | 1.129e-6 | 26 | 1.229e-10 | 9.942 |
-| ty_m0083 | 32 | none | 2.3581e-5 | — | 1.8231e-5 | — | 4.110e-6 | 37 | 1.599e-10 | 9.486 |
-| ty_m0083 | 32 | augmented | 8.8742e-6 | — | 7.6540e-6 | — | 1.110e-6 | 27 | 1.249e-10 | 9.419 |
-| rot_axis123_17deg | 32 | none | 6.3481e-6 | — | 4.2590e-6 | — | 5.758e-6 | 42 | 1.353e-10 | 18.571 |
-| rot_axis123_17deg | 32 | augmented | 2.7241e-6 | — | 2.4491e-6 | — | 1.157e-6 | 27 | 1.394e-10 | 18.424 |
-| baseline | 64 | none | 4.1457e-7 | 5.399 | 5.1426e-7 | 4.764 | 1.880e-7 | 25 | 9.414e-11 | 17.102 |
-| baseline | 64 | augmented | 4.4683e-7 | 4.140 | 5.4698e-7 | 3.659 | 8.697e-8 | 23 | 1.561e-10 | 17.173 |
-| ty_m0083 | 64 | none | 5.8297e-7 | 5.338 | 6.7208e-7 | 4.762 | 2.445e-7 | 27 | 1.450e-10 | 18.510 |
-| ty_m0083 | 64 | augmented | 5.5977e-7 | 3.987 | 6.4876e-7 | 3.560 | 9.237e-8 | 24 | 8.461e-11 | 18.232 |
-| rot_axis123_17deg | 64 | none | 6.4877e-7 | 3.291 | 6.0981e-7 | 2.804 | 6.247e-7 | 38 | 1.280e-10 | 41.219 |
-| rot_axis123_17deg | 64 | augmented | 3.1795e-7 | 3.099 | 3.2156e-7 | 2.929 | 8.192e-8 | 26 | 1.993e-10 | 40.493 |
+| baseline | 32 | none | 1.7497e-5 | — | 1.3972e-5 | — | 3.626e-6 | 33 | 1.976e-10 | 9.721 |
+| baseline | 32 | augmented | 7.8786e-6 | — | 6.9076e-6 | — | 1.129e-6 | 26 | 1.229e-10 | 9.755 |
+| ty_m0083 | 32 | none | 2.3581e-5 | — | 1.8231e-5 | — | 4.110e-6 | 37 | 1.599e-10 | 10.033 |
+| ty_m0083 | 32 | augmented | 8.8742e-6 | — | 7.6540e-6 | — | 1.110e-6 | 27 | 1.249e-10 | 9.937 |
+| rot_axis123_17deg | 32 | none | 6.3481e-6 | — | 4.2590e-6 | — | 5.758e-6 | 42 | 1.353e-10 | 18.827 |
+| rot_axis123_17deg | 32 | augmented | 2.7241e-6 | — | 2.4491e-6 | — | 1.157e-6 | 27 | 1.394e-10 | 18.679 |
+| baseline | 64 | none | 4.1457e-7 | 5.399 | 5.1426e-7 | 4.764 | 1.880e-7 | 25 | 9.414e-11 | 17.621 |
+| baseline | 64 | augmented | 4.4683e-7 | 4.140 | 5.4698e-7 | 3.659 | 8.697e-8 | 23 | 1.561e-10 | 17.581 |
+| ty_m0083 | 64 | none | 5.8297e-7 | 5.338 | 6.7208e-7 | 4.762 | 2.445e-7 | 27 | 1.450e-10 | 18.974 |
+| ty_m0083 | 64 | augmented | 5.5977e-7 | 3.987 | 6.4876e-7 | 3.560 | 9.237e-8 | 24 | 8.461e-11 | 18.825 |
+| rot_axis123_17deg | 64 | none | 6.4877e-7 | 3.291 | 6.0981e-7 | 2.804 | 6.247e-7 | 38 | 1.280e-10 | 40.391 |
+| rot_axis123_17deg | 64 | augmented | 3.1795e-7 | 3.099 | 3.2156e-7 | 2.929 | 8.192e-8 | 26 | 1.993e-10 | 39.850 |
 
 ## L2 errors and orders
 
@@ -188,33 +179,33 @@ Shared setup phases, in seconds:
 
 | Case | N | Geometry | Surface/stencils | Grid/labels | Pipeline init | Crossings | Owner preprocess | Trace templates | Other setup | Total |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| baseline | 32 | 0.0409 | 0.0146 | 0.0609 | 1.2803 | 0.0050 | 8.0060 | 0.1363 | 0.0001 | 9.5442 |
-| baseline | 64 | 0.1712 | 0.2215 | 0.3376 | 3.2460 | 0.0191 | 10.6778 | 0.4201 | 0.0003 | 15.0937 |
-| ty_m0083 | 32 | 0.0421 | 0.0152 | 0.0821 | 1.2382 | 0.0047 | 7.3976 | 0.1208 | 0.0001 | 8.9008 |
-| ty_m0083 | 64 | 0.1679 | 0.2259 | 0.3624 | 3.3066 | 0.0201 | 11.6362 | 0.4405 | 0.0003 | 16.1600 |
-| rot_axis123_17deg | 32 | 1.0674 | 0.0148 | 0.0785 | 1.2462 | 0.0091 | 15.4069 | 0.1412 | 0.0001 | 17.9642 |
-| rot_axis123_17deg | 64 | 4.3959 | 0.2101 | 0.6135 | 3.2190 | 0.0301 | 28.6932 | 0.4756 | 0.0005 | 37.6379 |
+| baseline | 32 | 0.0408 | 0.0146 | 0.0583 | 1.3049 | 0.0049 | 7.7579 | 0.1312 | 0.0001 | 9.3127 |
+| baseline | 64 | 0.1742 | 0.2182 | 0.3649 | 3.2328 | 0.0193 | 10.6727 | 0.4144 | 0.0003 | 15.0968 |
+| ty_m0083 | 32 | 0.0520 | 0.0167 | 0.0561 | 1.2360 | 0.0049 | 7.8831 | 0.1326 | 0.0001 | 9.3816 |
+| ty_m0083 | 64 | 0.1700 | 0.2133 | 0.3799 | 3.2122 | 0.0261 | 12.1574 | 0.4184 | 0.0003 | 16.5776 |
+| rot_axis123_17deg | 32 | 1.1893 | 0.0147 | 0.0740 | 1.2494 | 0.0059 | 15.4626 | 0.1331 | 0.0001 | 18.1290 |
+| rot_axis123_17deg | 64 | 4.7019 | 0.2415 | 0.6743 | 3.1031 | 0.0281 | 28.3673 | 0.4271 | 0.0003 | 37.5436 |
 
 Mode runtime phases, in seconds:
 
 | Case | N | Mode | Edge values | Cauchy | Spread | FFT | Restrict continued | Recovery | GMRES/other | Runtime |
 |---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| baseline | 32 | none | 0 | 0.044917 | 0.002069 | 0.284114 | 0.082019 | 0.000193 | 0.002757 | 0.416069 |
-| baseline | 32 | augmented | 0.000759 | 0.095488 | 0.001620 | 0.229577 | 0.068006 | 0.000157 | 0.002098 | 0.397704 |
-| ty_m0083 | 32 | none | 0 | 0.049913 | 0.002233 | 0.437351 | 0.092166 | 0.000236 | 0.003332 | 0.585230 |
-| ty_m0083 | 32 | augmented | 0.000807 | 0.102474 | 0.001786 | 0.338287 | 0.072097 | 0.000190 | 0.002706 | 0.518347 |
-| rot_axis123_17deg | 32 | none | 0 | 0.061868 | 0.003567 | 0.413175 | 0.124376 | 0.000300 | 0.003852 | 0.607136 |
-| rot_axis123_17deg | 32 | augmented | 0.000836 | 0.129002 | 0.002366 | 0.246692 | 0.078399 | 0.000175 | 0.002254 | 0.459724 |
-| baseline | 64 | none | 0 | 0.133055 | 0.007543 | 1.647383 | 0.192286 | 0.000570 | 0.027395 | 2.008233 |
-| baseline | 64 | augmented | 0.001700 | 0.253301 | 0.007216 | 1.612253 | 0.179360 | 0.000518 | 0.025344 | 2.079691 |
-| ty_m0083 | 64 | none | 0 | 0.151844 | 0.008730 | 1.938449 | 0.217615 | 0.000678 | 0.033167 | 2.350483 |
-| ty_m0083 | 64 | augmented | 0.001705 | 0.252124 | 0.007075 | 1.595894 | 0.188793 | 0.000528 | 0.026290 | 2.072408 |
-| rot_axis123_17deg | 64 | none | 0 | 0.189296 | 0.012390 | 3.033833 | 0.307042 | 0.000808 | 0.038241 | 3.581609 |
-| rot_axis123_17deg | 64 | augmented | 0.001895 | 0.288477 | 0.009796 | 2.285715 | 0.233181 | 0.000616 | 0.035767 | 2.855447 |
+| baseline | 32 | none | 0.000000 | 0.046669 | 0.002051 | 0.272498 | 0.083564 | 0.000195 | 0.002978 | 0.407954 |
+| baseline | 32 | augmented | 0.000944 | 0.107040 | 0.001971 | 0.254124 | 0.076076 | 0.000192 | 0.002348 | 0.442695 |
+| ty_m0083 | 32 | none | 0.000000 | 0.055923 | 0.002583 | 0.490080 | 0.098678 | 0.000258 | 0.003463 | 0.650986 |
+| ty_m0083 | 32 | augmented | 0.000915 | 0.104510 | 0.001923 | 0.366888 | 0.078778 | 0.000208 | 0.002432 | 0.555653 |
+| rot_axis123_17deg | 32 | none | 0.000000 | 0.058931 | 0.003220 | 0.512769 | 0.118543 | 0.000292 | 0.003739 | 0.697494 |
+| rot_axis123_17deg | 32 | augmented | 0.000901 | 0.103643 | 0.002195 | 0.358151 | 0.082657 | 0.000185 | 0.002423 | 0.550155 |
+| baseline | 64 | none | 0.000000 | 0.136964 | 0.007440 | 2.158092 | 0.193910 | 0.000587 | 0.026832 | 2.523825 |
+| baseline | 64 | augmented | 0.001815 | 0.249500 | 0.006781 | 2.018223 | 0.176627 | 0.000520 | 0.030680 | 2.484148 |
+| ty_m0083 | 64 | none | 0.000000 | 0.162150 | 0.009358 | 1.956664 | 0.235631 | 0.000769 | 0.032096 | 2.396669 |
+| ty_m0083 | 64 | augmented | 0.001887 | 0.285469 | 0.008959 | 1.721346 | 0.201194 | 0.000599 | 0.027776 | 2.247229 |
+| rot_axis123_17deg | 64 | none | 0.000000 | 0.187294 | 0.012114 | 2.302183 | 0.306285 | 0.000782 | 0.038221 | 2.846880 |
+| rot_axis123_17deg | 64 | augmented | 0.001882 | 0.294630 | 0.009549 | 1.745390 | 0.223641 | 0.000559 | 0.030458 | 2.306108 |
 
 Legacy edge-value calls are exactly zero. Augmented calls are positive:
 32, 33, and 33 at `N=32`, and 29, 30, and 32 at `N=64`. The measured
-edge-value overhead is `0.000759--0.001895 s`. Every setup and runtime
+edge-value overhead is `0.000901--0.001887 s`. Every setup and runtime
 phase sum agrees with its corresponding wall interval within the
 required tolerance, and total time equals shared setup plus mode runtime.
 
