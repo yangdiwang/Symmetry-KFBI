@@ -34,6 +34,29 @@ exterior_value_restrict_correction_mode_3d(
     throw std::invalid_argument("unknown exterior value restrict mode");
 }
 
+double apply_exterior_value_trace_correction_3d(
+    int center_dof,
+    const Eigen::MatrixXd& coefficients,
+    const Eigen::VectorXd& center_evaluation,
+    const std::vector<HarmonicTraceOwnerTerm3D>& owner_terms)
+{
+    return apply_exterior_value_trace_correction_3d(
+        center_dof, coefficients, center_evaluation, owner_terms,
+        ExteriorValueRestrictMode3D::JointTricubicCauchy);
+}
+
+double apply_exterior_value_trace_correction_3d(
+    int center_dof,
+    const Eigen::MatrixXd& coefficients,
+    const Eigen::VectorXd& center_evaluation,
+    const std::vector<HarmonicTraceOwnerTerm3D>& owner_terms,
+    ExteriorValueRestrictMode3D mode)
+{
+    return apply_harmonic_trace_correction_3d(
+        center_dof, coefficients, center_evaluation, owner_terms,
+        exterior_value_restrict_correction_mode_3d(mode));
+}
+
 double apply_harmonic_trace_correction_3d(
     int center_dof,
     const Eigen::MatrixXd& coefficients,

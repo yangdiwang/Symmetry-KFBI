@@ -13,6 +13,7 @@ using kfbim::app3d::apply_harmonic_trace_correction_3d;
 using kfbim::app3d::ExteriorValueRestrictMode3D;
 using kfbim::app3d::exterior_value_restrict_correction_mode_3d;
 
+using kfbim::app3d::apply_exterior_value_trace_correction_3d;
 void require(bool value, const std::string& message)
 {
     if (!value)
@@ -111,6 +112,30 @@ void test_rejects_invalid_owner_indices()
         "out-of-range owner index rejected");
 }
 
+void test_value_trace_dispatch_preserves_legacy_and_selects_crossing_owner()
+{
+    const Eigen::MatrixXd coefficients = literal_coefficients();
+    const Eigen::VectorXd center_evaluation =
+        (Eigen::Vector2d() << 1.0, 3.0).finished();
+    const std::vector<HarmonicTraceOwnerTerm3D> owner_terms{
+        {1, (Eigen::Vector2d() << 3.0, 1.0).finished()},
+        {2, (Eigen::Vector2d() << 0.0, 2.0).finished()}};
+
+    const double legacy = apply_exterior_value_trace_correction_3d(
+        0, coefficients, center_evaluation, owner_terms);
+    const double explicit_cauchy = apply_exterior_value_trace_correction_3d(
+        0, coefficients, center_evaluation, owner_terms,
+        ExteriorValueRestrictMode3D::JointTricubicCauchy);
+    const double crossing_owner = apply_exterior_value_trace_correction_3d(
+        0, coefficients, center_evaluation, owner_terms,
+        ExteriorValueRestrictMode3D::JointTricubicCrossingOwner);
+
+    require(std::abs(legacy - explicit_cauchy) < 1.0e-14,
+            "legacy value trace dispatch equals explicit Cauchy dispatch");
+    require(std::abs(crossing_owner - explicit_cauchy) > 1.0e-14,
+            "crossing-owner value trace dispatch selects owner corrections");
+}
+
 void test_rejects_incompatible_evaluation_dimensions()
 {
     const Eigen::MatrixXd coefficients = literal_coefficients();
@@ -140,6 +165,7 @@ void test_rejects_incompatible_evaluation_dimensions()
 int main()
 {
     try {
+        test_value_trace_dispatch_preserves_legacy_and_selects_crossing_owner();
         test_selects_center_or_precomputed_crossing_owner_rows();
         test_maps_value_restrict_modes_to_owner_correction_modes();
         test_rejects_invalid_owner_indices();

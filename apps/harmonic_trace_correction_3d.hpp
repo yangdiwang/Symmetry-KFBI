@@ -25,6 +25,19 @@ struct HarmonicTraceOwnerTerm3D {
     Eigen::VectorXd evaluation;
 };
 
+[[nodiscard]] double apply_exterior_value_trace_correction_3d(
+    int center_dof,
+    const Eigen::MatrixXd& coefficients,
+    const Eigen::VectorXd& center_evaluation,
+    const std::vector<HarmonicTraceOwnerTerm3D>& owner_terms);
+
+[[nodiscard]] double apply_exterior_value_trace_correction_3d(
+    int center_dof,
+    const Eigen::MatrixXd& coefficients,
+    const Eigen::VectorXd& center_evaluation,
+    const std::vector<HarmonicTraceOwnerTerm3D>& owner_terms,
+    ExteriorValueRestrictMode3D mode);
+
 [[nodiscard]] double apply_harmonic_trace_correction_3d(
     int center_dof,
     const Eigen::MatrixXd& coefficients,

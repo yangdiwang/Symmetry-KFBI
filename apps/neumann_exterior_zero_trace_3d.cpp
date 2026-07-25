@@ -1071,8 +1071,7 @@ public:
         app3d::ExteriorValueRestrictMode3D mode) const
     {
         return recover_trace(
-            continued_samples(field, value_jump, normal_jump, false,
-                              app3d::exterior_value_restrict_correction_mode_3d(mode)),
+            continued_samples(field, value_jump, normal_jump, false, mode),
             c0_weights_, 1.0);
     }
 
@@ -1092,8 +1091,7 @@ public:
         app3d::ExteriorValueRestrictMode3D mode) const
     {
         return recover_trace(
-            continued_samples(field, value_jump, normal_jump, true,
-                              app3d::exterior_value_restrict_correction_mode_3d(mode)),
+            continued_samples(field, value_jump, normal_jump, true, mode),
             c0_weights_, 1.0);
     }
 
@@ -1121,12 +1119,12 @@ public:
             }
             return exterior_only_restrict_->apply(field.potential);
         }
-        const app3d::HarmonicTraceCorrectionMode3D correction_mode =
+        const app3d::ExteriorValueRestrictMode3D value_mode =
             mode == ExteriorNormalRestrictMode3D::JointTricubicCrossingOwner
-            ? app3d::HarmonicTraceCorrectionMode3D::CrossingOwned
-            : app3d::HarmonicTraceCorrectionMode3D::CenterOwned;
+            ? app3d::ExteriorValueRestrictMode3D::JointTricubicCrossingOwner
+            : app3d::ExteriorValueRestrictMode3D::JointTricubicCauchy;
         return recover_trace(continued_samples(field, value_jump, normal_jump, false,
-                                                correction_mode), c1_weights_, 1.0 / h_);
+                                                value_mode), c1_weights_, 1.0 / h_);
     }
 
     Eigen::VectorXd interior_normal_trace(
@@ -1144,11 +1142,11 @@ private:
                                       const Eigen::VectorXd& value_jump,
                                       const Eigen::VectorXd& normal_jump,
                                        bool interior_continuation,
-                                       app3d::HarmonicTraceCorrectionMode3D correction_mode =
-                                           app3d::HarmonicTraceCorrectionMode3D::CenterOwned) const
+                                       app3d::ExteriorValueRestrictMode3D mode =
+                                           app3d::ExteriorValueRestrictMode3D::JointTricubicCauchy) const
     {
-        const bool use_crossing_owner = correction_mode
-            == app3d::HarmonicTraceCorrectionMode3D::CrossingOwned;
+        const bool use_crossing_owner = mode
+            == app3d::ExteriorValueRestrictMode3D::JointTricubicCrossingOwner;
         if (use_crossing_owner && !crossing_owner_templates_built_) {
             throw std::runtime_error(
                 "crossing-owner normal restrict was not initialized");
@@ -1174,11 +1172,11 @@ private:
                                * field.potential[
                                    sample.grid_ids[static_cast<std::size_t>(q)]];
                     }
-                    value += app3d::apply_harmonic_trace_correction_3d(
+                    value += app3d::apply_exterior_value_trace_correction_3d(
                         center, field.coefficients,
                         sample.legacy_correction_evaluation,
                         sample.owner_corrections,
-                        correction_mode);
+                        mode);
                     samples(center, 4 * side + layer) = value;
                 }
             }
@@ -1632,8 +1630,8 @@ public:
     }
 
 private:
-    app3d::ExteriorValueRestrictMode3D mode_;
     const PanelCenterHarmonicJetKFBI3D& pipeline_;
+    app3d::ExteriorValueRestrictMode3D mode_;
 };
 
 struct ExteriorZeroTraceSolution3D {
