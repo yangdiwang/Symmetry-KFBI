@@ -345,6 +345,12 @@ bool augmented_order_ok(const RowMap& rows,
 
 } // namespace
 
+bool neumann_edge_cauchy_edge_value_row_finite_3d(
+    const std::array<double, 6>& values)
+{
+    return std::all_of(values.begin(), values.end(),
+        [](double value) { return std::isfinite(value); });
+}
 std::vector<int> normalize_neumann_edge_cauchy_levels_3d(
     std::vector<int> levels)
 {

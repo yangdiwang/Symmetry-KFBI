@@ -216,6 +216,9 @@ if(KFBIM_BUILD_3D)
     if(WIN32)
         target_link_libraries(neumann_exterior_zero_trace_3d PRIVATE Psapi)
     endif()
+    if(MSVC)
+        target_compile_options(neumann_exterior_zero_trace_3d PRIVATE /bigobj)
+    endif()
 endif()
 
 target_compile_definitions(shape_opt_transmission_2d PRIVATE

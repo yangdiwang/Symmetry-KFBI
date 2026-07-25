@@ -1,9 +1,11 @@
 #include "neumann_edge_cauchy_study_3d.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -108,6 +110,22 @@ const NeumannEdgeCauchyDerivedRow3D& find_row(
     return *found;
 }
 
+void test_edge_value_row_finiteness()
+{
+    const std::array<double, 6> clean{{1.0, 2.0, 3.0, 1.0, 2.0, 1.0}};
+    require(neumann_edge_cauchy_edge_value_row_finite_3d(clean),
+            "finite edge-value row was rejected");
+    for (std::size_t q = 0; q < clean.size(); ++q) {
+        auto changed = clean;
+        changed[q] = std::numeric_limits<double>::quiet_NaN();
+        require(!neumann_edge_cauchy_edge_value_row_finite_3d(changed),
+                "NaN edge-value component was accepted");
+        changed[q] = std::numeric_limits<double>::infinity();
+        require(!neumann_edge_cauchy_edge_value_row_finite_3d(changed),
+                "infinite edge-value component was accepted");
+    }
+}
+
 void test_level_prefixes()
 {
     require(normalize_neumann_edge_cauchy_levels_3d({}) == std::vector<int>({32, 64}),
@@ -205,7 +223,12 @@ void test_coarse_gate_mutations()
         auto rows = passing;
         mutate(rows);
         const auto evaluation = evaluate_neumann_edge_cauchy_study_3d(rows, kCases, true);
-        require(evaluation.acceptance.*member == Status::Fail, message);
+        require(evaluation.acceptance.*member == Status::Fail
+                    && evaluation.acceptance.overall_pass == Status::Fail
+                    && !evaluation.all_pass
+                    && !neumann_edge_cauchy_study_exit_pass_3d(
+                        evaluation, true),
+                message);
     };
     gate([](auto& r) { r.front().covered_non_g1_connections = 3; },
          &NeumannEdgeCauchyAcceptance3D::structure_pass,
@@ -257,6 +280,71 @@ void test_coarse_gate_mutations()
          "shared-preprocess failure was hidden");
 }
 
+void test_exact_thresholds_and_ratio_allowance()
+{
+    auto rows = passing_measurements();
+    rows.front().gmres_iterations = 80;
+    rows.front().gmres_relative_residual = 2.0e-10;
+    rows.front().harmonic_cubic_reproduction_defect = 1.0e-11;
+    for (auto& row : rows) {
+        if (row.case_id == "baseline"
+            && row.mode
+                == NeumannEdgeCauchyMode3D::NonG1AuxiliaryValues) {
+            if (row.N == 32) row.interior_l2 = 4.4;
+            if (row.N == 64)
+                row.density_linf = 0.9 / std::pow(2.0, 1.8);
+        }
+    }
+    const auto exact = evaluate_neumann_edge_cauchy_study_3d(
+        rows, kCases, true);
+    require(exact.acceptance.reproduction_pass == Status::Pass
+                && exact.acceptance.gmres_pass == Status::Pass
+                && exact.acceptance.error_guard_pass == Status::Pass
+                && exact.acceptance.order_pass == Status::Pass
+                && exact.acceptance.overall_pass == Status::Pass,
+            "an inclusive exact threshold was rejected");
+
+    rows = passing_measurements();
+    const double allowance =
+        64.0 * std::numeric_limits<double>::epsilon();
+    for (auto& row : rows) {
+        if (row.case_id == "baseline" && row.N == 32
+            && row.mode
+                == NeumannEdgeCauchyMode3D::NonG1AuxiliaryValues) {
+            row.interior_l2 = 4.0 * 1.10 * (1.0 + 0.5 * allowance);
+            require(row.interior_l2 / 4.0 > 1.10,
+                    "roundoff-allowance fixture did not exceed 1.10");
+        }
+    }
+    const auto allowed = evaluate_neumann_edge_cauchy_study_3d(
+        rows, kCases, true);
+    require(allowed.acceptance.error_guard_pass == Status::Pass
+                && allowed.acceptance.overall_pass == Status::Pass,
+            "64-epsilon relative ratio allowance was not honored");
+}
+
+void test_failed_n128_evidence_is_isolated()
+{
+    auto rows = passing_measurements();
+    auto legacy = passing_measurement(
+        "baseline", 128, NeumannEdgeCauchyMode3D::None);
+    auto augmented = passing_measurement(
+        "baseline", 128,
+        NeumannEdgeCauchyMode3D::NonG1AuxiliaryValues);
+    legacy.finite_metrics = false;
+    augmented.finite_metrics = false;
+    rows.push_back(legacy);
+    rows.push_back(augmented);
+    const auto evaluation = evaluate_neumann_edge_cauchy_study_3d(
+        rows, kCases, true);
+    require(evaluation.acceptance.extended_evidence_pass == Status::Fail
+                && evaluation.acceptance.overall_pass == Status::Pass
+                && evaluation.all_pass
+                && neumann_edge_cauchy_study_exit_pass_3d(
+                    evaluation, true),
+            "explicit failed N=128 evidence changed coarse process success");
+}
+
 void test_n128_isolation()
 {
     auto rows = passing_measurements(true, true);
@@ -289,10 +377,13 @@ void test_n128_isolation()
 int main()
 {
     try {
+        test_edge_value_row_finiteness();
         test_level_prefixes();
         test_input_keys_and_prefix_semantics();
         test_passing_fixture_and_derived_values();
         test_coarse_gate_mutations();
+        test_exact_thresholds_and_ratio_allowance();
+        test_failed_n128_evidence_is_isolated();
         test_n128_isolation();
         std::cout << "3D Neumann edge-Cauchy study tests passed\n";
         return 0;

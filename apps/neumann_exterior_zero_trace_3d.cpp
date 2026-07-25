@@ -3157,25 +3157,49 @@ SolveMetrics3D run_neumann_case(
         edge_projector = nullptr,
     Eigen::VectorXd* solved_value_jump = nullptr,
     Eigen::MatrixXd* solved_coefficients = nullptr,
-    Eigen::VectorXd* prescribed_normal_jump_output = nullptr)
+    Eigen::VectorXd* prescribed_normal_jump_output = nullptr,
+    Eigen::VectorXd* prescribed_exact_trace_output = nullptr,
+    const Eigen::VectorXd* shared_exact_trace_input = nullptr,
+    const Eigen::VectorXd* shared_normal_jump_input = nullptr)
 {
     const int size = pipeline.surface_size();
-    Eigen::VectorXd exact_trace(size);
-    Eigen::VectorXd normal_data(size);
-    for (int q = 0; q < size; ++q) {
-        const SurfaceDof& dof =
-            pipeline.surface().dofs[static_cast<std::size_t>(q)];
-        exact_trace[q] = app3d::transformed_manufactured_harmonic_value_3d(
-            transform, dof.point);
-        normal_data[q] =
-            app3d::transformed_manufactured_harmonic_gradient_3d(
-                transform, dof.point).dot(dof.normal);
+    if ((shared_exact_trace_input == nullptr)
+        != (shared_normal_jump_input == nullptr)) {
+        throw std::invalid_argument(
+            "shared Neumann exact trace and normal jump must be provided together");
     }
-    // Enforce the discrete compatibility condition.  The exact flux has zero
-    // continuous mean; the tiny quadrature defect is otherwise amplified by
-    // the first-kind exterior-trace equation.
-    normal_data.array() -= surface_weighted_mean(
-        pipeline.surface(), normal_data);
+    Eigen::VectorXd exact_trace_storage;
+    Eigen::VectorXd normal_data_storage;
+    if (shared_exact_trace_input == nullptr) {
+        exact_trace_storage.resize(size);
+        normal_data_storage.resize(size);
+        for (int q = 0; q < size; ++q) {
+            const SurfaceDof& dof =
+                pipeline.surface().dofs[static_cast<std::size_t>(q)];
+            exact_trace_storage[q] =
+                app3d::transformed_manufactured_harmonic_value_3d(
+                    transform, dof.point);
+            normal_data_storage[q] =
+                app3d::transformed_manufactured_harmonic_gradient_3d(
+                    transform, dof.point).dot(dof.normal);
+        }
+        exact_trace_storage.array() -= surface_weighted_mean(
+            pipeline.surface(), exact_trace_storage);
+        // Enforce the discrete compatibility condition. The exact flux has
+        // zero continuous mean; the quadrature defect is otherwise amplified.
+        normal_data_storage.array() -= surface_weighted_mean(
+            pipeline.surface(), normal_data_storage);
+    } else if (shared_exact_trace_input->size() != size
+               || shared_normal_jump_input->size() != size
+               || !shared_exact_trace_input->allFinite()
+               || !shared_normal_jump_input->allFinite()) {
+        throw std::invalid_argument(
+            "shared Neumann manufactured data has invalid size or values");
+    }
+    const Eigen::VectorXd& exact_trace = shared_exact_trace_input == nullptr
+        ? exact_trace_storage : *shared_exact_trace_input;
+    const Eigen::VectorXd& normal_data = shared_normal_jump_input == nullptr
+        ? normal_data_storage : *shared_normal_jump_input;
 
     const auto solve_start = std::chrono::steady_clock::now();
     const ExteriorZeroTraceSolution3D solution =
@@ -3211,8 +3235,6 @@ SolveMetrics3D run_neumann_case(
     result.density_weighted_mean = surface_weighted_mean(
         pipeline.surface(), solution.value_jump);
 
-    exact_trace.array() -= surface_weighted_mean(
-        pipeline.surface(), exact_trace);
     const Eigen::VectorXd density_error = solution.value_jump - exact_trace;
     result.density_linf = vector_linf(density_error);
     result.density_l2 = vector_rms(density_error);
@@ -3260,6 +3282,8 @@ SolveMetrics3D run_neumann_case(
         *solved_coefficients = solution.coefficients;
     if (prescribed_normal_jump_output != nullptr)
         *prescribed_normal_jump_output = normal_data;
+    if (prescribed_exact_trace_output != nullptr)
+        *prescribed_exact_trace_output = exact_trace;
     return result;
 }
 
@@ -8670,6 +8694,7 @@ struct NeumannEdgeCauchyEdgeValueRow3D {
 };
 
 struct NeumannEdgeCauchyPairRun3D {
+    bool completed = true;
     std::array<app3d::NeumannEdgeCauchyMeasurement3D, 2> measurements;
     std::array<std::vector<double>, 2> residual_histories;
     std::array<std::vector<NeumannEdgeCauchyEdgeValueRow3D>, 2>
@@ -8681,6 +8706,8 @@ struct NeumannEdgeCauchyPairRun3D {
     int setup_factorization_count = 0;
     std::array<int, 2> factorization_counts_before{};
     std::array<int, 2> factorization_counts_after{};
+    std::array<bool, 2> shared_exact_trace_bitwise{};
+    std::array<bool, 2> shared_normal_jump_bitwise{};
 };
 
 PhaseRecordArray3D capture_phase_records_3d(
@@ -8869,6 +8896,29 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
             pipeline_wall_seconds, pipeline_child_seconds,
             "Neumann edge-Cauchy pipeline setup"), 1);
 
+    const int surface_size = pipeline.surface_size();
+    Eigen::VectorXd shared_exact_trace(surface_size);
+    Eigen::VectorXd prescribed_normal_jump(surface_size);
+    for (int q = 0; q < surface_size; ++q) {
+        const SurfaceDof& dof =
+            pipeline.surface().dofs[static_cast<std::size_t>(q)];
+        shared_exact_trace[q] =
+            app3d::transformed_manufactured_harmonic_value_3d(
+                study_case.transform, dof.point);
+        prescribed_normal_jump[q] =
+            app3d::transformed_manufactured_harmonic_gradient_3d(
+                study_case.transform, dof.point).dot(dof.normal);
+    }
+    shared_exact_trace.array() -= surface_weighted_mean(
+        pipeline.surface(), shared_exact_trace);
+    prescribed_normal_jump.array() -= surface_weighted_mean(
+        pipeline.surface(), prescribed_normal_jump);
+    if (!shared_exact_trace.allFinite()
+        || !prescribed_normal_jump.allFinite()) {
+        throw std::runtime_error(
+            "Neumann edge-Cauchy manufactured data are non-finite");
+    }
+
     const double setup_wall_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - setup_start).count();
     const double setup_recorded_before_remainder = phase_record_sum_3d(
@@ -8901,20 +8951,11 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
             "Neumann edge-Cauchy setup query-count mismatch");
     }
 
-    const int surface_size = pipeline.surface_size();
     Eigen::VectorXd value_probe(surface_size);
-    Eigen::VectorXd prescribed_normal_jump(surface_size);
     for (int q = 0; q < surface_size; ++q) {
         value_probe[q] = std::sin(0.37 * (q + 1))
                        + 0.2 * std::cos(0.11 * (q + 1));
-        const SurfaceDof& dof =
-            pipeline.surface().dofs[static_cast<std::size_t>(q)];
-        prescribed_normal_jump[q] =
-            app3d::transformed_manufactured_harmonic_gradient_3d(
-                study_case.transform, dof.point).dot(dof.normal);
     }
-    prescribed_normal_jump.array() -= surface_weighted_mean(
-        pipeline.surface(), prescribed_normal_jump);
     const Eigen::VectorXd zero_grid =
         Eigen::VectorXd::Zero(grid.num_dofs());
     const HarmonicJetField3D legacy_probe =
@@ -8959,6 +9000,7 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
     std::array<Eigen::VectorXd, 2> solved_value_jumps;
     std::array<Eigen::MatrixXd, 2> solved_coefficients;
     std::array<Eigen::VectorXd, 2> solved_normal_jumps;
+    std::array<Eigen::VectorXd, 2> used_exact_traces;
     for (std::size_t index = 0; index < modes.size(); ++index) {
         auto& measurement = result.measurements[index];
         measurement.case_id = study_case.id;
@@ -9011,7 +9053,29 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
             gmres_max_iterations, restrict_mode, modes[index],
             &result.residual_histories[index], nullptr,
             &solved_value_jumps[index], &solved_coefficients[index],
-            &solved_normal_jumps[index]);
+            &solved_normal_jumps[index], &used_exact_traces[index],
+            &shared_exact_trace, &prescribed_normal_jump);
+        result.shared_exact_trace_bitwise[index] =
+            bitwise_equal_vector_3d(
+                used_exact_traces[index], shared_exact_trace);
+        result.shared_normal_jump_bitwise[index] =
+            bitwise_equal_vector_3d(
+                solved_normal_jumps[index], prescribed_normal_jump);
+        if (index != 0) {
+            result.shared_exact_trace_bitwise[index] =
+                result.shared_exact_trace_bitwise[index]
+                && bitwise_equal_vector_3d(
+                    used_exact_traces[0], used_exact_traces[index]);
+            result.shared_normal_jump_bitwise[index] =
+                result.shared_normal_jump_bitwise[index]
+                && bitwise_equal_vector_3d(
+                    solved_normal_jumps[0], solved_normal_jumps[index]);
+        }
+        if (!result.shared_exact_trace_bitwise[index]
+            || !result.shared_normal_jump_bitwise[index]) {
+            throw std::logic_error(
+                "Neumann edge-Cauchy modes did not share manufactured data bitwise");
+        }
         const double mode_wall_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - route_start).count();
         after_snapshots[index] =
@@ -9081,6 +9145,10 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
             throw std::logic_error(
                 "Neumann edge-Cauchy edge-value output has wrong size");
         }
+        if (!shared_edge_values.allFinite()) {
+            throw std::runtime_error(
+                "Neumann edge-Cauchy auxiliary values are non-finite");
+        }
         double discrepancy = 0.0;
         for (std::size_t q = 0; q < samples.size(); ++q) {
             const auto& sample = samples[q];
@@ -9104,6 +9172,17 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
                 edge_row.first_value - edge_row.shared_auxiliary_value);
             edge_row.second_shared_difference = std::abs(
                 edge_row.second_value - edge_row.shared_auxiliary_value);
+            const std::array<double, 6> edge_values{{
+                edge_row.first_value, edge_row.second_value,
+                edge_row.shared_auxiliary_value,
+                edge_row.first_second_difference,
+                edge_row.first_shared_difference,
+                edge_row.second_shared_difference}};
+            if (!app3d::neumann_edge_cauchy_edge_value_row_finite_3d(
+                    edge_values)) {
+                throw std::runtime_error(
+                    "Neumann edge-Cauchy edge comparison is non-finite");
+            }
             discrepancy = std::max(
                 discrepancy, edge_row.first_second_difference);
             result.edge_value_rows[index].push_back(edge_row);
@@ -9148,6 +9227,27 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
     }
     return result;
 }
+
+NeumannEdgeCauchyPairRun3D failed_neumann_edge_cauchy_pair_3d(
+    int N, const app3d::LPrismRigidStudyCase3D& study_case)
+{
+    const std::array<app3d::NeumannEdgeCauchyMode3D, 2> modes{{
+        app3d::NeumannEdgeCauchyMode3D::None,
+        app3d::NeumannEdgeCauchyMode3D::NonG1AuxiliaryValues}};
+    NeumannEdgeCauchyPairRun3D result;
+    result.completed = false;
+    result.owner_snapshots.resize(6);
+    for (std::size_t index = 0; index < modes.size(); ++index) {
+        auto& measurement = result.measurements[index];
+        measurement.case_id = study_case.id;
+        measurement.N = N;
+        measurement.h = kBoxSide / static_cast<double>(N);
+        measurement.mode = modes[index];
+        measurement.finite_metrics = false;
+    }
+    return result;
+}
+
 std::vector<app3d::LPrismRigidStudyCase3D> neumann_edge_pilot_cases_3d()
 {
     const std::array<std::string, 3> wanted{{
@@ -9201,7 +9301,9 @@ void write_neumann_edge_cauchy_checkpoints_3d(
     std::filesystem::create_directories(output_dir);
     std::ofstream summary = open_output_file(output_dir / "summary.csv");
     summary << std::setprecision(17) << std::boolalpha
-        << "case_id,N,h,mode,finite_metrics,gmres_converged,gmres_iterations,"
+        << "case_id,N,h,mode,pair_completed,shared_exact_trace_bitwise,"
+           "shared_normal_jump_bitwise,finite_metrics,gmres_converged,"
+           "gmres_iterations,"
            "gmres_relative_residual,density_linf,density_l2,interior_linf,"
            "interior_l2,incident_edge_discrepancy_linf,"
            "expected_non_g1_connections,covered_non_g1_connections,"
@@ -9238,6 +9340,9 @@ void write_neumann_edge_cauchy_checkpoints_3d(
                 << ',' << measurement.h << ','
                 << app3d::neumann_edge_cauchy_mode_name_3d(
                        measurement.mode)
+                << ',' << pair.completed
+                << ',' << pair.shared_exact_trace_bitwise[mode_index]
+                << ',' << pair.shared_normal_jump_bitwise[mode_index]
                 << ',' << measurement.finite_metrics
                 << ',' << measurement.gmres_converged
                 << ',' << measurement.gmres_iterations
@@ -9336,7 +9441,8 @@ void write_neumann_edge_cauchy_checkpoints_3d(
     std::ofstream owners = open_output_file(
         output_dir / "owner_diagnostics.csv");
     owners << std::boolalpha
-        << "case_id,N,mode,stable_workload_fingerprint,"
+        << "case_id,N,mode,pair_completed,shared_exact_trace_bitwise,"
+           "shared_normal_jump_bitwise,stable_workload_fingerprint,"
            "stable_output_digest,stable_wrong_side_queries,"
            "stable_geometry_queries,before_workload_fingerprint,"
            "after_workload_fingerprint,before_output_digest,"
@@ -9362,6 +9468,9 @@ void write_neumann_edge_cauchy_checkpoints_3d(
             owners << measurement.case_id << ',' << measurement.N
                 << ',' << app3d::neumann_edge_cauchy_mode_name_3d(
                        measurement.mode)
+                << ',' << pair.completed
+                << ',' << pair.shared_exact_trace_bitwise[mode_index]
+                << ',' << pair.shared_normal_jump_bitwise[mode_index]
                 << ',' << stable.workload_fingerprint
                 << ',' << stable.output_digest
                 << ',' << stable.wrong_side_queries
@@ -9514,13 +9623,40 @@ int run_neumann_edge_cauchy_study_3d(std::vector<int> levels)
         for (const auto& study_case : cases) {
             std::cout << "[neumann-edge-cauchy-study] case="
                 << study_case.id << " N=" << N << " setup\n";
-            pairs.push_back(run_neumann_edge_cauchy_pair_3d(
-                N, study_case));
+            bool evidence_exception = false;
+            std::string evidence_message;
+            if (N == 128) {
+                try {
+                    pairs.push_back(run_neumann_edge_cauchy_pair_3d(
+                        N, study_case));
+                } catch (const std::logic_error& error) {
+                    evidence_exception = true;
+                    evidence_message = error.what();
+                    pairs.push_back(failed_neumann_edge_cauchy_pair_3d(
+                        N, study_case));
+                } catch (const std::system_error&) {
+                    throw;
+                } catch (const std::runtime_error& error) {
+                    evidence_exception = true;
+                    evidence_message = error.what();
+                    pairs.push_back(failed_neumann_edge_cauchy_pair_3d(
+                        N, study_case));
+                }
+            } else {
+                pairs.push_back(run_neumann_edge_cauchy_pair_3d(
+                    N, study_case));
+            }
             evaluation = app3d::evaluate_neumann_edge_cauchy_study_3d(
                 neumann_edge_cauchy_measurements_3d(pairs),
                 case_ids, require_complete_pilot);
             write_neumann_edge_cauchy_checkpoints_3d(
                 output_dir, pairs, evaluation);
+            if (evidence_exception) {
+                std::cerr
+                    << "warning: N=128 Neumann edge-Cauchy evidence failed: case="
+                    << study_case.id << " reason=" << evidence_message
+                    << "; checkpoint records pair_completed=false\n";
+            }
 
             bool pair_execution_pass = true;
             const auto& pair = pairs.back();

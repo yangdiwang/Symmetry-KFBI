@@ -3,6 +3,7 @@
 #include "dirichlet_rigid_transform_study_3d.hpp"
 #include "neumann_edge_augmented_cauchy_3d.hpp"
 
+#include <array>
 #include <limits>
 #include <string>
 #include <vector>
@@ -75,6 +76,9 @@ struct NeumannEdgeCauchyEvaluation3D {
     NeumannEdgeCauchyAcceptance3D acceptance;
     bool all_pass = false;
 };
+
+bool neumann_edge_cauchy_edge_value_row_finite_3d(
+    const std::array<double, 6>& values);
 
 std::vector<int> normalize_neumann_edge_cauchy_levels_3d(std::vector<int> levels);
 
