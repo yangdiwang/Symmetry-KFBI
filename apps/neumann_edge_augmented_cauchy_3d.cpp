@@ -23,13 +23,13 @@ NeumannEdgeSampleCountPlan3D plan_neumann_edge_sample_count_3d(
     double requested_sample_count,
     int minimum_edge_samples,
     int cumulative_sample_count,
-    int reserved_factorization_count,
+    int reserved_factorization_units,
     int connection_index)
 {
     const std::string context = " at connection "
         + std::to_string(connection_index);
     if (minimum_edge_samples <= 0 || cumulative_sample_count < 0
-        || reserved_factorization_count < 0) {
+        || reserved_factorization_units < 0) {
         throw std::invalid_argument(
             "Neumann auxiliary edge sample count planner has invalid input"
             + context);
@@ -46,13 +46,28 @@ NeumannEdgeSampleCountPlan3D plan_neumann_edge_sample_count_3d(
     const int connection_sample_count = std::max(
         minimum_edge_samples,
         static_cast<int>(requested_sample_count));
-    constexpr int factorization_limit =
-        std::numeric_limits<int>::max() / 2;
-    if (reserved_factorization_count > factorization_limit
-        || cumulative_sample_count
-            > factorization_limit - reserved_factorization_count
+
+    // The value map emits at most 48 raw triplets per sample (the normal
+    // map emits 28). Eigen's default SparseMatrix StorageIndex is int;
+    // duplicate collapse can only reduce this raw count. At this sample
+    // cap, the row-major outer-index array's samples+1 length is also safe.
+    constexpr int maximum_sparse_samples =
+        std::numeric_limits<int>::max() / 48;
+    if (cumulative_sample_count > maximum_sparse_samples
         || connection_sample_count
-            > factorization_limit - reserved_factorization_count
+            > maximum_sparse_samples - cumulative_sample_count) {
+        throw std::overflow_error(
+            "Neumann auxiliary cumulative sample count exceeds int-backed "
+            "sparse storage range" + context);
+    }
+
+    constexpr int maximum_factorization_units =
+        std::numeric_limits<int>::max() / 2;
+    if (reserved_factorization_units > maximum_factorization_units
+        || cumulative_sample_count
+            > maximum_factorization_units - reserved_factorization_units
+        || connection_sample_count
+            > maximum_factorization_units - reserved_factorization_units
                 - cumulative_sample_count) {
         throw std::overflow_error(
             "Neumann auxiliary cumulative sample count exceeds int-backed "

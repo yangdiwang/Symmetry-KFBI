@@ -660,8 +660,10 @@ void test_geometric_symmetry_certificate()
 void test_sample_count_integer_boundaries()
 {
     using kfbim::app3d::detail::plan_neumann_edge_sample_count_3d;
-    constexpr int factorization_limit =
+    constexpr int maximum_factorization_units =
         std::numeric_limits<int>::max() / 2;
+    constexpr int maximum_sparse_samples =
+        std::numeric_limits<int>::max() / 48;
 
     require_throws<std::overflow_error>([]{
         (void)plan_neumann_edge_sample_count_3d(
@@ -669,25 +671,29 @@ void test_sample_count_integer_boundaries()
             4,0,0,17);
     },"connection 17");
 
-    const auto exact_cumulative_limit =
+    const auto exact_sparse_limit =
         plan_neumann_edge_sample_count_3d(
-            4.0,4,factorization_limit-4,0,18);
-    require(exact_cumulative_limit.connection_sample_count==4
-            && exact_cumulative_limit.cumulative_sample_count
-                ==factorization_limit,
-        "sample count planner rejected the last safe cumulative count");
+            4.0,4,maximum_sparse_samples-4,0,18);
+    require(exact_sparse_limit.connection_sample_count==4
+            && exact_sparse_limit.cumulative_sample_count
+                ==maximum_sparse_samples,
+        "sample count planner rejected the last sparse-storage-safe count");
 
     require_throws<std::overflow_error>([=]{
         (void)plan_neumann_edge_sample_count_3d(
-            4.0,4,factorization_limit-3,0,19);
-    },"cumulative sample count");
+            4.0,4,maximum_sparse_samples-3,0,19);
+    },"sparse storage");
 
-    const auto reserved_limit =
+    const auto exact_factorization_reserve =
         plan_neumann_edge_sample_count_3d(
-            4.0,4,factorization_limit-9,5,20);
-    require(reserved_limit.cumulative_sample_count
-            ==factorization_limit-5,
+            4.0,4,0,maximum_factorization_units-4,20);
+    require(exact_factorization_reserve.cumulative_sample_count==4,
         "sample count planner did not reserve downstream factorizations");
+
+    require_throws<std::overflow_error>([=]{
+        (void)plan_neumann_edge_sample_count_3d(
+            4.0,4,0,maximum_factorization_units-3,21);
+    },"factorization");
 }
 
 std::vector<NeumannEdgeFaceStencil3D> exact_face_stencils(
