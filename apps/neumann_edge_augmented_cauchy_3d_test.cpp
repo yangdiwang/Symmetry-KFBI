@@ -1,15 +1,19 @@
 #include "neumann_edge_augmented_cauchy_3d.hpp"
 #include "native_nurbs_surface_transform_3d.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <queue>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -271,6 +275,615 @@ void test_rigid_covariance()
     std::cout<<"rigid covariance defect "<<defect<<'\n';
 }
 
+std::vector<NeumannEdgeFaceStencil3D> exact_face_stencils(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud3D& cloud)
+{
+    std::vector<NeumannEdgeFaceStencil3D> result;
+    result.reserve(cloud.dofs.size());
+    for(int center=0;center<static_cast<int>(cloud.dofs.size());++center) {
+        result.push_back({
+            nearest_g1_cauchy_dofs(surface,cloud,center,48),
+            nearest_g1_cauchy_dofs(surface,cloud,center,28)});
+    }
+    return result;
+}
+
+std::map<int,std::vector<int>> expected_edge_groups(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud3D& cloud,
+    const std::vector<NeumannEdgeFaceStencil3D>& stencils,
+    const NeumannEdgeAuxiliaryValueMap3D& edge_map,
+    int center,
+    double h)
+{
+    const auto& center_dof=cloud.dofs.at(static_cast<std::size_t>(center));
+    double radius_squared=0.0;
+    for(const int id:stencils.at(static_cast<std::size_t>(center)).value_dofs) {
+        radius_squared=std::max(radius_squared,
+            (cloud.dofs.at(static_cast<std::size_t>(id)).point-center_dof.point)
+                .squaredNorm());
+    }
+    const auto component_vector=smooth_patch_component(surface,center_dof.patch_id);
+    const std::set<int> component(component_vector.begin(),component_vector.end());
+    std::map<int,std::vector<std::pair<std::pair<double,int>,int>>> candidates;
+    for(int index=0;index<static_cast<int>(edge_map.samples.size());++index) {
+        const auto& sample=edge_map.samples[static_cast<std::size_t>(index)];
+        candidates[sample.connection_index].push_back({
+            {(sample.point-center_dof.point).squaredNorm(),sample.sample_index},
+            index});
+    }
+    std::map<int,std::vector<int>> result;
+    for(auto& item:candidates) {
+        const auto& connection=surface.geometric_connections.at(
+            static_cast<std::size_t>(item.first));
+        require(!connection.g1,"auxiliary map unexpectedly contains a G1 sample");
+        const bool first=component.count(connection.first.patch)==1;
+        const bool second=component.count(connection.second.patch)==1;
+        auto& sorted=item.second;
+        std::sort(sorted.begin(),sorted.end(),
+            [](const auto& a,const auto& b){return a.first<b.first;});
+        if(first==second || sorted.front().first.first>radius_squared)
+            continue;
+        require(sorted.size()>=4,"eligible connection has fewer than four samples");
+        std::vector<int> selected;
+        for(int q=0;q<4;++q) selected.push_back(sorted[static_cast<std::size_t>(q)].second);
+        std::sort(selected.begin(),selected.end(),[&](int a,int b) {
+            const auto& x=edge_map.samples[static_cast<std::size_t>(a)];
+            const auto& y=edge_map.samples[static_cast<std::size_t>(b)];
+            return std::tie(x.connection_index,x.sample_index)
+                <std::tie(y.connection_index,y.sample_index);
+        });
+        result.emplace(item.first,std::move(selected));
+    }
+    return result;
+}
+
+const NeumannEdgeLocalMap3D* find_local_map(
+    const NeumannEdgeAugmentedCauchy3D& augmented,
+    int center)
+{
+    for(const auto& map:augmented.local_maps())
+        if(map.center_dof==center) return &map;
+    return nullptr;
+}
+
+bool bitwise_equal(double first,double second)
+{
+    return std::memcmp(&first,&second,sizeof(double))==0;
+}
+
+double independently_recomputed_local_defect(
+    const NeumannEdgeAugmentedCauchy3D& augmented,
+    const SurfaceDofCloud3D& cloud,
+    double h)
+{
+    const HarmonicPolynomialSpace3D space(3);
+    double defect=augmented.edge_value_map().diagnostics
+        .harmonic_cubic_reproduction_defect_max;
+    for(const auto& local:augmented.local_maps()) {
+        const auto& center=cloud.dofs[static_cast<std::size_t>(local.center_dof)];
+        for(int column=0;column<16;++column) {
+            Eigen::VectorXd coefficients=Eigen::VectorXd::Zero(16);
+            for(int k=0;k<48;++k) {
+                const auto& sample=cloud.dofs[static_cast<std::size_t>(
+                    local.value_dofs[static_cast<std::size_t>(k)])];
+                const Eigen::Vector3d d=(sample.point-center.point)/h;
+                const Eigen::Vector3d xi(
+                    d.dot(center.tangent1),d.dot(center.tangent2),d.dot(center.normal));
+                coefficients+=local.value_map.col(k)
+                    *space.basis(xi.x(),xi.y(),xi.z())[column];
+            }
+            for(int k=0;k<28;++k) {
+                const auto& sample=cloud.dofs[static_cast<std::size_t>(
+                    local.normal_dofs[static_cast<std::size_t>(k)])];
+                const Eigen::Vector3d d=(sample.point-center.point)/h;
+                const Eigen::Vector3d xi(
+                    d.dot(center.tangent1),d.dot(center.tangent2),d.dot(center.normal));
+                const Eigen::Vector3d nc(
+                    sample.normal.dot(center.tangent1),
+                    sample.normal.dot(center.tangent2),
+                    sample.normal.dot(center.normal));
+                const double physical_normal=nc.dot(
+                    space.gradient(xi.x(),xi.y(),xi.z()).col(column))/h;
+                coefficients+=local.normal_map.col(k)*physical_normal;
+            }
+            for(int k=0;k<static_cast<int>(local.edge_sample_indices.size());++k) {
+                const auto& sample=augmented.edge_value_map().samples[
+                    static_cast<std::size_t>(local.edge_sample_indices[
+                        static_cast<std::size_t>(k)])];
+                const Eigen::Vector3d d=(sample.point-center.point)/h;
+                const Eigen::Vector3d xi(
+                    d.dot(center.tangent1),d.dot(center.tangent2),d.dot(center.normal));
+                coefficients+=local.edge_map.col(k)
+                    *space.basis(xi.x(),xi.y(),xi.z())[column];
+            }
+            Eigen::VectorXd exact=Eigen::VectorXd::Zero(16);
+            exact[column]=1.0;
+            defect=std::max(defect,(coefficients-exact).lpNorm<Eigen::Infinity>());
+            const Eigen::VectorXd center_basis=space.basis(0.0,0.0,0.0);
+            defect=std::max(defect,
+                std::abs(center_basis.dot(coefficients)-center_basis[column]));
+            for(const int edge_index:local.edge_sample_indices) {
+                const auto& sample=augmented.edge_value_map().samples[
+                    static_cast<std::size_t>(edge_index)];
+                const Eigen::Vector3d d=(sample.point-center.point)/h;
+                const Eigen::Vector3d xi(
+                    d.dot(center.tangent1),d.dot(center.tangent2),d.dot(center.normal));
+                const Eigen::VectorXd basis=space.basis(xi.x(),xi.y(),xi.z());
+                defect=std::max(defect,
+                    std::abs(basis.dot(coefficients)-basis[column]));
+            }
+        }
+    }
+    return defect;
+}
+
+void test_local_attachment_groups_and_overwrite()
+{
+    const auto surface=make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
+    const double h=3.0/32.0;
+    const auto cloud=make_native_surface_dofs_3d(surface,h);
+    const auto stencils=exact_face_stencils(surface,cloud);
+    const auto augmented=build_neumann_edge_augmented_cauchy_3d(
+        surface,cloud,h,stencils);
+    require(augmented.surface_size()==static_cast<int>(cloud.dofs.size())
+        && augmented.edge_sample_count()
+            ==static_cast<int>(augmented.edge_value_map().samples.size()),
+        "augmented Cauchy dimensions are inconsistent");
+    std::set<int> seen_centers;
+    int expected_affected=0,expected_corners=0,far_centers=0;
+    std::vector<bool> affected(cloud.dofs.size(),false);
+    for(int center=0;center<static_cast<int>(cloud.dofs.size());++center) {
+        const auto expected=expected_edge_groups(
+            surface,cloud,stencils,augmented.edge_value_map(),center,h);
+        const auto* local=find_local_map(augmented,center);
+        if(expected.empty()) {
+            require(local==nullptr,"far center unexpectedly has a local edge map");
+            ++far_centers;
+            continue;
+        }
+        ++expected_affected;
+        if(expected.size()>=2) ++expected_corners;
+        require(local!=nullptr,"eligible center is missing a local edge map");
+        require(seen_centers.insert(center).second,
+            "center ID occurs more than once in local maps");
+        affected[static_cast<std::size_t>(center)]=true;
+        require(local->center_dof==center
+            && local->value_dofs==stencils[static_cast<std::size_t>(center)].value_dofs
+            && local->normal_dofs==stencils[static_cast<std::size_t>(center)].normal_dofs,
+            "local map did not preserve the exact legacy stencil IDs");
+        require(local->value_map.rows()==16 && local->value_map.cols()==48
+            && local->normal_map.rows()==16 && local->normal_map.cols()==28
+            && local->edge_map.rows()==16
+            && local->edge_map.cols()
+                ==static_cast<Eigen::Index>(local->edge_sample_indices.size())
+            && local->value_map.allFinite() && local->normal_map.allFinite()
+            && local->edge_map.allFinite(),
+            "affected local map dimensions or entries are invalid");
+        std::map<int,std::vector<int>> actual;
+        std::pair<int,int> previous{-1,-1};
+        for(const int index:local->edge_sample_indices) {
+            require(index>=0 && index<augmented.edge_sample_count(),
+                "local map contains an invalid edge sample index");
+            const auto& sample=augmented.edge_value_map().samples[
+                static_cast<std::size_t>(index)];
+            const std::pair<int,int> key{sample.connection_index,sample.sample_index};
+            require(previous<key,"local edge samples are not grouped deterministically");
+            previous=key;
+            actual[sample.connection_index].push_back(index);
+        }
+        require(actual.size()==expected.size(),
+            "local edge groups do not match exact eligible connections");
+        for(const auto& expected_group:expected) {
+            const auto found=actual.find(expected_group.first);
+            require(found!=actual.end(),"eligible exact-distance group is absent");
+            if(found->second==expected_group.second) continue;
+            std::vector<int> actual_only,expected_only;
+            for(const int id:found->second)
+                if(std::find(expected_group.second.begin(),expected_group.second.end(),id)
+                    ==expected_group.second.end()) actual_only.push_back(id);
+            for(const int id:expected_group.second)
+                if(std::find(found->second.begin(),found->second.end(),id)
+                    ==found->second.end()) expected_only.push_back(id);
+            require(actual_only.size()==expected_only.size() && !actual_only.empty(),
+                "nearest-four group differs by more than tied samples");
+            std::sort(actual_only.begin(),actual_only.end());
+            std::sort(expected_only.begin(),expected_only.end());
+            for(std::size_t k=0;k<actual_only.size();++k) {
+                const auto& a=augmented.edge_value_map().samples[
+                    static_cast<std::size_t>(actual_only[k])];
+                const auto& e=augmented.edge_value_map().samples[
+                    static_cast<std::size_t>(expected_only[k])];
+                const double da=(a.point-cloud.dofs[static_cast<std::size_t>(center)].point)
+                    .squaredNorm();
+                const double de=(e.point-cloud.dofs[static_cast<std::size_t>(center)].point)
+                    .squaredNorm();
+                const double tolerance=64.0*std::numeric_limits<double>::epsilon()
+                    *std::max({h*h,da,de});
+                require(std::abs(da-de)<=tolerance
+                    && a.sample_index<e.sample_index,
+                    "nearest-four group replaced a strictly nearer sample");
+            }
+        }
+        for(const auto& group:actual)
+            require(group.second.size()==4,"local edge group is partial");
+    }
+    require(static_cast<int>(augmented.local_maps().size())==expected_affected
+        && augmented.diagnostics().affected_center_count==expected_affected,
+        "affected-center count is wrong");
+    require(expected_corners>0
+        && augmented.diagnostics().corner_center_count==expected_corners,
+        "no corner center received multiple non-G1 edge groups");
+    require(far_centers>0,"fixture has no unaffected far center");
+    require(augmented.diagnostics().unrelated_attachment_count==0,
+        "an unrelated non-G1 connection was attached");
+    require(augmented.diagnostics().factorization_count
+            ==2*(augmented.edge_sample_count()+expected_affected),
+        "setup factorization count is incomplete");
+    require(augmented.diagnostics().pass,
+        "augmented Cauchy setup diagnostics did not pass");
+    const double independently_recomputed=independently_recomputed_local_defect(
+        augmented,cloud,h);
+
+    require(std::abs(augmented.diagnostics().harmonic_cubic_reproduction_defect_max
+            -independently_recomputed)<=2.0e-15,
+        "combined reproduction diagnostic omits a coefficient or evaluation defect");
+    for(int index=0;index<augmented.edge_sample_count();++index) {
+        const auto& sample=augmented.edge_value_map().samples[
+            static_cast<std::size_t>(index)];
+        for(const int owner:{sample.first_owner_dof,sample.second_owner_dof}) {
+            const auto* local=find_local_map(augmented,owner);
+            require(local!=nullptr
+                && std::find(local->edge_sample_indices.begin(),
+                             local->edge_sample_indices.end(),index)
+                    !=local->edge_sample_indices.end(),
+                "edge sample owner lacks its incident local attachment");
+        }
+    }
+
+    Eigen::VectorXd values(augmented.surface_size());
+    Eigen::VectorXd normals(augmented.surface_size());
+    for(int i=0;i<augmented.surface_size();++i) {
+        values[i]=std::sin(0.031*(i+1));
+        normals[i]=std::cos(0.047*(i+2));
+    }
+    const Eigen::VectorXd edge_values=augmented.edge_values(values,normals);
+    Eigen::MatrixXd coefficients(augmented.surface_size(),16);
+    for(int row=0;row<coefficients.rows();++row)
+        for(int column=0;column<coefficients.cols();++column)
+            coefficients(row,column)=0.125+0.003*row-0.007*column;
+    const Eigen::MatrixXd before=coefficients;
+    const int factorizations=augmented.diagnostics().factorization_count;
+    augmented.overwrite_affected_coefficients(
+        values,normals,edge_values,coefficients);
+    require(augmented.diagnostics().factorization_count==factorizations,
+        "evaluation changed the setup factorization count");
+    for(int center=0;center<coefficients.rows();++center) {
+        if(affected[static_cast<std::size_t>(center)]) continue;
+        for(int column=0;column<coefficients.cols();++column)
+            require(bitwise_equal(coefficients(center,column),before(center,column)),
+                "unaffected coefficient row changed bitwise");
+    }
+}
+struct GlobalHarmonicFields {
+    Eigen::MatrixXd values;
+    Eigen::MatrixXd normals;
+};
+
+GlobalHarmonicFields global_harmonic_fields(
+    const SurfaceDofCloud3D& cloud,
+    const RigidTransform3D& transform,
+    const Eigen::Vector3d& origin,
+    double length)
+{
+    const HarmonicPolynomialSpace3D space(3);
+    GlobalHarmonicFields result;
+    result.values.resize(static_cast<Eigen::Index>(cloud.dofs.size()),16);
+    result.normals.resize(static_cast<Eigen::Index>(cloud.dofs.size()),16);
+    for(int id=0;id<static_cast<int>(cloud.dofs.size());++id) {
+        const auto& dof=cloud.dofs[static_cast<std::size_t>(id)];
+        const Eigen::Vector3d point=transform.inverse_point(dof.point);
+        const Eigen::Vector3d normal=transform.rotation().transpose()*dof.normal;
+        const Eigen::Vector3d xi=(point-origin)/length;
+        result.values.row(id)=space.basis(xi.x(),xi.y(),xi.z()).transpose();
+        result.normals.row(id)=normal.transpose()
+            *space.gradient(xi.x(),xi.y(),xi.z())/length;
+    }
+    return result;
+}
+
+double exact_global_harmonic_value(
+    const Eigen::Vector3d& moved_point,
+    const RigidTransform3D& transform,
+    const Eigen::Vector3d& origin,
+    double length,
+    int column)
+{
+    const Eigen::Vector3d point=transform.inverse_point(moved_point);
+    const Eigen::Vector3d xi=(point-origin)/length;
+    return HarmonicPolynomialSpace3D(3).basis(xi.x(),xi.y(),xi.z())[column];
+}
+
+double require_local_harmonic_reproduction(
+    const SurfaceDofCloud3D& cloud,
+    double h,
+    const NeumannEdgeAugmentedCauchy3D& augmented,
+    const RigidTransform3D& transform,
+    const Eigen::Vector3d& origin,
+    double length)
+{
+    const HarmonicPolynomialSpace3D space(3);
+    const auto fields=global_harmonic_fields(cloud,transform,origin,length);
+    std::vector<Eigen::MatrixXd> expected_coefficients;
+    expected_coefficients.reserve(augmented.local_maps().size());
+    for(const auto& local:augmented.local_maps()) {
+        const auto& center=cloud.dofs[static_cast<std::size_t>(local.center_dof)];
+        Eigen::MatrixXd design(76,16),rhs(76,16);
+        for(int k=0;k<48;++k) {
+            const int id=local.value_dofs[static_cast<std::size_t>(k)];
+            const auto& sample=cloud.dofs[static_cast<std::size_t>(id)];
+            const Eigen::Vector3d d=(sample.point-center.point)/h;
+            const Eigen::Vector3d xi(
+                d.dot(center.tangent1),d.dot(center.tangent2),d.dot(center.normal));
+            design.row(k)=space.basis(xi.x(),xi.y(),xi.z()).transpose();
+            rhs.row(k)=fields.values.row(id);
+        }
+        for(int k=0;k<28;++k) {
+            const int id=local.normal_dofs[static_cast<std::size_t>(k)];
+            const auto& sample=cloud.dofs[static_cast<std::size_t>(id)];
+            const Eigen::Vector3d d=(sample.point-center.point)/h;
+            const Eigen::Vector3d xi(
+                d.dot(center.tangent1),d.dot(center.tangent2),d.dot(center.normal));
+            const Eigen::Vector3d normal_components(
+                sample.normal.dot(center.tangent1),
+                sample.normal.dot(center.tangent2),
+                sample.normal.dot(center.normal));
+            design.row(48+k)=normal_components.transpose()
+                *space.gradient(xi.x(),xi.y(),xi.z());
+            rhs.row(48+k)=h*fields.normals.row(id);
+        }
+        Eigen::ColPivHouseholderQR<Eigen::MatrixXd> qr(design);
+        require(qr.rank()==16,"independent expected-coefficient solve is rank deficient");
+        expected_coefficients.push_back(qr.solve(rhs));
+    }
+
+    double defect=0.0;
+    const int factorization_count=augmented.diagnostics().factorization_count;
+    for(int column=0;column<16;++column) {
+        const Eigen::VectorXd values=fields.values.col(column);
+        const Eigen::VectorXd normals=fields.normals.col(column);
+        const Eigen::VectorXd edge_values=augmented.edge_values(values,normals);
+        Eigen::MatrixXd coefficients=Eigen::MatrixXd::Constant(
+            augmented.surface_size(),16,0.3141592653589793);
+        augmented.overwrite_affected_coefficients(
+            values,normals,edge_values,coefficients);
+        for(std::size_t map_index=0;map_index<augmented.local_maps().size();++map_index) {
+            const auto& local=augmented.local_maps()[map_index];
+            const auto& center=cloud.dofs[static_cast<std::size_t>(local.center_dof)];
+            defect=std::max(defect,
+                (coefficients.row(local.center_dof).transpose()
+                    -expected_coefficients[map_index].col(column))
+                    .lpNorm<Eigen::Infinity>());
+            const double center_value=space.basis(0.0,0.0,0.0).dot(
+                coefficients.row(local.center_dof).transpose());
+            defect=std::max(defect,std::abs(center_value
+                -fields.values(local.center_dof,column)));
+            for(const int edge_index:local.edge_sample_indices) {
+                const auto& sample=augmented.edge_value_map().samples[
+                    static_cast<std::size_t>(edge_index)];
+                const Eigen::Vector3d d=(sample.point-center.point)/h;
+                const Eigen::Vector3d xi(
+                    d.dot(center.tangent1),d.dot(center.tangent2),
+                    d.dot(center.normal));
+                const double predicted=space.basis(xi.x(),xi.y(),xi.z()).dot(
+                    coefficients.row(local.center_dof).transpose());
+                const double exact=exact_global_harmonic_value(
+                    sample.point,transform,origin,length,column);
+                defect=std::max(defect,std::abs(predicted-exact));
+            }
+        }
+    }
+    require(augmented.diagnostics().factorization_count==factorization_count,
+        "harmonic evaluation performed a new factorization");
+    require(defect<=1.0e-11,
+        "affected local maps do not reproduce all harmonic cubics");
+    require(augmented.diagnostics().harmonic_cubic_reproduction_defect_max<=1.0e-11,
+        "combined setup reproduction diagnostic is too large");
+    return defect;
+}
+
+void test_local_harmonic_reproduction_and_rigid_covariance()
+{
+    const auto source=make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
+    const double h=3.0/32.0;
+    const auto bounds=source.geometry_model().control_bounds();
+    const Eigen::Vector3d origin=0.5*(bounds.lower+bounds.upper);
+    const double length=bounds.diameter();
+    const std::array<RigidTransform3D,3> transforms{{
+        RigidTransform3D{},
+        RigidTransform3D(Eigen::Matrix3d::Identity(),Eigen::Vector3d::Zero(),
+                         Eigen::Vector3d(0.23,-0.17,0.31)),
+        RigidTransform3D::from_axis_angle(
+            Eigen::Vector3d(1.0,-2.0,0.7),0.61,Eigen::Vector3d(0.04,-0.03,0.08),
+            Eigen::Vector3d(-0.12,0.09,0.15))}};
+    std::vector<std::tuple<int,std::vector<std::pair<int,int>>>> baseline_keys;
+    double defect=0.0;
+    for(std::size_t pose=0;pose<transforms.size();++pose) {
+        const auto surface=transform_native_nurbs_surface_3d(source,transforms[pose]);
+        const auto cloud=make_native_surface_dofs_3d(surface,h);
+        const auto stencils=exact_face_stencils(surface,cloud);
+        const auto augmented=build_neumann_edge_augmented_cauchy_3d(
+            surface,cloud,h,stencils);
+        std::vector<std::tuple<int,std::vector<std::pair<int,int>>>> keys;
+        for(const auto& local:augmented.local_maps()) {
+            std::vector<std::pair<int,int>> samples;
+            for(const int index:local.edge_sample_indices) {
+                const auto& sample=augmented.edge_value_map().samples[
+                    static_cast<std::size_t>(index)];
+                samples.push_back({sample.connection_index,sample.sample_index});
+            }
+            keys.push_back({local.center_dof,std::move(samples)});
+        }
+        if(pose<=1) {
+            std::vector<int> tied_endpoint_samples;
+            for(const auto& local_key:keys) {
+                if(std::get<0>(local_key)!=9) continue;
+                for(const auto& sample_key:std::get<1>(local_key))
+                    if(sample_key.first==10)
+                        tied_endpoint_samples.push_back(sample_key.second);
+            }
+            require(tied_endpoint_samples==std::vector<int>({0,1,2,3}),
+                "baseline/translated tied endpoint samples are not canonical");
+        }
+        if(pose==0) baseline_keys=keys;
+        else if(keys!=baseline_keys) {
+            std::cout<<"attachment mismatch pose "<<pose
+                <<" baseline_maps "<<baseline_keys.size()
+                <<" moved_maps "<<keys.size()<<'\n';
+            const std::size_t common=std::min(keys.size(),baseline_keys.size());
+            for(std::size_t i=0;i<common;++i) if(keys[i]!=baseline_keys[i]) {
+                std::cout<<"first attachment mismatch index "<<i
+                    <<" baseline_center "<<std::get<0>(baseline_keys[i])
+                    <<" moved_center "<<std::get<0>(keys[i])<<'\n';
+                std::cout<<"baseline samples";
+                for(const auto& key:std::get<1>(baseline_keys[i]))
+                    std::cout<<" ("<<key.first<<','<<key.second<<')';
+                std::cout<<"\nmoved samples";
+                for(const auto& key:std::get<1>(keys[i]))
+                    std::cout<<" ("<<key.first<<','<<key.second<<')';
+                std::cout<<'\n';
+                break;
+            }
+            require(false,
+                "rigid transform changed center/connection/sample attachment keys");
+        }
+        defect=std::max(defect,require_local_harmonic_reproduction(
+            cloud,h,augmented,transforms[pose],origin,length));
+    }
+    std::cout<<"local rigid covariance defect "<<defect<<'\n';
+}
+void test_local_map_rejections()
+{
+    const auto surface=make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
+    const double h=3.0/32.0;
+    const auto cloud=make_native_surface_dofs_3d(surface,h);
+    const auto stencils=exact_face_stencils(surface,cloud);
+    auto wrong_count=stencils;
+    wrong_count.pop_back();
+    require_throws<std::invalid_argument>([&]{
+        (void)build_neumann_edge_augmented_cauchy_3d(surface,cloud,h,wrong_count);
+    },"stencil count");
+    auto wrong_value=stencils;
+    wrong_value.front().value_dofs.pop_back();
+    require_throws<std::invalid_argument>([&]{
+        (void)build_neumann_edge_augmented_cauchy_3d(surface,cloud,h,wrong_value);
+    },"48");
+    auto wrong_normal=stencils;
+    wrong_normal.front().normal_dofs.pop_back();
+    require_throws<std::invalid_argument>([&]{
+        (void)build_neumann_edge_augmented_cauchy_3d(surface,cloud,h,wrong_normal);
+    },"28");
+    for(int which=0;which<4;++which) {
+        NeumannEdgeAugmentedCauchyOptions3D options;
+        if(which==0) options.degree=2;
+        if(which==1) options.edge_samples_per_connection=3;
+        if(which==2) options.edge_weight_scale=0.5;
+        if(which==3) options.rank_relative_cutoff=4.0e-12;
+        require_throws<std::invalid_argument>([&]{
+            (void)build_neumann_edge_augmented_cauchy_3d(
+                surface,cloud,h,stencils,{},options);
+        },"");
+    }
+    const auto baseline=build_neumann_edge_augmented_cauchy_3d(
+        surface,cloud,h,stencils);
+    require(!baseline.local_maps().empty(),"rank-deficiency fixture has no affected center");
+    auto repeated=stencils;
+    const int repeated_center=baseline.local_maps().front().center_dof;
+    const int repeated_value=
+        repeated[static_cast<std::size_t>(repeated_center)].value_dofs.back();
+    const int repeated_normal=
+        repeated[static_cast<std::size_t>(repeated_center)].normal_dofs.back();
+    repeated[static_cast<std::size_t>(repeated_center)].value_dofs.assign(
+        48,repeated_value);
+    repeated[static_cast<std::size_t>(repeated_center)].normal_dofs.assign(
+        28,repeated_normal);
+    require_throws<std::runtime_error>([&]{
+        (void)build_neumann_edge_augmented_cauchy_3d(surface,cloud,h,repeated);
+    },"rank-deficient local");
+
+    auto expanded=stencils;
+    int farthest=0;
+    const int center=baseline.local_maps().front().center_dof;
+    for(int id=1;id<static_cast<int>(cloud.dofs.size());++id)
+        if((cloud.dofs[static_cast<std::size_t>(id)].point
+            -cloud.dofs[static_cast<std::size_t>(center)].point).squaredNorm()
+           >(cloud.dofs[static_cast<std::size_t>(farthest)].point
+            -cloud.dofs[static_cast<std::size_t>(center)].point).squaredNorm())
+            farthest=id;
+    expanded[static_cast<std::size_t>(center)].value_dofs.back()=farthest;
+    const auto expanded_map=build_neumann_edge_augmented_cauchy_3d(
+        surface,cloud,h,expanded);
+    const auto* expanded_local=find_local_map(expanded_map,center);
+    require(expanded_local!=nullptr,"expanded-radius center lost its local map");
+    const auto component_vector=smooth_patch_component(
+        surface,cloud.dofs[static_cast<std::size_t>(center)].patch_id);
+    const std::set<int> component(component_vector.begin(),component_vector.end());
+    for(const int index:expanded_local->edge_sample_indices) {
+        const auto& sample=expanded_map.edge_value_map().samples[
+            static_cast<std::size_t>(index)];
+        const auto& connection=surface.geometric_connections[
+            static_cast<std::size_t>(sample.connection_index)];
+        require((component.count(connection.first.patch)==1)
+                !=(component.count(connection.second.patch)==1),
+            "expanded radius attached an unrelated connection");
+    }
+
+    Eigen::VectorXd values=Eigen::VectorXd::Ones(baseline.surface_size());
+    Eigen::VectorXd normals=Eigen::VectorXd::Ones(baseline.surface_size());
+    const Eigen::VectorXd edge_values=baseline.edge_values(values,normals);
+    Eigen::MatrixXd coefficients=Eigen::MatrixXd::Zero(baseline.surface_size(),16);
+    require_throws<std::invalid_argument>([&]{
+        (void)baseline.edge_values(values.head(values.size()-1),normals);
+    },"value");
+    require_throws<std::invalid_argument>([&]{
+        (void)baseline.edge_values(values,normals.head(normals.size()-1));
+    },"normal");
+    require_throws<std::invalid_argument>([&]{
+        baseline.overwrite_affected_coefficients(
+            values.head(values.size()-1),normals,edge_values,coefficients);
+    },"value");
+    require_throws<std::invalid_argument>([&]{
+        baseline.overwrite_affected_coefficients(
+            values,normals.head(normals.size()-1),edge_values,coefficients);
+    },"normal");
+    require_throws<std::invalid_argument>([&]{
+        baseline.overwrite_affected_coefficients(
+            values,normals,edge_values.head(edge_values.size()-1),coefficients);
+    },"edge");
+    Eigen::MatrixXd wrong_rows=Eigen::MatrixXd::Zero(baseline.surface_size()-1,16);
+    require_throws<std::invalid_argument>([&]{
+        baseline.overwrite_affected_coefficients(
+            values,normals,edge_values,wrong_rows);
+    },"coefficient");
+    Eigen::MatrixXd wrong_columns=Eigen::MatrixXd::Zero(baseline.surface_size(),15);
+    require_throws<std::invalid_argument>([&]{
+        baseline.overwrite_affected_coefficients(
+            values,normals,edge_values,wrong_columns);
+    },"coefficient");
+
+    auto duplicate=baseline;
+    auto& duplicate_maps=const_cast<std::vector<NeumannEdgeLocalMap3D>&>(
+        duplicate.local_maps());
+    require(duplicate_maps.front().edge_sample_indices.size()>=2,
+        "duplicate-edge mutation lacks samples");
+    duplicate_maps.front().edge_sample_indices[1]
+        =duplicate_maps.front().edge_sample_indices[0];
+    require_throws<std::invalid_argument>([&]{
+        duplicate.overwrite_affected_coefficients(
+            values,normals,edge_values,coefficients);
+    },"duplicate edge sample");
+}
 SurfaceDofCloud3D restricted_cloud(const SurfaceDofCloud3D& dense)
 {
     SurfaceDofCloud3D result; result.expected_area=dense.expected_area;
@@ -483,9 +1096,12 @@ int main()
     try {
         test_l_prism_geometry_topology_reproduction_and_direct_map();
         test_rigid_covariance();
+        test_local_attachment_groups_and_overwrite();
+        test_local_harmonic_reproduction_and_rigid_covariance();
+        test_local_map_rejections();
         test_review_rejection_paths();
         test_rejections_and_shared_values();
-        std::cout<<"3D Neumann auxiliary edge-value tests passed\n";
+        std::cout<<"3D Neumann edge-augmented Cauchy tests passed\n";
         return 0;
     } catch(const std::exception& error) {
         std::cerr<<"3D Neumann auxiliary edge-value test failure: "<<error.what()<<'\n';

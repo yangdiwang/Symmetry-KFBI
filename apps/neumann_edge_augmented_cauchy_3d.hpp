@@ -85,4 +85,81 @@ Eigen::VectorXd evaluate_neumann_edge_values_3d(
     const Eigen::VectorXd& value_jump,
     const Eigen::VectorXd& normal_jump);
 
+struct NeumannEdgeFaceStencil3D {
+    std::vector<int> value_dofs;
+    std::vector<int> normal_dofs;
+};
+
+struct NeumannEdgeLocalMap3D {
+    int center_dof = -1;
+    std::vector<int> value_dofs;
+    std::vector<int> normal_dofs;
+    std::vector<int> edge_sample_indices;
+    Eigen::MatrixXd value_map;
+    Eigen::MatrixXd normal_map;
+    Eigen::MatrixXd edge_map;
+    double condition = 0.0;
+};
+
+struct NeumannEdgeAugmentedCauchyOptions3D {
+    int degree = 3;
+    int edge_samples_per_connection = 4;
+    double edge_weight_scale = 1.0;
+    double rank_relative_cutoff = 3.0e-12;
+};
+
+struct NeumannEdgeAugmentedCauchyDiagnostics3D {
+    NeumannEdgeAuxiliaryDiagnostics3D edge;
+    int affected_center_count = 0;
+    int corner_center_count = 0;
+    int unrelated_attachment_count = 0;
+    int rank_deficient_local_fit_count = 0;
+    int factorization_count = 0;
+    double harmonic_cubic_reproduction_defect_max = 0.0;
+    double local_condition_max = 0.0;
+    bool pass = false;
+};
+
+class NeumannEdgeAugmentedCauchy3D {
+public:
+    int surface_size() const;
+    int edge_sample_count() const;
+    const NeumannEdgeAuxiliaryValueMap3D& edge_value_map() const;
+    const std::vector<NeumannEdgeLocalMap3D>& local_maps() const;
+    const NeumannEdgeAugmentedCauchyDiagnostics3D& diagnostics() const;
+
+    Eigen::VectorXd edge_values(
+        const Eigen::VectorXd& value_jump,
+        const Eigen::VectorXd& normal_jump) const;
+
+    void overwrite_affected_coefficients(
+        const Eigen::VectorXd& value_jump,
+        const Eigen::VectorXd& normal_jump,
+        const Eigen::VectorXd& edge_values,
+        Eigen::MatrixXd& coefficients) const;
+
+private:
+    friend NeumannEdgeAugmentedCauchy3D
+    build_neumann_edge_augmented_cauchy_3d(
+        const NativeNurbsSurface3D& surface,
+        const SurfaceDofCloud3D& cloud,
+        double h,
+        const std::vector<NeumannEdgeFaceStencil3D>& face_stencils,
+        const NeumannEdgeAuxiliaryOptions3D& edge_options,
+        const NeumannEdgeAugmentedCauchyOptions3D& local_options);
+    int surface_size_ = 0;
+    NeumannEdgeAuxiliaryValueMap3D edge_value_map_;
+    std::vector<NeumannEdgeLocalMap3D> local_maps_;
+    NeumannEdgeAugmentedCauchyDiagnostics3D diagnostics_;
+};
+
+NeumannEdgeAugmentedCauchy3D
+build_neumann_edge_augmented_cauchy_3d(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud3D& cloud,
+    double h,
+    const std::vector<NeumannEdgeFaceStencil3D>& face_stencils,
+    const NeumannEdgeAuxiliaryOptions3D& edge_options = {},
+    const NeumannEdgeAugmentedCauchyOptions3D& local_options = {});
+
 } // namespace kfbim::app3d

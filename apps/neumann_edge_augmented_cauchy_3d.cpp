@@ -6,10 +6,12 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <map>
 #include <queue>
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 namespace kfbim::app3d {
@@ -454,6 +456,238 @@ void append_side_rows(Eigen::MatrixXd& design,
     }
 }
 
+void validate_local_options(
+    const NeumannEdgeAugmentedCauchyOptions3D& options)
+{
+    if (options.degree != 3)
+        throw std::invalid_argument("Neumann augmented Cauchy degree must be 3");
+    if (options.edge_samples_per_connection != 4) {
+        throw std::invalid_argument(
+            "Neumann augmented Cauchy edge samples per connection must be 4");
+    }
+    if (options.edge_weight_scale != 1.0) {
+        throw std::invalid_argument(
+            "Neumann augmented Cauchy edge weight scale must be 1");
+    }
+    if (options.rank_relative_cutoff != 3.0e-12) {
+        throw std::invalid_argument(
+            "Neumann augmented Cauchy rank cutoff must be 3e-12");
+    }
+}
+
+void validate_face_stencils(
+    const std::vector<NeumannEdgeFaceStencil3D>& stencils,
+    int surface_size)
+{
+    if (stencils.size() != static_cast<std::size_t>(surface_size)) {
+        throw std::invalid_argument(
+            "Neumann augmented Cauchy face stencil count does not match surface DOFs");
+    }
+    for (int center = 0; center < surface_size; ++center) {
+        const auto& stencil = stencils[static_cast<std::size_t>(center)];
+        if (stencil.value_dofs.size() != 48) {
+            throw std::invalid_argument(
+                "Neumann augmented Cauchy center " + std::to_string(center)
+                + " must have exactly 48 value DOFs");
+        }
+        if (stencil.normal_dofs.size() != 28) {
+            throw std::invalid_argument(
+                "Neumann augmented Cauchy center " + std::to_string(center)
+                + " must have exactly 28 normal DOFs");
+        }
+        auto validate_ids = [&](const std::vector<int>& ids, const char* kind) {
+            for (const int id : ids) {
+                if (id < 0 || id >= surface_size) {
+                    throw std::invalid_argument(
+                        "Neumann augmented Cauchy center "
+                        + std::to_string(center) + " has invalid " + kind
+                        + " DOF " + std::to_string(id));
+                }
+            }
+        };
+        validate_ids(stencil.value_dofs, "value");
+        validate_ids(stencil.normal_dofs, "normal");
+    }
+}
+
+Eigen::Vector3d center_coordinate(
+    const SurfaceDof3D& center,
+    const Eigen::Vector3d& point,
+    double h)
+{
+    const Eigen::Vector3d displacement = (point - center.point) / h;
+    return {displacement.dot(center.tangent1),
+            displacement.dot(center.tangent2),
+            displacement.dot(center.normal)};
+}
+
+std::vector<int> attached_edge_samples(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud3D& cloud,
+    const NeumannEdgeFaceStencil3D& stencil,
+    const NeumannEdgeAuxiliaryValueMap3D& edge_map,
+    const std::map<int, std::vector<int>>& samples_by_connection,
+    int center,
+    double h,
+    int samples_per_connection,
+    int& connection_group_count)
+{
+    const auto& center_dof = cloud.dofs.at(static_cast<std::size_t>(center));
+    double radius_squared = 0.0;
+    for (const int id : stencil.value_dofs) {
+        radius_squared = std::max(
+            radius_squared,
+            (cloud.dofs.at(static_cast<std::size_t>(id)).point
+                - center_dof.point).squaredNorm());
+    }
+    const std::vector<int> component =
+        smooth_patch_component(surface, center_dof.patch_id);
+    std::vector<bool> in_component(surface.patches.size(), false);
+    for (const int patch : component) {
+        if (patch < 0 || patch >= static_cast<int>(surface.patches.size())) {
+            throw std::runtime_error(
+                "Neumann augmented Cauchy center " + std::to_string(center)
+                + " has invalid G1 component patch");
+        }
+        in_component[static_cast<std::size_t>(patch)] = true;
+    }
+
+    std::vector<int> result;
+    connection_group_count = 0;
+    for (const auto& item : samples_by_connection) {
+        const int connection_index = item.first;
+        if (connection_index < 0
+            || connection_index
+                >= static_cast<int>(surface.geometric_connections.size())) {
+            throw std::runtime_error(
+                "Neumann augmented Cauchy edge map has invalid connection ID");
+        }
+        const auto& connection = surface.geometric_connections[
+            static_cast<std::size_t>(connection_index)];
+        if (connection.g1) {
+            throw std::runtime_error(
+                "Neumann augmented Cauchy edge map contains a G1 connection");
+        }
+        const bool first = in_component.at(
+            static_cast<std::size_t>(connection.first.patch));
+        const bool second = in_component.at(
+            static_cast<std::size_t>(connection.second.patch));
+        if (first == second)
+            continue;
+
+        std::vector<std::tuple<double, int, int>> nearest;
+        nearest.reserve(item.second.size());
+        for (const int sample_index : item.second) {
+            if (sample_index < 0
+                || sample_index >= static_cast<int>(edge_map.samples.size())) {
+                throw std::runtime_error(
+                    "Neumann augmented Cauchy edge map has invalid sample ID");
+            }
+            const auto& sample = edge_map.samples[
+                static_cast<std::size_t>(sample_index)];
+            if (sample.connection_index != connection_index) {
+                throw std::runtime_error(
+                    "Neumann augmented Cauchy edge sample group is inconsistent");
+            }
+            nearest.emplace_back(
+                (sample.point - center_dof.point).squaredNorm(),
+                sample.sample_index,
+                sample_index);
+        }
+        // Canonicalize only roundoff-scale mathematical distance ties so a
+        // rigid transform cannot change which endpoint-symmetric sample wins.
+        const double distance_tolerance_scale = 64.0
+            * std::numeric_limits<double>::epsilon();
+        std::sort(nearest.begin(), nearest.end());
+        for (std::size_t begin = 0; begin < nearest.size();) {
+            const double anchor_distance = std::get<0>(nearest[begin]);
+            std::size_t end = begin + 1;
+            while (end < nearest.size()) {
+                const double candidate_distance = std::get<0>(nearest[end]);
+                const double tolerance = distance_tolerance_scale
+                    * std::max({h * h, anchor_distance, candidate_distance});
+                if (candidate_distance - anchor_distance > tolerance)
+                    break;
+                ++end;
+            }
+            std::sort(nearest.begin() + static_cast<std::ptrdiff_t>(begin),
+                      nearest.begin() + static_cast<std::ptrdiff_t>(end),
+                      [](const auto& a, const auto& b) {
+                          return std::get<1>(a) < std::get<1>(b);
+                      });
+            begin = end;
+        }
+        if (nearest.empty())
+            continue;
+        if (std::get<0>(nearest.front()) > radius_squared)
+            continue;
+        if (nearest.size() < static_cast<std::size_t>(samples_per_connection)) {
+            throw std::runtime_error(
+                "Neumann augmented Cauchy connection "
+                + std::to_string(connection_index)
+                + " has fewer than four edge samples");
+        }
+        std::vector<int> selected;
+        selected.reserve(static_cast<std::size_t>(samples_per_connection));
+        for (int k = 0; k < samples_per_connection; ++k)
+            selected.push_back(std::get<2>(nearest[static_cast<std::size_t>(k)]));
+        std::sort(selected.begin(), selected.end(), [&](int a, int b) {
+            const auto& first_sample = edge_map.samples[static_cast<std::size_t>(a)];
+            const auto& second_sample = edge_map.samples[static_cast<std::size_t>(b)];
+            return std::tie(first_sample.connection_index, first_sample.sample_index)
+                < std::tie(second_sample.connection_index, second_sample.sample_index);
+        });
+        result.insert(result.end(), selected.begin(), selected.end());
+        ++connection_group_count;
+    }
+    return result;
+}
+
+void append_local_value_rows(
+    Eigen::MatrixXd& design,
+    Eigen::VectorXd& sqrt_weights,
+    int first_row,
+    const std::vector<int>& ids,
+    const SurfaceDof3D& center,
+    const SurfaceDofCloud3D& cloud,
+    double h,
+    const HarmonicPolynomialSpace3D& space)
+{
+    for (int k = 0; k < static_cast<int>(ids.size()); ++k) {
+        const auto& sample = cloud.dofs.at(
+            static_cast<std::size_t>(ids[static_cast<std::size_t>(k)]));
+        const Eigen::Vector3d xi = center_coordinate(center, sample.point, h);
+        design.row(first_row + k) =
+            space.basis(xi.x(), xi.y(), xi.z()).transpose();
+        sqrt_weights[first_row + k] = std::sqrt(
+            1.0 / std::pow(0.35 + xi.norm(), 2.0));
+    }
+}
+
+void append_local_normal_rows(
+    Eigen::MatrixXd& design,
+    Eigen::VectorXd& sqrt_weights,
+    int first_row,
+    const std::vector<int>& ids,
+    const SurfaceDof3D& center,
+    const SurfaceDofCloud3D& cloud,
+    double h,
+    const HarmonicPolynomialSpace3D& space)
+{
+    for (int k = 0; k < static_cast<int>(ids.size()); ++k) {
+        const auto& sample = cloud.dofs.at(
+            static_cast<std::size_t>(ids[static_cast<std::size_t>(k)]));
+        const Eigen::Vector3d xi = center_coordinate(center, sample.point, h);
+        const Eigen::Vector3d normal_components(
+            sample.normal.dot(center.tangent1),
+            sample.normal.dot(center.tangent2),
+            sample.normal.dot(center.normal));
+        design.row(first_row + k) = normal_components.transpose()
+            * space.gradient(xi.x(), xi.y(), xi.z());
+        sqrt_weights[first_row + k] = std::sqrt(
+            0.85 / std::pow(0.35 + xi.norm(), 2.0));
+    }
+}
 } // namespace
 
 const char* neumann_edge_cauchy_mode_name_3d(NeumannEdgeCauchyMode3D mode)
@@ -728,4 +962,333 @@ Eigen::VectorXd evaluate_neumann_edge_values_3d(
     return result;
 }
 
+int NeumannEdgeAugmentedCauchy3D::surface_size() const
+{
+    return surface_size_;
+}
+
+int NeumannEdgeAugmentedCauchy3D::edge_sample_count() const
+{
+    return static_cast<int>(edge_value_map_.samples.size());
+}
+
+const NeumannEdgeAuxiliaryValueMap3D&
+NeumannEdgeAugmentedCauchy3D::edge_value_map() const
+{
+    return edge_value_map_;
+}
+
+const std::vector<NeumannEdgeLocalMap3D>&
+NeumannEdgeAugmentedCauchy3D::local_maps() const
+{
+    return local_maps_;
+}
+
+const NeumannEdgeAugmentedCauchyDiagnostics3D&
+NeumannEdgeAugmentedCauchy3D::diagnostics() const
+{
+    return diagnostics_;
+}
+
+Eigen::VectorXd NeumannEdgeAugmentedCauchy3D::edge_values(
+    const Eigen::VectorXd& value_jump,
+    const Eigen::VectorXd& normal_jump) const
+{
+    if (value_jump.size() != surface_size_ || !value_jump.allFinite())
+        throw std::invalid_argument("Neumann augmented Cauchy value data is invalid");
+    if (normal_jump.size() != surface_size_ || !normal_jump.allFinite())
+        throw std::invalid_argument("Neumann augmented Cauchy normal data is invalid");
+    return evaluate_neumann_edge_values_3d(
+        edge_value_map_, value_jump, normal_jump);
+}
+
+void NeumannEdgeAugmentedCauchy3D::overwrite_affected_coefficients(
+    const Eigen::VectorXd& value_jump,
+    const Eigen::VectorXd& normal_jump,
+    const Eigen::VectorXd& edge_values_data,
+    Eigen::MatrixXd& coefficients) const
+{
+    if (value_jump.size() != surface_size_ || !value_jump.allFinite())
+        throw std::invalid_argument("Neumann augmented Cauchy value data is invalid");
+    if (normal_jump.size() != surface_size_ || !normal_jump.allFinite())
+        throw std::invalid_argument("Neumann augmented Cauchy normal data is invalid");
+    if (edge_values_data.size() != edge_sample_count()
+        || !edge_values_data.allFinite()) {
+        throw std::invalid_argument("Neumann augmented Cauchy edge values are invalid");
+    }
+    if (coefficients.rows() != surface_size_ || coefficients.cols() != 16
+        || !coefficients.allFinite()) {
+        throw std::invalid_argument(
+            "Neumann augmented Cauchy coefficient matrix is invalid");
+    }
+
+    for (const auto& local : local_maps_) {
+        const int edge_count = static_cast<int>(local.edge_sample_indices.size());
+        if (local.center_dof < 0 || local.center_dof >= surface_size_
+            || local.value_dofs.size() != 48 || local.normal_dofs.size() != 28
+            || local.value_map.rows() != 16 || local.value_map.cols() != 48
+            || local.normal_map.rows() != 16 || local.normal_map.cols() != 28
+            || local.edge_map.rows() != 16 || local.edge_map.cols() != edge_count) {
+            throw std::invalid_argument(
+                "Neumann augmented Cauchy local map dimensions are invalid");
+        }
+        std::set<int> unique_edge_samples;
+        for (const int id : local.edge_sample_indices) {
+            if (id < 0 || id >= edge_sample_count())
+                throw std::invalid_argument(
+                    "Neumann augmented Cauchy local map has invalid edge sample");
+            if (!unique_edge_samples.insert(id).second) {
+                throw std::invalid_argument(
+                    "Neumann augmented Cauchy local map has duplicate edge sample");
+            }
+        }
+        Eigen::VectorXd values(48);
+        Eigen::VectorXd normals(28);
+        Eigen::VectorXd edges(edge_count);
+        for (int k = 0; k < 48; ++k) {
+            const int id = local.value_dofs[static_cast<std::size_t>(k)];
+            if (id < 0 || id >= surface_size_)
+                throw std::invalid_argument(
+                    "Neumann augmented Cauchy local map has invalid value DOF");
+            values[k] = value_jump[id];
+        }
+        for (int k = 0; k < 28; ++k) {
+            const int id = local.normal_dofs[static_cast<std::size_t>(k)];
+            if (id < 0 || id >= surface_size_)
+                throw std::invalid_argument(
+                    "Neumann augmented Cauchy local map has invalid normal DOF");
+            normals[k] = normal_jump[id];
+        }
+        for (int k = 0; k < edge_count; ++k)
+            edges[k] = edge_values_data[local.edge_sample_indices[
+                static_cast<std::size_t>(k)]];
+        const Eigen::VectorXd row = local.value_map * values
+            + local.normal_map * normals + local.edge_map * edges;
+        if (!row.allFinite()) {
+            throw std::runtime_error(
+                "Neumann augmented Cauchy coefficient row is non-finite");
+        }
+        coefficients.row(local.center_dof) = row.transpose();
+    }
+}
+
+NeumannEdgeAugmentedCauchy3D
+build_neumann_edge_augmented_cauchy_3d(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud3D& cloud,
+    double h,
+    const std::vector<NeumannEdgeFaceStencil3D>& face_stencils,
+    const NeumannEdgeAuxiliaryOptions3D& edge_options,
+    const NeumannEdgeAugmentedCauchyOptions3D& local_options)
+{
+    validate_local_options(local_options);
+    validate_face_stencils(face_stencils, static_cast<int>(cloud.dofs.size()));
+
+    NeumannEdgeAugmentedCauchy3D result;
+    result.surface_size_ = static_cast<int>(cloud.dofs.size());
+    result.edge_value_map_ = build_neumann_edge_auxiliary_value_map_3d(
+        surface, cloud, h, edge_options);
+    result.diagnostics_.edge = result.edge_value_map_.diagnostics;
+    result.diagnostics_.factorization_count = 2 * static_cast<int>(
+        result.edge_value_map_.samples.size());
+    result.diagnostics_.harmonic_cubic_reproduction_defect_max =
+        result.diagnostics_.edge.harmonic_cubic_reproduction_defect_max;
+
+    std::map<int, std::vector<int>> samples_by_connection;
+    for (int index = 0;
+         index < static_cast<int>(result.edge_value_map_.samples.size());
+         ++index) {
+        const auto& sample = result.edge_value_map_.samples[
+            static_cast<std::size_t>(index)];
+        samples_by_connection[sample.connection_index].push_back(index);
+    }
+
+    const HarmonicPolynomialSpace3D space(local_options.degree);
+    for (int center_id = 0; center_id < result.surface_size_; ++center_id) {
+        int connection_group_count = 0;
+        std::vector<int> attached = attached_edge_samples(
+            surface, cloud, face_stencils[static_cast<std::size_t>(center_id)],
+            result.edge_value_map_, samples_by_connection, center_id, h,
+            local_options.edge_samples_per_connection, connection_group_count);
+        if (attached.empty())
+            continue;
+        if (attached.size()
+            != static_cast<std::size_t>(connection_group_count
+                * local_options.edge_samples_per_connection)) {
+            throw std::runtime_error(
+                "Neumann augmented Cauchy center " + std::to_string(center_id)
+                + " has a partial edge sample group");
+        }
+        if (connection_group_count >= 2)
+            ++result.diagnostics_.corner_center_count;
+
+        NeumannEdgeLocalMap3D local;
+        local.center_dof = center_id;
+        local.value_dofs = face_stencils[static_cast<std::size_t>(center_id)].value_dofs;
+        local.normal_dofs = face_stencils[static_cast<std::size_t>(center_id)].normal_dofs;
+        local.edge_sample_indices = std::move(attached);
+        const int edge_count = static_cast<int>(local.edge_sample_indices.size());
+        const int rows = 48 + 28 + edge_count;
+        Eigen::MatrixXd design(rows, space.dimension());
+        Eigen::VectorXd sqrt_weights(rows);
+        const auto& center = cloud.dofs[static_cast<std::size_t>(center_id)];
+        append_local_value_rows(
+            design, sqrt_weights, 0, local.value_dofs,
+            center, cloud, h, space);
+        append_local_normal_rows(
+            design, sqrt_weights, 48, local.normal_dofs,
+            center, cloud, h, space);
+        for (int k = 0; k < edge_count; ++k) {
+            const auto& sample = result.edge_value_map_.samples[
+                static_cast<std::size_t>(local.edge_sample_indices[
+                    static_cast<std::size_t>(k)])];
+            const Eigen::Vector3d xi = center_coordinate(center, sample.point, h);
+            design.row(76 + k) =
+                space.basis(xi.x(), xi.y(), xi.z()).transpose();
+            sqrt_weights[76 + k] = std::sqrt(
+                local_options.edge_weight_scale
+                / std::pow(0.35 + xi.norm(), 2.0));
+        }
+
+        const Eigen::MatrixXd weighted = sqrt_weights.asDiagonal() * design;
+        Eigen::JacobiSVD<Eigen::MatrixXd> condition_svd(weighted);
+        const Eigen::VectorXd singular = condition_svd.singularValues();
+        result.diagnostics_.factorization_count += 2;
+        if (singular.size() != space.dimension() || singular.size() == 0
+            || !singular.allFinite() || !(singular[0] > 0.0)
+            || !(singular[singular.size() - 1]
+                > local_options.rank_relative_cutoff * singular[0])) {
+            ++result.diagnostics_.rank_deficient_local_fit_count;
+            throw std::runtime_error(
+                "Neumann augmented Cauchy rank-deficient local fit at center "
+                + std::to_string(center_id));
+        }
+        local.condition = singular[0] / singular[singular.size() - 1];
+        const Eigen::MatrixXd pinv = svd_pseudoinverse_3d(
+            weighted, local_options.rank_relative_cutoff);
+        local.value_map.resize(space.dimension(), 48);
+        local.normal_map.resize(space.dimension(), 28);
+        local.edge_map.resize(space.dimension(), edge_count);
+        for (int k = 0; k < 48; ++k)
+            local.value_map.col(k) = pinv.col(k) * sqrt_weights[k];
+        for (int k = 0; k < 28; ++k) {
+            local.normal_map.col(k) =
+                pinv.col(48 + k) * sqrt_weights[48 + k] * h;
+        }
+        for (int k = 0; k < edge_count; ++k)
+            local.edge_map.col(k) = pinv.col(76 + k) * sqrt_weights[76 + k];
+        if (!local.value_map.allFinite() || !local.normal_map.allFinite()
+            || !local.edge_map.allFinite() || !std::isfinite(local.condition)) {
+            throw std::runtime_error(
+                "Neumann augmented Cauchy local map is non-finite at center "
+                + std::to_string(center_id));
+        }
+        result.diagnostics_.local_condition_max = std::max(
+            result.diagnostics_.local_condition_max, local.condition);
+        result.local_maps_.push_back(std::move(local));
+    }
+    result.diagnostics_.affected_center_count =
+        static_cast<int>(result.local_maps_.size());
+
+    std::vector<int> center_to_local(
+        static_cast<std::size_t>(result.surface_size_), -1);
+    for (int index = 0; index < static_cast<int>(result.local_maps_.size()); ++index) {
+        const int center = result.local_maps_[static_cast<std::size_t>(index)].center_dof;
+        if (center_to_local[static_cast<std::size_t>(center)] != -1)
+            throw std::runtime_error("Neumann augmented Cauchy center occurs more than once");
+        center_to_local[static_cast<std::size_t>(center)] = index;
+    }
+    for (int sample_index = 0;
+         sample_index < static_cast<int>(result.edge_value_map_.samples.size());
+         ++sample_index) {
+        const auto& sample = result.edge_value_map_.samples[
+            static_cast<std::size_t>(sample_index)];
+        for (const int owner : {sample.first_owner_dof, sample.second_owner_dof}) {
+            if (owner < 0 || owner >= result.surface_size_
+                || center_to_local[static_cast<std::size_t>(owner)] < 0) {
+                throw std::runtime_error(
+                    "Neumann augmented Cauchy edge sample owner lacks a local map");
+            }
+            const auto& local = result.local_maps_[static_cast<std::size_t>(
+                center_to_local[static_cast<std::size_t>(owner)])];
+            if (std::find(local.edge_sample_indices.begin(),
+                          local.edge_sample_indices.end(), sample_index)
+                == local.edge_sample_indices.end()) {
+                throw std::runtime_error(
+                    "Neumann augmented Cauchy edge sample owner lacks its sample");
+            }
+        }
+    }
+
+    for (const auto& local : result.local_maps_) {
+        const auto& center = cloud.dofs[static_cast<std::size_t>(local.center_dof)];
+        for (int basis_column = 0; basis_column < space.dimension(); ++basis_column) {
+            Eigen::VectorXd predicted = Eigen::VectorXd::Zero(space.dimension());
+            for (int k = 0; k < 48; ++k) {
+                const auto& sample = cloud.dofs[static_cast<std::size_t>(
+                    local.value_dofs[static_cast<std::size_t>(k)])];
+                const Eigen::Vector3d xi = center_coordinate(center, sample.point, h);
+                predicted += local.value_map.col(k)
+                    * space.basis(xi.x(), xi.y(), xi.z())[basis_column];
+            }
+            for (int k = 0; k < 28; ++k) {
+                const auto& sample = cloud.dofs[static_cast<std::size_t>(
+                    local.normal_dofs[static_cast<std::size_t>(k)])];
+                const Eigen::Vector3d xi = center_coordinate(center, sample.point, h);
+                const Eigen::Vector3d normal_components(
+                    sample.normal.dot(center.tangent1),
+                    sample.normal.dot(center.tangent2),
+                    sample.normal.dot(center.normal));
+                const double physical_normal = normal_components.dot(
+                    space.gradient(xi.x(), xi.y(), xi.z()).col(basis_column)) / h;
+                predicted += local.normal_map.col(k) * physical_normal;
+            }
+            for (int k = 0;
+                 k < static_cast<int>(local.edge_sample_indices.size());
+                 ++k) {
+                const auto& sample = result.edge_value_map_.samples[
+                    static_cast<std::size_t>(local.edge_sample_indices[
+                        static_cast<std::size_t>(k)])];
+                const Eigen::Vector3d xi = center_coordinate(center, sample.point, h);
+                predicted += local.edge_map.col(k)
+                    * space.basis(xi.x(), xi.y(), xi.z())[basis_column];
+            }
+            Eigen::VectorXd exact = Eigen::VectorXd::Zero(space.dimension());
+            exact[basis_column] = 1.0;
+            result.diagnostics_.harmonic_cubic_reproduction_defect_max = std::max(
+                result.diagnostics_.harmonic_cubic_reproduction_defect_max,
+                (predicted - exact).lpNorm<Eigen::Infinity>());
+            const Eigen::VectorXd center_basis = space.basis(0.0, 0.0, 0.0);
+            result.diagnostics_.harmonic_cubic_reproduction_defect_max = std::max(
+                result.diagnostics_.harmonic_cubic_reproduction_defect_max,
+                std::abs(center_basis.dot(predicted)
+                    - center_basis[basis_column]));
+            for (const int edge_index : local.edge_sample_indices) {
+                const auto& edge_sample = result.edge_value_map_.samples[
+                    static_cast<std::size_t>(edge_index)];
+                const Eigen::Vector3d edge_xi = center_coordinate(
+                    center, edge_sample.point, h);
+                const Eigen::VectorXd edge_basis = space.basis(
+                    edge_xi.x(), edge_xi.y(), edge_xi.z());
+                result.diagnostics_.harmonic_cubic_reproduction_defect_max =
+                    std::max(
+                        result.diagnostics_.harmonic_cubic_reproduction_defect_max,
+                        std::abs(edge_basis.dot(predicted)
+                            - edge_basis[basis_column]));
+            }
+        }
+    }
+
+    result.diagnostics_.pass = result.diagnostics_.edge.pass
+        && result.diagnostics_.affected_center_count > 0
+        && result.diagnostics_.corner_center_count > 0
+        && result.diagnostics_.unrelated_attachment_count == 0
+        && result.diagnostics_.rank_deficient_local_fit_count == 0
+        && result.diagnostics_.factorization_count
+            == 2 * (static_cast<int>(result.edge_value_map_.samples.size())
+                + result.diagnostics_.affected_center_count)
+        && result.diagnostics_.harmonic_cubic_reproduction_defect_max <= 1.0e-11
+        && std::isfinite(result.diagnostics_.local_condition_max);
+    return result;
+}
 } // namespace kfbim::app3d
