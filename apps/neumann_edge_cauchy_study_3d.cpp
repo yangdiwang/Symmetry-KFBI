@@ -8,6 +8,7 @@
 #include <memory>
 #include <set>
 #include <stdexcept>
+#include <system_error>
 #include <tuple>
 #include <utility>
 
@@ -40,7 +41,8 @@ bool finite_nonnegative(double value)
 
 bool measurement_finite(const NeumannEdgeCauchyMeasurement3D& row)
 {
-    return row.pair_completed && row.finite_metrics && row.N > 0
+    return row.pair_completed && row.residual_history_valid
+        && row.finite_metrics && row.N > 0
         && std::isfinite(row.h)
         && row.h > 0.0 && finite_nonnegative(row.gmres_relative_residual)
         && finite_nonnegative(row.density_linf)
@@ -352,6 +354,48 @@ bool neumann_edge_cauchy_edge_value_row_finite_3d(
     return std::all_of(values.begin(), values.end(),
         [](double value) { return std::isfinite(value); });
 }
+
+bool neumann_edge_cauchy_residual_history_valid_3d(
+    const std::vector<double>& residual_history,
+    int gmres_iterations,
+    double terminal_residual)
+{
+    if (gmres_iterations < 0 || !std::isfinite(terminal_residual)
+        || residual_history.size()
+            != static_cast<std::size_t>(gmres_iterations) + 1) {
+        return false;
+    }
+    return std::all_of(residual_history.begin(), residual_history.end(),
+               [](double value) { return std::isfinite(value); })
+        && residual_history.back() == terminal_residual;
+}
+
+NeumannEdgeCauchyPairProcessResult3D process_neumann_edge_cauchy_pair_3d(
+    int N,
+    const std::function<void()>& run_pair,
+    const std::function<void()>& append_failed_pair,
+    const std::function<bool()>& evaluate_write_and_pair_pass)
+{
+    NeumannEdgeCauchyPairProcessResult3D result;
+    try {
+        run_pair();
+        result.evidence_completed = true;
+    } catch (const std::logic_error& error) {
+        result.failure_message = error.what();
+        append_failed_pair();
+    } catch (const std::system_error&) {
+        throw;
+    } catch (const std::runtime_error& error) {
+        result.failure_message = error.what();
+        append_failed_pair();
+    }
+
+    const bool pair_execution_pass = evaluate_write_and_pair_pass();
+    result.continue_study = N == 128
+        || (result.evidence_completed && pair_execution_pass);
+    return result;
+}
+
 std::vector<int> normalize_neumann_edge_cauchy_levels_3d(
     std::vector<int> levels)
 {

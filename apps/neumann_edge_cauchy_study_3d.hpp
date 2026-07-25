@@ -4,6 +4,7 @@
 #include "neumann_edge_augmented_cauchy_3d.hpp"
 
 #include <array>
+#include <functional>
 #include <limits>
 #include <string>
 #include <vector>
@@ -16,6 +17,7 @@ struct NeumannEdgeCauchyMeasurement3D {
     double h = 0.0;
     NeumannEdgeCauchyMode3D mode = NeumannEdgeCauchyMode3D::None;
     bool pair_completed = false;
+    bool residual_history_valid = false;
     bool finite_metrics = false;
     bool gmres_converged = false;
     int gmres_iterations = 0;
@@ -78,8 +80,25 @@ struct NeumannEdgeCauchyEvaluation3D {
     bool all_pass = false;
 };
 
+struct NeumannEdgeCauchyPairProcessResult3D {
+    bool evidence_completed = false;
+    bool continue_study = false;
+    std::string failure_message;
+};
+
 bool neumann_edge_cauchy_edge_value_row_finite_3d(
     const std::array<double, 6>& values);
+
+bool neumann_edge_cauchy_residual_history_valid_3d(
+    const std::vector<double>& residual_history,
+    int gmres_iterations,
+    double terminal_residual);
+
+NeumannEdgeCauchyPairProcessResult3D process_neumann_edge_cauchy_pair_3d(
+    int N,
+    const std::function<void()>& run_pair,
+    const std::function<void()>& append_failed_pair,
+    const std::function<bool()>& evaluate_write_and_pair_pass);
 
 std::vector<int> normalize_neumann_edge_cauchy_levels_3d(std::vector<int> levels);
 

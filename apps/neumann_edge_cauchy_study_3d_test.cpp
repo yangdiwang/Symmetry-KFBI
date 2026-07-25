@@ -8,6 +8,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace {
@@ -49,6 +50,7 @@ NeumannEdgeCauchyMeasurement3D passing_measurement(
     row.h = 1.0 / N;
     row.mode = mode;
     row.pair_completed = true;
+    row.residual_history_valid = true;
     row.finite_metrics = true;
     row.gmres_converged = true;
     const int pose = case_index(case_id);
@@ -125,6 +127,154 @@ void test_edge_value_row_finiteness()
         require(!neumann_edge_cauchy_edge_value_row_finite_3d(changed),
                 "infinite edge-value component was accepted");
     }
+}
+
+void test_residual_history_validation()
+{
+    const std::vector<double> valid{1.0, 0.25, 0.01};
+    require(neumann_edge_cauchy_residual_history_valid_3d(
+                valid, 2, 0.01),
+            "valid residual history was rejected");
+
+    for (std::size_t q = 0; q < valid.size(); ++q) {
+        auto changed = valid;
+        changed[q] = std::numeric_limits<double>::quiet_NaN();
+        require(!neumann_edge_cauchy_residual_history_valid_3d(
+                    changed, 2, 0.01),
+                "NaN residual history entry was accepted");
+        changed[q] = std::numeric_limits<double>::infinity();
+        require(!neumann_edge_cauchy_residual_history_valid_3d(
+                    changed, 2, 0.01),
+                "infinite residual history entry was accepted");
+    }
+    require(!neumann_edge_cauchy_residual_history_valid_3d(
+                {1.0, 0.01}, 2, 0.01)
+                && !neumann_edge_cauchy_residual_history_valid_3d(
+                    {1.0, 0.25, 0.1, 0.01}, 2, 0.01),
+            "wrong-sized residual history was accepted");
+    require(!neumann_edge_cauchy_residual_history_valid_3d(
+                valid, 2, 0.02),
+            "residual history terminal mismatch was accepted");
+}
+
+void test_pair_process_recovery_and_checkpointing()
+{
+    const auto exercise_coarse_failure = [](bool logic_failure) {
+        auto rows = passing_measurements(false);
+        rows.erase(std::remove_if(rows.begin(), rows.end(),
+            [](const auto& row) {
+                return row.case_id == "baseline" && row.N == 32;
+            }), rows.end());
+        int failed_pair_appends = 0;
+        int checkpoint_writes = 0;
+        std::array<std::string, 6> checkpoints;
+        checkpoints.fill("stale");
+        NeumannEdgeCauchyEvaluation3D evaluation;
+        const auto outcome = process_neumann_edge_cauchy_pair_3d(
+            32,
+            [logic_failure] {
+                if (logic_failure)
+                    throw std::logic_error("logic evidence failure");
+                throw std::runtime_error("runtime evidence failure");
+            },
+            [&] {
+                ++failed_pair_appends;
+                for (NeumannEdgeCauchyMode3D mode : {
+                         NeumannEdgeCauchyMode3D::None,
+                         NeumannEdgeCauchyMode3D::NonG1AuxiliaryValues}) {
+                    auto failed = passing_measurement("baseline", 32, mode);
+                    failed.pair_completed = false;
+                    failed.residual_history_valid = false;
+                    failed.finite_metrics = false;
+                    rows.push_back(failed);
+                }
+            },
+            [&] {
+                ++checkpoint_writes;
+                evaluation = evaluate_neumann_edge_cauchy_study_3d(
+                    rows, kCases, false);
+                checkpoints.fill("failed-checkpoint");
+                return std::all_of(evaluation.rows.begin(),
+                    evaluation.rows.end(), [](const auto& row) {
+                        return row.measurement.case_id != "baseline"
+                            || row.measurement.N != 32
+                            || row.row_pass == Status::Pass;
+                    });
+            });
+        require(!outcome.evidence_completed && !outcome.continue_study
+                    && outcome.failure_message.find(
+                        logic_failure ? "logic evidence" : "runtime evidence")
+                        != std::string::npos,
+                "coarse recoverable evidence failure did not request exit");
+        require(failed_pair_appends == 1 && checkpoint_writes == 1,
+                "coarse failure did not append once and checkpoint once");
+        require(std::all_of(checkpoints.begin(), checkpoints.end(),
+                    [](const auto& value) {
+                        return value == "failed-checkpoint";
+                    }),
+                "coarse failure left a stale checkpoint");
+        require(evaluation.acceptance.overall_pass == Status::Fail
+                    && !evaluation.all_pass
+                    && !neumann_edge_cauchy_study_exit_pass_3d(
+                        evaluation, false),
+                "coarse failed pair did not fail evaluator/process gates");
+        require(std::count_if(rows.begin(), rows.end(), [](const auto& row) {
+                    return row.case_id == "baseline" && row.N == 32
+                        && !row.pair_completed && !row.finite_metrics;
+                }) == 2,
+                "coarse recovery did not retain two explicit failed rows");
+    };
+    exercise_coarse_failure(true);
+    exercise_coarse_failure(false);
+
+    int extended_failed_appends = 0;
+    int extended_checkpoint_writes = 0;
+    const auto extended = process_neumann_edge_cauchy_pair_3d(
+        128,
+        [] { throw std::logic_error("extended evidence failure"); },
+        [&] { ++extended_failed_appends; },
+        [&] {
+            ++extended_checkpoint_writes;
+            return false;
+        });
+    require(!extended.evidence_completed && extended.continue_study
+                && extended_failed_appends == 1
+                && extended_checkpoint_writes == 1,
+            "extended recovery did not checkpoint and continue");
+
+    bool system_rethrown = false;
+    bool system_failed_append = false;
+    bool system_checkpoint = false;
+    try {
+        (void)process_neumann_edge_cauchy_pair_3d(
+            32,
+            [] {
+                throw std::system_error(
+                    std::make_error_code(std::errc::io_error));
+            },
+            [&] { system_failed_append = true; },
+            [&] {
+                system_checkpoint = true;
+                return false;
+            });
+    } catch (const std::system_error&) {
+        system_rethrown = true;
+    }
+    require(system_rethrown && !system_failed_append && !system_checkpoint,
+            "system failure was swallowed as recoverable evidence");
+
+    bool checkpoint_rethrown = false;
+    try {
+        (void)process_neumann_edge_cauchy_pair_3d(
+            32, [] {}, [] {}, []() -> bool {
+                throw std::system_error(
+                    std::make_error_code(std::errc::io_error));
+            });
+    } catch (const std::system_error&) {
+        checkpoint_rethrown = true;
+    }
+    require(checkpoint_rethrown,
+            "checkpoint system failure was swallowed by evidence recovery");
 }
 
 void test_level_prefixes()
@@ -246,6 +396,9 @@ void test_coarse_gate_mutations()
     gate([](auto& r) { r.front().gmres_converged = false; },
          &NeumannEdgeCauchyAcceptance3D::gmres_pass,
          "nonconvergence was hidden");
+    gate([](auto& r) { r.front().residual_history_valid = false; },
+         &NeumannEdgeCauchyAcceptance3D::gmres_pass,
+         "invalid residual history was hidden");
     gate([](auto& r) { r.front().gmres_relative_residual = 2.01e-10; },
          &NeumannEdgeCauchyAcceptance3D::gmres_pass,
          "GMRES residual was hidden");
@@ -379,6 +532,8 @@ int main()
 {
     try {
         test_edge_value_row_finiteness();
+        test_residual_history_validation();
+        test_pair_process_recovery_and_checkpointing();
         test_level_prefixes();
         test_input_keys_and_prefix_semantics();
         test_passing_fixture_and_derived_values();

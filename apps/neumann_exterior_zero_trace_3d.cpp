@@ -9006,7 +9006,6 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
         measurement.N = N;
         measurement.h = h;
         measurement.mode = modes[index];
-        measurement.pair_completed = true;
         measurement.expected_non_g1_connections =
             augmented_diagnostics.edge.expected_non_g1_connections;
         measurement.covered_non_g1_connections =
@@ -9128,6 +9127,14 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
         measurement.gmres_iterations = solve.iterations;
         measurement.gmres_relative_residual =
             solve.gmres_relative_residual;
+        measurement.residual_history_valid =
+            app3d::neumann_edge_cauchy_residual_history_valid_3d(
+                result.residual_histories[index], solve.iterations,
+                solve.gmres_relative_residual);
+        if (!measurement.residual_history_valid) {
+            throw std::runtime_error(
+                "Neumann edge-Cauchy GMRES residual history is invalid");
+        }
         measurement.density_linf = solve.density_linf;
         measurement.density_l2 = solve.density_l2;
         measurement.interior_linf = solve.interior_linf;
@@ -9190,13 +9197,15 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
             result.edge_value_rows[index].push_back(edge_row);
         }
         measurement.incident_edge_discrepancy_linf = discrepancy;
-        measurement.finite_metrics = finite_neumann_owner_metrics_3d(solve)
+        measurement.finite_metrics = measurement.residual_history_valid
+            && finite_neumann_owner_metrics_3d(solve)
             && std::isfinite(measurement.shared_setup_seconds)
             && std::isfinite(measurement.mode_runtime_seconds)
             && std::isfinite(measurement.total_seconds)
             && std::isfinite(measurement.incident_edge_discrepancy_linf)
             && std::isfinite(measurement.edge_condition_max)
             && std::isfinite(measurement.local_condition_max);
+        measurement.pair_completed = true;
         measurement.owner_invariants_pass =
             neumann_edge_preprocess_snapshot_equal_3d(
                 stable_snapshot, before_snapshots[index])
@@ -9244,6 +9253,8 @@ NeumannEdgeCauchyPairRun3D failed_neumann_edge_cauchy_pair_3d(
         measurement.N = N;
         measurement.h = kBoxSide / static_cast<double>(N);
         measurement.mode = modes[index];
+        measurement.pair_completed = false;
+        measurement.residual_history_valid = false;
         measurement.finite_metrics = false;
     }
     return result;
@@ -9294,6 +9305,22 @@ find_neumann_edge_cauchy_derived_row_3d(
         ? nullptr : std::addressof(*found);
 }
 
+bool neumann_edge_cauchy_pair_execution_pass_3d(
+    const NeumannEdgeCauchyPairRun3D& pair,
+    const app3d::NeumannEdgeCauchyEvaluation3D& evaluation)
+{
+    return std::all_of(
+        pair.measurements.begin(), pair.measurements.end(),
+        [&](const auto& measurement) {
+            const auto* derived =
+                find_neumann_edge_cauchy_derived_row_3d(
+                    evaluation, measurement);
+            return derived != nullptr
+                && derived->row_pass
+                    == app3d::RigidStudyCriterionStatus3D::Pass;
+        });
+}
+
 void write_neumann_edge_cauchy_checkpoints_3d(
     const std::filesystem::path& output_dir,
     const std::vector<NeumannEdgeCauchyPairRun3D>& pairs,
@@ -9302,8 +9329,9 @@ void write_neumann_edge_cauchy_checkpoints_3d(
     std::filesystem::create_directories(output_dir);
     std::ofstream summary = open_output_file(output_dir / "summary.csv");
     summary << std::setprecision(17) << std::boolalpha
-        << "case_id,N,h,mode,pair_completed,shared_exact_trace_bitwise,"
-           "shared_normal_jump_bitwise,finite_metrics,gmres_converged,"
+        << "case_id,N,h,mode,pair_completed,residual_history_valid,"
+           "shared_exact_trace_bitwise,shared_normal_jump_bitwise,"
+           "finite_metrics,gmres_converged,"
            "gmres_iterations,"
            "gmres_relative_residual,density_linf,density_l2,interior_linf,"
            "interior_l2,incident_edge_discrepancy_linf,"
@@ -9342,6 +9370,7 @@ void write_neumann_edge_cauchy_checkpoints_3d(
                 << app3d::neumann_edge_cauchy_mode_name_3d(
                        measurement.mode)
                 << ',' << measurement.pair_completed
+                << ',' << measurement.residual_history_valid
                 << ',' << pair.shared_exact_trace_bitwise[mode_index]
                 << ',' << pair.shared_normal_jump_bitwise[mode_index]
                 << ',' << measurement.finite_metrics
@@ -9624,42 +9653,39 @@ int run_neumann_edge_cauchy_study_3d(std::vector<int> levels)
         for (const auto& study_case : cases) {
             std::cout << "[neumann-edge-cauchy-study] case="
                 << study_case.id << " N=" << N << " setup\n";
-            bool evidence_exception = false;
-            std::string evidence_message;
-            if (N == 128) {
-                try {
-                    pairs.push_back(run_neumann_edge_cauchy_pair_3d(
-                        N, study_case));
-                } catch (const std::logic_error& error) {
-                    evidence_exception = true;
-                    evidence_message = error.what();
-                    pairs.push_back(failed_neumann_edge_cauchy_pair_3d(
-                        N, study_case));
-                } catch (const std::system_error&) {
-                    throw;
-                } catch (const std::runtime_error& error) {
-                    evidence_exception = true;
-                    evidence_message = error.what();
-                    pairs.push_back(failed_neumann_edge_cauchy_pair_3d(
-                        N, study_case));
-                }
-            } else {
-                pairs.push_back(run_neumann_edge_cauchy_pair_3d(
-                    N, study_case));
-            }
-            evaluation = app3d::evaluate_neumann_edge_cauchy_study_3d(
-                neumann_edge_cauchy_measurements_3d(pairs),
-                case_ids, require_complete_pilot);
-            write_neumann_edge_cauchy_checkpoints_3d(
-                output_dir, pairs, evaluation);
-            if (evidence_exception) {
-                std::cerr
-                    << "warning: N=128 Neumann edge-Cauchy evidence failed: case="
-                    << study_case.id << " reason=" << evidence_message
+            bool pair_execution_pass = false;
+            const auto process =
+                app3d::process_neumann_edge_cauchy_pair_3d(
+                    N,
+                    [&] {
+                        pairs.push_back(run_neumann_edge_cauchy_pair_3d(
+                            N, study_case));
+                    },
+                    [&] {
+                        pairs.push_back(failed_neumann_edge_cauchy_pair_3d(
+                            N, study_case));
+                    },
+                    [&] {
+                        evaluation =
+                            app3d::evaluate_neumann_edge_cauchy_study_3d(
+                                neumann_edge_cauchy_measurements_3d(pairs),
+                                case_ids, require_complete_pilot);
+                        pair_execution_pass =
+                            neumann_edge_cauchy_pair_execution_pass_3d(
+                                pairs.back(), evaluation);
+                        write_neumann_edge_cauchy_checkpoints_3d(
+                            output_dir, pairs, evaluation);
+                        return pair_execution_pass;
+                    });
+            if (!process.evidence_completed) {
+                std::cerr << (N == 128 ? "warning: " : "error: ")
+                    << "N=" << N
+                    << " Neumann edge-Cauchy evidence failed: case="
+                    << study_case.id
+                    << " reason=" << process.failure_message
                     << "; checkpoint records pair_completed=false\n";
             }
 
-            bool pair_execution_pass = true;
             const auto& pair = pairs.back();
             for (const auto& measurement : pair.measurements) {
                 const auto* derived =
@@ -9668,7 +9694,6 @@ int run_neumann_edge_cauchy_study_3d(std::vector<int> levels)
                 const bool row_pass = derived != nullptr
                     && derived->row_pass
                         == app3d::RigidStudyCriterionStatus3D::Pass;
-                pair_execution_pass = pair_execution_pass && row_pass;
                 std::cout << "[neumann-edge-cauchy-study] case="
                     << measurement.case_id << " N=" << measurement.N
                     << " mode="
@@ -9688,8 +9713,8 @@ int run_neumann_edge_cauchy_study_3d(std::vector<int> levels)
                     << "Neumann edge-Cauchy structural or GMRES row gate "
                        "failed: case=" << study_case.id
                     << " N=" << N << '\n';
-                if (N != 128) return 1;
             }
+            if (!process.continue_study) return 1;
         }
     }
 
