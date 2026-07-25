@@ -18,6 +18,11 @@ std::vector<int> select_neumann_edge_distance_candidates_3d(
     double radius_squared,
     int count);
 
+void validate_neumann_edge_local_map_3d(
+    const NeumannEdgeLocalMap3D& local,
+    int surface_size,
+    int edge_sample_count);
+
 int certified_l_prism_symmetric_partner_3d(
     const NativeNurbsSurface3D& surface,
     const SurfaceDofCloud3D& cloud,

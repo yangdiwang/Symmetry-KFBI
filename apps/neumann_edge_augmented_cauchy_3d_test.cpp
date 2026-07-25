@@ -1,3 +1,4 @@
+#define EIGEN_RUNTIME_NO_MALLOC
 #include "neumann_edge_augmented_cauchy_3d.hpp"
 #include "neumann_edge_augmented_cauchy_3d_detail.hpp"
 #include "native_nurbs_surface_transform_3d.hpp"
@@ -6,10 +7,12 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <functional>
 #include <iostream>
 #include <limits>
 #include <map>
+#include <new>
 #include <queue>
 #include <set>
 #include <stdexcept>
@@ -17,6 +20,42 @@
 #include <tuple>
 #include <vector>
 
+namespace {
+bool track_runtime_allocations=false;
+std::size_t runtime_allocation_count=0;
+}
+
+void* operator new(std::size_t size)
+{
+    if(track_runtime_allocations) ++runtime_allocation_count;
+    if(void* memory=std::malloc(size==0?1:size)) return memory;
+    throw std::bad_alloc();
+}
+
+void* operator new[](std::size_t size)
+{
+    return ::operator new(size);
+}
+
+void operator delete(void* memory) noexcept
+{
+    std::free(memory);
+}
+
+void operator delete[](void* memory) noexcept
+{
+    std::free(memory);
+}
+
+void operator delete(void* memory,std::size_t) noexcept
+{
+    std::free(memory);
+}
+
+void operator delete[](void* memory,std::size_t) noexcept
+{
+    std::free(memory);
+}
 
 namespace {
 using namespace kfbim::app3d;
@@ -369,6 +408,19 @@ void test_geometric_symmetry_certificate()
         require_pair(surface,cloud,partial_reversed,0,3,
             "partial reversed interval");
     }
+
+    constexpr int huge_count=2100000000;
+    auto huge_cloud=make_native_surface_dofs_3d(source,h);
+    huge_cloud.patches[0].nv=huge_count;
+    auto huge_center=huge_cloud.dofs.front();
+    huge_center.j=huge_count-2;
+    NeumannEdgeAuxiliarySample3D huge_sample;
+    huge_sample.sample_count=huge_count;
+    huge_sample.sample_index=huge_count-1;
+    require(certified_l_prism_symmetric_partner_3d(
+                source,huge_cloud,huge_center,full,huge_sample)
+            ==huge_count-3,
+        "large exact symmetry overflowed its integer product");
 
     auto replace_patch_zero=[](NativeNurbsSurface3D& surface,
                                std::vector<std::vector<Eigen::Vector3d>> net) {
@@ -777,6 +829,58 @@ void test_local_attachment_groups_and_overwrite()
                 "unaffected coefficient row changed bitwise");
     }
 }
+
+void test_runtime_overwrite_has_no_per_center_heap_path()
+{
+    const auto surface=make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
+    const double h=3.0/32.0;
+    const auto cloud=make_native_surface_dofs_3d(surface,h);
+    const auto stencils=exact_face_stencils(surface,cloud);
+    const auto augmented=build_neumann_edge_augmented_cauchy_3d(
+        surface,cloud,h,stencils);
+    Eigen::VectorXd values=Eigen::VectorXd::LinSpaced(
+        augmented.surface_size(),-0.25,0.75);
+    Eigen::VectorXd normals=Eigen::VectorXd::LinSpaced(
+        augmented.surface_size(),0.5,-0.5);
+    const Eigen::VectorXd edges=augmented.edge_values(values,normals);
+    Eigen::MatrixXd coefficients=Eigen::MatrixXd::Constant(
+        augmented.surface_size(),16,0.2718281828459045);
+    const Eigen::MatrixXd before=coefficients;
+    std::vector<bool> affected(static_cast<std::size_t>(augmented.surface_size()),false);
+    for(const auto& local:augmented.local_maps())
+        affected[static_cast<std::size_t>(local.center_dof)]=true;
+    const int factorizations=augmented.diagnostics().factorization_count;
+
+    struct NoAllocationScope {
+        NoAllocationScope()
+        {
+            runtime_allocation_count=0;
+            Eigen::internal::set_is_malloc_allowed(false);
+            track_runtime_allocations=true;
+        }
+        ~NoAllocationScope()
+        {
+            track_runtime_allocations=false;
+            Eigen::internal::set_is_malloc_allowed(true);
+        }
+    };
+    {
+        NoAllocationScope scope;
+        augmented.overwrite_affected_coefficients(
+            values,normals,edges,coefficients);
+    }
+    require(runtime_allocation_count==0,
+        "runtime overwrite used a validation/workspace heap allocation path");
+    require(augmented.diagnostics().factorization_count==factorizations,
+        "runtime overwrite performed setup work or factorization");
+    for(int row=0;row<coefficients.rows();++row) {
+        if(affected[static_cast<std::size_t>(row)]) continue;
+        for(int column=0;column<coefficients.cols();++column)
+            require(bitwise_equal(coefficients(row,column),before(row,column)),
+                "no-allocation runtime changed an unaffected row");
+    }
+}
+
 struct GlobalHarmonicFields {
     Eigen::MatrixXd values;
     Eigen::MatrixXd normals;
@@ -1009,6 +1113,37 @@ void test_local_map_rejections()
     const auto baseline=build_neumann_edge_augmented_cauchy_3d(
         surface,cloud,h,stencils);
     require(!baseline.local_maps().empty(),"rank-deficiency fixture has no affected center");
+    const int component_center=baseline.local_maps().front().center_dof;
+    const auto component_patches=smooth_patch_component(
+        surface,cloud.dofs[static_cast<std::size_t>(component_center)].patch_id);
+    const std::set<int> center_component(
+        component_patches.begin(),component_patches.end());
+    int outside_dof=-1;
+    for(int id=0;id<static_cast<int>(cloud.dofs.size());++id) {
+        if(center_component.count(cloud.dofs[static_cast<std::size_t>(id)].patch_id)==0) {
+            outside_dof=id;
+            break;
+        }
+    }
+    require(outside_dof>=0,"wrong-side fixture lacks an outside-component DOF");
+    const int outside_patch=cloud.dofs[static_cast<std::size_t>(outside_dof)].patch_id;
+    auto wrong_side_value=stencils;
+    wrong_side_value[static_cast<std::size_t>(component_center)].value_dofs.back()
+        =outside_dof;
+    require_throws<std::invalid_argument>([&]{
+        (void)build_neumann_edge_augmented_cauchy_3d(
+            surface,cloud,h,wrong_side_value);
+    },"value DOF "+std::to_string(outside_dof)
+        +" patch "+std::to_string(outside_patch));
+    auto wrong_side_normal=stencils;
+    wrong_side_normal[static_cast<std::size_t>(component_center)].normal_dofs.back()
+        =outside_dof;
+    require_throws<std::invalid_argument>([&]{
+        (void)build_neumann_edge_augmented_cauchy_3d(
+            surface,cloud,h,wrong_side_normal);
+    },"normal DOF "+std::to_string(outside_dof)
+        +" patch "+std::to_string(outside_patch));
+
     auto repeated=stencils;
     const int repeated_center=baseline.local_maps().front().center_dof;
     const int repeated_value=
@@ -1024,29 +1159,30 @@ void test_local_map_rejections()
     },"rank-deficient local");
 
     auto expanded=stencils;
-    int farthest=0;
     const int center=baseline.local_maps().front().center_dof;
-    for(int id=1;id<static_cast<int>(cloud.dofs.size());++id)
+    int farthest=center;
+    for(int id=0;id<static_cast<int>(cloud.dofs.size());++id) {
+        if(center_component.count(cloud.dofs[static_cast<std::size_t>(id)].patch_id)==0)
+            continue;
         if((cloud.dofs[static_cast<std::size_t>(id)].point
             -cloud.dofs[static_cast<std::size_t>(center)].point).squaredNorm()
            >(cloud.dofs[static_cast<std::size_t>(farthest)].point
             -cloud.dofs[static_cast<std::size_t>(center)].point).squaredNorm())
             farthest=id;
+    }
     expanded[static_cast<std::size_t>(center)].value_dofs.back()=farthest;
     const auto expanded_map=build_neumann_edge_augmented_cauchy_3d(
         surface,cloud,h,expanded);
     const auto* expanded_local=find_local_map(expanded_map,center);
     require(expanded_local!=nullptr,"expanded-radius center lost its local map");
-    const auto component_vector=smooth_patch_component(
-        surface,cloud.dofs[static_cast<std::size_t>(center)].patch_id);
-    const std::set<int> component(component_vector.begin(),component_vector.end());
+
     for(const int index:expanded_local->edge_sample_indices) {
         const auto& sample=expanded_map.edge_value_map().samples[
             static_cast<std::size_t>(index)];
         const auto& connection=surface.geometric_connections[
             static_cast<std::size_t>(sample.connection_index)];
-        require((component.count(connection.first.patch)==1)
-                !=(component.count(connection.second.patch)==1),
+        require((center_component.count(connection.first.patch)==1)
+                !=(center_component.count(connection.second.patch)==1),
             "expanded radius attached an unrelated connection");
     }
 
@@ -1091,23 +1227,40 @@ void test_local_map_rejections()
     duplicate_maps.front().edge_sample_indices[1]
         =duplicate_maps.front().edge_sample_indices[0];
     require_throws<std::invalid_argument>([&]{
-        duplicate.overwrite_affected_coefficients(
-            values,normals,edge_values,coefficients);
+        kfbim::app3d::detail::validate_neumann_edge_local_map_3d(
+            duplicate_maps.front(),duplicate.surface_size(),
+            duplicate.edge_sample_count());
     },"duplicate edge sample");
 }
-SurfaceDofCloud3D restricted_cloud(const SurfaceDofCloud3D& dense)
+
+SurfaceDofCloud3D restricted_cloud(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud3D& dense)
 {
     SurfaceDofCloud3D result; result.expected_area=dense.expected_area;
-    for(int patch=0;patch<static_cast<int>(dense.patches.size());++patch) {
-        SurfaceDofPatch3D tensor=dense.patches[static_cast<std::size_t>(patch)];
+    for(int patch_id=0;patch_id<static_cast<int>(dense.patches.size());++patch_id) {
+        SurfaceDofPatch3D tensor=dense.patches[static_cast<std::size_t>(patch_id)];
         tensor.first_dof=static_cast<int>(result.dofs.size());
-        const int wanted=patch<6?8:24; tensor.nu=wanted; tensor.nv=1;
-        int copied=0;
-        for(const auto& dof:dense.dofs) if(dof.patch_id==patch && copied<wanted) {
-            auto copy=dof; copy.i=copied; copy.j=0;
-            result.dofs.push_back(copy); ++copied;
+        const int wanted=patch_id<6?8:24;
+        tensor.nu=wanted;
+        tensor.nv=1;
+        const auto& patch=surface.patches[static_cast<std::size_t>(patch_id)];
+        const double du=(patch.domain_end_u()-patch.domain_start_u())/wanted;
+        const double dv=patch.domain_end_v()-patch.domain_start_v();
+        for(int i=0;i<wanted;++i) {
+            const double u=patch.domain_start_u()+(static_cast<double>(i)+0.5)*du;
+            const double v=patch.domain_start_v()+0.5*dv;
+            const auto geometry=patch.evaluate_with_derivatives(u,v);
+            Eigen::Vector3d normal=geometry.du.cross(geometry.dv);
+            const double jacobian=normal.norm();
+            normal/=jacobian;
+            Eigen::Vector3d tangent1=geometry.du
+                -geometry.du.dot(normal)*normal;
+            tangent1.normalize();
+            const Eigen::Vector3d tangent2=normal.cross(tangent1).normalized();
+            result.dofs.push_back({geometry.point,normal,tangent1,tangent2,
+                jacobian*du*dv,u,v,patch_id,i,0});
         }
-        require(copied==wanted,"restricted fixture lacked source DOFs");
         result.patches.push_back(std::move(tensor));
     }
     return result;
@@ -1226,6 +1379,25 @@ void test_review_rejection_paths()
         (void)build_neumann_edge_auxiliary_value_map_3d(surface,translated_cloud,h);
     },"DOF 0 patch 0");
 
+    auto shifted_tensor_parameter=cloud;
+    auto& shifted=shifted_tensor_parameter.dofs[0];
+    const auto& shifted_patch=surface.patches[0];
+    const double cell_width=(shifted_patch.domain_end_u()
+        -shifted_patch.domain_start_u())/shifted_tensor_parameter.patches[0].nu;
+    shifted.u+=0.1*cell_width;
+    const auto shifted_geometry=
+        shifted_patch.evaluate_with_derivatives(shifted.u,shifted.v);
+    shifted.point=shifted_geometry.point;
+    shifted.normal=shifted_geometry.du.cross(shifted_geometry.dv).normalized();
+    shifted.tangent1=(shifted_geometry.du
+        -shifted_geometry.du.dot(shifted.normal)*shifted.normal).normalized();
+    shifted.tangent2=shifted.normal.cross(shifted.tangent1).normalized();
+    record_required_rejection<std::invalid_argument>(failures,
+        "shifted tensor-center parameters",[&]{
+        (void)build_neumann_edge_auxiliary_value_map_3d(
+            surface,shifted_tensor_parameter,h);
+    },"tensor-center parameters");
+
     auto wrong_tensor_index=cloud;
     wrong_tensor_index.dofs[0].i=1;
     record_required_rejection<std::invalid_argument>(failures,"wrong tensor index",[&]{
@@ -1253,7 +1425,7 @@ void test_review_rejection_paths()
     require(chosen<restricted_surface.geometric_connections.size(),"side-label fixture connection missing");
     restricted_surface.geometric_connections={restricted_surface.geometric_connections[chosen]};
     remove_reciprocal_g1_relation(restricted_surface,0,1);
-    const auto small=restricted_cloud(make_native_surface_dofs_3d(surface,0.08));
+    const auto small=restricted_cloud(surface,make_native_surface_dofs_3d(surface,0.08));
     record_required_rejection<std::runtime_error>(failures,"insufficient side label",[&]{
         (void)build_neumann_edge_auxiliary_value_map_3d(restricted_surface,small,h);
     },"second-value side");
@@ -1276,6 +1448,9 @@ void test_rejections_and_shared_values()
     const auto coarse=make_native_surface_dofs_3d(surface,10.0);
     require_throws<std::runtime_error>([&]{(void)build_neumann_edge_auxiliary_value_map_3d(surface,coarse,10.0);},"insufficient");
     require_throws<std::invalid_argument>([&]{(void)build_neumann_edge_auxiliary_value_map_3d(surface,cloud,0.0);},"positive h");
+    require_throws<std::overflow_error>([&]{
+        (void)build_neumann_edge_auxiliary_value_map_3d(surface,cloud,1.0e-12);
+    },"sample count");
     for(int which=0;which<5;++which) {
         NeumannEdgeAuxiliaryOptions3D options;
         if(which==0) options.degree=2; if(which==1) options.value_samples_per_side=23;
@@ -1292,7 +1467,7 @@ void test_rejections_and_shared_values()
     const auto connection=restricted_surface.geometric_connections[chosen];
     restricted_surface.geometric_connections={connection};
     remove_reciprocal_g1_relation(restricted_surface,0,1);
-    const auto small=restricted_cloud(make_native_surface_dofs_3d(surface,0.08));
+    const auto small=restricted_cloud(surface,make_native_surface_dofs_3d(surface,0.08));
     require_throws<std::runtime_error>([&]{(void)build_neumann_edge_auxiliary_value_map_3d(restricted_surface,small,h);},"second-value side");
     const auto degenerate=degenerate_normal_surface(); const auto degenerate_cloud=make_native_surface_dofs_3d(degenerate,0.1);
     require_throws<std::runtime_error>([&]{(void)build_neumann_edge_auxiliary_value_map_3d(degenerate,degenerate_cloud,0.1);},"connection 0 sample 0");
@@ -1302,11 +1477,17 @@ void test_rejections_and_shared_values()
 
 } // namespace
 
-int main()
+int main(int argc,char** argv)
 {
     try {
+        if(argc==2 && std::string(argv[1])=="--runtime-no-alloc") {
+            test_runtime_overwrite_has_no_per_center_heap_path();
+            std::cout<<"3D Neumann runtime no-allocation test passed\n";
+            return 0;
+        }
         test_l_prism_geometry_topology_reproduction_and_direct_map();
         test_rigid_covariance();
+        test_runtime_overwrite_has_no_per_center_heap_path();
         test_exact_distance_selection_boundaries();
         test_geometric_symmetry_certificate();
         test_local_attachment_groups_and_overwrite();
