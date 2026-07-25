@@ -2,10 +2,13 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <map>
 #include <stdexcept>
 #include <utility>
+
+#include <Eigen/SparseQR>
 
 namespace kfbim::app3d {
 namespace {
@@ -223,6 +226,205 @@ double neumann_edge_mismatch_weighted_rms_3d(const NeumannEdgeConstraintSet3D& c
     const double value = std::sqrt((constraints.quadrature_weights.array() * residual.array().square()).sum() / denominator);
     require_finite(value, "edge mismatch is non-finite");
     return value;
+}
+
+namespace {
+
+void validate_projector_density(const Eigen::VectorXd& density, int expected_size)
+{
+    if (density.size() != expected_size || !density.allFinite())
+        throw std::invalid_argument("edge projector density has invalid size or values");
+}
+
+} // namespace
+
+NeumannEdgeContinuityProjector3D::NeumannEdgeContinuityProjector3D(
+    const NeumannEdgeConstraintSet3D& constraints,
+    const SurfaceDofCloud3D& cloud,
+    double rank_tolerance)
+    : density_size_(constraints.density_size),
+      physical_constraints_(constraints.matrix),
+      edge_quadrature_weights_(constraints.quadrature_weights)
+{
+    if (!std::isfinite(rank_tolerance) || rank_tolerance <= 0.0)
+        throw std::invalid_argument("edge projector rank tolerance must be positive and finite");
+    if (density_size_ != static_cast<int>(cloud.dofs.size()) || density_size_ < 0
+        || physical_constraints_.cols() != density_size_
+        || physical_constraints_.rows() != edge_quadrature_weights_.size())
+        throw std::invalid_argument("edge projector constraint dimensions are invalid");
+    diagnostics_.input_constraint_count = static_cast<int>(physical_constraints_.rows());
+    diagnostics_.rank_tolerance = rank_tolerance;
+    inverse_surface_mass_.resize(density_size_);
+    for (int q = 0; q < density_size_; ++q) {
+        const double mass = cloud.dofs[static_cast<std::size_t>(q)].weight;
+        if (!std::isfinite(mass) || mass <= 0.0)
+            throw std::invalid_argument("edge projector surface mass is invalid");
+        inverse_surface_mass_[q] = 1.0 / mass;
+    }
+    for (Eigen::Index row = 0; row < edge_quadrature_weights_.size(); ++row)
+        if (!std::isfinite(edge_quadrature_weights_[row]) || edge_quadrature_weights_[row] <= 0.0)
+            throw std::invalid_argument("edge projector quadrature weight is invalid");
+    for (int row = 0; row < physical_constraints_.outerSize(); ++row)
+        for (Eigen::SparseMatrix<double, Eigen::RowMajor>::InnerIterator it(physical_constraints_, row); it; ++it)
+            if (!std::isfinite(it.value()))
+                throw std::invalid_argument("edge projector constraint coefficient is invalid");
+
+    const Eigen::VectorXd constant_mismatch = physical_constraints_ * Eigen::VectorXd::Ones(density_size_);
+    diagnostics_.constant_constraint_defect = constant_mismatch.size() == 0 ? 0.0 : constant_mismatch.lpNorm<Eigen::Infinity>();
+    if (!std::isfinite(diagnostics_.constant_constraint_defect))
+        throw std::invalid_argument("edge projector constant constraint defect is invalid");
+    if (physical_constraints_.rows() == 0)
+        return;
+
+    const auto setup_start = std::chrono::steady_clock::now();
+    std::vector<Eigen::Triplet<double>> scaled_entries;
+    scaled_entries.reserve(static_cast<std::size_t>(physical_constraints_.nonZeros()));
+    for (int row = 0; row < physical_constraints_.outerSize(); ++row) {
+        const double row_scale = std::sqrt(edge_quadrature_weights_[row]);
+        for (Eigen::SparseMatrix<double, Eigen::RowMajor>::InnerIterator it(physical_constraints_, row); it; ++it)
+            scaled_entries.emplace_back(row, it.col(), row_scale * it.value() * std::sqrt(inverse_surface_mass_[it.col()]));
+    }
+    Eigen::SparseMatrix<double> scaled_constraint(physical_constraints_.rows(), physical_constraints_.cols());
+    scaled_constraint.setFromTriplets(scaled_entries.begin(), scaled_entries.end());
+    Eigen::SparseQR<Eigen::SparseMatrix<double>, Eigen::COLAMDOrdering<int>> qr;
+    qr.setPivotThreshold(rank_tolerance);
+    qr.compute(scaled_constraint.transpose());
+    if (qr.info() != Eigen::Success)
+        throw std::runtime_error("edge projector sparse QR factorization failed");
+    const int rank = static_cast<int>(qr.rank());
+    if (rank < 0 || rank > physical_constraints_.rows())
+        throw std::runtime_error("edge projector sparse QR rank is invalid");
+    diagnostics_.retained_constraint_rank = rank;
+    retained_original_rows_.reserve(static_cast<std::size_t>(rank));
+    for (int q = 0; q < rank; ++q) {
+        const int row = qr.colsPermutation().indices()[q];
+        if (row < 0 || row >= physical_constraints_.rows())
+            throw std::runtime_error("edge projector sparse QR selected an invalid row");
+        retained_original_rows_.push_back(row);
+    }
+    std::sort(retained_original_rows_.begin(), retained_original_rows_.end());
+    if (std::adjacent_find(retained_original_rows_.begin(), retained_original_rows_.end()) != retained_original_rows_.end())
+        throw std::runtime_error("edge projector sparse QR selected duplicate rows");
+    if (rank == 0) {
+        diagnostics_.factorization_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - setup_start).count();
+        return;
+    }
+
+    std::vector<Eigen::Triplet<double>> retained_entries;
+    std::vector<std::vector<std::pair<int, double>>> retained_rows;
+    retained_rows.reserve(static_cast<std::size_t>(rank));
+    for (int retained = 0; retained < rank; ++retained) {
+        const int source = retained_original_rows_[static_cast<std::size_t>(retained)];
+        const double row_scale = std::sqrt(edge_quadrature_weights_[source]);
+        std::vector<std::pair<int, double>> row_entries;
+        for (Eigen::SparseMatrix<double, Eigen::RowMajor>::InnerIterator it(physical_constraints_, source); it; ++it) {
+            const double value = row_scale * it.value();
+            retained_entries.emplace_back(retained, it.col(), value);
+            row_entries.emplace_back(it.col(), value);
+        }
+        retained_rows.push_back(std::move(row_entries));
+    }
+    retained_scaled_constraints_.resize(rank, density_size_);
+    retained_scaled_constraints_.setFromTriplets(retained_entries.begin(), retained_entries.end());
+    Eigen::MatrixXd gram = Eigen::MatrixXd::Zero(rank, rank);
+    for (int first = 0; first < rank; ++first) for (int second = first; second < rank; ++second) {
+        const auto& a = retained_rows[static_cast<std::size_t>(first)];
+        const auto& b = retained_rows[static_cast<std::size_t>(second)];
+        std::size_t ia = 0, ib = 0;
+        double value = 0.0;
+        while (ia < a.size() && ib < b.size()) {
+            if (a[ia].first < b[ib].first) ++ia;
+            else if (b[ib].first < a[ia].first) ++ib;
+            else { value += a[ia].second * b[ib].second * inverse_surface_mass_[a[ia].first]; ++ia; ++ib; }
+        }
+        gram(first, second) = value;
+        gram(second, first) = value;
+    }
+    if (!gram.allFinite())
+        throw std::runtime_error("edge projector Gram matrix is non-finite");
+    gram_factor_.compute(gram);
+    if (gram_factor_.info() != Eigen::Success || !gram_factor_.vectorD().allFinite()
+        || (gram_factor_.vectorD().array() <= 0.0).any())
+        throw std::runtime_error("edge projector Gram factorization is not positive definite");
+    diagnostics_.factorization_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - setup_start).count();
+}
+
+int NeumannEdgeContinuityProjector3D::density_size() const { return density_size_; }
+int NeumannEdgeContinuityProjector3D::constraint_count() const { return diagnostics_.input_constraint_count; }
+int NeumannEdgeContinuityProjector3D::retained_rank() const { return diagnostics_.retained_constraint_rank; }
+
+Eigen::VectorXd NeumannEdgeContinuityProjector3D::project(const Eigen::VectorXd& density) const
+{
+    validate_projector_density(density, density_size_);
+    if (retained_rank() == 0)
+        return density;
+    const Eigen::VectorXd residual = retained_scaled_constraints_ * density;
+    const Eigen::VectorXd coefficients = gram_factor_.solve(residual);
+    if (gram_factor_.info() != Eigen::Success || !coefficients.allFinite())
+        throw std::runtime_error("edge projector Gram solve failed");
+    return density - inverse_surface_mass_.asDiagonal() * (retained_scaled_constraints_.transpose() * coefficients);
+}
+
+Eigen::VectorXd NeumannEdgeContinuityProjector3D::complement(const Eigen::VectorXd& density) const
+{
+    validate_projector_density(density, density_size_);
+    return density - project(density);
+}
+
+Eigen::VectorXd NeumannEdgeContinuityProjector3D::constraint_mismatch(const Eigen::VectorXd& density) const
+{
+    validate_projector_density(density, density_size_);
+    return physical_constraints_ * density;
+}
+
+double NeumannEdgeContinuityProjector3D::mismatch_linf(const Eigen::VectorXd& density) const
+{
+    const Eigen::VectorXd mismatch = constraint_mismatch(density);
+    return mismatch.size() == 0 ? 0.0 : mismatch.lpNorm<Eigen::Infinity>();
+}
+
+double NeumannEdgeContinuityProjector3D::mismatch_weighted_rms(const Eigen::VectorXd& density) const
+{
+    const Eigen::VectorXd mismatch = constraint_mismatch(density);
+    if (mismatch.size() == 0)
+        return 0.0;
+    return std::sqrt((edge_quadrature_weights_.array() * mismatch.array().square()).sum() / edge_quadrature_weights_.sum());
+}
+
+const NeumannEdgeProjectionDiagnostics3D& NeumannEdgeContinuityProjector3D::diagnostics() const { return diagnostics_; }
+
+NeumannEdgeProjectedAugmentedOperator3D::NeumannEdgeProjectedAugmentedOperator3D(
+    const kfbim::IKFBIOperator& base, const NeumannEdgeContinuityProjector3D& projector)
+    : base_(base), projector_(projector)
+{
+    if (base_.problem_size() != projector_.density_size() + 1)
+        throw std::invalid_argument("projected augmented operator base size is invalid");
+}
+
+int NeumannEdgeProjectedAugmentedOperator3D::problem_size() const { return base_.problem_size(); }
+
+void NeumannEdgeProjectedAugmentedOperator3D::apply(const Eigen::VectorXd& unknown, Eigen::VectorXd& result) const
+{
+    if (unknown.size() != problem_size())
+        throw std::invalid_argument("projected augmented operator input has invalid size");
+    const int n = projector_.density_size();
+    Eigen::VectorXd projected_unknown = unknown;
+    projected_unknown.head(n) = projector_.project(unknown.head(n));
+    Eigen::VectorXd base_result;
+    base_.apply(projected_unknown, base_result);
+    if (base_result.size() != problem_size())
+        throw std::invalid_argument("projected augmented operator base result has invalid size");
+    result = base_result;
+    result.head(n) = projector_.project(base_result.head(n)) + unknown.head(n) - projected_unknown.head(n);
+}
+
+Eigen::VectorXd NeumannEdgeProjectedAugmentedOperator3D::project_right_hand_side(const Eigen::VectorXd& base_rhs) const
+{
+    if (base_rhs.size() != problem_size())
+        throw std::invalid_argument("projected augmented operator RHS has invalid size");
+    Eigen::VectorXd projected_rhs = base_rhs;
+    projected_rhs.head(projector_.density_size()) = projector_.project(base_rhs.head(projector_.density_size()));
+    return projected_rhs;
 }
 
 } // namespace kfbim::app3d

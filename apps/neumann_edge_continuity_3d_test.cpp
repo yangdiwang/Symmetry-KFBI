@@ -1,5 +1,7 @@
 #include "neumann_edge_continuity_3d.hpp"
 
+#include "../src/operators/i_kfbi_operator.hpp"
+
 #include <array>
 #include <cmath>
 #include <iostream>
@@ -70,6 +72,37 @@ Eigen::VectorXd exact_density(const SurfaceDofCloud3D& cloud)
     return values;
 }
 
+class SyntheticAugmentedOperator final : public kfbim::IKFBIOperator {
+public:
+    explicit SyntheticAugmentedOperator(const Eigen::VectorXd& mass)
+        : mass_(mass), matrix_(Eigen::MatrixXd::Zero(mass.size(), mass.size()))
+    {
+        if (mass_.size() == 0 || !mass_.allFinite() || (mass_.array() <= 0.0).any())
+            throw std::invalid_argument("synthetic mass is invalid");
+        for (Eigen::Index row = 0; row < matrix_.rows(); ++row)
+            for (Eigen::Index col = 0; col < matrix_.cols(); ++col)
+                matrix_(row, col) = (row == col ? 1.7 : 0.0)
+                    + 0.015 * std::sin(0.13 * (row + 1) * (col + 2));
+    }
+
+    int problem_size() const override { return static_cast<int>(mass_.size()) + 1; }
+    const Eigen::MatrixXd& matrix() const { return matrix_; }
+
+    void apply(const Eigen::VectorXd& unknown, Eigen::VectorXd& result) const override
+    {
+        if (unknown.size() != problem_size())
+            throw std::invalid_argument("synthetic augmented input has invalid size");
+        result.resize(problem_size());
+        result.head(mass_.size()) = matrix_ * unknown.head(mass_.size())
+            + unknown[mass_.size()] * Eigen::VectorXd::Ones(mass_.size());
+        result[mass_.size()] = mass_.dot(unknown.head(mass_.size())) / mass_.sum();
+    }
+
+private:
+    Eigen::VectorXd mass_;
+    Eigen::MatrixXd matrix_;
+};
+
 void test_non_g1_topology_and_rows()
 {
     const auto surface = make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
@@ -133,6 +166,154 @@ void test_fallback_and_order()
     require(std::isfinite(m32) && std::isfinite(m64) && m32 > 0.0 && m64 > 0.0 && m32 / m64 >= 6.0,
             "exact trace mismatch is not at least third-order");
 }
+
+void test_surface_mass_projector()
+{
+    const auto surface = make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
+    const double h = 3.0 / 32.0;
+    const auto cloud = make_native_surface_dofs_3d(surface, h);
+    const auto constraints = build_neumann_edge_constraints_3d(surface, cloud, h);
+    require(constraints.quadrature_weights.size() == constraints.matrix.rows(),
+            "public edge quadrature weights have invalid size");
+    for (Eigen::Index row = 0; row < constraints.quadrature_weights.size(); ++row) {
+        require(std::isfinite(constraints.quadrature_weights[row])
+                    && constraints.quadrature_weights[row] > 0.0,
+                "public edge quadrature weight is invalid");
+        require(std::abs(constraints.quadrature_weights[row]
+                         - constraints.samples[static_cast<std::size_t>(row)].quadrature_weight)
+                    <= 1.0e-15 * constraints.quadrature_weights[row],
+                "public edge quadrature weights do not match samples");
+    }
+    Eigen::VectorXd mass(static_cast<Eigen::Index>(cloud.dofs.size()));
+    for (std::size_t q = 0; q < cloud.dofs.size(); ++q) {
+        mass[static_cast<Eigen::Index>(q)] = cloud.dofs[q].weight;
+        require(std::isfinite(mass[static_cast<Eigen::Index>(q)])
+                    && mass[static_cast<Eigen::Index>(q)] > 0.0,
+                "surface mass is invalid");
+    }
+
+    NeumannEdgeContinuityProjector3D projector(constraints, cloud, 1.0e-12);
+    Eigen::VectorXd x(static_cast<Eigen::Index>(cloud.dofs.size()));
+    for (Eigen::Index q = 0; q < x.size(); ++q)
+        x[q] = std::sin(0.37 * (q + 1)) + 0.2 * std::cos(0.11 * (q + 1));
+    const Eigen::VectorXd px = projector.project(x);
+    const double scale = std::max(1.0, x.lpNorm<Eigen::Infinity>());
+    require(apply_neumann_edge_constraints_3d(constraints, px).lpNorm<Eigen::Infinity>() / scale <= 1.0e-11,
+            "projected density violates edge constraints");
+    require((projector.project(px) - px).lpNorm<Eigen::Infinity>() / scale <= 1.0e-11,
+            "projector is not idempotent");
+    require((projector.project(Eigen::VectorXd::Ones(x.size()))
+             - Eigen::VectorXd::Ones(x.size())).lpNorm<Eigen::Infinity>() <= 1.0e-11,
+            "projector does not preserve constants");
+    require(projector.retained_rank() > 0
+                && projector.retained_rank() <= projector.constraint_count()
+                && projector.constraint_count() == constraints.matrix.rows(),
+            "projector rank diagnostics are invalid");
+    const Eigen::VectorXd complement = x - px;
+    const double weighted_orthogonality = px.dot(mass.cwiseProduct(complement));
+    const double weighted_scale = std::sqrt(px.dot(mass.cwiseProduct(px))
+        * complement.dot(mass.cwiseProduct(complement)));
+    require((projector.complement(x) - complement).lpNorm<Eigen::Infinity>() <= 1.0e-13 * scale,
+            "projector complement is inconsistent");
+    require(std::abs(weighted_orthogonality) <= 1.0e-11 * std::max(1.0, weighted_scale),
+            "projector is not orthogonal in the surface-mass metric");
+    const Eigen::VectorXd direct = constraints.matrix * x;
+    const double direct_linf = direct.lpNorm<Eigen::Infinity>();
+    const double direct_rms = std::sqrt((constraints.quadrature_weights.array()
+                                         * direct.array().square()).sum()
+                                        / constraints.quadrature_weights.sum());
+    require((projector.constraint_mismatch(x) - direct).lpNorm<Eigen::Infinity>() <= 1.0e-13 * scale
+                && std::abs(projector.mismatch_linf(x) - direct_linf) <= 1.0e-13 * scale
+                && std::abs(projector.mismatch_weighted_rms(x) - direct_rms) <= 1.0e-13 * scale,
+            "projector mismatch helpers disagree with direct constraints");
+    bool bad_size_threw = false;
+    try { projector.project(Eigen::VectorXd::Zero(x.size() - 1)); }
+    catch (const std::invalid_argument&) { bad_size_threw = true; }
+    require(bad_size_threw, "projector accepts an invalid density size");
+
+    NeumannEdgeConstraintSet3D empty;
+    empty.density_size = static_cast<int>(x.size());
+    empty.matrix.resize(0, x.size());
+    NeumannEdgeContinuityProjector3D identity(empty, cloud);
+    require((identity.project(x) - x).lpNorm<Eigen::Infinity>() <= 1.0e-13 * scale
+                && identity.retained_rank() == 0,
+            "zero-row projector is not the identity");
+
+    NeumannEdgeConstraintSet3D redundant;
+    redundant.density_size = static_cast<int>(x.size());
+    redundant.matrix.resize(2, x.size());
+    const std::vector<Eigen::Triplet<double>> redundant_entries = {
+        {0, 0, 1.0}, {0, 1, -1.0}, {1, 0, 2.0}, {1, 1, -2.0}};
+    redundant.matrix.setFromTriplets(redundant_entries.begin(), redundant_entries.end());
+    redundant.quadrature_weights = Eigen::Vector2d(0.7, 1.3);
+    NeumannEdgeContinuityProjector3D rank_filtered(redundant, cloud);
+    const Eigen::VectorXd rank_filtered_x = rank_filtered.project(x);
+    require(rank_filtered.retained_rank() == 1
+                && (redundant.matrix * rank_filtered_x).lpNorm<Eigen::Infinity>() <= 1.0e-12 * scale,
+            "rank-filtered projector does not satisfy dropped physical rows");
+}
+
+void test_projected_augmented_operator()
+{
+    const auto surface = make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
+    const double h = 3.0 / 32.0;
+    const auto cloud = make_native_surface_dofs_3d(surface, h);
+    const auto constraints = build_neumann_edge_constraints_3d(surface, cloud, h);
+    NeumannEdgeContinuityProjector3D projector(constraints, cloud, 1.0e-12);
+    Eigen::VectorXd mass(static_cast<Eigen::Index>(cloud.dofs.size()));
+    for (std::size_t q = 0; q < cloud.dofs.size(); ++q)
+        mass[static_cast<Eigen::Index>(q)] = cloud.dofs[q].weight;
+    SyntheticAugmentedOperator base(mass);
+    NeumannEdgeProjectedAugmentedOperator3D wrapper(base, projector);
+    const Eigen::Index n = mass.size();
+    Eigen::VectorXd unknown(n + 1);
+    for (Eigen::Index q = 0; q < n; ++q)
+        unknown[q] = std::sin(0.19 * (q + 1)) - 0.3 * std::cos(0.07 * (q + 1));
+    unknown[n] = -0.45;
+    Eigen::VectorXd baseline, after;
+    base.apply(unknown, baseline);
+    Eigen::VectorXd result;
+    wrapper.apply(unknown, result);
+    base.apply(unknown, after);
+    Eigen::VectorXd projected_unknown = unknown;
+    projected_unknown.head(n) = projector.project(unknown.head(n));
+    Eigen::VectorXd base_top = base.matrix() * projected_unknown.head(n)
+        + projected_unknown[n] * Eigen::VectorXd::Ones(n);
+    Eigen::VectorXd expected(n + 1);
+    expected.head(n) = projector.project(base_top)
+        + unknown.head(n) - projected_unknown.head(n);
+    expected[n] = mass.dot(projected_unknown.head(n)) / mass.sum();
+    require((result - expected).lpNorm<Eigen::Infinity>() <= 1.0e-11,
+            "projected augmented wrapper has incorrect algebra");
+    require((baseline - after).lpNorm<Eigen::Infinity>() <= 1.0e-13,
+            "projected augmented wrapper mutates the base operator");
+    const Eigen::VectorXd excluded = projector.complement(unknown.head(n));
+    Eigen::VectorXd excluded_unknown = Eigen::VectorXd::Zero(n + 1);
+    excluded_unknown.head(n) = excluded;
+    Eigen::VectorXd excluded_result;
+    wrapper.apply(excluded_unknown, excluded_result);
+    require((excluded_result.head(n) - excluded).lpNorm<Eigen::Infinity>() <= 1.0e-11,
+            "wrapper does not retain an excluded density component");
+    const Eigen::VectorXd projected_rhs = wrapper.project_right_hand_side(unknown);
+    require((projected_rhs.head(n) - projector.project(unknown.head(n))).lpNorm<Eigen::Infinity>() <= 1.0e-11
+                && projected_rhs[n] == unknown[n],
+            "projected augmented RHS is incorrect");
+    bool bad_apply_threw = false, bad_rhs_threw = false, bad_base_threw = false;
+    try { wrapper.apply(Eigen::VectorXd::Zero(n), result); }
+    catch (const std::invalid_argument&) { bad_apply_threw = true; }
+    try { wrapper.project_right_hand_side(Eigen::VectorXd::Zero(n)); }
+    catch (const std::invalid_argument&) { bad_rhs_threw = true; }
+    try {
+        class WrongSizeOperator final : public kfbim::IKFBIOperator {
+        public:
+            int problem_size() const override { return 1; }
+            void apply(const Eigen::VectorXd&, Eigen::VectorXd&) const override {}
+        } wrong;
+        NeumannEdgeProjectedAugmentedOperator3D invalid_wrapper(wrong, projector);
+    } catch (const std::invalid_argument&) { bad_base_threw = true; }
+    require(bad_apply_threw && bad_rhs_threw && bad_base_threw,
+            "projected augmented wrapper accepts invalid sizes");
+}
 }
 
 int main()
@@ -140,6 +321,8 @@ int main()
     try {
         test_non_g1_topology_and_rows();
         test_fallback_and_order();
+        test_surface_mass_projector();
+        test_projected_augmented_operator();
         std::cout << "3D Neumann edge-continuity tests passed\n";
         return 0;
     } catch (const std::exception& error) {
