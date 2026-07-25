@@ -35,6 +35,16 @@ struct NurbsElementIntersectionDiagnostics3D {
     int triangle_seed_hits = 0;
     int newton_attempts = 0;
     int newton_iterations = 0;
+    int early_unique_certificate_attempts = 0;
+    int early_unique_certificate_successes = 0;
+    int planar_analytic_hits = 0;
+    int planar_analytic_misses = 0;
+    int planar_analytic_fallbacks = 0;
+    int closest_point_prefilter_attempts = 0;
+    int closest_point_prefilter_certified_hits = 0;
+    int closest_point_prefilter_certified_misses = 0;
+    int closest_point_prefilter_fallbacks = 0;
+    int certified_fallback_elements = 0;
     int roots_recovered_without_triangle_seed = 0;
     int unresolved_boxes = 0;
     int maximum_subdivision_depth_reached = 0;
@@ -93,6 +103,9 @@ struct NurbsElementIntersectionOptions3D {
         kDefaultTerminalSeparationSubdivisionDepth3D;
     int max_newton_iterations = 24;
     bool use_triangle_seed = true;
+    bool use_early_unique_root_certificate = false;
+    bool use_affine_planar_fast_path = false;
+    bool use_closest_point_prefilter = false;
     std::vector<NurbsElementParameterSeed3D> parameter_seeds;
 };
 

@@ -80,6 +80,15 @@ if(KFBIM_BUILD_3D)
         kfbi_phase_profile_3d_test.cpp
     )
 
+    add_executable(nurbs_geometry_preprocess_benchmark_3d_test
+        nurbs_geometry_preprocess_benchmark_3d.cpp
+        nurbs_geometry_preprocess_benchmark_3d_test.cpp
+    )
+
+    add_executable(nurbs_geometry_preprocess_benchmark_3d
+        nurbs_geometry_preprocess_benchmark_3d.cpp
+    )
+
     add_executable(neumann_exterior_zero_trace_3d
         neumann_exterior_zero_trace_3d.cpp
     )
@@ -154,6 +163,14 @@ if(KFBIM_BUILD_3D)
         kfbim_phase_profile_3d
     )
 
+    target_link_libraries(nurbs_geometry_preprocess_benchmark_3d_test PRIVATE
+        kfbim_3d_app_geometry
+    )
+
+    target_link_libraries(nurbs_geometry_preprocess_benchmark_3d PRIVATE
+        kfbim_3d_app_geometry
+    )
+
     target_link_libraries(neumann_exterior_zero_trace_3d PRIVATE
         kfbim_3d_app_geometry
         kfbim_core
@@ -195,6 +212,10 @@ target_compile_definitions(dirichlet_harmonic_jet_python_compatible_2d PRIVATE
 )
 
 if(KFBIM_BUILD_3D)
+    target_compile_definitions(nurbs_geometry_preprocess_benchmark_3d PRIVATE
+        KFBIM_NURBS_GEOMETRY_PREPROCESS_BENCHMARK_3D_MAIN=1
+    )
+
     target_compile_definitions(neumann_exterior_zero_trace_3d PRIVATE
         KFBIM_APP_OUTPUT_DIR="${PROJECT_SOURCE_DIR}/output"
     )
@@ -219,5 +240,7 @@ if(KFBIM_BUILD_3D)
     target_compile_features(kfbim_phase_profile_3d_test PRIVATE cxx_std_17)
     target_compile_features(restrict_owner_geometry_preprocessor_3d_test PRIVATE cxx_std_17)
     target_compile_features(harmonic_trace_correction_3d_test PRIVATE cxx_std_17)
+    target_compile_features(nurbs_geometry_preprocess_benchmark_3d_test PRIVATE cxx_std_17)
+    target_compile_features(nurbs_geometry_preprocess_benchmark_3d PRIVATE cxx_std_17)
     target_compile_features(neumann_exterior_zero_trace_3d PRIVATE cxx_std_17)
 endif()
