@@ -30,6 +30,7 @@ if(KFBIM_BUILD_3D)
     find_package(Threads REQUIRED)
 
     add_library(kfbim_3d_app_geometry STATIC
+        harmonic_trace_correction_3d.cpp
         crossing_owner_restrict_3d.cpp
         exterior_only_cubic_normal_restrict_3d.cpp
         harmonic_polynomial_space_3d.cpp
@@ -69,6 +70,10 @@ if(KFBIM_BUILD_3D)
 
     add_executable(restrict_owner_geometry_preprocessor_3d_test
         restrict_owner_geometry_preprocessor_3d_test.cpp
+    )
+
+    add_executable(harmonic_trace_correction_3d_test
+        harmonic_trace_correction_3d_test.cpp
     )
 
     add_executable(kfbim_phase_profile_3d_test
@@ -141,6 +146,10 @@ if(KFBIM_BUILD_3D)
         kfbim_3d_app_geometry
     )
 
+    target_link_libraries(harmonic_trace_correction_3d_test PRIVATE
+        kfbim_3d_app_geometry
+    )
+
     target_link_libraries(kfbim_phase_profile_3d_test PRIVATE
         kfbim_phase_profile_3d
     )
@@ -209,5 +218,6 @@ if(KFBIM_BUILD_3D)
     target_compile_features(crossing_owner_restrict_3d_test PRIVATE cxx_std_17)
     target_compile_features(kfbim_phase_profile_3d_test PRIVATE cxx_std_17)
     target_compile_features(restrict_owner_geometry_preprocessor_3d_test PRIVATE cxx_std_17)
+    target_compile_features(harmonic_trace_correction_3d_test PRIVATE cxx_std_17)
     target_compile_features(neumann_exterior_zero_trace_3d PRIVATE cxx_std_17)
 endif()
