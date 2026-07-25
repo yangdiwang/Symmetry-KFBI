@@ -892,8 +892,8 @@ int certified_l_prism_symmetric_partner(
             && sample_factor
                 > std::numeric_limits<long long>::max() / scaled_numerator)
         || (scaled_numerator < 0
-            && sample_factor
-                > std::numeric_limits<long long>::min() / scaled_numerator)) {
+            && scaled_numerator
+                < std::numeric_limits<long long>::min() / sample_factor)) {
         return -1;
     }
     const long long reflected_sum = scaled_numerator * sample_factor;

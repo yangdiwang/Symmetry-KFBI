@@ -657,6 +657,27 @@ void test_geometric_symmetry_certificate()
         "metadata-preserving bilinear control net was certified");
 }
 
+void test_negative_reduced_symmetry_numerator_is_rejected()
+{
+    using kfbim::app3d::detail::certified_l_prism_symmetric_partner_3d;
+    const auto surface=make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
+    const auto cloud=make_native_surface_dofs_3d(surface,3.0/64.0);
+    const auto& tensor=cloud.patches.at(6);
+    const auto& center=cloud.dofs.at(static_cast<std::size_t>(
+        tensor.dof_index(6,0)));
+    constexpr int connection_index=11;
+    const auto& connection=surface.geometric_connections.at(connection_index);
+    NeumannEdgeAuxiliarySample3D sample;
+    sample.connection_index=connection_index;
+    sample.sample_index=0;
+    sample.sample_count=13;
+    require(center.patch_id==6 && center.i==6 && center.j==0,
+        "negative reduced-numerator fixture selected the wrong center");
+    require(certified_l_prism_symmetric_partner_3d(
+                surface,cloud,center,connection,sample)==-1,
+        "negative reduced symmetry numerator was not rejected");
+}
+
 void test_sample_count_integer_boundaries()
 {
     using kfbim::app3d::detail::plan_neumann_edge_sample_count_3d;
@@ -1710,11 +1731,18 @@ int main(int argc,char** argv)
             std::cout<<"3D Neumann sample-count boundary tests passed\n";
             return 0;
         }
+        if(argc==2
+            && std::string(argv[1])=="--negative-symmetry-guard") {
+            test_negative_reduced_symmetry_numerator_is_rejected();
+            std::cout<<"3D Neumann negative symmetry guard test passed\n";
+            return 0;
+        }
         test_l_prism_geometry_topology_reproduction_and_direct_map();
         test_rigid_covariance();
         test_runtime_overwrite_has_no_per_center_heap_path();
         test_exact_distance_selection_boundaries();
         test_geometric_symmetry_certificate();
+        test_negative_reduced_symmetry_numerator_is_rejected();
         test_sample_count_integer_boundaries();
         test_local_attachment_groups_and_overwrite();
         test_local_harmonic_reproduction_and_rigid_covariance();
