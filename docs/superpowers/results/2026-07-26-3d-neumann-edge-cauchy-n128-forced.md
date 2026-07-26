@@ -18,8 +18,15 @@
 - 功能提交：`099184b`、`8ddabd5`
 - 命令：
 
-  ```text
-  tfpm3d_cut_l_prism.exe --neumann-edge-cauchy-study --force-extended 32 64 128
+  ```powershell
+  # Evidence code SHA: 8ddabd5
+  cmake --build build --config Release -- /m:1
+  $env:KFBIM_3D_NEUMANN_EDGE_CAUCHY_OUTPUT_DIR = `
+    'output/neumann_edge_cauchy_3d_n128_forced'
+  & .\build\apps\Release\neumann_exterior_zero_trace_3d.exe `
+    --neumann-edge-cauchy-study --force-extended 32 64 128
+  $forcedExit = $LASTEXITCODE
+  Write-Output "FORCED_EXIT=$forcedExit"
   ```
 
 - 输出：`output/neumann_edge_cauchy_3d_n128_forced`
