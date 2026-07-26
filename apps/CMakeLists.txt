@@ -31,6 +31,7 @@ if(KFBIM_BUILD_3D)
 
     add_library(kfbim_3d_app_geometry STATIC
         harmonic_trace_correction_3d.cpp
+        harmonic_cauchy_fit_3d.cpp
         crossing_owner_restrict_3d.cpp
         exterior_only_cubic_normal_restrict_3d.cpp
         harmonic_polynomial_space_3d.cpp
@@ -50,6 +51,10 @@ if(KFBIM_BUILD_3D)
 
     add_executable(native_nurbs_surface_3d_test
         native_nurbs_surface_3d_test.cpp
+    )
+
+    add_executable(harmonic_cauchy_fit_3d_test
+        harmonic_cauchy_fit_3d_test.cpp
     )
 
     add_executable(neumann_edge_continuity_3d_test
@@ -150,6 +155,11 @@ if(KFBIM_BUILD_3D)
     target_link_libraries(native_nurbs_surface_3d_test PRIVATE
         kfbim_3d_app_geometry
     )
+
+    target_link_libraries(harmonic_cauchy_fit_3d_test PRIVATE
+        kfbim_3d_app_geometry
+    )
+    target_compile_features(harmonic_cauchy_fit_3d_test PRIVATE cxx_std_17)
 
     target_link_libraries(neumann_edge_continuity_3d_test PRIVATE
         kfbim_3d_app_geometry
