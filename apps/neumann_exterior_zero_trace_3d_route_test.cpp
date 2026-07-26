@@ -671,6 +671,8 @@ TwoLevelNeumannStudyRouteRow3D make_shared_writer_fixture_3d()
     row.physical_residuals = {1.0, 0.1, 0.01};
     row.common_residuals = {1.0, 0.02};
     row.common_rhs_rms = 1.0;
+    row.defect_linf = 0.5;
+    row.defect_rms = std::sqrt(0.59 / 3.0);
     row.edge_value_linf = 0.05;
     row.edge_value_rms = 0.05;
     row.edge_bins = {{
@@ -694,7 +696,7 @@ TwoLevelNeumannStudyRouteRow3D make_shared_writer_fixture_3d()
     point.native_uv[1] = Eigen::Vector2d(0.75, 0.0);
     point.point = Eigen::Vector3d(0.25, 0.0, 0.0);
     point.tangent = Eigen::Vector3d::UnitX();
-    point.sectors = "{{0},{1}}";
+    point.sectors = "{{0};{1}}";
     point.exact_value = 1.25;
     point.reconstructed_value = 1.20;
     point.error = -0.05;
@@ -732,6 +734,10 @@ TwoLevelNeumannStudyRouteRow3D make_shared_writer_fixture_3d()
     surfaceFit.ordinary_value_count = 48;
     surfaceFit.normal_count = 28;
     surfaceFit.edge_count = 1;
+    surfaceFit.value_sector_patch_ids = "{{0};{1}}";
+    surfaceFit.value_sector_counts = "{24;24}";
+    surfaceFit.normal_sector_patch_ids = "{{0};{1}}";
+    surfaceFit.normal_sector_counts = "{14;14}";
     surfaceFit.value_radius_over_h = 1.1;
     surfaceFit.normal_radius_over_h = 1.2;
     surfaceFit.sigma_min = 0.5;
@@ -1030,6 +1036,67 @@ void require_review_schema_negative_mutations_3d(
             directory / "summary.csv", {{"case_id", "synthetic"}},
             "defect_linf", "NaN");
     });
+    exercise("summary_defect_linf_inconsistent", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_matching_3d(
+            directory / "summary.csv", {{"case_id", "synthetic"}},
+            "defect_linf", "4.0e-1");
+    });
+    exercise("summary_defect_rms_inconsistent", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_matching_3d(
+            directory / "summary.csv", {{"case_id", "synthetic"}},
+            "defect_rms", "4.0e-1");
+    });
+    exercise("owner_nonnumeric_output_digest", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_matching_3d(
+            directory / "owner_diagnostics.csv",
+            {{"case_id", "synthetic"}},
+            "owner_output_digest_before", "not-a-uint64");
+    });
+    exercise("surface_malformed_sector_syntax", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_matching_3d(
+            directory / "surface_fit_diagnostics.csv",
+            {{"case_id", "synthetic"}, {"center_dof", "0"}},
+            "value_sector_patch_ids", "{{0};oops}");
+    });
+    exercise("surface_sector_count_total_mismatch", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_matching_3d(
+            directory / "surface_fit_diagnostics.csv",
+            {{"case_id", "synthetic"}, {"center_dof", "0"}},
+            "value_sector_counts", "{23;24}");
+    });
+    exercise("surface_patch_id_out_of_range", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_matching_3d(
+            directory / "surface_fit_diagnostics.csv",
+            {{"case_id", "synthetic"}, {"center_dof", "0"}},
+            "value_sector_patch_ids", "{{0};{2}}");
+    });
+    exercise("shared_surface_edge_count_above_six", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_matching_3d(
+            directory / "surface_fit_diagnostics.csv",
+            {{"case_id", "synthetic"}, {"center_dof", "0"}},
+            "edge_count", "7");
+    });
+    exercise("edge_point_malformed_sectors", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_matching_3d(
+            directory / "edge_point_diagnostics.csv",
+            {{"case_id", "synthetic"}, {"cell_id", "6"}},
+            "sectors", "{0;1}");
+    });
+    exercise("edge_point_sector_trailing_newline", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_matching_3d(
+            directory / "edge_point_diagnostics.csv",
+            {{"case_id", "synthetic"}, {"cell_id", "6"}},
+            "sectors", std::string("{{0};{1}}") + static_cast<char>(10));
+    });
     exercise("successful_summary_failure_metadata", [](
         const std::filesystem::path& directory) {
         mutate_csv_field_matching_3d(
@@ -1209,6 +1276,19 @@ void require_review_schema_negative_mutations_3d(
             directory / "summary.csv", "post_solve_available",
             "physical_final_residual", "5.0e-1");
     });
+    exercise("failed_na_summary_with_residual_history", [](
+        const std::filesystem::path& directory) {
+        append_csv_record_for_case_3d(
+            directory / "gmres_residuals.csv", "synthetic",
+            "solve_available");
+    });
+    exercise("failed_dof_partial_postsolve_values", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_matching_3d(
+            directory / "dof_diagnostics.csv",
+            {{"case_id", "solve_available"}, {"dof_id", "0"}},
+            "density_error", "1.0e-1");
+    });
     exercise("mismatched_edge_key_set", [](
         const std::filesystem::path& directory) {
         mutate_csv_field_3d(directory / "edge_point_diagnostics.csv", 2,
@@ -1238,14 +1318,15 @@ int run_two_level_neumann_audit_command_3d(
 {
     std::ostringstream command;
     command << "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
-            << static_cast<char>(34) << "& { & '" << script.string()
+            << static_cast<char>(34) << "& { try { & '" << script.string()
             << "' -OutputDirectory '" << outputDirectory.string()
             << "' -ExpectedLevels @(" << expectedLevels
             << ") -AllowNumericalFailure";
     if (schemaOnly) command << " -SchemaOnly";
     if (!decision.empty())
         command << " -DecisionJson '" << decision.string() << "'";
-    command << " }" << static_cast<char>(34);
+    command << " } catch { Write-Error $_; exit 1 } }"
+            << static_cast<char>(34);
     return std::system(command.str().c_str());
 }
 
@@ -1363,7 +1444,7 @@ TwoLevelNeumannStudyRouteRow3D make_decision_writer_fixture_3d(
     if (N == 128)
         for (auto& order : row.orders_64_128) order = 1.0;
     row.defect_linf = 0.5;
-    row.defect_rms = 0.25;
+    row.defect_rms = std::sqrt(0.59 / 3.0);
     row.edge_value_linf = 1.0 / static_cast<double>(N);
     row.edge_value_rms = 0.5 / static_cast<double>(N);
     for (auto& point : row.edge_points) {
@@ -1399,6 +1480,7 @@ TwoLevelNeumannStudyRouteRow3D make_decision_writer_fixture_3d(
         row.edge_fits.clear();
         row.edge_value_linf.reset();
         row.edge_value_rms.reset();
+        for (auto& fit : row.surface_fits) fit.edge_count = 0;
     }
     return row;
 }
@@ -1498,6 +1580,102 @@ void test_decision_state_distinguishes_partial_performance_and_failure()
             "formal performance decision audit failed");
     require_json_state_3d(performanceDecision,
         "sector_polynomials_with_shared_edge_constraints", "true", "true");
+
+    const auto exerciseFormalRejection = [&performance, &script, &error](
+        const std::string& name,
+        const std::function<void(const std::filesystem::path&)>& mutate) {
+        const auto destination = performance.parent_path()
+            / (performance.filename().string() + "_" + name);
+        std::filesystem::remove_all(destination, error);
+        std::filesystem::copy(performance, destination,
+            std::filesystem::copy_options::recursive);
+        mutate(destination);
+        require(run_two_level_neumann_audit_command_3d(
+                    script, destination, "32,64,128", false,
+                    destination / "decision.json") != 0,
+                "audit accepted invalid formal evidence: " + name);
+        std::filesystem::remove_all(destination, error);
+    };
+    exerciseFormalRejection("control_surface_nonzero_edge_count", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_matching_3d(
+            directory / "surface_fit_diagnostics.csv",
+            {{"case_id", "baseline"}, {"N", "32"},
+             {"route", "g1_value_g1_normal"}, {"center_dof", "0"}},
+            "edge_count", "1");
+    });
+    exerciseFormalRejection("derived_order_overflow", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_matching_3d(
+            directory / "summary.csv",
+            {{"case_id", "baseline"}, {"N", "32"},
+             {"route", "g1_value_g1_normal"}},
+            "density_linf", "1.0e308");
+        mutate_csv_field_matching_3d(
+            directory / "summary.csv",
+            {{"case_id", "baseline"}, {"N", "64"},
+             {"route", "g1_value_g1_normal"}},
+            "density_linf", "1.0e-308");
+    });
+    exerciseFormalRejection("combined_weight_overflow", [](
+        const std::filesystem::path& directory) {
+        for (const std::string& dof : {"0", "1"}) {
+            mutate_csv_field_matching_3d(
+                directory / "dof_diagnostics.csv",
+                {{"case_id", "baseline"}, {"N", "32"},
+                 {"route", "g1_value_g1_normal"}, {"dof_id", dof}},
+                "weight", "1.0e308");
+        }
+        for (const std::string& bin : {"lt_h", "h_to_2h"}) {
+            mutate_csv_field_matching_3d(
+                directory / "edge_distance_bins.csv",
+                {{"case_id", "baseline"}, {"N", "32"},
+                 {"route", "g1_value_g1_normal"}, {"distance_bin", bin}},
+                "weight_sum", "1.0e308");
+        }
+    });
+    exerciseFormalRejection("combined_square_overflow", [](
+        const std::filesystem::path& directory) {
+        for (const std::string& dof : {"0", "1"}) {
+            mutate_csv_field_matching_3d(
+                directory / "dof_diagnostics.csv",
+                {{"case_id", "baseline"}, {"N", "32"},
+                 {"route", "g1_value_g1_normal"}, {"dof_id", dof}},
+                "weight", "9.0e-1");
+            mutate_csv_field_matching_3d(
+                directory / "dof_diagnostics.csv",
+                {{"case_id", "baseline"}, {"N", "32"},
+                 {"route", "g1_value_g1_normal"}, {"dof_id", dof}},
+                "equation_defect", "1.0e154");
+        }
+        for (const std::string& bin : {"lt_h", "h_to_2h"}) {
+            mutate_csv_field_matching_3d(
+                directory / "edge_distance_bins.csv",
+                {{"case_id", "baseline"}, {"N", "32"},
+                 {"route", "g1_value_g1_normal"}, {"distance_bin", bin}},
+                "weight_sum", "9.0e-1");
+            mutate_csv_field_matching_3d(
+                directory / "edge_distance_bins.csv",
+                {{"case_id", "baseline"}, {"N", "32"},
+                 {"route", "g1_value_g1_normal"}, {"distance_bin", bin}},
+                "defect_linf", "1.0e154");
+            mutate_csv_field_matching_3d(
+                directory / "edge_distance_bins.csv",
+                {{"case_id", "baseline"}, {"N", "32"},
+                 {"route", "g1_value_g1_normal"}, {"distance_bin", bin}},
+                "defect_weighted_rms", "1.0e154");
+        }
+        mutate_csv_field_matching_3d(
+            directory / "summary.csv",
+            {{"case_id", "baseline"}, {"N", "32"},
+             {"route", "g1_value_g1_normal"}},
+            "defect_linf", "1.0e154");
+        mutate_csv_field_matching_3d(
+            directory / "summary.csv",
+            {{"case_id", "baseline"}, {"N", "32"},
+             {"route", "g1_value_g1_normal"}},
+            "defect_rms", "1.0e154");
+    });
 
     const auto controlEdgeValue = performance.parent_path()
         / (performance.filename().string() + "_control_edge_value");

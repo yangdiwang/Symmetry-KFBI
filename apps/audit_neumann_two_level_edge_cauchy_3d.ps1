@@ -34,10 +34,16 @@ public sealed class NeumannDetailKeyAggregate {
     public int Count;
     public int MinId = Int32.MaxValue;
     public int MaxId = -1;
+    public int MaxPatchId = -1;
     public double ValueRadiusMax;
     public double NormalRadiusMax;
     public double EdgeRadiusMax;
     public double ConditionMax;
+    public double WeightSum;
+    public double DensityLinf;
+    public double DensitySquare;
+    public double DefectLinf;
+    public double DefectSquare;
 }
 
 public sealed class NeumannSurfaceAuditResult {
@@ -96,6 +102,100 @@ public static class NeumannEvidenceDomainAudit {
         if (!Int32.TryParse(text, out value))
             throw new InvalidDataException(context + " is not an integer");
         return value;
+    }
+
+    private static int NonnegativeIntegerToken(
+            string text, string context) {
+        if (String.IsNullOrEmpty(text))
+            throw new InvalidDataException(context + " is empty");
+        foreach (char value in text) {
+            if (value < '0' || value > '9')
+                throw new InvalidDataException(
+                    context + " is not an unsigned decimal integer");
+        }
+        int parsed;
+        if (!Int32.TryParse(text, NumberStyles.None,
+                CultureInfo.InvariantCulture, out parsed))
+            throw new InvalidDataException(context + " exceeds Int32");
+        return parsed;
+    }
+
+    private static List<int> PositiveCounts(string text, string context) {
+        if (text == null || text.Length < 3 || text[0] != '{'
+                || text[text.Length - 1] != '}')
+            throw new InvalidDataException(
+                context + " has invalid count-vector syntax");
+        string body = text.Substring(1, text.Length - 2);
+        if (body.Length == 0)
+            throw new InvalidDataException(context + " has no counts");
+        List<int> result = new List<int>();
+        foreach (string token in body.Split(';')) {
+            int value = NonnegativeIntegerToken(token, context + " count");
+            if (value <= 0)
+                throw new InvalidDataException(
+                    context + " contains a nonpositive count");
+            result.Add(value);
+        }
+        return result;
+    }
+
+    private static List<List<int>> SectorPatchIds(
+            string text, string context) {
+        if (text == null || text.Length < 4 || text[0] != '{'
+                || text[text.Length - 1] != '}')
+            throw new InvalidDataException(
+                context + " has invalid nested-sector syntax");
+        List<List<int>> result = new List<List<int>>();
+        int position = 1;
+        while (position < text.Length - 1) {
+            if (text[position] != '{')
+                throw new InvalidDataException(
+                    context + " has invalid sector-group syntax");
+            int close = text.IndexOf('}', position + 1);
+            if (close < 0 || close == position + 1)
+                throw new InvalidDataException(
+                    context + " has an empty or unterminated sector group");
+            string body = text.Substring(position + 1, close - position - 1);
+            List<int> group = new List<int>();
+            foreach (string token in body.Split(';'))
+                group.Add(NonnegativeIntegerToken(
+                    token, context + " patch ID"));
+            result.Add(group);
+            position = close + 1;
+            if (position == text.Length - 1) break;
+            if (text[position] != ';')
+                throw new InvalidDataException(
+                    context + " has invalid sector-group separator");
+            ++position;
+            if (position == text.Length - 1)
+                throw new InvalidDataException(
+                    context + " has a trailing sector separator");
+        }
+        if (position != text.Length - 1 || result.Count == 0)
+            throw new InvalidDataException(
+                context + " has invalid nested-sector cardinality");
+        return result;
+    }
+
+    private static int ValidateSectorCounts(
+            string sectorText, string countText, int expectedTotal,
+            string context) {
+        List<List<int>> sectors = SectorPatchIds(sectorText, context);
+        List<int> counts = PositiveCounts(countText, context);
+        if (sectors.Count != counts.Count)
+            throw new InvalidDataException(
+                context + " sector/count group cardinality mismatch");
+        long total = 0;
+        int maxPatchId = -1;
+        for (int group = 0; group < sectors.Count; ++group) {
+            total += counts[group];
+            foreach (int patchId in sectors[group])
+                maxPatchId = Math.Max(maxPatchId, patchId);
+        }
+        if (total != expectedTotal)
+            throw new InvalidDataException(
+                context + " count total mismatch");
+        return maxPatchId;
     }
 
     private static TextFieldParser Parser(string path) {
@@ -229,12 +329,33 @@ public static class NeumannEvidenceDomainAudit {
                 ++state.Count;
                 state.MinId = Math.Min(state.MinId, center);
                 state.MaxId = Math.Max(state.MaxId, center);
-                foreach (string field in new string[] {
-                        "ordinary_value_count", "normal_count", "edge_count" }) {
-                    if (Integer(row[columns[field]], entity + " " + field) < 0)
-                        throw new InvalidDataException(
-                            "negative surface fit count " + entity + " " + field);
-                }
+                int values = Integer(row[columns["ordinary_value_count"]],
+                    entity + " ordinary_value_count");
+                int normals = Integer(row[columns["normal_count"]],
+                    entity + " normal_count");
+                int edgeCount = Integer(row[columns["edge_count"]],
+                    entity + " edge_count");
+                if (values < 0 || normals < 0 || edgeCount < 0)
+                    throw new InvalidDataException(
+                        "negative surface fit count " + entity);
+                string route = row[columns["route"]];
+                if ((route == "edge_reconstructed_value"
+                            && edgeCount > 6)
+                        || (route != "edge_reconstructed_value"
+                            && edgeCount != 0))
+                    throw new InvalidDataException(
+                        "surface edge count is outside its route domain "
+                        + entity);
+                int valueMaxPatchId = ValidateSectorCounts(
+                    row[columns["value_sector_patch_ids"]],
+                    row[columns["value_sector_counts"]], values,
+                    entity + " value sectors");
+                int normalMaxPatchId = ValidateSectorCounts(
+                    row[columns["normal_sector_patch_ids"]],
+                    row[columns["normal_sector_counts"]], normals,
+                    entity + " normal sectors");
+                state.MaxPatchId = Math.Max(state.MaxPatchId,
+                    Math.Max(valueMaxPatchId, normalMaxPatchId));
                 double valueRadius = Number(
                     row[columns["value_radius_over_h"]],
                     entity + " value_radius_over_h");
@@ -270,13 +391,11 @@ public static class NeumannEvidenceDomainAudit {
                 state.ConditionMax = Math.Max(state.ConditionMax, condition);
                 if (!successful.Contains(key)) continue;
                 if (!(sigmaMin > 0.0)
-                        || !NearlyEqual(condition, sigmaMax / sigmaMin))
+                        || !NearlyEqual(condition, FiniteResult(
+                            sigmaMax / sigmaMin,
+                            entity + " surface condition ratio")))
                     throw new InvalidDataException(
                         "surface fit condition ratio mismatch " + entity);
-                int values = Integer(row[columns["ordinary_value_count"]],
-                    entity + " values");
-                int normals = Integer(row[columns["normal_count"]],
-                    entity + " normals");
                 if (values != 48 || normals != 28)
                     result.MandatoryFailures.Add("surface_fit_counts:" + entity);
                 if (!(sigmaMin > 3.0e-12 * sigmaMax))
@@ -336,8 +455,9 @@ public static class NeumannEvidenceDomainAudit {
                 ++state.Count;
                 state.MinId = Math.Min(state.MinId, dof);
                 state.MaxId = Math.Max(state.MaxId, dof);
-                if (Integer(row[columns["patch_id"]],
-                        entity + " patch_id") < 0)
+                int patchId = Integer(row[columns["patch_id"]],
+                    entity + " patch_id");
+                if (patchId < 0)
                     throw new InvalidDataException(
                         "negative DOF patch ID " + entity);
                 foreach (string field in new string[] {
@@ -356,6 +476,11 @@ public static class NeumannEvidenceDomainAudit {
                         "negative DOF edge distance " + entity);
                 string densityText = row[columns["density_error"]];
                 string defectText = row[columns["equation_defect"]];
+                bool densityMissing = densityText == "NA";
+                bool defectMissing = defectText == "NA";
+                if (densityMissing != defectMissing)
+                    throw new InvalidDataException(
+                        "DOF post-solve value availability mismatch " + entity);
                 if (densityText != "NA")
                     Number(densityText, entity + " density_error");
                 if (defectText != "NA")
@@ -367,6 +492,24 @@ public static class NeumannEvidenceDomainAudit {
                 double density = Number(
                     densityText, entity + " density_error");
                 double defect = Number(defectText, entity + " equation_defect");
+                state.WeightSum = FiniteResult(state.WeightSum + weight,
+                    entity + " total weight sum");
+                state.DensityLinf = Math.Max(
+                    state.DensityLinf, Math.Abs(density));
+                double totalDensityTerm = FiniteResult(
+                    weight * density * density,
+                    entity + " total density weighted square");
+                state.DensitySquare = FiniteResult(
+                    state.DensitySquare + totalDensityTerm,
+                    entity + " total density square sum");
+                state.DefectLinf = Math.Max(
+                    state.DefectLinf, Math.Abs(defect));
+                double totalDefectTerm = FiniteResult(
+                    weight * defect * defect,
+                    entity + " total defect weighted square");
+                state.DefectSquare = FiniteResult(
+                    state.DefectSquare + totalDefectTerm,
+                    entity + " total defect square sum");
                 string bin = distance < 1.0 ? "lt_h"
                     : (distance <= 2.0 ? "h_to_2h" : "gt_2h");
                 NeumannDofBinAggregate aggregate = bins[key + "|" + bin];
@@ -398,6 +541,14 @@ public static class NeumannEvidenceDomainAudit {
                     && (state.MinId != 0 || state.MaxId != state.Count - 1))
                 throw new InvalidDataException(
                     "DOF IDs are not contiguous " + state.Key);
+            if (successful.Contains(state.Key)
+                    && (!Finite(state.WeightSum)
+                        || !Finite(state.DensityLinf)
+                        || !Finite(state.DensitySquare)
+                        || !Finite(state.DefectLinf)
+                        || !Finite(state.DefectSquare)))
+                throw new InvalidDataException(
+                    "nonfinite raw DOF aggregate " + state.Key);
             result.Keys.Add(state);
         }
         foreach (NeumannDofBinAggregate aggregate in bins.Values) {
@@ -552,6 +703,53 @@ function Nearly-Equal([double]$Left, [double]$Right) {
     $scale = [Math]::Max(1.0, [Math]::Max([Math]::Abs($Left),
         [Math]::Abs($Right)))
     return [Math]::Abs($Left - $Right) -le 1.0e-12 * $scale
+}
+
+function Finite-Result([double]$Value, [string]$Context) {
+    Assert-True (-not [double]::IsNaN($Value) -and
+        -not [double]::IsInfinity($Value)) ("$Context is not finite")
+    return $Value
+}
+
+function Finite-Add(
+    [double]$Left, [double]$Right, [string]$Context) {
+    return Finite-Result ($Left + $Right) $Context
+}
+
+function Finite-Multiply(
+    [double]$Left, [double]$Right, [string]$Context) {
+    return Finite-Result ($Left * $Right) $Context
+}
+
+function Finite-Divide(
+    [double]$Numerator, [double]$Denominator, [string]$Context) {
+    Assert-True ($Denominator -ne 0.0) ("$Context divides by zero")
+    return Finite-Result ($Numerator / $Denominator) $Context
+}
+
+function Finite-Subtract(
+    [double]$Left, [double]$Right, [string]$Context) {
+    return Finite-Result ($Left - $Right) $Context
+}
+
+function Finite-SquareRoot([double]$Value, [string]$Context) {
+    Assert-True ($Value -ge 0.0) ("$Context has a negative radicand")
+    return Finite-Result ([Math]::Sqrt($Value)) $Context
+}
+
+function Finite-Log2([double]$Value, [string]$Context) {
+    Assert-True ($Value -gt 0.0) ("$Context has a nonpositive argument")
+    return Finite-Result ([Math]::Log($Value, 2.0)) $Context
+}
+
+function Assert-SectorSetSerialization($Value, [string]$Context) {
+    $text = [string]$Value
+    Assert-True ([regex]::IsMatch($text,
+        '^\{\{[0-9]+(?:;[0-9]+)*\}(?:;\{[0-9]+(?:;[0-9]+)*\})*\}\z')) `
+        ("$Context has invalid nested-sector syntax")
+    foreach ($match in [regex]::Matches($text, '[0-9]+')) {
+        [void](Integer $match.Value "$Context patch ID")
+    }
 }
 
 $expectedHeaders = [ordered]@{
@@ -770,6 +968,26 @@ foreach ($row in $summary) {
             'neighborhood_fingerprint')) {
         [void](UnsignedInteger $row.$field "$key $field")
     }
+    $ownerAvailable = Integer $matchingOwner.available "$key owner available"
+    Assert-True ($ownerAvailable -eq 0 -or $ownerAvailable -eq 1) `
+        ("invalid successful owner availability flag $key")
+    foreach ($field in @('owner_query_count','cauchy_geometry_queries',
+            'cauchy_svd_factorizations','runtime_geometry_queries',
+            'runtime_svd_factorizations')) {
+        Assert-True ((Integer $matchingOwner.$field "$key owner $field") -ge 0) `
+            ("negative successful owner counter $key $field")
+    }
+    foreach ($field in @('reference_equal','label_equal',
+            'neighborhood_equal','common_rhs_hash_equal')) {
+        $flag = Integer $matchingOwner.$field "$key owner $field"
+        Assert-True ($flag -eq 0 -or $flag -eq 1) `
+            ("invalid successful owner flag $key $field")
+    }
+    foreach ($field in @('owner_fingerprint_before','owner_fingerprint_after',
+            'owner_output_digest_before','owner_output_digest_after',
+            'cauchy_fingerprint_before','cauchy_fingerprint_after')) {
+        [void](UnsignedInteger $matchingOwner.$field "$key owner $field")
+    }
     if ($row.route -eq 'edge_reconstructed_value') {
         $sharedPointCount = Integer $row.shared_edge_point_count `
             "$key shared_edge_point_count"
@@ -817,9 +1035,14 @@ foreach ($row in $summary) {
             ("negative final residual $key $kind")
         $historyFinal = Number $history[-1].relative_residual `
             "$key $kind history final residual"
-        $finalTolerance = 64.0 * 2.2204460492503131e-16 *
-            [Math]::Max(1.0, [Math]::Abs($summaryFinal))
-        Assert-True ([Math]::Abs($summaryFinal - $historyFinal) -le
+        $finalToleranceFactor = Finite-Multiply 64.0 `
+            2.2204460492503131e-16 "$key $kind residual tolerance factor"
+        $finalTolerance = Finite-Multiply $finalToleranceFactor `
+            ([Math]::Max(1.0, [Math]::Abs($summaryFinal))) `
+            "$key $kind residual tolerance"
+        $finalDifference = [Math]::Abs((Finite-Subtract $summaryFinal `
+            $historyFinal "$key $kind final residual difference"))
+        Assert-True ($finalDifference -le
             $finalTolerance) ("final residual mismatch $key $kind")
     }
 }
@@ -859,7 +1082,7 @@ foreach ($row in $summary | Where-Object status -eq 'failed') {
         $hasFinal = -not (Is-NA $finalValue)
         Assert-True ($hasIterations -eq $hasFinal) `
             ("summary solve availability mismatch $key $kind")
-        if ($row.status -eq 'ok' -or $hasIterations) {
+        if ($hasIterations) {
             Assert-True ($hasIterations -and $hasFinal) `
                 ("complete residual summary unavailable $key $kind")
             $iterations = Integer $iterationValue "$key $kind iterations"
@@ -872,10 +1095,19 @@ foreach ($row in $summary | Where-Object status -eq 'failed') {
                 ("negative final residual $key $kind")
             $historyFinal = Number $history[-1].relative_residual `
                 "$key $kind history final residual"
-            $finalTolerance = 64.0 * 2.2204460492503131e-16 *
-                [Math]::Max(1.0, [Math]::Abs($summaryFinal))
-            Assert-True ([Math]::Abs($summaryFinal - $historyFinal) -le
+            $finalToleranceFactor = Finite-Multiply 64.0 `
+                2.2204460492503131e-16 `
+                "$key $kind residual tolerance factor"
+            $finalTolerance = Finite-Multiply $finalToleranceFactor `
+                ([Math]::Max(1.0, [Math]::Abs($summaryFinal))) `
+                "$key $kind residual tolerance"
+            $finalDifference = [Math]::Abs((Finite-Subtract $summaryFinal `
+                $historyFinal "$key $kind final residual difference"))
+            Assert-True ($finalDifference -le
                 $finalTolerance) ("final residual mismatch $key $kind")
+        } else {
+            Assert-True ($history.Count -eq 0) `
+                ("residual history exists without summary evidence $key $kind")
         }
     }
 }
@@ -911,6 +1143,7 @@ foreach ($point in $edgePoints) {
         "$key frame_orthogonality_error"
     Assert-True ($mismatch -ge 0.0) ("negative position mismatch $key")
     Assert-True ($frameError -ge 0.0) ("negative frame error $key")
+    Assert-SectorSetSerialization $point.sectors "$key sectors"
     $hasExact = -not (Is-NA $point.exact_value)
     $hasReconstructed = -not (Is-NA $point.reconstructed_value)
     $hasError = -not (Is-NA $point.error)
@@ -925,7 +1158,9 @@ foreach ($point in $edgePoints) {
         $reconstructed = Number $point.reconstructed_value `
             "$key reconstructed_value"
         $edgeError = Number $point.error "$key error"
-        Assert-True (Nearly-Equal $edgeError ($reconstructed - $exact)) `
+        $recomputedEdgeError = Finite-Subtract $reconstructed $exact `
+            "$key recomputed edge error"
+        Assert-True (Nearly-Equal $edgeError $recomputedEdgeError) `
             ("edge error identity mismatch $key")
         $absoluteError = [Math]::Abs($edgeError)
         if (-not $rawEdgeLinfByKey.ContainsKey($summaryKey)) {
@@ -959,8 +1194,11 @@ foreach ($fit in $edgeFits) {
         $sigmaMin -le $sigmaMax -and $condition -ge 1.0) `
         ("invalid edge fit SVD domain $key")
     if ($summaryByKey[$summaryKey].status -eq 'ok') {
+        $conditionRatio = if ($sigmaMin -gt 0.0) {
+            Finite-Divide $sigmaMax $sigmaMin "$key edge condition ratio"
+        } else { 0.0 }
         Assert-True ($sigmaMin -gt 0.0 -and
-            (Nearly-Equal $condition ($sigmaMax / $sigmaMin))) `
+            (Nearly-Equal $condition $conditionRatio)) `
             ("edge fit condition ratio mismatch $key")
     }
     if (-not $edgeFitMaxByKey.ContainsKey($summaryKey)) {
@@ -998,6 +1236,7 @@ foreach ($row in $summary | Where-Object {
     $keyDofAudit = $dofAuditByKey[$key]
     $keyEdgePoints = @(Indexed-Rows $edgePointsByKey $key)
     $keyEdgeFits = @(Indexed-Rows $edgeFitsByKey $key)
+    $patchCount = Integer $row.patch_count "$key patch_count"
     Assert-True ($keySurfaceAudit.Count -eq $expectedSurfaceMaps) `
         ("surface map count mismatch $key")
     Assert-True ($keyDofAudit.Count -eq $expectedDofs) `
@@ -1008,6 +1247,9 @@ foreach ($row in $summary | Where-Object {
     Assert-True ($expectedValueMaps -eq $expectedSurfaceMaps -and
         $expectedNormalMaps -eq $expectedSurfaceMaps) `
         ("value/normal map count mismatch $key")
+    Assert-True ($keySurfaceAudit.MaxPatchId -ge 0 -and
+        $keySurfaceAudit.MaxPatchId -lt $patchCount) `
+        ("surface sector patch ID is outside patch_count $key")
     Assert-True ($ownerByKey[$key].available -eq '1') `
         ("successful owner is unavailable $key")
     foreach ($field in @('value_radius_max_over_h','normal_radius_max_over_h',
@@ -1043,6 +1285,18 @@ foreach ($row in $summary | Where-Object {
     Assert-True ($summaryCondition -ge 1.0 -and
         (Nearly-Equal $summaryCondition $rawConditionMax)) `
         ("summary condition maximum mismatch $key")
+    Assert-True ($keyDofAudit.WeightSum -gt 0.0) `
+        ("nonpositive raw DOF total weight $key")
+    $rawDefectMeanSquare = Finite-Divide $keyDofAudit.DefectSquare `
+        $keyDofAudit.WeightSum "$key raw defect mean square"
+    $rawDefectRms = Finite-SquareRoot $rawDefectMeanSquare `
+        "$key raw defect RMS"
+    $summaryDefectLinf = Number $row.defect_linf "$key defect_linf"
+    $summaryDefectRms = Number $row.defect_rms "$key defect_rms"
+    Assert-True (Nearly-Equal $summaryDefectLinf $keyDofAudit.DefectLinf) `
+        ("summary defect Linf does not match raw DOFs $key")
+    Assert-True (Nearly-Equal $summaryDefectRms $rawDefectRms) `
+        ("summary defect RMS does not match raw DOFs $key")
     if ($row.route -eq 'edge_reconstructed_value') {
         $expectedSharedPoints = Integer $row.shared_edge_point_count `
             "$key shared_edge_point_count"
@@ -1108,9 +1362,17 @@ foreach ($row in $summary | Where-Object status -eq 'ok') {
         $totalCount += $count
         $raw = $rawBinsByKey[$key][$bin.distance_bin]
         $rawDensityRms = if ($raw.weight_sum -gt 0.0) {
-            [Math]::Sqrt($raw.density_square / $raw.weight_sum) } else { 0.0 }
+            $meanSquare = Finite-Divide $raw.density_square $raw.weight_sum `
+                "$key $($bin.distance_bin) raw density mean square"
+            Finite-SquareRoot $meanSquare `
+                "$key $($bin.distance_bin) raw density RMS"
+        } else { 0.0 }
         $rawDefectRms = if ($raw.weight_sum -gt 0.0) {
-            [Math]::Sqrt($raw.defect_square / $raw.weight_sum) } else { 0.0 }
+            $meanSquare = Finite-Divide $raw.defect_square $raw.weight_sum `
+                "$key $($bin.distance_bin) raw defect mean square"
+            Finite-SquareRoot $meanSquare `
+                "$key $($bin.distance_bin) raw defect RMS"
+        } else { 0.0 }
         $equal = $count -eq $raw.count -and
             (Nearly-Equal $weight $raw.weight_sum) -and
             (Nearly-Equal $densityLinf $raw.density_linf) -and
@@ -1356,7 +1618,10 @@ for ($index = 1; $index -lt $sortedLevels.Count; ++$index) {
                 $fineError = Number $fine.$field "$caseId $route fine $field"
                 Assert-True ($coarseError -gt 0.0 -and $fineError -gt 0.0) `
                     ("order errors must be positive $caseId $route $field")
-                $order = [Math]::Log($coarseError / $fineError, 2.0)
+                $errorRatio = Finite-Divide $coarseError $fineError `
+                    "$caseId $route $field order ratio"
+                $order = Finite-Log2 $errorRatio `
+                    "$caseId $route $field order"
                 $orders.Add([ordered]@{ case_id=$caseId; route=$route;
                     coarse_N=$coarseN; fine_N=$fineN; metric=$field; order=$order })
                 if ($route -eq 'edge_reconstructed_value' -and
@@ -1380,9 +1645,15 @@ foreach ($orderRow in $orders) {
     $fine = $summaryByKey["$($orderRow.case_id)|$($orderRow.fine_N)|$($orderRow.route)"]
     $column = $orderRow.metric + '_' + $suffix
     $recorded = Number $fine.$column "$($orderRow.case_id) $column"
-    $equal = [Math]::Abs($recorded - $orderRow.order) -le
-        256.0 * 2.2204460492503131e-16 *
-        [Math]::Max(1.0, [Math]::Abs($orderRow.order))
+    $recordedDifference = [Math]::Abs((Finite-Subtract $recorded `
+        $orderRow.order "$($orderRow.case_id) $column order difference"))
+    $orderToleranceFactor = Finite-Multiply 256.0 `
+        2.2204460492503131e-16 `
+        "$($orderRow.case_id) $column order tolerance factor"
+    $orderTolerance = Finite-Multiply $orderToleranceFactor `
+        ([Math]::Max(1.0, [Math]::Abs($orderRow.order))) `
+        "$($orderRow.case_id) $column order tolerance"
+    $equal = $recordedDifference -le $orderTolerance
     $recordedOrderChecks.Add([ordered]@{case_id=$orderRow.case_id;
         route=$orderRow.route; column=$column; recorded=$recorded;
         recomputed=$orderRow.order; equal=$equal})
@@ -1401,12 +1672,20 @@ foreach ($row in $summary | Where-Object status -eq 'ok') {
         $w = Number $bin.weight_sum "$key near weight"
         Assert-True ($w -ge 0.0) ("negative near-edge weight $key")
         $rms = Number $bin.defect_weighted_rms "$key near rms"
-        $weight += $w
-        $square += $w * $rms * $rms
+        $weight = Finite-Add $weight $w "$key near-edge weight sum"
+        $weightedRms = Finite-Multiply $w $rms `
+            "$key near-edge weighted RMS factor"
+        $weightedSquare = Finite-Multiply $weightedRms $rms `
+            "$key near-edge weighted square"
+        $square = Finite-Add $square $weightedSquare `
+            "$key near-edge square sum"
         $linf = [Math]::Max($linf, (Number $bin.defect_linf "$key near linf"))
     }
     Assert-True ($weight -gt 0.0) ("nonpositive near-edge combined weight $key")
-    $combinedRms = if ($weight -gt 0.0) { [Math]::Sqrt($square / $weight) } else { 0.0 }
+    $combinedMeanSquare = Finite-Divide $square $weight `
+        "$key near-edge mean square"
+    $combinedRms = Finite-SquareRoot $combinedMeanSquare `
+        "$key near-edge combined RMS"
     $nearEdge.Add([ordered]@{ case_id=$row.case_id; N=[int]$row.N;
         route=$row.route; weight_sum=$weight; defect_linf=$linf;
         defect_weighted_rms=$combinedRms })
@@ -1426,7 +1705,8 @@ if ($sortedLevels -contains 128) {
                 $controlError = Number $control.$field "$caseId control $field"
                 Assert-True ($primaryError -gt 0.0 -and $controlError -gt 0.0) `
                     ("N128 ratio errors must be positive $caseId $field")
-                $ratio = $primaryError / $controlError
+                $ratio = Finite-Divide $primaryError $controlError `
+                    "$caseId primary/control $field ratio"
                 $ratios.Add([ordered]@{ case_id=$caseId; control=$controlRoute;
                     metric=$field; ratio=$ratio })
                 Record-Predicate ($ratio -le 1.10) `
@@ -1554,8 +1834,10 @@ if ($ExpectedLevels -contains 128) {
             $g1Error = Number $g1.$field "$caseId g1 $field"
             Assert-True ($directError -gt 0.0 -and $g1Error -gt 0.0) `
                 ("direct ratio errors must be positive $caseId $field")
+            $directRatio = Finite-Divide $directError $g1Error `
+                "$caseId direct/g1 $field ratio"
             $directRatioPass = $directRatioPass -and
-                $directError / $g1Error -le 1.10
+                $directRatio -le 1.10
         }
         $g1Near = @($nearEdge | Where-Object { $_.case_id -eq $caseId -and
             $_.N -eq 128 -and $_.route -eq 'g1_value_g1_normal' })[0]
