@@ -606,6 +606,14 @@ select_direct_cross_face_value_dofs_3d(
             diagnostic.incident_sectors = result.sector_patch_ids;
             diagnostic.actual_value_counts = result.sector_sample_counts;
             diagnostic.required_value_count = count;
+            const Eigen::Vector3d& center_point =
+                cloud.dofs[static_cast<std::size_t>(center_dof)].point;
+            for (int id : result.dof_ids) {
+                diagnostic.value_radius_over_h = std::max(
+                    diagnostic.value_radius_over_h,
+                    (cloud.dofs[static_cast<std::size_t>(id)].point
+                        - center_point).norm() / h);
+            }
             diagnostic.message =
                 "outside-band G1 sector cannot fill direct Cauchy sample count";
             throw HarmonicCauchyError3D(std::move(diagnostic));
@@ -679,15 +687,10 @@ select_direct_cross_face_value_dofs_3d(
                 .squaredNorm(),
             q});
     }
-    const double distance_quantum = 1.0e-12 * h * h;
-    const auto candidate_less = [distance_quantum](const Candidate& first,
-                                                    const Candidate& second) {
-        const long long first_key = static_cast<long long>(
-            std::llround(first.first / distance_quantum));
-        const long long second_key = static_cast<long long>(
-            std::llround(second.first / distance_quantum));
-        return first_key != second_key
-            ? first_key < second_key : first.second < second.second;
+    const auto candidate_less = [](const Candidate& first,
+                                   const Candidate& second) {
+        return first.first != second.first
+            ? first.first < second.first : first.second < second.second;
     };
     for (auto& sector_candidates : candidates)
         std::sort(sector_candidates.begin(), sector_candidates.end(),
@@ -832,15 +835,10 @@ select_surface_edge_points_3d(
     const Eigen::Vector3d& center_point =
         cloud.dofs[static_cast<std::size_t>(center_dof)].point;
     using Candidate = std::pair<double, int>;
-    const double distance_quantum = 1.0e-12 * h * h;
-    const auto candidate_less = [distance_quantum](const Candidate& first,
-                                                    const Candidate& second) {
-        const long long first_key = static_cast<long long>(
-            std::llround(first.first / distance_quantum));
-        const long long second_key = static_cast<long long>(
-            std::llround(second.first / distance_quantum));
-        return first_key != second_key
-            ? first_key < second_key : first.second < second.second;
+    const auto candidate_less = [](const Candidate& first,
+                                   const Candidate& second) {
+        return first.first != second.first
+            ? first.first < second.first : first.second < second.second;
     };
     std::vector<Candidate> selected;
     for (int connection_id : neighborhood.relevant_connection_ids) {
@@ -1224,21 +1222,24 @@ SurfaceCauchyMap3D select_surface_map_inputs(
         result.value_sector_patch_ids = direct.sector_patch_ids;
         result.value_sector_counts = direct.sector_sample_counts;
     } else {
-        result.value_ids = nearest_sector_dofs(
-            cloud, cloud.dofs[static_cast<std::size_t>(center)].point,
-            center_sector, value_count, h);
+        result.value_ids = nearest_g1_cauchy_dofs(
+            surface, cloud, center, value_count);
         result.value_sector_patch_ids = {center_sector};
         result.value_sector_counts = {
             static_cast<int>(result.value_ids.size())};
     }
     result.normal_ids = legacy_policy
         ? legacy_ids(normal_count)
-        : nearest_sector_dofs(
-              cloud, cloud.dofs[static_cast<std::size_t>(center)].point,
-              center_sector, normal_count, h);
+        : nearest_g1_cauchy_dofs(surface, cloud, center, normal_count);
     result.normal_sector_patch_ids = {center_sector};
     result.normal_sector_counts = {
         static_cast<int>(result.normal_ids.size())};
+    const Eigen::Vector3d& center_point =
+        cloud.dofs[static_cast<std::size_t>(center)].point;
+    result.value_radius_over_h = sample_radius_over_h(
+        cloud, center_point, result.value_ids, h);
+    result.normal_radius_over_h = sample_radius_over_h(
+        cloud, center_point, result.normal_ids, h);
     if (static_cast<int>(result.value_ids.size()) != value_count
         || static_cast<int>(result.normal_ids.size()) != normal_count) {
         HarmonicCauchyFailure3D diagnostic;
@@ -1250,6 +1251,8 @@ SurfaceCauchyMap3D select_surface_map_inputs(
         diagnostic.actual_normal_counts = result.normal_sector_counts;
         diagnostic.required_value_count = value_count;
         diagnostic.required_normal_count = normal_count;
+        diagnostic.value_radius_over_h = result.value_radius_over_h;
+        diagnostic.normal_radius_over_h = result.normal_radius_over_h;
         diagnostic.message =
             "surface Cauchy sectors cannot fill the requested sample counts";
         throw HarmonicCauchyError3D(std::move(diagnostic));
@@ -1263,12 +1266,6 @@ SurfaceCauchyMap3D select_surface_map_inputs(
                 surface, cloud, *edge_points, neighborhoods, center, h);
         result.edge_point_ids = edge.edge_point_ids;
     }
-    const Eigen::Vector3d& center_point =
-        cloud.dofs[static_cast<std::size_t>(center)].point;
-    result.value_radius_over_h = sample_radius_over_h(
-        cloud, center_point, result.value_ids, h);
-    result.normal_radius_over_h = sample_radius_over_h(
-        cloud, center_point, result.normal_ids, h);
     result.incident_patch_count = incident_patch_count(
         cloud, result.value_ids, result.normal_ids);
     result.value_patch_imbalance = patch_imbalance(cloud, result.value_ids);

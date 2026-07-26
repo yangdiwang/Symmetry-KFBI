@@ -413,6 +413,12 @@ void test_second_level_routes_reproduce_cubic_and_share_edge_values()
         const auto& direct_map =
             direct.surface_maps()[static_cast<std::size_t>(q)];
         const auto& edge_map = edge.surface_maps()[static_cast<std::size_t>(q)];
+        const std::vector<int> baseline_values =
+            nearest_g1_cauchy_dofs(surface, cloud, q, 48);
+        const std::vector<int> baseline_normals =
+            nearest_g1_cauchy_dofs(surface, cloud, q, 28);
+        const auto direct_values = select_direct_cross_face_value_dofs_3d(
+            surface, cloud, neighborhoods, q, 48, h);
         require(g1_map.value_ids.size() == 48
                     && g1_map.normal_ids.size() == 28
                     && g1_map.edge_point_ids.empty()
@@ -425,6 +431,26 @@ void test_second_level_routes_reproduce_cubic_and_share_edge_values()
         require(edge_map.value_ids.size() == 48
                     && edge_map.normal_ids.size() == 28,
                 "edge route retains ordinary G1 48/28 rows");
+        require(g1_map.value_ids == baseline_values
+                    && edge_map.value_ids == baseline_values,
+                "G1 and edge routes preserve the ordered 48-ID G1 baseline at "
+                    + std::to_string(q));
+        require(g1_map.normal_ids == baseline_normals
+                    && direct_map.normal_ids == baseline_normals
+                    && edge_map.normal_ids == baseline_normals,
+                "all routes preserve the ordered 28-ID G1 normal baseline at "
+                    + std::to_string(q));
+        require(direct_map.value_ids == direct_values.dof_ids,
+                "only the direct route replaces ordinary value IDs at "
+                    + std::to_string(q));
+        if (direct_map.relevant_connection_ids.empty()
+            || direct_map.nearest_edge_distance_over_h > 2.0) {
+            require(direct_map.value_ids == baseline_values
+                        && direct_map.edge_point_ids.empty()
+                        && direct_map.M_edge.size() == 0,
+                    "outside-band direct maps retain the exact G1 baseline and no edge rows at "
+                        + std::to_string(q));
+        }
         require(g1_map.nearest_edge_distance_over_h
                         == direct_map.nearest_edge_distance_over_h
                     && g1_map.nearest_edge_distance_over_h
@@ -919,6 +945,40 @@ void test_direct_selector_balances_regular_and_three_sector_centers()
             "feature-vertex direct selection retains its center");
 }
 
+void test_direct_selector_orders_exact_unequal_distances_before_ids()
+{
+    // Catches quantizing unequal squared distances into one tie bucket and then
+    // allowing the smaller ID to precede the geometrically nearer DOF.
+    constexpr double h = 1.0 / 8.0;
+    const NativeNurbsSurface3D surface = unit_y_edge_wedge();
+    SurfaceDofCloud3D cloud = make_native_surface_dofs_3d(surface, h);
+    const auto neighborhoods =
+        build_surface_non_g1_edge_neighborhoods_3d(surface, cloud, h);
+    const int center = cloud.patches[0].dof_index(0, 3);
+    const Eigen::Vector3d center_point =
+        cloud.dofs[static_cast<std::size_t>(center)].point;
+    const int farther_lower_id = 0;
+    const int nearer_higher_id = 1;
+    const double quantum = 1.0e-12 * h * h;
+    const double key = 10000000000.0;
+    cloud.dofs[static_cast<std::size_t>(farther_lower_id)].point =
+        center_point
+        + Eigen::Vector3d(std::sqrt((key + 0.3) * quantum), 0.0, 0.0);
+    cloud.dofs[static_cast<std::size_t>(nearer_higher_id)].point =
+        center_point
+        + Eigen::Vector3d(std::sqrt((key + 0.1) * quantum), 0.0, 0.0);
+
+    const auto selection = select_direct_cross_face_value_dofs_3d(
+        surface, cloud, neighborhoods, center, 48, h);
+    const auto farther = std::find(
+        selection.dof_ids.begin(), selection.dof_ids.end(), farther_lower_id);
+    const auto nearer = std::find(
+        selection.dof_ids.begin(), selection.dof_ids.end(), nearer_higher_id);
+    require(farther != selection.dof_ids.end()
+                && nearer != selection.dof_ids.end() && nearer < farther,
+            "direct selector orders unequal distances exactly before using ID ties");
+}
+
 NativeNurbsSurface3D wedge_with_unrelated_coincident_patch()
 {
     NativeNurbsSurface3D surface = reversed_unit_wedge();
@@ -1038,9 +1098,40 @@ void test_outside_band_short_g1_template_fails_with_value_count_diagnostic()
         require(diagnostic.incident_sectors
                     == std::vector<std::vector<int>>{{0}},
                 "short outside-band template reports the center G1 sector");
+        require(diagnostic.value_radius_over_h > 0.0,
+                "short outside-band template reports its available value radius");
     }
     require(caught,
             "outside-band short G1 template must fail instead of returning 25 IDs");
+}
+
+void test_short_surface_template_reports_available_value_and_normal_radii()
+{
+    // Catches throwing the second-level count failure before measuring the
+    // available ordinary value and normal selections.
+    constexpr double h = 0.2;
+    const NativeNurbsSurface3D surface = reversed_unit_wedge();
+    const SurfaceDofCloud3D cloud = make_native_surface_dofs_3d(surface, h);
+    const auto neighborhoods =
+        build_surface_non_g1_edge_neighborhoods_3d(surface, cloud, h);
+
+    bool caught = false;
+    try {
+        (void)HarmonicCauchyFit3D::build(
+            surface, cloud, neighborhoods, h,
+            HarmonicCauchyRoute3D::G1ValueG1Normal);
+    } catch (const kfbim::app3d::HarmonicCauchyError3D& error) {
+        const auto& diagnostic = error.diagnostic();
+        caught = true;
+        require(diagnostic.stage == "surface_sector_selection"
+                    && diagnostic.actual_value_counts == std::vector<int>{25}
+                    && diagnostic.actual_normal_counts == std::vector<int>{25},
+                "short surface template reports its actual ordinary row counts");
+        require(diagnostic.value_radius_over_h > 0.0
+                    && diagnostic.normal_radius_over_h > 0.0,
+                "short surface template reports both available ordinary radii");
+    }
+    require(caught, "a 25-DOF G1 sector cannot fill the 48/28 surface template");
 }
 
 void test_edge_selector_contributes_each_connection_and_is_deterministic()
@@ -1110,6 +1201,49 @@ void test_edge_selector_contributes_each_connection_and_is_deterministic()
     }
 }
 
+void test_edge_selector_orders_exact_unequal_distances_before_ids()
+{
+    // Catches quantizing unequal squared distances into one tie bucket in the
+    // shared-edge selector.
+    constexpr double h = 0.2;
+    const NativeNurbsSurface3D surface = reversed_unit_wedge();
+    const SurfaceDofCloud3D cloud = make_native_surface_dofs_3d(surface, h);
+    const int center = cloud.patches[0].dof_index(2, 2);
+    const Eigen::Vector3d center_point =
+        cloud.dofs[static_cast<std::size_t>(center)].point;
+
+    kfbim::app3d::SurfaceNonG1EdgeNeighborhoodSet3D neighborhoods;
+    neighborhoods.centers.resize(cloud.dofs.size());
+    for (int q = 0; q < static_cast<int>(cloud.dofs.size()); ++q)
+        neighborhoods.centers[static_cast<std::size_t>(q)].center_dof = q;
+    neighborhoods.centers[static_cast<std::size_t>(center)]
+        .nearest_distance_over_h = 1.0;
+    neighborhoods.centers[static_cast<std::size_t>(center)]
+        .relevant_connection_ids = {0};
+
+    const double quantum = 1.0e-12 * h * h;
+    const double key = 10000000000.0;
+    kfbim::app3d::SharedEdgePoint3D farther;
+    farther.id = 0;
+    farther.connection_id = 0;
+    farther.point = center_point
+        + Eigen::Vector3d(std::sqrt((key + 0.3) * quantum), 0.0, 0.0);
+    kfbim::app3d::SharedEdgePoint3D nearer;
+    nearer.id = 1;
+    nearer.connection_id = 0;
+    nearer.point = center_point
+        + Eigen::Vector3d(std::sqrt((key + 0.1) * quantum), 0.0, 0.0);
+    kfbim::app3d::SharedEdgePointSet3D edge_points;
+    edge_points.points = {farther, nearer};
+    edge_points.point_ids_by_connection.resize(1);
+    edge_points.point_ids_by_connection[0] = {0, 1};
+
+    const auto selection = select_surface_edge_points_3d(
+        surface, cloud, edge_points, neighborhoods, center, h);
+    require(selection.edge_point_ids == std::vector<int>({1, 0}),
+            "edge selector orders unequal distances exactly before using ID ties");
+}
+
 SurfaceDofCloud3D transform_test_cloud(
     SurfaceDofCloud3D cloud,
     const RigidTransform3D& transform)
@@ -1123,10 +1257,10 @@ SurfaceDofCloud3D transform_test_cloud(
     return cloud;
 }
 
-void test_two_level_maps_are_rigid_transform_invariant()
+void test_two_level_maps_follow_selector_contracts_after_rigid_transform()
 {
-    // Catches world-axis local coordinates and non-deterministic distance-tie
-    // ranking in either level of the precomputed maps.
+    // Catches world-axis local coordinates while allowing exact floating-point
+    // distances to choose each geometry's IDs through its public selectors.
     constexpr double h = 1.0 / 8.0;
     constexpr double pi = 3.1415926535897932384626433832795;
     const NativeNurbsSurface3D surface = unit_y_edge_wedge();
@@ -1185,8 +1319,16 @@ void test_two_level_maps_are_rigid_transform_invariant()
     for (int q = 0; q < static_cast<int>(original.surface_maps().size()); ++q) {
         const auto& a = original.surface_maps()[static_cast<std::size_t>(q)];
         const auto& b = moved.surface_maps()[static_cast<std::size_t>(q)];
-        require(a.value_ids == b.value_ids
-                    && a.normal_ids == b.normal_ids
+        require(a.value_ids
+                        == nearest_g1_cauchy_dofs(surface, cloud, q, 48)
+                    && b.value_ids
+                           == nearest_g1_cauchy_dofs(
+                               moved_surface, moved_cloud, q, 48)
+                    && a.normal_ids
+                           == nearest_g1_cauchy_dofs(surface, cloud, q, 28)
+                    && b.normal_ids
+                           == nearest_g1_cauchy_dofs(
+                               moved_surface, moved_cloud, q, 28)
                     && a.edge_point_ids
                            == select_surface_edge_points_3d(
                                surface, cloud, original_points,
@@ -1197,21 +1339,8 @@ void test_two_level_maps_are_rigid_transform_invariant()
                                moved_neighborhoods, q, h).edge_point_ids
                     && a.value_sector_counts == b.value_sector_counts
                     && a.normal_sector_counts == b.normal_sector_counts,
-                "rigid G1 IDs and verbatim edge-selector IDs hold at "
+                "each rigid geometry consumes its G1 and edge selector IDs at "
                     + std::to_string(q));
-        require(std::abs(a.sigma_max - b.sigma_max)
-                        <= 5.0e-12 * std::max(1.0, std::abs(a.sigma_max))
-                    && std::abs(a.sigma_min - b.sigma_min)
-                           <= 5.0e-12 * std::max(1.0, std::abs(a.sigma_min))
-                    && std::abs(a.condition - b.condition)
-                           <= 5.0e-12 * std::max(1.0, std::abs(a.condition)),
-                "rigid transform preserves second-level singular diagnostics at "
-                    + std::to_string(q) + " dmax="
-                    + std::to_string(std::abs(a.sigma_max - b.sigma_max))
-                    + " dmin="
-                    + std::to_string(std::abs(a.sigma_min - b.sigma_min))
-                    + " dcond="
-                    + std::to_string(std::abs(a.condition - b.condition)));
         const auto& direct_a =
             original_direct.surface_maps()[static_cast<std::size_t>(q)];
         const auto& direct_b =
@@ -1221,26 +1350,15 @@ void test_two_level_maps_are_rigid_transform_invariant()
                             surface, cloud, neighborhoods, q, 48, h).dof_ids
                     && direct_b.value_ids
                            == select_direct_cross_face_value_dofs_3d(
-                               moved_surface, moved_cloud,
-                               moved_neighborhoods, q, 48, h).dof_ids
-                    && direct_a.normal_ids == direct_b.normal_ids
-                    && direct_a.value_sector_counts
-                           == direct_b.value_sector_counts,
-                "direct rigid maps consume direct-selector IDs verbatim at "
+                                moved_surface, moved_cloud,
+                                moved_neighborhoods, q, 48, h).dof_ids
+                    && direct_a.normal_ids
+                           == nearest_g1_cauchy_dofs(surface, cloud, q, 28)
+                    && direct_b.normal_ids
+                           == nearest_g1_cauchy_dofs(
+                               moved_surface, moved_cloud, q, 28),
+                "direct rigid maps consume local direct values and G1 normals at "
                     + std::to_string(q));
-        if (!direct_a.relevant_connection_ids.empty()) {
-            require(std::abs(direct_a.sigma_max - direct_b.sigma_max)
-                            <= 5.0e-12
-                               * std::max(1.0, std::abs(direct_a.sigma_max))
-                        && std::abs(direct_a.sigma_min - direct_b.sigma_min)
-                               <= 5.0e-12
-                                  * std::max(1.0, std::abs(direct_a.sigma_min))
-                        && std::abs(direct_a.condition - direct_b.condition)
-                               <= 5.0e-12
-                                  * std::max(1.0, std::abs(direct_a.condition)),
-                    "rigid transform preserves in-band direct diagnostics at "
-                        + std::to_string(q));
-        }
     }
 
     Eigen::VectorXd moved_mu(static_cast<int>(moved_cloud.dofs.size()));
@@ -1367,10 +1485,13 @@ int main()
         test_circular_edge_closest_point_is_rigid_transform_invariant();
         test_lprism_split_edges_have_disjoint_midpoint_ids_and_reversed_parameters();
         test_direct_selector_balances_regular_and_three_sector_centers();
+        test_direct_selector_orders_exact_unequal_distances_before_ids();
         test_direct_selector_uses_topology_not_physical_proximity_and_g1_outside_band();
         test_corrupted_unrelated_connection_cache_fails_structurally();
         test_outside_band_short_g1_template_fails_with_value_count_diagnostic();
+        test_short_surface_template_reports_available_value_and_normal_radii();
         test_edge_selector_contributes_each_connection_and_is_deterministic();
+        test_edge_selector_orders_exact_unequal_distances_before_ids();
         test_edge_selector_snaps_exact_two_h_boundary_under_rigid_transform();
         test_hollow_cylinder_periodic_g1_sectors_are_admitted_without_other_sheets();
         test_first_level_edge_maps_reproduce_cubic();
@@ -1382,7 +1503,7 @@ int main()
         test_second_level_routes_reproduce_cubic_and_share_edge_values();
         test_sparse_apply_is_linear_and_preserves_immutable_audit();
         test_legacy_policies_keep_two_term_maps_and_publish_summary();
-        test_two_level_maps_are_rigid_transform_invariant();
+        test_two_level_maps_follow_selector_contracts_after_rigid_transform();
         std::cout << "harmonic_cauchy_fit_3d_test passed" << std::endl;
         return 0;
     } catch (const kfbim::app3d::HarmonicCauchyError3D& error) {
