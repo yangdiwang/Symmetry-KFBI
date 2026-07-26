@@ -1105,6 +1105,44 @@ void test_outside_band_short_g1_template_fails_with_value_count_diagnostic()
             "outside-band short G1 template must fail instead of returning 25 IDs");
 }
 
+void test_in_band_short_direct_template_reports_available_value_radius()
+{
+    // Catches throwing after exhausting admitted in-band sectors without
+    // measuring the value IDs that were actually selected.
+    constexpr double h = 1.0 / 4.0;
+    const NativeNurbsSurface3D surface = unit_y_edge_wedge();
+    const SurfaceDofCloud3D cloud = make_native_surface_dofs_3d(surface, h);
+    const auto neighborhoods =
+        build_surface_non_g1_edge_neighborhoods_3d(surface, cloud, h);
+    const int center = cloud.patches[0].dof_index(0, 1);
+    require(neighborhoods.centers[static_cast<std::size_t>(center)]
+                    .nearest_distance_over_h <= 2.0,
+            "short direct fixture lies inside the literal 2h edge band");
+
+    bool caught = false;
+    try {
+        (void)select_direct_cross_face_value_dofs_3d(
+            surface, cloud, neighborhoods, center, 48, h);
+    } catch (const kfbim::app3d::HarmonicCauchyError3D& error) {
+        const auto& diagnostic = error.diagnostic();
+        caught = true;
+        require(diagnostic.stage == "direct_selector"
+                    && diagnostic.entity_kind == "surface_dof"
+                    && diagnostic.entity_id == center
+                    && diagnostic.required_value_count == 48,
+                "short in-band template reports its selector center and target");
+        require(diagnostic.incident_sectors
+                        == std::vector<std::vector<int>>{{0}, {1}}
+                    && diagnostic.actual_value_counts
+                           == std::vector<int>({16, 16}),
+                "short in-band template reports both exhausted G1 sectors");
+        require(diagnostic.value_radius_over_h > 0.0,
+                "short in-band template reports its available value radius");
+    }
+    require(caught,
+            "two 16-DOF sectors cannot fill the 48-value direct template");
+}
+
 void test_short_surface_template_reports_available_value_and_normal_radii()
 {
     // Catches throwing the second-level count failure before measuring the
@@ -1489,6 +1527,7 @@ int main()
         test_direct_selector_uses_topology_not_physical_proximity_and_g1_outside_band();
         test_corrupted_unrelated_connection_cache_fails_structurally();
         test_outside_band_short_g1_template_fails_with_value_count_diagnostic();
+        test_in_band_short_direct_template_reports_available_value_radius();
         test_short_surface_template_reports_available_value_and_normal_radii();
         test_edge_selector_contributes_each_connection_and_is_deterministic();
         test_edge_selector_orders_exact_unequal_distances_before_ids();

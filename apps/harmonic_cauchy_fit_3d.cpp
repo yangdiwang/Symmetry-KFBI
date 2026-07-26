@@ -755,6 +755,12 @@ select_direct_cross_face_value_dofs_3d(
         diagnostic.incident_sectors = result.sector_patch_ids;
         diagnostic.actual_value_counts = result.sector_sample_counts;
         diagnostic.required_value_count = count;
+        for (int id : result.dof_ids) {
+            diagnostic.value_radius_over_h = std::max(
+                diagnostic.value_radius_over_h,
+                (cloud.dofs[static_cast<std::size_t>(id)].point
+                    - center_point).norm() / h);
+        }
         diagnostic.message =
             "admitted G1 sectors cannot fill direct Cauchy sample count";
         throw HarmonicCauchyError3D(std::move(diagnostic));
