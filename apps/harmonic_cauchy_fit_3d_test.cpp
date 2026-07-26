@@ -478,6 +478,43 @@ void test_direct_selector_uses_topology_not_physical_proximity_and_g1_outside_ba
             "outside 2h direct IDs equal nearest_g1_cauchy_dofs in order");
 }
 
+void test_outside_band_short_g1_template_fails_with_value_count_diagnostic()
+{
+    // Catches silently returning fewer values than the requested direct-route
+    // template when the outside-band baseline G1 component is too small.
+    constexpr double h = 0.2;
+    const NativeNurbsSurface3D surface = reversed_unit_wedge();
+    const SurfaceDofCloud3D cloud = make_native_surface_dofs_3d(surface, h);
+    const auto neighborhoods =
+        build_surface_non_g1_edge_neighborhoods_3d(surface, cloud, h);
+    const auto& patch = cloud.patches[0];
+    const int center = patch.dof_index(patch.nu / 2, patch.nv / 2);
+    require(neighborhoods.centers[static_cast<std::size_t>(center)]
+                .nearest_distance_over_h > 2.0,
+            "short-template fixture is outside the literal 2h edge band");
+
+    bool caught = false;
+    try {
+        (void)select_direct_cross_face_value_dofs_3d(
+            surface, cloud, neighborhoods, center, 48, h);
+    } catch (const kfbim::app3d::HarmonicCauchyError3D& error) {
+        const auto& diagnostic = error.diagnostic();
+        caught = true;
+        require(diagnostic.stage == "direct_selector"
+                    && diagnostic.entity_kind == "surface_dof"
+                    && diagnostic.entity_id == center,
+                "short outside-band template reports its selector center");
+        require(diagnostic.required_value_count == 48
+                    && diagnostic.actual_value_counts == std::vector<int>{25},
+                "short outside-band template reports literal required 48 and actual 25");
+        require(diagnostic.incident_sectors
+                    == std::vector<std::vector<int>>{{0}},
+                "short outside-band template reports the center G1 sector");
+    }
+    require(caught,
+            "outside-band short G1 template must fail instead of returning 25 IDs");
+}
+
 void test_edge_selector_contributes_each_connection_and_is_deterministic()
 {
     // Catches repeating geometry queries in selectors, omitting a relevant
@@ -545,6 +582,78 @@ void test_edge_selector_contributes_each_connection_and_is_deterministic()
     }
 }
 
+SurfaceDofCloud3D transform_test_cloud(
+    SurfaceDofCloud3D cloud,
+    const RigidTransform3D& transform)
+{
+    for (auto& dof : cloud.dofs) {
+        dof.point = transform.forward_point(dof.point);
+        dof.normal = transform.forward_vector(dof.normal);
+        dof.tangent1 = transform.forward_vector(dof.tangent1);
+        dof.tangent2 = transform.forward_vector(dof.tangent2);
+    }
+    return cloud;
+}
+
+void test_edge_selector_snaps_exact_two_h_boundary_under_rigid_transform()
+{
+    // Catches comparing raw rounded point distance with 2h: a mathematically
+    // exact boundary point must keep the same ID after a fixed rigid transform.
+    constexpr double h = 0.2;
+    const NativeNurbsSurface3D surface = reversed_unit_wedge();
+    const SurfaceDofCloud3D cloud = make_native_surface_dofs_3d(surface, h);
+    const auto& patch = cloud.patches[0];
+    const int center = patch.dof_index(patch.nu / 2, patch.nv / 2);
+    const Eigen::Vector3d center_point =
+        cloud.dofs[static_cast<std::size_t>(center)].point;
+
+    kfbim::app3d::SurfaceNonG1EdgeNeighborhoodSet3D neighborhoods;
+    neighborhoods.centers.resize(cloud.dofs.size());
+    for (int q = 0; q < static_cast<int>(cloud.dofs.size()); ++q)
+        neighborhoods.centers[static_cast<std::size_t>(q)].center_dof = q;
+    neighborhoods.centers[static_cast<std::size_t>(center)]
+        .nearest_distance_over_h = 1.0;
+    neighborhoods.centers[static_cast<std::size_t>(center)]
+        .relevant_connection_ids = {0};
+
+    kfbim::app3d::SharedEdgePointSet3D edge_points;
+    edge_points.point_ids_by_connection.resize(
+        surface.geometric_connections.size());
+    edge_points.point_ids_by_connection[0] = {0, 1};
+    kfbim::app3d::SharedEdgePoint3D nearest;
+    nearest.id = 0;
+    nearest.connection_id = 0;
+    nearest.point = center_point + Eigen::Vector3d(0.0, 0.5 * h, 0.0);
+    kfbim::app3d::SharedEdgePoint3D boundary;
+    boundary.id = 1;
+    boundary.connection_id = 0;
+    boundary.point = center_point + Eigen::Vector3d(2.0 * h, 0.0, 0.0);
+    edge_points.points = {nearest, boundary};
+
+    const auto original = select_surface_edge_points_3d(
+        surface, cloud, edge_points, neighborhoods, center, h);
+    require(original.edge_point_ids == std::vector<int>({0, 1}),
+            "literal nearest and exact-2h shared points are both selected");
+
+    const RigidTransform3D transform = RigidTransform3D::from_axis_angle(
+        Eigen::Vector3d(1.0, 2.0, -1.0),
+        0.37,
+        Eigen::Vector3d(0.2, -0.1, 0.3),
+        Eigen::Vector3d(-0.4, 0.25, 0.15));
+    const NativeNurbsSurface3D moved_surface =
+        transform_native_nurbs_surface_3d(surface, transform);
+    const SurfaceDofCloud3D moved_cloud =
+        transform_test_cloud(cloud, transform);
+    auto moved_edge_points = edge_points;
+    for (auto& point : moved_edge_points.points)
+        point.point = transform.forward_point(point.point);
+    const auto moved = select_surface_edge_points_3d(
+        moved_surface, moved_cloud, moved_edge_points,
+        neighborhoods, center, h);
+    require(moved.edge_point_ids == original.edge_point_ids,
+            "exact-2h selected IDs are invariant under the fixed rigid transform");
+}
+
 void test_hollow_cylinder_periodic_g1_sectors_are_admitted_without_other_sheets()
 {
     // Catches using only immediate patch neighbors instead of transitive G1
@@ -592,7 +701,9 @@ int main()
         test_lprism_split_edges_have_disjoint_midpoint_ids_and_reversed_parameters();
         test_direct_selector_balances_regular_and_three_sector_centers();
         test_direct_selector_uses_topology_not_physical_proximity_and_g1_outside_band();
+        test_outside_band_short_g1_template_fails_with_value_count_diagnostic();
         test_edge_selector_contributes_each_connection_and_is_deterministic();
+        test_edge_selector_snaps_exact_two_h_boundary_under_rigid_transform();
         test_hollow_cylinder_periodic_g1_sectors_are_admitted_without_other_sheets();
         std::cout << "harmonic_cauchy_fit_3d_test passed" << std::endl;
         return 0;

@@ -563,6 +563,18 @@ select_direct_cross_face_value_dofs_3d(
         result.sector_patch_ids = {center_sector};
         result.sector_sample_counts = {
             static_cast<int>(result.dof_ids.size())};
+        if (static_cast<int>(result.dof_ids.size()) != count) {
+            HarmonicCauchyFailure3D diagnostic;
+            diagnostic.stage = "direct_selector";
+            diagnostic.entity_kind = "surface_dof";
+            diagnostic.entity_id = center_dof;
+            diagnostic.incident_sectors = result.sector_patch_ids;
+            diagnostic.actual_value_counts = result.sector_sample_counts;
+            diagnostic.required_value_count = count;
+            diagnostic.message =
+                "outside-band G1 sector cannot fill direct Cauchy sample count";
+            throw HarmonicCauchyError3D(std::move(diagnostic));
+        }
         return result;
     }
 
@@ -751,6 +763,14 @@ select_surface_edge_points_3d(
     SurfaceEdgePointSelection3D result;
     result.relevant_connection_ids = neighborhood.relevant_connection_ids;
     result.nearest_edge_distance_over_h = neighborhood.nearest_distance_over_h;
+    const double model_diameter =
+        surface.geometry_model().control_bounds().diameter();
+    if (!std::isfinite(model_diameter) || model_diameter <= 0.0) {
+        throw std::invalid_argument(
+            "edge-point selector requires a positive model diameter");
+    }
+    const double physical_tolerance =
+        std::max(1.0e-12 * model_diameter, 1.0e-14);
     const Eigen::Vector3d& center_point =
         cloud.dofs[static_cast<std::size_t>(center_dof)].point;
     using Candidate = std::pair<double, int>;
@@ -793,8 +813,8 @@ select_surface_edge_points_3d(
         for (std::size_t q = 1;
              q < candidates.size() && taken < max_points_per_edge;
              ++q) {
-            const double distance =
-                std::sqrt(candidates[q].first);
+            const double distance = snapped_edge_distance(
+                std::sqrt(candidates[q].first), h, physical_tolerance);
             if (distance <= 2.0 * h) {
                 selected.push_back(candidates[q]);
                 ++taken;
