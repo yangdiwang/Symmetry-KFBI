@@ -629,7 +629,7 @@ git commit -m 'feat: add two-level harmonic Cauchy maps'
 **Files:**
 - Modify: `apps/neumann_exterior_zero_trace_3d.cpp`
 - Modify: `apps/neumann_exterior_zero_trace_3d_route_test.cpp`
-- Create: `apps/audit_neumann_two_level_edge_cauchy_3d.ps1`
+- Modify: `apps/CMakeLists.txt`
 
 **Interfaces:**
 - Consumes: `HarmonicCauchyFit3D` from Task 2.
@@ -660,6 +660,12 @@ The route enum controls only Cauchy reconstruction. It must remain independent
 of `ExteriorValueRestrictMode3D`, which controls crossing ownership.
 
 - [ ] **Step 1: Write RED route and second-level structure tests**
+
+Register the existing route-test source as a C++17 executable. Because it
+includes the application translation unit, link the same
+`kfbim_3d_app_geometry`, `kfbim_core`, `kfbim_phase_profile_3d`, Threads,
+Windows `Psapi`, output-directory definition, and MSVC `/bigobj` settings as
+`neumann_exterior_zero_trace_3d`.
 
 In the route test, require exact names:
 
@@ -771,7 +777,7 @@ remains `g1_nearest`.
 - [ ] **Step 7: Commit**
 
 ```powershell
-git add apps/neumann_exterior_zero_trace_3d.cpp apps/neumann_exterior_zero_trace_3d_route_test.cpp
+git add apps/neumann_exterior_zero_trace_3d.cpp apps/neumann_exterior_zero_trace_3d_route_test.cpp apps/CMakeLists.txt
 git commit -m 'refactor: integrate two-level Cauchy maps'
 ```
 
@@ -906,6 +912,7 @@ git commit -m 'test: add two-level Neumann probes'
 **Files:**
 - Modify: `apps/neumann_exterior_zero_trace_3d.cpp`
 - Modify: `apps/neumann_exterior_zero_trace_3d_route_test.cpp`
+- Create: `apps/audit_neumann_two_level_edge_cauchy_3d.ps1`
 
 **Interfaces:**
 - Consumes: Tasks 1-4.
