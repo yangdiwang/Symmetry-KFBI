@@ -671,6 +671,8 @@ TwoLevelNeumannStudyRouteRow3D make_shared_writer_fixture_3d()
     row.physical_residuals = {1.0, 0.1, 0.01};
     row.common_residuals = {1.0, 0.02};
     row.common_rhs_rms = 1.0;
+    row.density_linf = 0.4;
+    row.density_l2 = 0.31622776601683794;
     row.defect_linf = 0.5;
     row.defect_rms = std::sqrt(0.59 / 3.0);
     row.edge_value_linf = 0.05;
@@ -1035,6 +1037,18 @@ void require_review_schema_negative_mutations_3d(
         mutate_csv_field_matching_3d(
             directory / "summary.csv", {{"case_id", "synthetic"}},
             "defect_linf", "NaN");
+    });
+    exercise("summary_density_linf_inconsistent", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_matching_3d(
+            directory / "summary.csv", {{"case_id", "synthetic"}},
+            "density_linf", "3.0e-1");
+    });
+    exercise("summary_density_l2_inconsistent", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_matching_3d(
+            directory / "summary.csv", {{"case_id", "synthetic"}},
+            "density_l2", "3.0e-1");
     });
     exercise("summary_defect_linf_inconsistent", [](
         const std::filesystem::path& directory) {
@@ -1437,6 +1451,12 @@ TwoLevelNeumannStudyRouteRow3D make_decision_writer_fixture_3d(
     const double error = 32.0 / static_cast<double>(N);
     row.density_linf = error;
     row.density_l2 = error;
+    for (auto& dof : row.dofs) dof.density_error = error;
+    for (auto& bin : row.edge_bins) {
+        if (bin.count == 0) continue;
+        bin.density_linf = error;
+        bin.density_weighted_rms = error;
+    }
     row.interior_linf = error;
     row.interior_l2 = error;
     if (N == 64)
@@ -1610,12 +1630,12 @@ void test_decision_state_distinguishes_partial_performance_and_failure()
             directory / "summary.csv",
             {{"case_id", "baseline"}, {"N", "32"},
              {"route", "g1_value_g1_normal"}},
-            "density_linf", "1.0e308");
+            "interior_linf", "1.0e308");
         mutate_csv_field_matching_3d(
             directory / "summary.csv",
             {{"case_id", "baseline"}, {"N", "64"},
              {"route", "g1_value_g1_normal"}},
-            "density_linf", "1.0e-308");
+            "interior_linf", "1.0e-308");
     });
     exerciseFormalRejection("combined_weight_overflow", [](
         const std::filesystem::path& directory) {

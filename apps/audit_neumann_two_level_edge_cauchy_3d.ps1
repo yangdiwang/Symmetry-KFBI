@@ -497,8 +497,8 @@ public static class NeumannEvidenceDomainAudit {
                 state.DensityLinf = Math.Max(
                     state.DensityLinf, Math.Abs(density));
                 double totalDensityTerm = FiniteResult(
-                    weight * density * density,
-                    entity + " total density weighted square");
+                    density * density,
+                    entity + " total density square");
                 state.DensitySquare = FiniteResult(
                     state.DensitySquare + totalDensityTerm,
                     entity + " total density square sum");
@@ -1287,12 +1287,24 @@ foreach ($row in $summary | Where-Object {
         ("summary condition maximum mismatch $key")
     Assert-True ($keyDofAudit.WeightSum -gt 0.0) `
         ("nonpositive raw DOF total weight $key")
+    Assert-True ($keyDofAudit.Count -gt 0) `
+        ("nonpositive raw DOF count $key")
+    $rawDensityMeanSquare = Finite-Divide $keyDofAudit.DensitySquare `
+        $keyDofAudit.Count "$key raw density mean square"
+    $rawDensityL2 = Finite-SquareRoot $rawDensityMeanSquare `
+        "$key raw density L2"
     $rawDefectMeanSquare = Finite-Divide $keyDofAudit.DefectSquare `
         $keyDofAudit.WeightSum "$key raw defect mean square"
     $rawDefectRms = Finite-SquareRoot $rawDefectMeanSquare `
         "$key raw defect RMS"
     $summaryDefectLinf = Number $row.defect_linf "$key defect_linf"
     $summaryDefectRms = Number $row.defect_rms "$key defect_rms"
+    $summaryDensityLinf = Number $row.density_linf "$key density_linf"
+    $summaryDensityL2 = Number $row.density_l2 "$key density_l2"
+    Assert-True (Nearly-Equal $summaryDensityLinf $keyDofAudit.DensityLinf) `
+        ("summary density Linf does not match raw DOFs $key")
+    Assert-True (Nearly-Equal $summaryDensityL2 $rawDensityL2) `
+        ("summary density L2 does not match raw DOFs $key")
     Assert-True (Nearly-Equal $summaryDefectLinf $keyDofAudit.DefectLinf) `
         ("summary defect Linf does not match raw DOFs $key")
     Assert-True (Nearly-Equal $summaryDefectRms $rawDefectRms) `
