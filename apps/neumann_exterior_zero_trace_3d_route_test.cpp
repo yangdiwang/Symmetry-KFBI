@@ -1271,10 +1271,22 @@ TwoLevelNeumannStudyRouteRow3D make_failed_writer_fixture_3d(
     return row;
 }
 
-void test_structured_common_setup_failure_populates_all_route_rows()
+void test_structured_common_setup_failure_reaches_all_writer_rows()
 {
+    class SetupHookError3D : public app3d::HarmonicCauchyError3D {
+    public:
+        explicit SetupHookError3D(
+            const app3d::HarmonicCauchyFailure3D& diagnostic)
+            : app3d::HarmonicCauchyError3D(diagnostic)
+        {}
+
+        const char* what() const noexcept override
+        {
+            return "structured setup hook failure";
+        }
+    };
+
     app3d::HarmonicCauchyFailure3D diagnostic;
-    diagnostic.stage = "rank";
     diagnostic.entity_kind = "surface";
     diagnostic.entity_id = 17;
     diagnostic.connection_id = 23;
@@ -1290,62 +1302,153 @@ void test_structured_common_setup_failure_populates_all_route_rows()
     diagnostic.sigma_max = 12.0;
     diagnostic.sigma_min = 0.125;
     diagnostic.condition = 96.0;
-    diagnostic.message = "structured setup failure";
-    const app3d::HarmonicCauchyError3D error(diagnostic);
-    const std::array<app3d::HarmonicCauchyRoute3D, 3> routes{{
-        app3d::HarmonicCauchyRoute3D::G1ValueG1Normal,
-        app3d::HarmonicCauchyRoute3D::DirectCrossFaceValue,
-        app3d::HarmonicCauchyRoute3D::EdgeReconstructedValue}};
-    for (const auto route : routes) {
-        const auto row = failed_two_level_route_row_3d(
-            "structured_setup", 64, route, error.diagnostic(),
-            "setup", error.what(), 0.125);
-        require(row.case_id == "structured_setup" && row.N == 64
-                    && row.route == route && row.status == "failed"
-                    && row.h == 0.125 && !row.setup_available
-                    && !row.fit_available && !row.owner_before_available
-                    && !row.solve_available,
-                "structured common-setup failure row has wrong route metadata");
-        require(row.failure.stage == diagnostic.stage
-                    && row.failure.entity_kind == diagnostic.entity_kind
-                    && row.failure.entity_id == diagnostic.entity_id
-                    && row.failure.connection_id == diagnostic.connection_id
-                    && row.failure.incident_sectors
-                        == diagnostic.incident_sectors
-                    && row.failure.actual_value_counts
-                        == diagnostic.actual_value_counts
-                    && row.failure.actual_normal_counts
-                        == diagnostic.actual_normal_counts
-                    && row.failure.required_value_count
-                        == diagnostic.required_value_count
-                    && row.failure.required_normal_count
-                        == diagnostic.required_normal_count
-                    && row.failure.actual_edge_count
-                        == diagnostic.actual_edge_count
-                    && row.failure.value_radius_over_h
-                        == diagnostic.value_radius_over_h
-                    && row.failure.normal_radius_over_h
-                        == diagnostic.normal_radius_over_h
-                    && row.failure.edge_radius_over_h
-                        == diagnostic.edge_radius_over_h
-                    && row.failure.sigma_max == diagnostic.sigma_max
-                    && row.failure.sigma_min == diagnostic.sigma_min
-                    && row.failure.condition == diagnostic.condition
-                    && row.failure.message == diagnostic.message,
-                "structured common-setup failure lost diagnostic fields");
+    require(diagnostic.stage.empty() && diagnostic.message.empty(),
+            "setup hook fixture must exercise empty stage/message fallback");
+
+    const std::filesystem::path root = std::filesystem::current_path()
+        / "structured_setup_catch_test_output";
+    std::error_code error;
+    std::filesystem::remove_all(root, error);
+    int setupCalls = 0;
+    const int status = run_neumann_two_level_edge_cauchy_study_impl_3d(
+        {16}, root, [&] {
+            ++setupCalls;
+            throw SetupHookError3D(diagnostic);
+        });
+    require(status == 2 && setupCalls == 3,
+            "structured setup hook did not fail each study case");
+
+    const auto value = [](const std::vector<std::vector<std::string>>& records,
+                          const std::vector<std::string>& row,
+                          const std::string& column) -> const std::string& {
+        const auto found = std::find(
+            records.front().begin(), records.front().end(), column);
+        require(found != records.front().end(),
+                "structured setup CSV missing column " + column);
+        const std::size_t index = static_cast<std::size_t>(
+            std::distance(records.front().begin(), found));
+        require(index < row.size(),
+                "structured setup CSV has short row for " + column);
+        return row[index];
+    };
+    const auto requireFailure = [&](const auto& records, const auto& row) {
+        require(value(records, row, "failure_stage") == "setup"
+                    && value(records, row, "failure_message")
+                        == "structured setup hook failure"
+                    && value(records, row, "failure_entity_kind") == "surface"
+                    && value(records, row, "failure_entity_id") == "17"
+                    && value(records, row, "failure_connection_id") == "23"
+                    && value(records, row, "failure_incident_sectors")
+                        == "{{2;5};{7;11}}"
+                    && value(records, row, "failure_actual_value_counts")
+                        == "{19;29}"
+                    && value(records, row, "failure_actual_normal_counts")
+                        == "{13;17}"
+                    && value(records, row, "failure_required_value_count")
+                        == "48"
+                    && value(records, row, "failure_required_normal_count")
+                        == "28"
+                    && value(records, row, "failure_actual_edge_count") == "3"
+                    && value(records, row, "failure_value_radius_over_h")
+                        == "1.25000000000000000e+00"
+                    && value(records, row, "failure_normal_radius_over_h")
+                        == "1.50000000000000000e+00"
+                    && value(records, row, "failure_edge_radius_over_h")
+                        == "1.75000000000000000e+00"
+                    && value(records, row, "failure_sigma_max")
+                        == "1.20000000000000000e+01"
+                    && value(records, row, "failure_sigma_min")
+                        == "1.25000000000000000e-01"
+                    && value(records, row, "failure_condition")
+                        == "9.60000000000000000e+01",
+                "structured setup diagnostic did not round-trip completely");
+    };
+    const std::array<std::string, 3> expectedCases{{
+        "baseline", "rot_axis123_17deg", "rot_axis123_17deg_t_xyz_1"}};
+    const std::array<std::string, 3> expectedRoutes{{
+        "g1_value_g1_normal", "direct_cross_face_value",
+        "edge_reconstructed_value"}};
+    const std::array<std::string, 3> expectedBins{{
+        "lt_h", "h_to_2h", "gt_2h"}};
+    const auto contains = [](const auto& expected, const std::string& item) {
+        return std::find(expected.begin(), expected.end(), item)
+            != expected.end();
+    };
+
+    const auto summary = parse_csv_records_3d(
+        read_text_file(root / "summary.csv"));
+    require(summary.size() == 10,
+            "structured setup catch did not write exactly nine summary rows");
+    std::set<std::pair<std::string, std::string>> summaryKeys;
+    for (auto row = summary.begin() + 1; row != summary.end(); ++row) {
+        const std::string& caseId = value(summary, *row, "case_id");
+        const std::string& route = value(summary, *row, "route");
+        require(contains(expectedCases, caseId)
+                    && contains(expectedRoutes, route)
+                    && summaryKeys.emplace(caseId, route).second,
+                "structured setup summary has a missing/duplicate route key");
+        require(value(summary, *row, "N") == "16"
+                    && value(summary, *row, "status") == "failed"
+                    && value(summary, *row, "patch_count") == "NA"
+                    && value(summary, *row, "surface_dof_count") == "NA"
+                    && value(summary, *row, "shared_edge_point_count") == "NA"
+                    && value(summary, *row, "setup_seconds") == "NA"
+                    && value(summary, *row, "neighborhood_geometry_queries")
+                        == "NA"
+                    && value(summary, *row, "label_inside_count") == "NA"
+                    && value(summary, *row, "label_outside_count") == "NA"
+                    && value(summary, *row, "label_fingerprint") == "NA"
+                    && value(summary, *row, "neighborhood_fingerprint")
+                        == "NA",
+                "structured setup failure invented unavailable setup fields");
+        requireFailure(summary, *row);
+    }
+    require(summaryKeys.size() == 9,
+            "structured setup summary did not cover three cases by three routes");
+
+    const auto owners = parse_csv_records_3d(
+        read_text_file(root / "owner_diagnostics.csv"));
+    require(owners.size() == 10,
+            "structured setup catch did not write nine failed owner rows");
+    std::set<std::pair<std::string, std::string>> ownerKeys;
+    for (auto row = owners.begin() + 1; row != owners.end(); ++row) {
+        const auto key = std::make_pair(
+            value(owners, *row, "case_id"), value(owners, *row, "route"));
+        require(ownerKeys.insert(key).second
+                    && value(owners, *row, "status") == "failed"
+                    && value(owners, *row, "available") == "NA"
+                    && value(owners, *row, "owner_query_count") == "NA",
+                "structured setup owner row is duplicated or partially available");
+        requireFailure(owners, *row);
     }
 
-    app3d::HarmonicCauchyFailure3D fallbackSource;
-    fallbackSource.message = "exception what fallback";
-    const app3d::HarmonicCauchyError3D fallbackError(fallbackSource);
-    auto emptyDiagnostic = fallbackError.diagnostic();
-    emptyDiagnostic.message.clear();
-    const auto fallbackRow = failed_two_level_route_row_3d(
-        "fallback_setup", 32, routes.front(), emptyDiagnostic,
-        "setup", fallbackError.what(), 0.25);
-    require(fallbackRow.failure.stage == "setup"
-                && fallbackRow.failure.message == fallbackError.what(),
-            "empty structured setup stage/message did not use setup/what fallback");
+    const auto bins = parse_csv_records_3d(
+        read_text_file(root / "edge_distance_bins.csv"));
+    require(bins.size() == 28,
+            "structured setup catch did not write 27 failed bin rows");
+    std::set<std::tuple<std::string, std::string, std::string>> binKeys;
+    for (auto row = bins.begin() + 1; row != bins.end(); ++row) {
+        const std::string& bin = value(bins, *row, "distance_bin");
+        const auto key = std::make_tuple(
+            value(bins, *row, "case_id"), value(bins, *row, "route"), bin);
+        require(contains(expectedBins, bin) && binKeys.insert(key).second
+                    && value(bins, *row, "status") == "failed"
+                    && value(bins, *row, "count") == "NA"
+                    && value(bins, *row, "weight_sum") == "NA",
+                "structured setup bin row is duplicated or partially available");
+        requireFailure(bins, *row);
+    }
+    require(binKeys.size() == 27,
+            "structured setup bins did not cover all case/route/bin keys");
+
+    for (const std::string& filename : {
+             "gmres_residuals.csv", "edge_point_diagnostics.csv",
+             "edge_fit_diagnostics.csv", "surface_fit_diagnostics.csv",
+             "dof_diagnostics.csv"}) {
+        require(parse_csv_records_3d(read_text_file(root / filename)).size() == 1,
+                "structured setup failure invented detail rows in " + filename);
+    }
+    std::filesystem::remove_all(root, error);
 }
 
 void test_two_level_study_writer_and_schema_audit()
@@ -1507,7 +1610,7 @@ int main()
         test_owner_pipeline_and_bordered_operator_split_mu_eta();
         test_common_neumann_rhs_uses_native_parameters_and_surface_weights();
         test_detailed_neumann_probe_uses_literal_defect_and_exact_edge_fit();
-        test_structured_common_setup_failure_populates_all_route_rows();
+        test_structured_common_setup_failure_reaches_all_writer_rows();
         test_two_level_study_writer_and_schema_audit();
         test_failed_coarse_requires_na_adjacent_order();
         test_nonpositive_adjacent_order_error_is_rejected();

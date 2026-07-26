@@ -10828,17 +10828,14 @@ std::vector<int> normalize_two_level_neumann_levels_3d(
     return levels;
 }
 
-int run_neumann_two_level_edge_cauchy_study_3d(std::vector<int> levels)
+using TwoLevelNeumannStudySetupHook3D = std::function<void()>;
+
+int run_neumann_two_level_edge_cauchy_study_impl_3d(
+    std::vector<int> levels,
+    const std::filesystem::path& outputDirectory,
+    const TwoLevelNeumannStudySetupHook3D& setupHook)
 {
     levels = normalize_two_level_neumann_levels_3d(std::move(levels));
-#ifdef KFBIM_APP_OUTPUT_DIR
-    std::filesystem::path outputDirectory =
-        std::filesystem::path(KFBIM_APP_OUTPUT_DIR)
-        / "neumann_two_level_edge_cauchy_3d";
-#else
-    std::filesystem::path outputDirectory =
-        "output/neumann_two_level_edge_cauchy_3d";
-#endif
     TwoLevelNeumannStudyWriter3D writer(outputDirectory);
     const auto cases = two_level_neumann_study_cases_3d();
     const std::array<app3d::HarmonicCauchyRoute3D, 3> routes{{
@@ -10860,6 +10857,7 @@ int run_neumann_two_level_edge_cauchy_study_3d(std::vector<int> levels)
             const double h = kBoxSide / static_cast<double>(N);
             bool setupCompleted = false;
             try {
+                if (setupHook) setupHook();
                 const auto setupStart = std::chrono::steady_clock::now();
                 CartesianGrid3D grid{{kBoxMin, kBoxMin, kBoxMin}, {h, h, h},
                                      {N, N, N}, DofLayout3D::Node};
@@ -11084,6 +11082,20 @@ int run_neumann_two_level_edge_cauchy_study_3d(std::vector<int> levels)
     std::cout << "Two-level Neumann study output: "
               << outputDirectory.string() << '\n';
     return numericalFailure ? 2 : 0;
+}
+
+int run_neumann_two_level_edge_cauchy_study_3d(std::vector<int> levels)
+{
+#ifdef KFBIM_APP_OUTPUT_DIR
+    const std::filesystem::path outputDirectory =
+        std::filesystem::path(KFBIM_APP_OUTPUT_DIR)
+        / "neumann_two_level_edge_cauchy_3d";
+#else
+    const std::filesystem::path outputDirectory =
+        "output/neumann_two_level_edge_cauchy_3d";
+#endif
+    return run_neumann_two_level_edge_cauchy_study_impl_3d(
+        std::move(levels), outputDirectory, {});
 }
 
 int run_neumann_edge_cauchy_study_3d(
