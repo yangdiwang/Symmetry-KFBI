@@ -526,6 +526,18 @@ void test_n128_isolation()
                 && neumann_edge_cauchy_study_exit_pass_3d(bad, true),
             "failing N=128 evidence changed coarse acceptance or exit");
 }
+
+void test_extended_run_gate_policy()
+{
+    require(neumann_edge_cauchy_should_enter_n128_3d(true, false),
+            "passing coarse evidence did not enter N=128");
+    require(neumann_edge_cauchy_should_enter_n128_3d(true, true),
+            "force flag blocked passing coarse evidence");
+    require(!neumann_edge_cauchy_should_enter_n128_3d(false, false),
+            "default route bypassed a failed coarse gate");
+    require(neumann_edge_cauchy_should_enter_n128_3d(false, true),
+            "explicit force did not enter N=128 after coarse failure");
+}
 } // namespace
 
 int main()
@@ -535,6 +547,7 @@ int main()
         test_residual_history_validation();
         test_pair_process_recovery_and_checkpointing();
         test_level_prefixes();
+        test_extended_run_gate_policy();
         test_input_keys_and_prefix_semantics();
         test_passing_fixture_and_derived_values();
         test_coarse_gate_mutations();

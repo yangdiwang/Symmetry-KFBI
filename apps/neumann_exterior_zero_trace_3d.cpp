@@ -9593,7 +9593,9 @@ void write_neumann_edge_cauchy_checkpoints_3d(
                evaluation.acceptance.overall_pass) << '\n';
 }
 
-int run_neumann_edge_cauchy_study_3d(std::vector<int> levels)
+int run_neumann_edge_cauchy_study_3d(
+    std::vector<int> levels,
+    bool force_extended)
 {
     try {
         levels = app3d::normalize_neumann_edge_cauchy_levels_3d(
@@ -9643,11 +9645,19 @@ int run_neumann_edge_cauchy_study_3d(std::vector<int> levels)
                 case_ids, true);
             write_neumann_edge_cauchy_checkpoints_3d(
                 output_dir, pairs, evaluation);
-            if (!evaluation.all_pass) {
+            const bool enter_extended =
+                app3d::neumann_edge_cauchy_should_enter_n128_3d(
+                    evaluation.all_pass, force_extended);
+            if (!enter_extended) {
                 std::cerr
                     << "error: N=128 gated off because the completed N=32/64 "
                        "Neumann edge-Cauchy pilot did not pass\n";
                 return 1;
+            }
+            if (!evaluation.all_pass) {
+                std::cerr
+                    << "warning: forcing N=128 extended evidence after failed "
+                       "N=32/64 acceptance; acceptance thresholds are unchanged\n";
             }
         }
         for (const auto& study_case : cases) {
@@ -9896,7 +9906,8 @@ void print_usage(const char* executable)
         << "       " << executable << " --neumann-owner-study [N ...]\n"
         << "       " << executable << " --neumann-rigid-study [N ...]\n"
         << "       " << executable << " --neumann-edge-continuity-study [N ...]\n"
-        << "       " << executable << " --neumann-edge-cauchy-study [N ...]\n"
+        << "       " << executable
+        << " --neumann-edge-cauchy-study [--force-extended] [N ...]\n"
         << "  Each N must be a power of two and at least 16 (default: 32).\n"
         << "  Rigid-study default levels: 32, 64, 128.\n"
         << "  Restrict-probe default levels: 32, 64.\n"
@@ -9909,6 +9920,8 @@ void print_usage(const char* executable)
            "32; 32,64; or 32,64,128 (default: 32,64).\n"
         << "  Neumann-edge-cauchy-study levels are the refinement prefixes "
            "32; 32,64; or 32,64,128 (default: 32,64).\n"
+        << "  --force-extended records N=128 evidence after a failed coarse "
+           "gate without changing acceptance.\n"
         << "  This stage builds native NURBS parameter-cell-center surface\n"
         << "  unknowns, topology-filtered 48/28 Cauchy stencils, validates\n"
         << "  fixed transfer routes, and executes the Neumann value-jump and\n"
@@ -9950,6 +9963,11 @@ int main(int argc, char** argv)
             && std::string(argv[1]) == "--neumann-edge-continuity-study";
         const bool neumann_edge_cauchy_study = argc >= 2
             && std::string(argv[1]) == "--neumann-edge-cauchy-study";
+        const bool force_neumann_edge_cauchy_extended =
+            neumann_edge_cauchy_study && argc >= 3
+            && std::string(argv[2]) == "--force-extended";
+        const int first_level_argument =
+            force_neumann_edge_cauchy_extended ? 3 : 2;
         std::string selection = "all";
         std::vector<int> levels = rigid_study
             ? std::vector<int>{32, 64, 128}
@@ -9976,9 +9994,9 @@ int main(int argc, char** argv)
             print_usage(argv[0]);
             return 0;
         }
-        if (argc >= 3) {
+        if (argc > first_level_argument) {
             levels.clear();
-            for (int argument = 2; argument < argc; ++argument)
+            for (int argument = first_level_argument; argument < argc; ++argument)
                 levels.push_back(parse_grid_level_argument(argv[argument]));
         }
         if (restrict_probe || restrict_probe_owner
@@ -9996,7 +10014,8 @@ int main(int argc, char** argv)
         if (neumann_edge_continuity_study)
             return run_neumann_edge_continuity_study_3d(levels);
         if (neumann_edge_cauchy_study)
-            return run_neumann_edge_cauchy_study_3d(levels);
+            return run_neumann_edge_cauchy_study_3d(
+                levels, force_neumann_edge_cauchy_extended);
         const CauchyStencilPolicy3D cauchy_policy = selected_cauchy_policy();
         const int cauchy_value_count = positive_environment_integer(
             "KFBIM_3D_CAUCHY_VALUE_COUNT", kCauchyValueNeighborCount);
