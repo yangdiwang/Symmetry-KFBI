@@ -10788,6 +10788,22 @@ TwoLevelNeumannStudyRouteRow3D failed_two_level_route_row_3d(
     return row;
 }
 
+TwoLevelNeumannStudyRouteRow3D failed_two_level_route_row_3d(
+    const std::string& case_id, int N,
+    app3d::HarmonicCauchyRoute3D route,
+    const app3d::HarmonicCauchyFailure3D& diagnostic,
+    const std::string& fallback_stage,
+    const std::string& fallback_message,
+    double h = 0.0)
+{
+    TwoLevelNeumannStudyRouteRow3D row = failed_two_level_route_row_3d(
+        case_id, N, route, fallback_stage, fallback_message, h);
+    row.failure = diagnostic;
+    if (row.failure.stage.empty()) row.failure.stage = fallback_stage;
+    if (row.failure.message.empty()) row.failure.message = fallback_message;
+    return row;
+}
+
 std::vector<app3d::DirichletRigidStudyCase3D>
 two_level_neumann_study_cases_3d()
 {
@@ -11043,6 +11059,15 @@ int run_neumann_two_level_edge_cauchy_study_3d(std::vector<int> levels)
                               << " N=" << row.N << " route="
                               << harmonic_cauchy_route_name_3d(row.route)
                               << " status=" << row.status << '\n';
+                }
+            } catch (const app3d::HarmonicCauchyError3D& error) {
+                if (setupCompleted) throw;
+                previousErrors.clear();
+                numericalFailure = true;
+                for (const auto route : routes) {
+                    writer.append(failed_two_level_route_row_3d(
+                        studyCase.id, N, route, error.diagnostic(),
+                        "setup", error.what(), h));
                 }
             } catch (const std::exception& error) {
                 if (setupCompleted) throw;

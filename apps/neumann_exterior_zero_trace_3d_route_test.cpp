@@ -1271,6 +1271,83 @@ TwoLevelNeumannStudyRouteRow3D make_failed_writer_fixture_3d(
     return row;
 }
 
+void test_structured_common_setup_failure_populates_all_route_rows()
+{
+    app3d::HarmonicCauchyFailure3D diagnostic;
+    diagnostic.stage = "rank";
+    diagnostic.entity_kind = "surface";
+    diagnostic.entity_id = 17;
+    diagnostic.connection_id = 23;
+    diagnostic.incident_sectors = {{2, 5}, {7, 11}};
+    diagnostic.actual_value_counts = {19, 29};
+    diagnostic.actual_normal_counts = {13, 17};
+    diagnostic.required_value_count = 48;
+    diagnostic.required_normal_count = 28;
+    diagnostic.actual_edge_count = 3;
+    diagnostic.value_radius_over_h = 1.25;
+    diagnostic.normal_radius_over_h = 1.5;
+    diagnostic.edge_radius_over_h = 1.75;
+    diagnostic.sigma_max = 12.0;
+    diagnostic.sigma_min = 0.125;
+    diagnostic.condition = 96.0;
+    diagnostic.message = "structured setup failure";
+    const app3d::HarmonicCauchyError3D error(diagnostic);
+    const std::array<app3d::HarmonicCauchyRoute3D, 3> routes{{
+        app3d::HarmonicCauchyRoute3D::G1ValueG1Normal,
+        app3d::HarmonicCauchyRoute3D::DirectCrossFaceValue,
+        app3d::HarmonicCauchyRoute3D::EdgeReconstructedValue}};
+    for (const auto route : routes) {
+        const auto row = failed_two_level_route_row_3d(
+            "structured_setup", 64, route, error.diagnostic(),
+            "setup", error.what(), 0.125);
+        require(row.case_id == "structured_setup" && row.N == 64
+                    && row.route == route && row.status == "failed"
+                    && row.h == 0.125 && !row.setup_available
+                    && !row.fit_available && !row.owner_before_available
+                    && !row.solve_available,
+                "structured common-setup failure row has wrong route metadata");
+        require(row.failure.stage == diagnostic.stage
+                    && row.failure.entity_kind == diagnostic.entity_kind
+                    && row.failure.entity_id == diagnostic.entity_id
+                    && row.failure.connection_id == diagnostic.connection_id
+                    && row.failure.incident_sectors
+                        == diagnostic.incident_sectors
+                    && row.failure.actual_value_counts
+                        == diagnostic.actual_value_counts
+                    && row.failure.actual_normal_counts
+                        == diagnostic.actual_normal_counts
+                    && row.failure.required_value_count
+                        == diagnostic.required_value_count
+                    && row.failure.required_normal_count
+                        == diagnostic.required_normal_count
+                    && row.failure.actual_edge_count
+                        == diagnostic.actual_edge_count
+                    && row.failure.value_radius_over_h
+                        == diagnostic.value_radius_over_h
+                    && row.failure.normal_radius_over_h
+                        == diagnostic.normal_radius_over_h
+                    && row.failure.edge_radius_over_h
+                        == diagnostic.edge_radius_over_h
+                    && row.failure.sigma_max == diagnostic.sigma_max
+                    && row.failure.sigma_min == diagnostic.sigma_min
+                    && row.failure.condition == diagnostic.condition
+                    && row.failure.message == diagnostic.message,
+                "structured common-setup failure lost diagnostic fields");
+    }
+
+    app3d::HarmonicCauchyFailure3D fallbackSource;
+    fallbackSource.message = "exception what fallback";
+    const app3d::HarmonicCauchyError3D fallbackError(fallbackSource);
+    auto emptyDiagnostic = fallbackError.diagnostic();
+    emptyDiagnostic.message.clear();
+    const auto fallbackRow = failed_two_level_route_row_3d(
+        "fallback_setup", 32, routes.front(), emptyDiagnostic,
+        "setup", fallbackError.what(), 0.25);
+    require(fallbackRow.failure.stage == "setup"
+                && fallbackRow.failure.message == fallbackError.what(),
+            "empty structured setup stage/message did not use setup/what fallback");
+}
+
 void test_two_level_study_writer_and_schema_audit()
 {
     const std::filesystem::path root =
@@ -1430,6 +1507,7 @@ int main()
         test_owner_pipeline_and_bordered_operator_split_mu_eta();
         test_common_neumann_rhs_uses_native_parameters_and_surface_weights();
         test_detailed_neumann_probe_uses_literal_defect_and_exact_edge_fit();
+        test_structured_common_setup_failure_populates_all_route_rows();
         test_two_level_study_writer_and_schema_audit();
         test_failed_coarse_requires_na_adjacent_order();
         test_nonpositive_adjacent_order_error_is_rejected();
