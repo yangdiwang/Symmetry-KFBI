@@ -756,6 +756,83 @@ void duplicate_first_csv_data_record_over_second_3d(
     write_study_test_file_3d(path, text);
 }
 
+void append_csv_record_for_case_3d(
+    const std::filesystem::path& path, const std::string& sourceCase,
+    const std::string& destinationCase)
+{
+    auto records = parse_csv_records_3d(read_text_file(path));
+    auto found = records.end();
+    for (auto row = records.begin() + 1; row != records.end(); ++row) {
+        if (!row->empty() && (*row)[0] == sourceCase) {
+            found = row;
+            break;
+        }
+    }
+    require(found != records.end(),
+            "append-record mutation missing case " + sourceCase);
+    auto appended = *found;
+    appended[0] = destinationCase;
+    records.push_back(std::move(appended));
+    write_csv_records_3d(path, records);
+}
+
+void mutate_csv_field_for_case_3d(
+    const std::filesystem::path& path, const std::string& caseId,
+    const std::string& column, const std::string& value)
+{
+    auto records = parse_csv_records_3d(read_text_file(path));
+    const auto columnIt = std::find(
+        records.front().begin(), records.front().end(), column);
+    require(columnIt != records.front().end(),
+            "case mutation missing column " + column);
+    const std::size_t columnIndex = static_cast<std::size_t>(
+        std::distance(records.front().begin(), columnIt));
+    auto row = records.end();
+    for (auto candidate = records.begin() + 1;
+         candidate != records.end(); ++candidate) {
+        if (candidate->size() > columnIndex && (*candidate)[0] == caseId) {
+            row = candidate;
+            break;
+        }
+    }
+    require(row != records.end(), "case mutation missing case " + caseId);
+    (*row)[columnIndex] = value;
+    write_csv_records_3d(path, records);
+}
+
+void mutate_csv_field_for_case_and_kind_3d(
+    const std::filesystem::path& path, const std::string& caseId,
+    const std::string& kind, const std::string& column,
+    const std::string& value)
+{
+    auto records = parse_csv_records_3d(read_text_file(path));
+    const auto columnIt = std::find(
+        records.front().begin(), records.front().end(), column);
+    const auto kindIt = std::find(
+        records.front().begin(), records.front().end(), "rhs_kind");
+    require(columnIt != records.front().end()
+                && kindIt != records.front().end(),
+            "case/kind mutation missing a requested column");
+    const std::size_t columnIndex = static_cast<std::size_t>(
+        std::distance(records.front().begin(), columnIt));
+    const std::size_t kindIndex = static_cast<std::size_t>(
+        std::distance(records.front().begin(), kindIt));
+    auto row = records.end();
+    for (auto candidate = records.begin() + 1;
+         candidate != records.end(); ++candidate) {
+        if (candidate->size() > std::max(columnIndex, kindIndex)
+            && (*candidate)[0] == caseId
+            && (*candidate)[kindIndex] == kind) {
+            row = candidate;
+            break;
+        }
+    }
+    require(row != records.end(),
+            "case/kind mutation missing case " + caseId);
+    (*row)[columnIndex] = value;
+    write_csv_records_3d(path, records);
+}
+
 void require_review_schema_negative_mutations_3d(
     const std::filesystem::path& script,
     const std::filesystem::path& source)
@@ -820,6 +897,44 @@ void require_review_schema_negative_mutations_3d(
                 "orphan mutation found no surface-fit record");
         text.replace(headerEnd + 1, caseEnd - headerEnd - 1, "orphan_case");
         write_study_test_file_3d(path, text);
+    });
+    exercise("orphan_owner", [](const std::filesystem::path& directory) {
+        append_csv_record_for_case_3d(
+            directory / "owner_diagnostics.csv", "synthetic", "orphan_case");
+    });
+    exercise("orphan_bin", [](const std::filesystem::path& directory) {
+        append_csv_record_for_case_3d(
+            directory / "edge_distance_bins.csv", "synthetic", "orphan_case");
+    });
+    exercise("failed_duplicate_residual", [](
+        const std::filesystem::path& directory) {
+        append_csv_record_for_case_3d(
+            directory / "gmres_residuals.csv", "post_solve_available",
+            "post_solve_available");
+    });
+    exercise("failed_residual_gap", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_for_case_and_kind_3d(
+            directory / "gmres_residuals.csv", "post_solve_available",
+            "physical", "iteration", "3");
+    });
+    exercise("failed_surface_id_gap", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_for_case_3d(
+            directory / "surface_fit_diagnostics.csv", "post_solve_available",
+            "center_dof", "2");
+    });
+    exercise("failed_dof_id_gap", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_for_case_3d(
+            directory / "dof_diagnostics.csv", "post_solve_available",
+            "dof_id", "2");
+    });
+    exercise("failed_summary_residual_mismatch", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_for_case_3d(
+            directory / "summary.csv", "post_solve_available",
+            "physical_final_residual", "5.0e-1");
     });
     exercise("mismatched_edge_key_set", [](
         const std::filesystem::path& directory) {
@@ -1191,6 +1306,15 @@ void test_two_level_study_writer_and_schema_audit()
         dof.equation_defect.reset();
     }
     writer.append(solveFailure);
+    auto postSolveFailure = make_shared_writer_fixture_3d();
+    postSolveFailure.case_id = "post_solve_available";
+    postSolveFailure.status = "failed";
+    postSolveFailure.failure.stage = "post_solve_diagnostics";
+    postSolveFailure.failure.message = "synthetic post-solve failure";
+    postSolveFailure.fit_available = true;
+    postSolveFailure.owner_before_available = true;
+    postSolveFailure.solve_available = true;
+    writer.append(postSolveFailure);
     writer.close();
 
     for (const std::string& filename : two_level_neumann_study_csv_files_3d()) {

@@ -156,6 +156,11 @@ Assert-Columns -Columns @($columnsByName['owner_diagnostics.csv']) `
 $routes = @('g1_value_g1_normal','direct_cross_face_value',
     'edge_reconstructed_value')
 Assert-UniqueKeys $summary 'summary.csv' { param($row) Key $row }
+Assert-UniqueKeys $residuals 'gmres_residuals.csv' {
+    param($row)
+    (Key $row) + '|' + $row.rhs_kind + '|' +
+        (Integer $row.iteration ((Key $row) + ' residual iteration'))
+}
 Assert-UniqueKeys $owners 'owner_diagnostics.csv' { param($row) Key $row }
 Assert-UniqueKeys $bins 'edge_distance_bins.csv' {
     param($row) (Key $row) + '|' + $row.distance_bin }
@@ -186,6 +191,18 @@ foreach ($key in $summaryByKey.Keys) {
         Assert-True (@($keyBins | Where-Object distance_bin -eq $bin).Count -eq 1) `
             ("missing bin $bin for $key")
     }
+}
+Assert-True ($owners.Count -eq $summary.Count) `
+    'owner row count does not equal summary row count'
+Assert-True ($bins.Count -eq 3 * $summary.Count) `
+    'bin row count does not equal three rows per summary'
+foreach ($row in $owners) {
+    Assert-True ($summaryByKey.ContainsKey((Key $row))) `
+        ("orphan owner row " + (Key $row))
+}
+foreach ($row in $bins) {
+    Assert-True ($summaryByKey.ContainsKey((Key $row))) `
+        ("orphan bin row " + (Key $row))
 }
 
 foreach ($row in $summary) {
@@ -252,6 +269,52 @@ foreach ($row in $residuals) {
     Assert-True (@('physical','common') -contains $row.rhs_kind) `
         ("unknown rhs_kind " + $row.rhs_kind)
 }
+foreach ($row in $summary | Where-Object status -eq 'failed') {
+    $key = Key $row
+    foreach ($kind in @('physical','common')) {
+        $history = @($residuals | Where-Object {
+            (Key $_) -eq $key -and $_.rhs_kind -eq $kind } |
+            Sort-Object { [int]$_.iteration })
+        for ($iteration = 0; $iteration -lt $history.Count; ++$iteration) {
+            $recordedIteration = Integer $history[$iteration].iteration `
+                "$key $kind iteration"
+            Assert-True ($recordedIteration -eq $iteration) `
+                ("residual iteration mismatch $key $kind")
+            [void](Number $history[$iteration].relative_residual `
+                "$key $kind residual")
+        }
+        $iterationValue = if ($kind -eq 'physical') {
+            $row.physical_iterations
+        } else {
+            $row.common_iterations
+        }
+        $finalValue = if ($kind -eq 'physical') {
+            $row.physical_final_residual
+        } else {
+            $row.common_final_residual
+        }
+        $hasIterations = -not (Is-NA $iterationValue)
+        $hasFinal = -not (Is-NA $finalValue)
+        Assert-True ($hasIterations -eq $hasFinal) `
+            ("summary solve availability mismatch $key $kind")
+        if ($row.status -eq 'ok' -or $hasIterations) {
+            Assert-True ($hasIterations -and $hasFinal) `
+                ("complete residual summary unavailable $key $kind")
+            $iterations = Integer $iterationValue "$key $kind iterations"
+            Assert-True ($iterations -ge 0) `
+                ("negative iteration count $key $kind")
+            Assert-True ($history.Count -eq $iterations + 1) `
+                ("residual history length mismatch $key $kind")
+            $summaryFinal = Number $finalValue "$key $kind final residual"
+            $historyFinal = Number $history[-1].relative_residual `
+                "$key $kind history final residual"
+            $finalTolerance = 64.0 * 2.2204460492503131e-16 *
+                [Math]::Max(1.0, [Math]::Abs($summaryFinal))
+            Assert-True ([Math]::Abs($summaryFinal - $historyFinal) -le
+                $finalTolerance) ("final residual mismatch $key $kind")
+        }
+    }
+}
 foreach ($row in @($edgePoints) + @($edgeFits)) {
     Assert-True ($row.route -eq 'edge_reconstructed_value') `
         ("control route invented shared-edge diagnostics " + (Key $row))
@@ -261,6 +324,22 @@ foreach ($row in @($edgePoints) + @($edgeFits)) {
 foreach ($row in @($surfaceFits) + @($dofs)) {
     Assert-True ($summaryByKey.ContainsKey((Key $row))) `
         ("orphan diagnostic " + (Key $row))
+}
+foreach ($row in $summary | Where-Object status -eq 'failed') {
+    $key = Key $row
+    $surfaceIds = @($surfaceFits | Where-Object { (Key $_) -eq $key } |
+        ForEach-Object { Integer $_.center_dof "$key center_dof" } |
+        Sort-Object)
+    $dofIds = @($dofs | Where-Object { (Key $_) -eq $key } |
+        ForEach-Object { Integer $_.dof_id "$key dof_id" } | Sort-Object)
+    for ($index = 0; $index -lt $surfaceIds.Count; ++$index) {
+        Assert-True ($surfaceIds[$index] -eq $index) `
+            ("surface center IDs are not contiguous $key")
+    }
+    for ($index = 0; $index -lt $dofIds.Count; ++$index) {
+        Assert-True ($dofIds[$index] -eq $index) `
+            ("DOF IDs are not contiguous $key")
+    }
 }
 $edgePointBaseKeys = @($edgePoints | ForEach-Object {
     (Key $_) + '|' + $_.connection_id + '|' + $_.cell_id } | Sort-Object -Unique)
