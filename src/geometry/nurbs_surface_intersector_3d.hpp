@@ -1,5 +1,6 @@
 #pragma once
 
+#include "nurbs_bezier_intersection_3d.hpp"
 #include "nurbs_surface_model_3d.hpp"
 #include "rational_bezier_element_3d.hpp"
 
@@ -11,6 +12,30 @@
 #include <vector>
 
 namespace kfbim::geometry3d {
+
+class NurbsSurfaceIntersector3D;
+
+class NurbsSurfaceCandidate3D {
+public:
+    int patch_index() const noexcept;
+    int component() const noexcept;
+    const NurbsAabb3D& bounds() const noexcept;
+
+private:
+    friend class NurbsSurfaceIntersector3D;
+    NurbsSurfaceCandidate3D(
+        const NurbsSurfaceIntersector3D* source,
+        std::size_t query_element,
+        int patch_index,
+        int component,
+        NurbsAabb3D bounds);
+
+    const NurbsSurfaceIntersector3D* source_ = nullptr;
+    std::size_t query_element_ = 0;
+    int patch_index_ = -1;
+    int component_ = -1;
+    NurbsAabb3D bounds_;
+};
 
 struct NurbsSurfaceCrossing3D {
     int patch_index = -1;
@@ -76,6 +101,27 @@ struct NurbsSurfaceIntersectionResult3D {
     bool overlap_detected = false;
 };
 
+struct NurbsSurfaceCandidateCertificate3D {
+    NurbsElementSegmentCertificateKind3D kind =
+        NurbsElementSegmentCertificateKind3D::Unresolved;
+    std::optional<NurbsSurfaceCrossing3D> crossing;
+    NurbsElementIntersectionDiagnostics3D diagnostics;
+    bool overlap_detected = false;
+    bool segment_parameter_strictly_interior = false;
+    bool element_parameter_strictly_interior = false;
+    bool patch_parameter_strictly_interior = false;
+};
+
+struct NurbsSurfaceFilteredIntersectionOptions3D {
+    int maximum_independent_crossings = 2;
+};
+
+struct NurbsSurfaceFilteredIntersectionResult3D {
+    NurbsSurfaceIntersectionResult3D intersection;
+    bool all_candidates_processed = true;
+    bool independent_crossing_limit_reached = false;
+};
+
 struct NurbsCartesianEdgeQuery3D {
     int axis = -1;
     int i = -1;
@@ -138,6 +184,8 @@ struct NurbsSurfaceIntersectorOptions3D {
     double maximum_element_extent =
         std::numeric_limits<double>::infinity();
     int local_max_subdivision_depth = 4;
+    int terminal_separation_subdivision_depth =
+        kDefaultTerminalSeparationSubdivisionDepth3D;
 };
 
 class NurbsSurfaceIntersector3D {
@@ -155,6 +203,21 @@ public:
     double maximum_query_element_extent() const noexcept;
     const std::array<NurbsQueryElementSample3D, 16>&
     query_element_samples(std::size_t element) const;
+
+    std::vector<NurbsSurfaceCandidate3D> conservative_candidates(
+        const NurbsAabb3D& query_bounds) const;
+    std::vector<NurbsSurfaceCandidate3D> conservative_segment_candidates(
+        const Eigen::Vector3d& start,
+        const Eigen::Vector3d& end) const;
+    NurbsSurfaceCandidateCertificate3D certify_candidate_segment(
+        const NurbsSurfaceCandidate3D& candidate,
+        const Eigen::Vector3d& start,
+        const Eigen::Vector3d& end) const;
+    NurbsSurfaceFilteredIntersectionResult3D intersect_segment_candidates(
+        const Eigen::Vector3d& start,
+        const Eigen::Vector3d& end,
+        const std::vector<NurbsSurfaceCandidate3D>& ordered_candidates,
+        const NurbsSurfaceFilteredIntersectionOptions3D& options = {}) const;
 
     NurbsSurfaceIntersectionResult3D intersect_segment(
         const Eigen::Vector3d& start,
@@ -185,6 +248,11 @@ private:
         int node,
         const NurbsAabb3D& segment_bounds,
         std::vector<int>& candidates) const;
+    void validate_segment(
+        const Eigen::Vector3d& start,
+        const Eigen::Vector3d& end) const;
+    void validate_candidate_owner(
+        const NurbsSurfaceCandidate3D& candidate) const;
     NurbsSurfaceIntersectionResult3D intersect_segment_impl(
         const Eigen::Vector3d& start,
         const Eigen::Vector3d& end,
@@ -192,6 +260,17 @@ private:
         const std::vector<int>* mapped_candidates,
         int local_max_subdivision_depth,
         NurbsCartesianEdgeQueryRoute3D route) const;
+    NurbsSurfaceIntersectionResult3D intersect_segment_candidate_indices(
+        const Eigen::Vector3d& start,
+        const Eigen::Vector3d& end,
+        const std::vector<std::size_t>& candidates,
+        const NurbsCartesianEdgeQuery3D* cartesian_edge,
+        int maximum_independent_crossings,
+        bool* all_candidates_processed,
+        bool* independent_crossing_limit_reached,
+        int local_max_subdivision_depth,
+        NurbsCartesianEdgeQueryRoute3D route,
+        bool provided_candidates) const;
     NurbsCartesianEdgeIntersections3D intersect_cartesian_edge_impl(
         const NurbsCartesianEdgeQuery3D& edge,
         const std::vector<int>* mapped_candidates,

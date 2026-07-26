@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -14,14 +15,31 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <numeric>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+#ifdef interface
+#undef interface
+#endif
+#else
+#include <sys/resource.h>
+#endif
 
 #include <Eigen/Dense>
 #include <Eigen/SVD>
@@ -29,9 +47,15 @@
 #include "crossing_owner_restrict_3d.hpp"
 #include "dirichlet_rigid_transform_study_3d.hpp"
 #include "exterior_only_cubic_normal_restrict_3d.hpp"
-#include "harmonic_polynomial_space_3d.hpp"
 #include "harmonic_trace_correction_3d.hpp"
+#include "harmonic_polynomial_space_3d.hpp"
+#include "kfbi_phase_profile_3d.hpp"
 #include "native_nurbs_surface_3d.hpp"
+#include "neumann_edge_augmented_cauchy_3d.hpp"
+#include "neumann_edge_cauchy_study_3d.hpp"
+#include "neumann_edge_continuity_3d.hpp"
+#include "neumann_rigid_transform_study_3d.hpp"
+#include "restrict_owner_geometry_preprocessor_3d.hpp"
 #include "src/bulk_solvers/laplace_zfft_bulk_solver_3d.hpp"
 #include "src/geometry/grid_pair_3d.hpp"
 #include "src/geometry/nurbs_bezier_intersection_3d.hpp"
@@ -63,6 +87,7 @@ using NativeNurbsSurface3D = app3d::NativeNurbsSurface3D;
 using SurfaceDof = app3d::SurfaceDof3D;
 using SurfaceDofCloud = app3d::SurfaceDofCloud3D;
 using SurfacePatchInfo = app3d::SurfaceDofPatch3D;
+using PhaseProfileKind3D = app3d::PhaseProfileKind3D;
 
 enum class CauchyStencilPolicy3D {
     G1Nearest,
@@ -76,11 +101,99 @@ enum class SolveSelection3D {
     DirichletNormalOnly
 };
 
+enum class ExteriorValueRestrictMode3D {
+    JointTricubicCauchy,
+    JointTricubicCrossingOwner
+};
+
 enum class ExteriorNormalRestrictMode3D {
     JointTricubicCauchy,
     JointTricubicCrossingOwner,
     ExteriorOnlyHarmonicCubic
 };
+
+using ProfileClock3D = std::chrono::steady_clock;
+
+template <class Function>
+auto profile_phase_3d(app3d::PhaseProfile3D* profile,
+                      PhaseProfileKind3D kind,
+                      std::uint64_t calls,
+                      Function&& function)
+    -> decltype(function())
+{
+    if (profile == nullptr)
+        return function();
+
+    profile->note_timer_reads(1);
+    const ProfileClock3D::time_point start = ProfileClock3D::now();
+    const auto finish = [&] {
+        profile->note_timer_reads(1);
+        profile->add(
+            kind,
+            std::chrono::duration<double>(
+                ProfileClock3D::now() - start).count(),
+            calls);
+    };
+    try {
+        using Result = decltype(function());
+        if constexpr (std::is_void<Result>::value) {
+            function();
+            finish();
+        } else {
+            Result result = function();
+            finish();
+            return result;
+        }
+    } catch (...) {
+        finish();
+        throw;
+    }
+}
+
+ProfileClock3D::time_point profile_timer_start_3d(
+    app3d::PhaseProfile3D* profile)
+{
+    if (profile == nullptr)
+        return {};
+    profile->note_timer_reads(1);
+    return ProfileClock3D::now();
+}
+
+double profile_timer_elapsed_3d(
+    app3d::PhaseProfile3D* profile,
+    ProfileClock3D::time_point start)
+{
+    if (profile == nullptr)
+        return 0.0;
+    profile->note_timer_reads(1);
+    return std::chrono::duration<double>(
+        ProfileClock3D::now() - start).count();
+}
+
+void profile_add_elapsed_3d(
+    app3d::PhaseProfile3D* profile,
+    PhaseProfileKind3D kind,
+    ProfileClock3D::time_point start,
+    std::uint64_t calls = 1)
+{
+    if (profile != nullptr) {
+        profile->add(
+            kind, profile_timer_elapsed_3d(profile, start), calls);
+    }
+}
+
+double nonnegative_profile_remainder_3d(
+    double parent_seconds,
+    double child_seconds,
+    const char* context)
+{
+    const double remainder = parent_seconds - child_seconds;
+    const double tolerance =
+        std::max(1.0e-9, 1.0e-8 * parent_seconds);
+    if (remainder < -tolerance)
+        throw std::logic_error(std::string(context) + " child timers overlap");
+    return std::max(0.0, remainder);
+}
 
 std::string cauchy_policy_name(CauchyStencilPolicy3D policy)
 {
@@ -113,6 +226,39 @@ CauchyStencilPolicy3D selected_cauchy_policy()
     throw std::invalid_argument(
         "KFBIM_3D_CAUCHY_POLICY must be g1_nearest, same_patch, "
         "topological_nearest, or balanced_patches");
+}
+
+app3d::RestrictOwnerPreprocessMode3D
+selected_restrict_owner_preprocess_mode()
+{
+    const char* raw = std::getenv("KFBIM_3D_RESTRICT_OWNER_MODE");
+    if (raw == nullptr) {
+        return app3d::RestrictOwnerPreprocessMode3D::
+            FullIntersectionReference;
+    }
+    return app3d::parse_restrict_owner_preprocess_mode_3d(raw);
+}
+
+bool is_power_of_two(int value);
+
+int parse_grid_level_argument(const char* raw)
+{
+    const std::string text(raw);
+    std::size_t consumed = 0;
+    int value = 0;
+    try {
+        value = std::stoi(text, &consumed);
+    } catch (const std::exception&) {
+        throw std::invalid_argument(
+            "each N must be a power of two and at least 16");
+    }
+    if (consumed != text.size()
+        || value < 16
+        || !is_power_of_two(value)) {
+        throw std::invalid_argument(
+            "each N must be a power of two and at least 16");
+    }
+    return value;
 }
 
 int positive_environment_integer(const char* name, int default_value)
@@ -761,6 +907,404 @@ struct HarmonicCrossingRow3D {
     Eigen::VectorXd evaluation;
 };
 
+using HarmonicTraceCorrectionTerm3D =
+    app3d::HarmonicTraceCorrectionTermInput3D;
+
+struct RestrictOwnerTraceStencil3D {
+    app3d::RestrictOwnerSampleInput3D owner_input;
+    std::array<int, 64> grid_nodes{};
+    std::array<double, 64> weights{};
+};
+
+struct RestrictOwnerOracleNode3D {
+    std::uint8_t slot = 0;
+    int owner_dof = -1;
+    app3d::RestrictOwnerNormalizedClass3D owner_class =
+        app3d::RestrictOwnerNormalizedClass3D::Target;
+    int crossing_patch = -1;
+    std::optional<app3d::RestrictOwnerDecisionKind3D>
+        legacy_decision_kind;
+};
+
+struct RestrictOwnerWorkloadSample3D {
+    int target_dof = -1;
+    int side = -1;
+    int layer = -1;
+    Eigen::Vector3d query = Eigen::Vector3d::Zero();
+    std::array<int, 3> lower_stencil_index{};
+    std::uint64_t wrong_side_mask = 0;
+    std::vector<RestrictOwnerOracleNode3D> oracle_nodes;
+};
+
+using RestrictOwnerWorkload3D =
+    std::vector<RestrictOwnerWorkloadSample3D>;
+
+RestrictOwnerTraceStencil3D build_restrict_owner_trace_stencil_3d(
+    const CartesianGrid3D& grid,
+    const GridPair3D& grid_pair,
+    int target_dof,
+    bool desired_inside,
+    const Eigen::Vector3d& query,
+    const std::array<int, 3>& lower_stencil_index)
+{
+    RestrictOwnerTraceStencil3D result;
+    result.owner_input.target_dof = target_dof;
+    result.owner_input.query = query;
+
+    const double h = grid.spacing()[0];
+    const std::array<double, 3> origin = grid.origin();
+    std::array<std::array<double, 4>, 3> axis_weights{};
+    for (int axis = 0; axis < 3; ++axis) {
+        const double coordinate =
+            (query[axis] - origin[static_cast<std::size_t>(axis)]) / h;
+        const double fraction = coordinate
+            - static_cast<double>(
+                lower_stencil_index[static_cast<std::size_t>(axis)]);
+        axis_weights[static_cast<std::size_t>(axis)] =
+            cubic_lagrange_weights(fraction);
+    }
+
+    int q = 0;
+    for (int iz = 0; iz < 4; ++iz) {
+        for (int iy = 0; iy < 4; ++iy) {
+            for (int ix = 0; ix < 4; ++ix) {
+                const int i = lower_stencil_index[0] - 1 + ix;
+                const int j = lower_stencil_index[1] - 1 + iy;
+                const int k = lower_stencil_index[2] - 1 + iz;
+                const int node = grid.index(i, j, k);
+                const double weight =
+                    axis_weights[0][static_cast<std::size_t>(ix)]
+                    * axis_weights[1][static_cast<std::size_t>(iy)]
+                    * axis_weights[2][static_cast<std::size_t>(iz)];
+                const std::size_t slot = static_cast<std::size_t>(q);
+                const Eigen::Vector3d support = grid_point(grid, node);
+                result.grid_nodes[slot] = node;
+                result.weights[slot] = weight;
+                result.owner_input.support_points[slot] = support;
+                result.owner_input.wrong_side[slot] =
+                    (grid_pair.domain_label(node) > 0) != desired_inside;
+                ++q;
+            }
+        }
+    }
+    return result;
+}
+
+app3d::RestrictOwnerSampleInput3D
+reconstruct_restrict_owner_sample_input_3d(
+    const CartesianGrid3D& grid,
+    int target_dof,
+    const Eigen::Vector3d& query,
+    const std::array<int, 3>& lower_stencil_index,
+    std::uint64_t wrong_side_mask)
+{
+    app3d::RestrictOwnerSampleInput3D input;
+    input.target_dof = target_dof;
+    input.query = query;
+    int q = 0;
+    for (int iz = 0; iz < 4; ++iz) {
+        for (int iy = 0; iy < 4; ++iy) {
+            for (int ix = 0; ix < 4; ++ix) {
+                const int node = grid.index(
+                    lower_stencil_index[0] - 1 + ix,
+                    lower_stencil_index[1] - 1 + iy,
+                    lower_stencil_index[2] - 1 + iz);
+                const std::size_t slot = static_cast<std::size_t>(q);
+                input.support_points[slot] = grid_point(grid, node);
+                input.wrong_side[slot] =
+                    (wrong_side_mask
+                     & (UINT64_C(1) << static_cast<unsigned>(q))) != 0;
+                ++q;
+            }
+        }
+    }
+    return input;
+}
+
+void restrict_owner_fingerprint_append(
+    std::uint64_t& fingerprint,
+    std::uint64_t value) noexcept
+{
+    constexpr std::uint64_t prime = UINT64_C(1099511628211);
+    for (int byte = 0; byte < 8; ++byte) {
+        fingerprint ^= static_cast<std::uint8_t>(
+            value >> static_cast<unsigned>(8 * byte));
+        fingerprint *= prime;
+    }
+}
+
+void append_restrict_owner_trace_fingerprint(
+    std::uint64_t& fingerprint,
+    int target_dof,
+    int side,
+    int layer,
+    const std::array<int, 3>& lower_stencil_index,
+    const RestrictOwnerTraceStencil3D& trace) noexcept
+{
+    restrict_owner_fingerprint_append(
+        fingerprint, static_cast<std::uint32_t>(target_dof));
+    restrict_owner_fingerprint_append(
+        fingerprint, static_cast<std::uint32_t>(side));
+    restrict_owner_fingerprint_append(
+        fingerprint, static_cast<std::uint32_t>(layer));
+    for (int lower : lower_stencil_index) {
+        restrict_owner_fingerprint_append(
+            fingerprint, static_cast<std::uint32_t>(lower));
+    }
+    for (std::size_t q = 0; q < trace.grid_nodes.size(); ++q) {
+        std::uint64_t weight_bits = 0;
+        static_assert(sizeof(weight_bits) == sizeof(trace.weights[q]),
+                      "fingerprint requires binary64 weights");
+        std::memcpy(&weight_bits, &trace.weights[q], sizeof(weight_bits));
+        restrict_owner_fingerprint_append(
+            fingerprint,
+            static_cast<std::uint32_t>(trace.grid_nodes[q]));
+        restrict_owner_fingerprint_append(fingerprint, weight_bits);
+        restrict_owner_fingerprint_append(
+            fingerprint,
+            trace.owner_input.wrong_side[q] ? UINT64_C(1) : UINT64_C(0));
+    }
+}
+
+bool restrict_owner_preprocess_diagnostics_equal(
+    const app3d::RestrictOwnerPreprocessDiagnostics3D& lhs,
+    const app3d::RestrictOwnerPreprocessDiagnostics3D& rhs) noexcept
+{
+    return lhs.wrong_side_queries == rhs.wrong_side_queries
+        && lhs.path_counts == rhs.path_counts
+        && lhs.fallback_counts == rhs.fallback_counts
+        && lhs.compatible_aabb_candidates == rhs.compatible_aabb_candidates
+        && lhs.foreign_aabb_candidates == rhs.foreign_aabb_candidates
+        && lhs.control_hull_rejections == rhs.control_hull_rejections
+        && lhs.closest_point_attempts == rhs.closest_point_attempts
+        && lhs.closest_point_converged == rhs.closest_point_converged
+        && lhs.closest_point_iterations == rhs.closest_point_iterations
+        && lhs.closest_certified_misses == rhs.closest_certified_misses
+        && lhs.closest_certified_roots == rhs.closest_certified_roots
+        && lhs.closest_unresolved == rhs.closest_unresolved
+        && lhs.optimized_intersection_calls
+               == rhs.optimized_intersection_calls
+        && lhs.full_fallback_calls == rhs.full_fallback_calls
+        && lhs.target_decisions == rhs.target_decisions
+        && lhs.foreign_decisions == rhs.foreign_decisions
+        && lhs.fail_closed_target_decisions
+               == rhs.fail_closed_target_decisions
+        && lhs.region_seconds == rhs.region_seconds
+        && lhs.closest_point_seconds == rhs.closest_point_seconds
+        && lhs.optimized_intersection_seconds
+               == rhs.optimized_intersection_seconds
+        && lhs.full_fallback_seconds == rhs.full_fallback_seconds;
+}
+
+template <std::size_t Count>
+std::uint64_t restrict_owner_count_sum(
+    const std::array<std::uint64_t, Count>& counts) noexcept
+{
+    std::uint64_t result = 0;
+    for (std::uint64_t count : counts)
+        result += count;
+    return result;
+}
+
+void validate_restrict_owner_preprocess_diagnostics(
+    const app3d::RestrictOwnerPreprocessDiagnostics3D& diagnostics,
+    std::size_t compatible_query_count)
+{
+    const std::uint64_t query_count =
+        diagnostics.wrong_side_queries;
+    if (query_count == 0
+        || query_count
+               != static_cast<std::uint64_t>(
+                   compatible_query_count)) {
+        throw std::logic_error(
+            "restrict-owner preprocessing query count is inconsistent");
+    }
+    if (restrict_owner_count_sum(diagnostics.path_counts)
+            != query_count
+        || restrict_owner_count_sum(diagnostics.fallback_counts)
+               != query_count
+        || diagnostics.target_decisions
+                + diagnostics.foreign_decisions
+                + diagnostics.fail_closed_target_decisions
+               != query_count) {
+        throw std::logic_error(
+            "restrict-owner preprocessing diagnostics do not conserve "
+            "classified queries");
+    }
+}
+
+std::uint64_t current_working_set_bytes_3d()
+{
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    counters.cb = sizeof(counters);
+    const BOOL memory_ok = GetProcessMemoryInfo(GetCurrentProcess(),
+        reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(std::addressof(counters)),
+        sizeof(counters));
+    if (memory_ok == FALSE)
+        throw std::runtime_error("GetProcessMemoryInfo failed");
+    return static_cast<std::uint64_t>(counters.WorkingSetSize);
+#else
+    rusage usage{};
+    const int resource_status = getrusage(RUSAGE_SELF, std::addressof(usage));
+    if (resource_status != 0)
+        throw std::runtime_error("getrusage(RUSAGE_SELF) failed");
+#if defined(__APPLE__)
+    return static_cast<std::uint64_t>(usage.ru_maxrss);
+#else
+    return static_cast<std::uint64_t>(usage.ru_maxrss) * UINT64_C(1024);
+#endif
+#endif
+}
+
+class WorkingSetPeakSampler3D {
+public:
+    WorkingSetPeakSampler3D()
+    {
+        const std::uint64_t initial = current_working_set_bytes_3d();
+        peak_bytes_.store(initial, std::memory_order_relaxed);
+#ifdef _WIN32
+        worker_ = std::thread([this] {
+            while (!stop_.load(std::memory_order_relaxed)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                if (!enabled_.load(std::memory_order_acquire))
+                    continue;
+                std::lock_guard<std::mutex> lock(sample_mutex_);
+                if (!enabled_.load(std::memory_order_relaxed))
+                    continue;
+                try {
+                    update_sample(current_working_set_bytes_3d());
+                } catch (...) {
+                    failed_.store(true, std::memory_order_relaxed);
+                    enabled_.store(false, std::memory_order_release);
+                }
+            }
+        });
+#endif
+    }
+
+    WorkingSetPeakSampler3D(const WorkingSetPeakSampler3D&) = delete;
+    WorkingSetPeakSampler3D& operator=(
+        const WorkingSetPeakSampler3D&) = delete;
+
+    ~WorkingSetPeakSampler3D()
+    {
+        stop_worker();
+    }
+
+    void resume()
+    {
+        std::lock_guard<std::mutex> lock(sample_mutex_);
+        if (finished_)
+            throw std::logic_error("working-set sampler is finished");
+        if (enabled_.load(std::memory_order_relaxed))
+            throw std::logic_error("working-set sampler is already active");
+        if (failed_.load(std::memory_order_relaxed))
+            throw std::runtime_error("working-set sampler failed");
+        const std::uint64_t baseline = current_working_set_bytes_3d();
+        active_window_baseline_bytes_ = baseline;
+        update_sample(baseline);
+        enabled_.store(true, std::memory_order_release);
+    }
+
+    void pause() noexcept
+    {
+        enabled_.store(false, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(sample_mutex_);
+    }
+
+    void checkpoint()
+    {
+        std::lock_guard<std::mutex> lock(sample_mutex_);
+        if (!enabled_.load(std::memory_order_relaxed))
+            throw std::logic_error(
+                "working-set checkpoint requires an active window");
+        update_sample(current_working_set_bytes_3d());
+    }
+
+    void finish()
+    {
+        if (enabled_.load(std::memory_order_relaxed))
+            throw std::logic_error(
+                "working-set sampler must be paused before finish");
+        stop_worker();
+        if (failed_.load(std::memory_order_relaxed))
+            throw std::runtime_error("working-set sampler failed");
+        finished_ = true;
+    }
+
+    std::uint64_t peak_bytes() const
+    {
+        if (!finished_)
+            throw std::logic_error("working-set sampler is not finished");
+        return peak_bytes_.load(std::memory_order_relaxed);
+    }
+
+    std::uint64_t max_active_increase_bytes() const
+    {
+        if (!finished_)
+            throw std::logic_error("working-set sampler is not finished");
+        return max_active_increase_bytes_.load(
+            std::memory_order_relaxed);
+    }
+
+private:
+    void update_sample(std::uint64_t sample) noexcept
+    {
+        update_atomic_max(peak_bytes_, sample);
+        const std::uint64_t active_increase =
+            sample > active_window_baseline_bytes_
+                ? sample - active_window_baseline_bytes_ : 0;
+        update_atomic_max(max_active_increase_bytes_, active_increase);
+    }
+
+    static void update_atomic_max(
+        std::atomic<std::uint64_t>& destination,
+        std::uint64_t sample) noexcept
+    {
+        std::uint64_t peak = destination.load(std::memory_order_relaxed);
+        while (peak < sample
+               && !destination.compare_exchange_weak(
+                   peak, sample, std::memory_order_relaxed)) {
+        }
+    }
+
+    void stop_worker() noexcept
+    {
+#ifdef _WIN32
+        enabled_.store(false, std::memory_order_release);
+        stop_.store(true, std::memory_order_relaxed);
+        if (worker_.joinable())
+            worker_.join();
+#endif
+    }
+
+    std::uint64_t active_window_baseline_bytes_ = 0;
+    std::atomic<std::uint64_t> peak_bytes_{0};
+    std::atomic<std::uint64_t> max_active_increase_bytes_{0};
+    std::atomic<bool> stop_{false};
+    std::atomic<bool> enabled_{false};
+    std::atomic<bool> failed_{false};
+    std::mutex sample_mutex_;
+    bool finished_ = false;
+#ifdef _WIN32
+    std::thread worker_;
+#endif
+};
+struct RestrictOwnerPipelinePreprocessTiming3D {
+    double construction_seconds = 0.0;
+    double query_seconds = 0.0;
+    std::uint64_t peak_working_set_bytes = 0;
+    std::uint64_t max_active_increase_bytes = 0;
+    std::uint64_t output_digest = UINT64_C(14695981039346656037);
+    double assembly_seconds = 0.0;
+    double workload_capture_seconds = 0.0;
+};
+
+double production_pipeline_setup_seconds_3d(
+    double outer_constructor_seconds,
+    const RestrictOwnerPipelinePreprocessTiming3D& timing);
+
 constexpr std::size_t kRestrictOwnerDecisionKindCount =
     static_cast<std::size_t>(
         app3d::RestrictOwnerDecisionKind3D::AmbiguousEdgeFallback)
@@ -782,7 +1326,7 @@ struct HarmonicTraceSample3D {
     std::array<int, 64> grid_ids{};
     std::array<double, 64> weights{};
     Eigen::VectorXd legacy_correction_evaluation;
-    std::vector<app3d::HarmonicTraceOwnerTerm3D> owner_corrections;
+    std::vector<HarmonicTraceCorrectionTerm3D> owner_corrections;
     int wrong_side_node_count = 0;
     double wrong_side_sum_abs_weight = 0.0;
     std::array<int, kRestrictOwnerDecisionKindCount> owner_decision_counts{};
@@ -795,6 +1339,217 @@ struct HarmonicTraceSample3D {
     std::size_t owner_geometry_query_count = 0;
     std::vector<HarmonicTraceOwnerAuditTerm3D> owner_reroute_terms;
 };
+
+struct RestrictOwnerStagedDecision3D {
+    std::uint8_t slot = 0;
+    int owner_dof = -1;
+    app3d::RestrictOwnerNormalizedClass3D owner_class =
+        app3d::RestrictOwnerNormalizedClass3D::Target;
+    app3d::RestrictOwnerFallbackCause3D fallback_cause =
+        app3d::RestrictOwnerFallbackCause3D::None;
+    app3d::RestrictOwnerQueryPath3D query_path =
+        app3d::RestrictOwnerQueryPath3D::FullIntersection;
+    int legacy_decision_kind = -1;
+    int foreign_crossing_index = -1;
+};
+
+struct RestrictOwnerTraceSeed3D {
+    int target_dof = -1;
+    int side = -1;
+    int layer = -1;
+    Eigen::Vector3d query = Eigen::Vector3d::Zero();
+    std::array<int, 3> lower_stencil_index{};
+    std::uint64_t wrong_side_mask = 0;
+};
+
+struct RestrictOwnerPreparedTraceSample3D : RestrictOwnerTraceSeed3D {
+    std::uint64_t output_digest = UINT64_C(14695981039346656037);
+    std::vector<RestrictOwnerStagedDecision3D> decisions;
+    std::vector<geometry3d::NurbsSurfaceCrossing3D>
+        foreign_crossings;
+};
+
+int restrict_owner_mask_count_3d(std::uint64_t mask) noexcept
+{
+    int count = 0;
+    while (mask != 0) {
+        mask &= mask - UINT64_C(1);
+        ++count;
+    }
+    return count;
+}
+
+void prepare_restrict_owner_result_sink_3d(
+    RestrictOwnerPreparedTraceSample3D& sink)
+{
+    const std::size_t capacity = static_cast<std::size_t>(
+        restrict_owner_mask_count_3d(sink.wrong_side_mask));
+    sink.decisions.clear();
+    sink.foreign_crossings.clear();
+    sink.decisions.reserve(capacity);
+    sink.foreign_crossings.reserve(capacity);
+}
+
+void append_restrict_owner_output_digest_double_3d(
+    std::uint64_t& digest, double value) noexcept
+{
+    std::uint64_t bits = 0;
+    std::memcpy(&bits, std::addressof(value), sizeof(bits));
+    restrict_owner_fingerprint_append(digest, bits);
+}
+
+void append_restrict_owner_output_digest_crossing_3d(
+    std::uint64_t& digest,
+    const geometry3d::NurbsSurfaceCrossing3D& crossing) noexcept
+{
+    restrict_owner_fingerprint_append(
+        digest, static_cast<std::uint32_t>(crossing.patch_index));
+    restrict_owner_fingerprint_append(
+        digest, static_cast<std::uint32_t>(crossing.component));
+    append_restrict_owner_output_digest_double_3d(digest, crossing.u);
+    append_restrict_owner_output_digest_double_3d(digest, crossing.v);
+    append_restrict_owner_output_digest_double_3d(
+        digest, crossing.edge_parameter);
+    for (int axis = 0; axis < 3; ++axis) {
+        append_restrict_owner_output_digest_double_3d(
+            digest, crossing.point[axis]);
+        append_restrict_owner_output_digest_double_3d(
+            digest, crossing.normal[axis]);
+    }
+    append_restrict_owner_output_digest_double_3d(
+        digest, crossing.residual);
+    append_restrict_owner_output_digest_double_3d(
+        digest, crossing.transversality);
+    restrict_owner_fingerprint_append(
+        digest, crossing.feature_edge_contact ? UINT64_C(1) : UINT64_C(0));
+    append_restrict_owner_output_digest_double_3d(
+        digest, crossing.reliable_transversality_tolerance);
+}
+
+void stage_restrict_owner_compact_result_3d(
+    const app3d::RestrictOwnerSampleInput3D& input,
+    app3d::RestrictOwnerSampleResult3D owner_result,
+    RestrictOwnerPreparedTraceSample3D& sink)
+{
+    const std::size_t expected_count = static_cast<std::size_t>(
+        restrict_owner_mask_count_3d(sink.wrong_side_mask));
+    if (sink.decisions.size() != 0 || sink.foreign_crossings.size() != 0
+        || sink.decisions.capacity() < expected_count
+        || sink.foreign_crossings.capacity() < expected_count) {
+        throw std::logic_error(
+            "restrict-owner result sink was not preallocated");
+    }
+    sink.output_digest = UINT64_C(14695981039346656037);
+    for (int q = 0; q < 64; ++q) {
+        const std::size_t slot = static_cast<std::size_t>(q);
+        if (!input.wrong_side[slot]) {
+            if (owner_result.nodes[slot].has_value()) {
+                throw std::logic_error(
+                    "restrict-owner preprocessing classified a "
+                    "same-side support node");
+            }
+            continue;
+        }
+        if (!owner_result.nodes[slot].has_value()) {
+            throw std::logic_error(
+                "restrict-owner preprocessing omitted a wrong-side "
+                "support node");
+        }
+        app3d::RestrictOwnerPreprocessResult3D& source =
+            owner_result.nodes[slot].value();
+        RestrictOwnerStagedDecision3D decision;
+        decision.slot = static_cast<std::uint8_t>(q);
+        decision.owner_dof = source.owner_dof;
+        decision.owner_class = source.owner_class;
+        decision.fallback_cause = source.fallback_cause;
+        decision.query_path = source.query_path;
+        if (source.legacy_decision_kind.has_value()) {
+            decision.legacy_decision_kind = static_cast<int>(
+                *source.legacy_decision_kind);
+        }
+        if (source.owner_class
+            == app3d::RestrictOwnerNormalizedClass3D::UniqueForeign) {
+            if (!source.foreign_crossing.has_value()) {
+                throw std::logic_error(
+                    "foreign restrict-owner decision has no crossing");
+            }
+            decision.foreign_crossing_index = static_cast<int>(
+                sink.foreign_crossings.size());
+            sink.foreign_crossings.push_back(
+                std::move(*source.foreign_crossing));
+        } else if (source.foreign_crossing.has_value()) {
+            throw std::logic_error(
+                "target restrict-owner decision has a foreign crossing");
+        }
+        restrict_owner_fingerprint_append(
+            sink.output_digest, static_cast<std::uint32_t>(decision.slot));
+        restrict_owner_fingerprint_append(
+            sink.output_digest,
+            static_cast<std::uint32_t>(decision.owner_dof));
+        restrict_owner_fingerprint_append(
+            sink.output_digest,
+            static_cast<std::uint32_t>(decision.owner_class));
+        restrict_owner_fingerprint_append(
+            sink.output_digest,
+            static_cast<std::uint32_t>(decision.query_path));
+        restrict_owner_fingerprint_append(
+            sink.output_digest,
+            static_cast<std::uint32_t>(decision.fallback_cause));
+        restrict_owner_fingerprint_append(
+            sink.output_digest,
+            static_cast<std::uint32_t>(decision.legacy_decision_kind));
+        if (decision.foreign_crossing_index >= 0) {
+            append_restrict_owner_output_digest_crossing_3d(
+                sink.output_digest,
+                sink.foreign_crossings[static_cast<std::size_t>(
+                    decision.foreign_crossing_index)]);
+        }
+        sink.decisions.push_back(std::move(decision));
+    }
+    if (sink.decisions.size() != expected_count)
+        throw std::logic_error(
+            "restrict-owner compact result count is inconsistent");
+}
+
+void run_restrict_owner_sample_core_3d(
+    const CartesianGrid3D& grid,
+    app3d::RestrictOwnerGeometryPreprocessor3D& preprocessor,
+    RestrictOwnerPreparedTraceSample3D& sink)
+{
+    const app3d::RestrictOwnerSampleInput3D input =
+        reconstruct_restrict_owner_sample_input_3d(
+            grid, sink.target_dof, sink.query,
+            sink.lower_stencil_index, sink.wrong_side_mask);
+    stage_restrict_owner_compact_result_3d(
+        input, preprocessor.preprocess_sample(input), sink);
+}
+
+double run_restrict_owner_timed_sample_3d(
+    const CartesianGrid3D& grid,
+    app3d::RestrictOwnerGeometryPreprocessor3D& preprocessor,
+    RestrictOwnerPreparedTraceSample3D& sink,
+    WorkingSetPeakSampler3D* memory_sampler = nullptr)
+{
+    if (memory_sampler != nullptr) {
+        memory_sampler->resume();
+        memory_sampler->checkpoint();
+    }
+    const auto query_start = std::chrono::steady_clock::now();
+    try {
+        run_restrict_owner_sample_core_3d(grid, preprocessor, sink);
+        const auto query_end = std::chrono::steady_clock::now();
+        if (memory_sampler != nullptr) {
+            memory_sampler->checkpoint();
+            memory_sampler->pause();
+        }
+        return std::chrono::duration<double>(
+            query_end - query_start).count();
+    } catch (...) {
+        if (memory_sampler != nullptr)
+            memory_sampler->pause();
+        throw;
+    }
+}
 
 struct RestrictOwnerSampleDiagnostics3D {
     int target_dof = -1;
@@ -842,13 +1597,23 @@ public:
                                  const SurfaceDofCloud& cloud,
                                  const CauchyStencilSet& stencils,
                                  bool build_exterior_only_restrict = false,
-                                 bool build_crossing_owner_restrict = false)
+                                 std::optional<
+                                     app3d::RestrictOwnerPreprocessMode3D>
+                                     restrict_owner_mode = std::nullopt,
+                                 app3d::PhaseProfile3D* phase_profile = nullptr,
+                                 RestrictOwnerWorkload3D* workload_capture =
+                                     nullptr,
+                                 RestrictOwnerPipelinePreprocessTiming3D*
+                                     preprocess_timing = nullptr,
+                                 bool build_neumann_edge_augmented_cauchy = false)
         : grid_(grid)
         , grid_pair_(grid_pair)
         , native_surface_(native_surface)
         , correction_triangles_(correction_triangles)
         , geometry_triangles_(geometry_triangles)
         , cloud_(cloud)
+        , phase_profile_(phase_profile)
+        , workload_capture_(workload_capture)
         , h_(grid.spacing()[0])
         , fit_(cloud, stencils, h_, kCauchyPolynomialDegree)
         , bulk_(grid, ZfftBcType::Dirichlet, 0.0, 2)
@@ -861,22 +1626,150 @@ public:
             throw std::invalid_argument(
                 "harmonic-jet KFBI3D requires an isotropic Cartesian grid");
         }
+        if (build_neumann_edge_augmented_cauchy) {
+            std::vector<app3d::NeumannEdgeFaceStencil3D> face_stencils;
+            face_stencils.reserve(stencils.rows.size());
+            for (const CauchyStencil& stencil : stencils.rows) {
+                app3d::NeumannEdgeFaceStencil3D face_stencil;
+                face_stencil.value_dofs = stencil.value_ids;
+                face_stencil.normal_dofs = stencil.derivative_ids;
+                face_stencils.push_back(std::move(face_stencil));
+            }
+            neumann_edge_augmented_cauchy_ = std::make_unique<
+                app3d::NeumannEdgeAugmentedCauchy3D>(
+                    app3d::build_neumann_edge_augmented_cauchy_3d(
+                        native_surface_, cloud_, h_, face_stencils));
+        }
         if (build_exterior_only_restrict) {
             exterior_only_restrict_ =
                 std::make_unique<app3d::ExteriorOnlyCubicNormalRestrict3D>(
                     grid_, grid_pair_, cloud_);
         }
-        build_crossing_rows();
-        if (build_crossing_owner_restrict) {
-            geometry3d::NurbsSurfaceIntersectorOptions3D options;
-            options.maximum_element_extent = 2.0 * h_;
-            options.local_max_subdivision_depth = 4;
-            const geometry3d::NurbsSurfaceIntersector3D intersector(
-                native_surface_.geometry_model(), options);
-            build_trace_templates(&intersector);
+        profile_phase_3d(
+            phase_profile_, PhaseProfileKind3D::CrossingRows, 1,
+            [&] {
+                build_crossing_rows();
+            });
+        if (restrict_owner_mode.has_value()) {
+            RestrictOwnerPipelinePreprocessTiming3D phase_timing;
+            RestrictOwnerPipelinePreprocessTiming3D* timing =
+                preprocess_timing != nullptr
+                    ? preprocess_timing
+                    : (phase_profile_ != nullptr
+                        ? std::addressof(phase_timing) : nullptr);
+            if (preprocess_timing != nullptr)
+                *preprocess_timing = {};
+            std::chrono::steady_clock::time_point preparation_start;
+            if (phase_profile_ != nullptr)
+                preparation_start = std::chrono::steady_clock::now();
+            std::vector<RestrictOwnerTraceSeed3D>
+                prepared_samples =
+                    prepare_restrict_owner_trace_templates();
+            RestrictOwnerPreparedTraceSample3D scratch;
+            scratch.decisions.reserve(64);
+            scratch.foreign_crossings.reserve(64);
+            double preparation_seconds = 0.0;
+            if (phase_profile_ != nullptr) {
+                preparation_seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now()
+                    - preparation_start).count();
+            }
+            if (workload_capture_ != nullptr) {
+                std::chrono::steady_clock::time_point capture_start;
+                if (timing != nullptr)
+                    capture_start = std::chrono::steady_clock::now();
+                workload_capture_->clear();
+                workload_capture_->reserve(prepared_samples.size());
+                if (timing != nullptr) {
+                    timing->workload_capture_seconds +=
+                        std::chrono::duration<double>(
+                            std::chrono::steady_clock::now()
+                            - capture_start).count();
+                }
+            }
+            std::unique_ptr<WorkingSetPeakSampler3D> memory_sampler;
+            const bool sample_working_set =
+                preprocess_timing != nullptr
+                && phase_profile_ == nullptr;
+            if (sample_working_set) {
+                memory_sampler = std::make_unique<
+                    WorkingSetPeakSampler3D>();
+            }
+            if (timing != nullptr) {
+                if (memory_sampler != nullptr) {
+                    memory_sampler->resume();
+                    memory_sampler->checkpoint();
+                }
+                try {
+                    const auto construction_start =
+                        std::chrono::steady_clock::now();
+                    restrict_owner_preprocessor_ = std::make_unique<
+                        app3d::RestrictOwnerGeometryPreprocessor3D>(
+                            native_surface_, cloud_, h_,
+                            *restrict_owner_mode);
+                    const auto construction_end =
+                        std::chrono::steady_clock::now();
+                    if (memory_sampler != nullptr) {
+                        memory_sampler->checkpoint();
+                        memory_sampler->pause();
+                    }
+                    timing->construction_seconds =
+                        std::chrono::duration<double>(
+                            construction_end
+                            - construction_start).count();
+                } catch (...) {
+                    if (memory_sampler != nullptr)
+                        memory_sampler->pause();
+                    throw;
+                }
+            } else {
+                restrict_owner_preprocessor_ = std::make_unique<
+                    app3d::RestrictOwnerGeometryPreprocessor3D>(
+                        native_surface_, cloud_, h_,
+                        *restrict_owner_mode);
+            }
+            stream_restrict_owner_trace_templates(
+                prepared_samples, scratch, timing,
+                memory_sampler.get());
+            if (memory_sampler != nullptr) {
+                memory_sampler->finish();
+                preprocess_timing->peak_working_set_bytes =
+                    memory_sampler->peak_bytes();
+                preprocess_timing->max_active_increase_bytes =
+                    memory_sampler->max_active_increase_bytes();
+            }
+            if (phase_profile_ != nullptr) {
+                const std::uint64_t samples =
+                    static_cast<std::uint64_t>(
+                        prepared_samples.size());
+                std::uint64_t internal_timer_reads =
+                    UINT64_C(2)  // template preparation
+                    + UINT64_C(2)  // preprocessor construction
+                    + UINT64_C(2) * samples  // owner queries
+                    + UINT64_C(2) * samples; // trace assembly
+                if (workload_capture_ != nullptr) {
+                    internal_timer_reads +=
+                        UINT64_C(2)  // workload initialization
+                        + UINT64_C(2) * samples;
+                }
+                phase_profile_->note_timer_reads(
+                    internal_timer_reads);
+                phase_profile_->add(
+                    PhaseProfileKind3D::RestrictOwnerGeometryPreprocessing,
+                    timing->construction_seconds + timing->query_seconds,
+                    1);
+                phase_profile_->add(
+                    PhaseProfileKind3D::TraceOwnerTemplateAssembly,
+                    preparation_seconds + timing->assembly_seconds,
+                    1);
+            }
             crossing_owner_templates_built_ = true;
         } else {
-            build_trace_templates(nullptr);
+            if (workload_capture_ != nullptr) {
+                throw std::invalid_argument(
+                    "restrict-owner workload capture requires a mode");
+            }
+            build_trace_templates();
         }
         build_joint_trace_fit();
     }
@@ -896,9 +1789,23 @@ public:
 
     const SurfaceDofCloud& surface() const { return cloud_; }
 
+    const LaplaceCorrectionSupport3D& correction_support() const noexcept
+    {
+        return correction_support_;
+    }
+
     std::vector<double> cauchy_condition_values() const
     {
         return fit_.condition_values();
+    }
+
+    const app3d::NeumannEdgeAugmentedCauchy3D&
+    neumann_edge_augmented_cauchy() const
+    {
+        if (!neumann_edge_augmented_cauchy_)
+            throw std::runtime_error(
+                "edge-augmented Cauchy was not initialized");
+        return *neumann_edge_augmented_cauchy_;
     }
 
     std::vector<double> exterior_only_restrict_condition_values() const
@@ -933,7 +1840,7 @@ public:
     {
         if (!crossing_owner_templates_built_) {
             throw std::runtime_error(
-                "crossing-owner trace restrict was not initialized");
+                "crossing-owner normal restrict was not initialized");
         }
         std::vector<RestrictOwnerSampleDiagnostics3D> result;
         result.reserve(trace_samples_.size());
@@ -978,7 +1885,7 @@ public:
     {
         if (!crossing_owner_templates_built_) {
             throw std::runtime_error(
-                "crossing-owner trace restrict was not initialized");
+                "crossing-owner normal restrict was not initialized");
         }
         std::vector<RestrictOwnerAuditRecord3D> result;
         for (int center = 0; center < surface_size(); ++center) {
@@ -1020,6 +1927,93 @@ public:
         return result;
     }
 
+    std::uint64_t restrict_owner_workload_fingerprint() const noexcept
+    {
+        return restrict_owner_workload_fingerprint_;
+    }
+
+    std::uint64_t restrict_owner_output_digest() const noexcept
+    {
+        return restrict_owner_output_digest_;
+    }
+
+    const app3d::RestrictOwnerPreprocessDiagnostics3D&
+    restrict_owner_preprocess_diagnostics() const
+    {
+        if (!restrict_owner_preprocessor_) {
+            throw std::runtime_error(
+                "crossing-owner normal restrict was not initialized");
+        }
+        return restrict_owner_preprocessor_->diagnostics();
+    }
+
+    double restrict_owner_correction_linf() const
+    {
+        double result = 0.0;
+        for (const HarmonicTraceSample3D& sample : trace_samples_) {
+            for (const HarmonicTraceCorrectionTerm3D& term
+                 : sample.owner_corrections) {
+                result = std::max(
+                    result, term.evaluation.lpNorm<Eigen::Infinity>());
+            }
+        }
+        return result;
+    }
+
+    double restrict_owner_correction_linf_difference(
+        const PanelCenterHarmonicJetKFBI3D& other) const
+    {
+        if (!crossing_owner_templates_built_
+            || !other.crossing_owner_templates_built_) {
+            throw std::invalid_argument(
+                "crossing-owner correction comparison requires two "
+                "initialized pipelines");
+        }
+        if (restrict_owner_workload_fingerprint_
+                != other.restrict_owner_workload_fingerprint_
+            || trace_samples_.size() != other.trace_samples_.size()
+            || fit_.dimension() != other.fit_.dimension()) {
+            throw std::invalid_argument(
+                "crossing-owner correction comparison received different "
+                "trace workloads");
+        }
+
+        double result = 0.0;
+        for (std::size_t sample = 0;
+             sample < trace_samples_.size(); ++sample) {
+            const auto& lhs =
+                trace_samples_[sample].owner_corrections;
+            const auto& rhs =
+                other.trace_samples_[sample].owner_corrections;
+            std::size_t i = 0;
+            std::size_t j = 0;
+            while (i < lhs.size() || j < rhs.size()) {
+                if (j >= rhs.size()
+                    || (i < lhs.size()
+                        && lhs[i].owner_dof < rhs[j].owner_dof)) {
+                    result = std::max(
+                        result,
+                        lhs[i].evaluation.lpNorm<Eigen::Infinity>());
+                    ++i;
+                } else if (i >= lhs.size()
+                           || rhs[j].owner_dof < lhs[i].owner_dof) {
+                    result = std::max(
+                        result,
+                        rhs[j].evaluation.lpNorm<Eigen::Infinity>());
+                    ++j;
+                } else {
+                    result = std::max(
+                        result,
+                        (lhs[i].evaluation - rhs[j].evaluation)
+                            .lpNorm<Eigen::Infinity>());
+                    ++i;
+                    ++j;
+                }
+            }
+        }
+        return result;
+    }
+
     std::size_t restrict_owner_geometry_query_count() const
     {
         std::size_t result = 0;
@@ -1028,74 +2022,42 @@ public:
         return result;
     }
 
-    std::uint64_t restrict_owner_template_fingerprint() const
-    {
-        if (!crossing_owner_templates_built_) {
-            throw std::runtime_error(
-                "crossing-owner trace restrict was not initialized");
-        }
-        std::uint64_t hash = UINT64_C(14695981039346656037);
-        const auto append_u64 = [&hash](std::uint64_t value) {
-            for (int byte = 0; byte < 8; ++byte) {
-                hash ^= (value >> (8 * byte)) & UINT64_C(0xff);
-                hash *= UINT64_C(1099511628211);
-            }
-        };
-        const auto append_double = [&append_u64](double value) {
-            std::uint64_t bits = 0;
-            static_assert(sizeof(bits) == sizeof(value),
-                          "double fingerprint requires 64-bit double");
-            std::memcpy(&bits, &value, sizeof(bits));
-            append_u64(bits);
-        };
-
-        append_u64(static_cast<std::uint64_t>(trace_samples_.size()));
-        for (const HarmonicTraceSample3D& sample : trace_samples_) {
-            for (int grid_id : sample.grid_ids)
-                append_u64(static_cast<std::uint64_t>(grid_id));
-            for (double weight : sample.weights)
-                append_double(weight);
-            append_u64(static_cast<std::uint64_t>(
-                sample.legacy_correction_evaluation.size()));
-            for (int q = 0;
-                 q < sample.legacy_correction_evaluation.size(); ++q) {
-                append_double(sample.legacy_correction_evaluation[q]);
-            }
-            append_u64(static_cast<std::uint64_t>(
-                sample.owner_corrections.size()));
-            for (const app3d::HarmonicTraceOwnerTerm3D& term
-                 : sample.owner_corrections) {
-                append_u64(static_cast<std::uint64_t>(term.owner_dof));
-                append_u64(
-                    static_cast<std::uint64_t>(term.evaluation.size()));
-                for (int q = 0; q < term.evaluation.size(); ++q)
-                    append_double(term.evaluation[q]);
-            }
-        }
-        return hash;
-    }
-
-    HarmonicJetField3D evaluate(const Eigen::VectorXd& value_jump,
-                                const Eigen::VectorXd& normal_jump) const
+    HarmonicJetField3D evaluate(
+        const Eigen::VectorXd& value_jump,
+        const Eigen::VectorXd& normal_jump,
+        app3d::NeumannEdgeCauchyMode3D cauchy_mode =
+            app3d::NeumannEdgeCauchyMode3D::None) const
     {
         HarmonicJetField3D result;
-        result.coefficients = fit_.coefficients(value_jump, normal_jump);
+        result.coefficients = cauchy_coefficients(
+            value_jump, normal_jump, cauchy_mode);
         Eigen::VectorXd rhs = Eigen::VectorXd::Zero(grid_.num_dofs());
-        for (const HarmonicCrossingRow3D& row : crossing_rows_) {
-            rhs[row.rhs_node] += row.scale
-                * row.evaluation.dot(
-                    result.coefficients.row(row.center_dof).transpose());
-        }
+        profile_phase_3d(
+            phase_profile_, PhaseProfileKind3D::SpreadRhsAssembly, 1,
+            [&] {
+                for (const HarmonicCrossingRow3D& row : crossing_rows_) {
+                    rhs[row.rhs_node] += row.scale
+                        * row.evaluation.dot(
+                            result.coefficients.row(
+                                row.center_dof).transpose());
+                }
+            });
         // The spread correction is assembled for Delta_h, while the project
         // bulk solver accepts the right-hand side of -Delta_h.
-        bulk_.solve(-rhs, result.potential);
+        profile_phase_3d(
+            phase_profile_, PhaseProfileKind3D::FftBulkSolve, 1,
+            [&] {
+                bulk_.solve(-rhs, result.potential);
+            });
         return result;
     }
 
     HarmonicJetField3D field_from_grid_and_jumps(
         const Eigen::VectorXd& potential,
         const Eigen::VectorXd& value_jump,
-        const Eigen::VectorXd& normal_jump) const
+        const Eigen::VectorXd& normal_jump,
+        app3d::NeumannEdgeCauchyMode3D cauchy_mode =
+            app3d::NeumannEdgeCauchyMode3D::None) const
     {
         if (potential.size() != grid_.num_dofs()
             || value_jump.size() != surface_size()
@@ -1103,7 +2065,9 @@ public:
             throw std::invalid_argument(
                 "exact-grid field received incompatible sizes");
         }
-        return {potential, fit_.coefficients(value_jump, normal_jump)};
+        Eigen::MatrixXd coefficients = cauchy_coefficients(
+            value_jump, normal_jump, cauchy_mode);
+        return {potential, std::move(coefficients)};
     }
 
     Eigen::VectorXd exterior_trace(const HarmonicJetField3D& field,
@@ -1112,39 +2076,51 @@ public:
     {
         return exterior_trace(
             field, value_jump, normal_jump,
-            app3d::ExteriorValueRestrictMode3D::JointTricubicCauchy);
+            ExteriorValueRestrictMode3D::JointTricubicCauchy);
     }
+
     Eigen::VectorXd exterior_trace(
         const HarmonicJetField3D& field,
         const Eigen::VectorXd& value_jump,
         const Eigen::VectorXd& normal_jump,
-        app3d::ExteriorValueRestrictMode3D mode) const
+        ExteriorValueRestrictMode3D mode) const
     {
+        const auto correction_mode =
+            mode == ExteriorValueRestrictMode3D::
+                        JointTricubicCrossingOwner
+                ? app3d::TraceCorrectionOwnerMode3D::CrossingOwner
+                : app3d::TraceCorrectionOwnerMode3D::CenterDof;
         return recover_trace(
-            continued_samples(field, value_jump, normal_jump, false, mode),
+            continued_samples(
+                field, value_jump, normal_jump, false, correction_mode),
             c0_weights_, 1.0);
     }
-
 
     Eigen::VectorXd interior_trace(const HarmonicJetField3D& field,
                                    const Eigen::VectorXd& value_jump,
                                    const Eigen::VectorXd& normal_jump) const
     {
-        return interior_trace(
-            field, value_jump, normal_jump,
-            app3d::ExteriorValueRestrictMode3D::JointTricubicCauchy);
+        return recover_trace(
+            continued_samples(field, value_jump, normal_jump, true),
+            c0_weights_, 1.0);
     }
+
     Eigen::VectorXd interior_trace(
         const HarmonicJetField3D& field,
         const Eigen::VectorXd& value_jump,
         const Eigen::VectorXd& normal_jump,
-        app3d::ExteriorValueRestrictMode3D mode) const
+        ExteriorValueRestrictMode3D mode) const
     {
+        const auto correction_mode =
+            mode == ExteriorValueRestrictMode3D::
+                        JointTricubicCrossingOwner
+                ? app3d::TraceCorrectionOwnerMode3D::CrossingOwner
+                : app3d::TraceCorrectionOwnerMode3D::CenterDof;
         return recover_trace(
-            continued_samples(field, value_jump, normal_jump, true, mode),
+            continued_samples(
+                field, value_jump, normal_jump, true, correction_mode),
             c0_weights_, 1.0);
     }
-
 
     Eigen::VectorXd exterior_normal_trace(
         const HarmonicJetField3D& field,
@@ -1169,12 +2145,15 @@ public:
             }
             return exterior_only_restrict_->apply(field.potential);
         }
-        const app3d::ExteriorValueRestrictMode3D value_mode =
-            mode == ExteriorNormalRestrictMode3D::JointTricubicCrossingOwner
-            ? app3d::ExteriorValueRestrictMode3D::JointTricubicCrossingOwner
-            : app3d::ExteriorValueRestrictMode3D::JointTricubicCauchy;
-        return recover_trace(continued_samples(field, value_jump, normal_jump, false,
-                                                value_mode), c1_weights_, 1.0 / h_);
+        const auto correction_mode =
+            mode == ExteriorNormalRestrictMode3D::
+                        JointTricubicCrossingOwner
+                ? app3d::TraceCorrectionOwnerMode3D::CrossingOwner
+                : app3d::TraceCorrectionOwnerMode3D::CenterDof;
+        return recover_trace(
+            continued_samples(
+                field, value_jump, normal_jump, false, correction_mode),
+            c1_weights_, 1.0 / h_);
     }
 
     Eigen::VectorXd interior_normal_trace(
@@ -1188,15 +2167,53 @@ public:
     }
 
 private:
+    Eigen::MatrixXd cauchy_coefficients(
+        const Eigen::VectorXd& value_jump,
+        const Eigen::VectorXd& normal_jump,
+        app3d::NeumannEdgeCauchyMode3D mode) const
+    {
+        if (mode == app3d::NeumannEdgeCauchyMode3D::None) {
+            return profile_phase_3d(
+                phase_profile_, PhaseProfileKind3D::CauchyCoefficients, 1,
+                [&] {
+                    return fit_.coefficients(value_jump, normal_jump);
+                });
+        }
+        if (!neumann_edge_augmented_cauchy_)
+            throw std::runtime_error(
+                "edge-augmented Cauchy was not initialized");
+        const Eigen::VectorXd edge_values = profile_phase_3d(
+            phase_profile_, PhaseProfileKind3D::EdgeAuxiliaryValues, 1,
+            [&] {
+                return neumann_edge_augmented_cauchy_->edge_values(
+                    value_jump, normal_jump);
+            });
+        return profile_phase_3d(
+            phase_profile_, PhaseProfileKind3D::CauchyCoefficients, 1,
+            [&] {
+                Eigen::MatrixXd coefficients =
+                    fit_.coefficients(value_jump, normal_jump);
+                neumann_edge_augmented_cauchy_->
+                    overwrite_affected_coefficients(
+                        value_jump, normal_jump, edge_values, coefficients);
+                return coefficients;
+            });
+    }
+
     Eigen::MatrixXd continued_samples(const HarmonicJetField3D& field,
                                       const Eigen::VectorXd& value_jump,
                                       const Eigen::VectorXd& normal_jump,
-                                       bool interior_continuation,
-                                       app3d::ExteriorValueRestrictMode3D mode =
-                                           app3d::ExteriorValueRestrictMode3D::JointTricubicCauchy) const
+                                      bool interior_continuation,
+                                      app3d::TraceCorrectionOwnerMode3D mode =
+                                          app3d::
+                                              TraceCorrectionOwnerMode3D::
+                                                  CenterDof) const
     {
-        const bool use_crossing_owner = mode
-            == app3d::ExteriorValueRestrictMode3D::JointTricubicCrossingOwner;
+        return profile_phase_3d(
+            phase_profile_, PhaseProfileKind3D::RestrictContinuedSamples, 1,
+            [&] {
+        const bool use_crossing_owner =
+            mode == app3d::TraceCorrectionOwnerMode3D::CrossingOwner;
         if (use_crossing_owner && !crossing_owner_templates_built_) {
             throw std::runtime_error(
                 "crossing-owner trace restrict was not initialized");
@@ -1222,8 +2239,9 @@ private:
                                * field.potential[
                                    sample.grid_ids[static_cast<std::size_t>(q)]];
                     }
-                    value += app3d::apply_exterior_value_trace_correction_3d(
-                        center, field.coefficients,
+                    value += app3d::apply_harmonic_trace_correction_3d(
+                        center,
+                        field.coefficients,
                         sample.legacy_correction_evaluation,
                         sample.owner_corrections,
                         mode);
@@ -1250,6 +2268,7 @@ private:
             }
         }
         return samples;
+            });
     }
 
     Eigen::VectorXd recover_trace(
@@ -1257,6 +2276,9 @@ private:
         const std::array<double, 8>& weights,
         double scale) const
     {
+        return profile_phase_3d(
+            phase_profile_, PhaseProfileKind3D::RestrictRecovery, 1,
+            [&] {
         Eigen::VectorXd trace(samples.rows());
         for (int center = 0; center < samples.rows(); ++center) {
             double value = 0.0;
@@ -1266,6 +2288,7 @@ private:
             trace[center] = scale * value;
         }
         return trace;
+            });
     }
 
     std::size_t trace_sample_index(int center, int side, int layer) const
@@ -1379,20 +2402,28 @@ private:
         }
     }
 
-    HarmonicTraceSample3D build_trace_sample(int center,
-                                             bool desired_inside,
-                                             double signed_layer,
-                                             const geometry3d::
-                                                 NurbsSurfaceIntersector3D*
-                                                 restrict_intersector) const
+    HarmonicTraceSample3D build_trace_sample(
+        int center,
+        int side,
+        int layer,
+        RestrictOwnerTraceSeed3D* prepared = nullptr)
     {
+        if (side < 0 || side >= 2
+            || layer < 0
+            || layer >= static_cast<int>(normal_layers_.size())) {
+            throw std::logic_error(
+                "normal-layer trace sample index is invalid");
+        }
         const SurfaceDof& dof = cloud_.dofs[static_cast<std::size_t>(center)];
+        const bool desired_inside = side == 0;
+        const double sign = desired_inside ? -1.0 : 1.0;
+        const double signed_layer =
+            sign * normal_layers_[static_cast<std::size_t>(layer)];
         const Eigen::Vector3d query =
             dof.point + signed_layer * h_ * dof.normal;
         const std::array<double, 3> origin = grid_.origin();
         const std::array<int, 3> dims = grid_.dof_dims();
         std::array<int, 3> lo{};
-        std::array<std::array<double, 4>, 3> axis_weights{};
         for (int axis = 0; axis < 3; ++axis) {
             const double coordinate =
                 (query[axis] - origin[static_cast<std::size_t>(axis)]) / h_;
@@ -1408,178 +2439,373 @@ private:
                 std::min(floor_index - 1,
                          dims[static_cast<std::size_t>(axis)] - 4));
             lo[static_cast<std::size_t>(axis)] = start + 1;
-            const double fraction = coordinate
-                - static_cast<double>(lo[static_cast<std::size_t>(axis)]);
-            axis_weights[static_cast<std::size_t>(axis)] =
-                cubic_lagrange_weights(fraction);
+        }
+
+        if (prepared != nullptr) {
+            prepared->target_dof = center;
+            prepared->side = side;
+            prepared->layer = layer;
+            prepared->query = query;
+            prepared->lower_stencil_index = lo;
         }
 
         // Four Cartesian slices are first interpolated by a 4x4 bicubic
         // polynomial; a final cubic interpolation in the third direction is
         // algebraically the standard 4x4x4 tensor-product tricubic formula.
+        const RestrictOwnerTraceStencil3D trace =
+            build_restrict_owner_trace_stencil_3d(
+                grid_, grid_pair_, center, desired_inside, query, lo);
+        append_restrict_owner_trace_fingerprint(
+            restrict_owner_workload_fingerprint_,
+            center, side, layer, lo, trace);
+
         HarmonicTraceSample3D result;
+        result.grid_ids = trace.grid_nodes;
+        result.weights = trace.weights;
         result.legacy_correction_evaluation =
             Eigen::VectorXd::Zero(fit_.dimension());
-        std::map<int, Eigen::VectorXd> owner_evaluations;
-        int q = 0;
-        for (int iz = 0; iz < 4; ++iz) {
-            for (int iy = 0; iy < 4; ++iy) {
-                for (int ix = 0; ix < 4; ++ix) {
-                    const int i = lo[0] - 1 + ix;
-                    const int j = lo[1] - 1 + iy;
-                    const int k = lo[2] - 1 + iz;
-                    const int node = grid_.index(i, j, k);
-                    const double weight = axis_weights[0][static_cast<std::size_t>(ix)]
-                        * axis_weights[1][static_cast<std::size_t>(iy)]
-                        * axis_weights[2][static_cast<std::size_t>(iz)];
-                    result.grid_ids[static_cast<std::size_t>(q)] = node;
-                    result.weights[static_cast<std::size_t>(q)] = weight;
-                    const bool node_inside = grid_pair_.domain_label(node) > 0;
-                    if (node_inside != desired_inside) {
-                        ++result.wrong_side_node_count;
-                        const double absolute_weight = std::abs(weight);
-                        result.wrong_side_sum_abs_weight += absolute_weight;
-                        const Eigen::Vector3d node_point =
-                            grid_point(grid_, node);
-                        const Eigen::Vector3d target_xi =
-                            local_coordinate(center, node_point);
-                        const double correction_sign = desired_inside ? 1.0 : -1.0;
-                        result.legacy_correction_evaluation +=
-                            correction_sign * weight
-                            * fit_.space().basis(
-                                target_xi.x(), target_xi.y(), target_xi.z());
+        const double correction_sign = desired_inside ? 1.0 : -1.0;
+        for (int q = 0; q < 64; ++q) {
+            const std::size_t slot = static_cast<std::size_t>(q);
+            if (!trace.owner_input.wrong_side[slot]) {
+                continue;
+            }
+            if (prepared != nullptr) {
+                prepared->wrong_side_mask |=
+                    UINT64_C(1) << static_cast<unsigned>(q);
+            }
+            ++result.wrong_side_node_count;
+            const double weight = trace.weights[slot];
+            result.wrong_side_sum_abs_weight += std::abs(weight);
+            const Eigen::Vector3d& node_point =
+                trace.owner_input.support_points[slot];
+            const Eigen::Vector3d target_xi =
+                local_coordinate(center, node_point);
+            result.legacy_correction_evaluation +=
+                correction_sign * weight
+                * fit_.space().basis(
+                    target_xi.x(), target_xi.y(), target_xi.z());
+        }
 
-                        if (restrict_intersector != nullptr) {
-                            ++result.owner_geometry_query_count;
-                            int owner = center;
-                            try {
-                                const geometry3d::
-                                    NurbsSurfaceIntersectionResult3D intersection =
-                                        restrict_intersector->intersect_segment(
-                                            query, node_point);
-                                const app3d::RestrictOwnerDecision3D decision =
-                                    app3d::select_restrict_correction_owner_3d(
-                                        center, query, node_point,
-                                        native_surface_, cloud_, intersection);
-                                owner = decision.owner_dof;
-                                const std::size_t kind =
-                                    static_cast<std::size_t>(decision.kind);
-                                if (kind
-                                    >= result.owner_decision_counts.size()) {
-                                    throw std::logic_error(
-                                        "crossing-owner decision kind is invalid");
-                                }
-                                ++result.owner_decision_counts[kind];
-                                result.owner_decision_sum_abs_weights[kind] +=
-                                    absolute_weight;
-                                if (decision.kind == app3d::
-                                        RestrictOwnerDecisionKind3D::
-                                            ForeignNonG1SingleCrossing) {
-                                    if (intersection.crossings.size() != 1) {
-                                        throw std::logic_error(
-                                            "foreign crossing-owner decision "
-                                            "does not have one crossing");
-                                    }
-                                    const geometry3d::NurbsSurfaceCrossing3D&
-                                        root = intersection.crossings.front();
-                                    HarmonicTraceOwnerAuditTerm3D audit;
-                                    audit.grid_node = node;
-                                    audit.interpolation_weight = weight;
-                                    audit.owner_dof = owner;
-                                    audit.crossing_patch = root.patch_index;
-                                    audit.crossing_u = root.u;
-                                    audit.crossing_v = root.v;
-                                    audit.segment_parameter =
-                                        root.edge_parameter;
-                                    audit.residual = root.residual;
-                                    audit.transversality =
-                                        root.transversality;
-                                    result.owner_reroute_terms.push_back(
-                                        std::move(audit));
-                                }
-                            } catch (const geometry3d::
-                                         UnresolvedNurbsIntersectionCandidate3D&) {
-                                ++result.owner_unresolved_fallback_count;
-                                result.
-                                    owner_unresolved_fallback_sum_abs_weight +=
-                                        absolute_weight;
-                            } catch (const std::runtime_error& error) {
-                                if (std::string(error.what())
-                                    != "coincident roots on unrelated NURBS patches") {
-                                    throw;
-                                }
-                                ++result.
-                                    owner_unrelated_coincidence_fallback_count;
-                                result.
-                                    owner_unrelated_coincidence_fallback_sum_abs_weight +=
-                                        absolute_weight;
-                            }
+        if (prepared != nullptr) {
+            int mask_count = 0;
+            std::uint64_t remaining = prepared->wrong_side_mask;
+            while (remaining != 0) {
+                remaining &= remaining - UINT64_C(1);
+                ++mask_count;
+            }
+            if (mask_count != result.wrong_side_node_count) {
+                throw std::logic_error(
+                    "restrict-owner wrong-side mask is inconsistent");
+            }
+        }
 
-                            const Eigen::Vector3d owner_xi =
-                                local_coordinate(owner, node_point);
-                            Eigen::VectorXd& owner_evaluation =
-                                owner_evaluations[owner];
-                            if (owner_evaluation.size() == 0) {
-                                owner_evaluation =
-                                    Eigen::VectorXd::Zero(fit_.dimension());
-                            }
-                            owner_evaluation += correction_sign * weight
-                                * fit_.space().basis(
-                                    owner_xi.x(), owner_xi.y(), owner_xi.z());
-                        }
-                    }
-                    ++q;
+        return result;
+    }
+
+    std::vector<RestrictOwnerTraceSeed3D>
+    prepare_restrict_owner_trace_templates()
+    {
+        const std::size_t sample_count = static_cast<std::size_t>(
+            surface_size() * 2 * normal_layers_.size());
+        std::vector<RestrictOwnerTraceSeed3D> prepared;
+        prepared.reserve(sample_count);
+        trace_samples_.reserve(sample_count);
+        for (int center = 0; center < surface_size(); ++center) {
+            for (int side = 0; side < 2; ++side) {
+                for (int layer = 0;
+                     layer < static_cast<int>(normal_layers_.size());
+                     ++layer) {
+                    RestrictOwnerTraceSeed3D item;
+                    HarmonicTraceSample3D sample =
+                        build_trace_sample(
+                            center, side, layer, &item);
+                    prepared.push_back(std::move(item));
+                    trace_samples_.push_back(std::move(sample));
                 }
             }
         }
+        return prepared;
+    }
+
+    void stream_restrict_owner_trace_templates(
+        const std::vector<RestrictOwnerTraceSeed3D>& prepared,
+        RestrictOwnerPreparedTraceSample3D& scratch,
+        RestrictOwnerPipelinePreprocessTiming3D* preprocess_timing,
+        WorkingSetPeakSampler3D* memory_sampler)
+    {
+        if (!restrict_owner_preprocessor_
+            || prepared.size() != trace_samples_.size()) {
+            throw std::logic_error(
+                "restrict-owner preprocessing batch is invalid");
+        }
+        for (std::size_t sample = 0;
+             sample < prepared.size(); ++sample) {
+            static_cast<RestrictOwnerTraceSeed3D&>(scratch) =
+                prepared[sample];
+            prepare_restrict_owner_result_sink_3d(scratch);
+            if (preprocess_timing != nullptr) {
+                preprocess_timing->query_seconds +=
+                    run_restrict_owner_timed_sample_3d(
+                        grid_, *restrict_owner_preprocessor_, scratch,
+                        memory_sampler);
+            } else {
+                run_restrict_owner_sample_core_3d(
+                    grid_, *restrict_owner_preprocessor_, scratch);
+            }
+            restrict_owner_fingerprint_append(
+                restrict_owner_output_digest_, scratch.output_digest);
+            if (preprocess_timing != nullptr) {
+                restrict_owner_fingerprint_append(
+                    preprocess_timing->output_digest,
+                    scratch.output_digest);
+                const auto assembly_start =
+                    std::chrono::steady_clock::now();
+                assemble_restrict_owner_trace_sample(sample, scratch);
+                preprocess_timing->assembly_seconds +=
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now()
+                        - assembly_start).count();
+            } else {
+                assemble_restrict_owner_trace_sample(sample, scratch);
+            }
+            if (workload_capture_ != nullptr) {
+                if (preprocess_timing != nullptr) {
+                    const auto capture_start =
+                        std::chrono::steady_clock::now();
+                    capture_restrict_owner_workload_sample(scratch);
+                    preprocess_timing->workload_capture_seconds +=
+                        std::chrono::duration<double>(
+                            std::chrono::steady_clock::now()
+                            - capture_start).count();
+                } else {
+                    capture_restrict_owner_workload_sample(scratch);
+                }
+            }
+        }
+    }
+
+    void assemble_restrict_owner_trace_sample(
+        std::size_t sample_index,
+        const RestrictOwnerPreparedTraceSample3D& prepared)
+    {
+        HarmonicTraceSample3D& result =
+            trace_samples_[sample_index];
+        result.owner_geometry_query_count =
+            prepared.decisions.size();
+        const bool desired_inside = prepared.side == 0;
+        const double correction_sign =
+            desired_inside ? 1.0 : -1.0;
+        const bool full_reference =
+            restrict_owner_preprocessor_->mode()
+            == app3d::RestrictOwnerPreprocessMode3D::
+                FullIntersectionReference;
+        std::map<int, Eigen::VectorXd> owner_evaluations;
+        int normalized_foreign_count = 0;
+
+        std::size_t decision_index = 0;
+        for (int q = 0; q < 64; ++q) {
+            if (decision_index >= prepared.decisions.size()
+                || prepared.decisions[decision_index].slot
+                       > static_cast<std::uint8_t>(q)) {
+                continue;
+            }
+            const RestrictOwnerStagedDecision3D& decision =
+                prepared.decisions[decision_index];
+            if (decision.slot != static_cast<std::uint8_t>(q)) {
+                throw std::logic_error(
+                    "restrict-owner compact slots are not ordered");
+            }
+            ++decision_index;
+            const std::size_t slot = static_cast<std::size_t>(q);
+            const int owner = decision.owner_dof;
+            if (owner < 0 || owner >= surface_size()) {
+                throw std::logic_error(
+                    "restrict-owner preprocessing returned an invalid "
+                    "owner DOF");
+            }
+            const double weight = result.weights[slot];
+            const double absolute_weight = std::abs(weight);
+
+            if (full_reference) {
+                if (decision.legacy_decision_kind >= 0) {
+                    const std::size_t kind = static_cast<std::size_t>(
+                        decision.legacy_decision_kind);
+                    if (kind
+                        >= result.owner_decision_counts.size()) {
+                        throw std::logic_error(
+                            "crossing-owner decision kind is invalid");
+                    }
+                    ++result.owner_decision_counts[kind];
+                    result.owner_decision_sum_abs_weights[kind] +=
+                        absolute_weight;
+                } else if (decision.fallback_cause
+                           == app3d::RestrictOwnerFallbackCause3D::
+                               Unresolved) {
+                    ++result.owner_unresolved_fallback_count;
+                    result.owner_unresolved_fallback_sum_abs_weight +=
+                        absolute_weight;
+                } else if (decision.fallback_cause
+                           == app3d::RestrictOwnerFallbackCause3D::
+                               Coincidence) {
+                    ++result.
+                        owner_unrelated_coincidence_fallback_count;
+                    result.
+                        owner_unrelated_coincidence_fallback_sum_abs_weight +=
+                            absolute_weight;
+                } else {
+                    throw std::logic_error(
+                        "full-reference restrict-owner result has no "
+                        "legacy diagnostic class");
+                }
+            }
+
+            if (decision.owner_class
+                == app3d::RestrictOwnerNormalizedClass3D::
+                    UniqueForeign) {
+                if (decision.foreign_crossing_index < 0
+                    || decision.foreign_crossing_index
+                           >= static_cast<int>(
+                               prepared.foreign_crossings.size())) {
+                    throw std::logic_error(
+                        "foreign restrict-owner crossing index is invalid");
+                }
+                ++normalized_foreign_count;
+                const auto& root = prepared.foreign_crossings[
+                    static_cast<std::size_t>(
+                        decision.foreign_crossing_index)];
+                HarmonicTraceOwnerAuditTerm3D audit;
+                audit.grid_node = result.grid_ids[slot];
+                audit.interpolation_weight = weight;
+                audit.owner_dof = owner;
+                audit.crossing_patch = root.patch_index;
+                audit.crossing_u = root.u;
+                audit.crossing_v = root.v;
+                audit.segment_parameter = root.edge_parameter;
+                audit.residual = root.residual;
+                audit.transversality = root.transversality;
+                result.owner_reroute_terms.push_back(
+                    std::move(audit));
+            } else if (decision.foreign_crossing_index >= 0) {
+                throw std::logic_error(
+                    "target restrict-owner decision has a crossing index");
+            }
+
+            const Eigen::Vector3d node_point =
+                grid_point(grid_, result.grid_ids[slot]);
+            const Eigen::Vector3d owner_xi =
+                local_coordinate(owner, node_point);
+            Eigen::VectorXd& owner_evaluation =
+                owner_evaluations[owner];
+            if (owner_evaluation.size() == 0) {
+                owner_evaluation =
+                    Eigen::VectorXd::Zero(fit_.dimension());
+            }
+            owner_evaluation +=
+                correction_sign
+                * result.weights[slot]
+                * fit_.space().basis(
+                    owner_xi.x(), owner_xi.y(), owner_xi.z());
+        }
+        if (decision_index != prepared.decisions.size()) {
+            throw std::logic_error(
+                "restrict-owner compact decisions were not consumed");
+        }
         result.owner_corrections.reserve(owner_evaluations.size());
         for (auto& owner_evaluation : owner_evaluations) {
-            app3d::HarmonicTraceOwnerTerm3D term;
+            HarmonicTraceCorrectionTerm3D term;
             term.owner_dof = owner_evaluation.first;
             term.evaluation = std::move(owner_evaluation.second);
             result.owner_corrections.push_back(std::move(term));
         }
-        if (restrict_intersector != nullptr) {
+        if (full_reference) {
             int classified_count =
                 result.owner_unresolved_fallback_count
                 + result.owner_unrelated_coincidence_fallback_count;
             for (int count : result.owner_decision_counts)
                 classified_count += count;
-            if (classified_count != result.wrong_side_node_count
-                || result.owner_geometry_query_count
-                       != static_cast<std::size_t>(
-                           result.wrong_side_node_count)) {
+            if (classified_count != result.wrong_side_node_count) {
                 throw std::logic_error(
-                    "crossing-owner restrict did not classify every "
-                    "wrong-side support node");
-            }
-            const std::size_t foreign_kind = static_cast<std::size_t>(
-                app3d::RestrictOwnerDecisionKind3D::
-                    ForeignNonG1SingleCrossing);
-            if (result.owner_reroute_terms.size()
-                != static_cast<std::size_t>(
-                    result.owner_decision_counts[foreign_kind])) {
-                throw std::logic_error(
-                    "crossing-owner reroute audit count is inconsistent");
+                    "full-reference restrict-owner diagnostics did not "
+                    "classify every wrong-side support node");
             }
         }
-        return result;
+        if (result.owner_geometry_query_count
+                != static_cast<std::size_t>(
+                    result.wrong_side_node_count)
+            || result.owner_reroute_terms.size()
+                   != static_cast<std::size_t>(
+                       normalized_foreign_count)) {
+            throw std::logic_error(
+                "crossing-owner preprocessing diagnostics are "
+                "inconsistent");
+        }
     }
 
-    void build_trace_templates(
-        const geometry3d::NurbsSurfaceIntersector3D* restrict_intersector)
+    void capture_restrict_owner_workload_sample(
+        const RestrictOwnerPreparedTraceSample3D& source)
+    {
+        if (workload_capture_ == nullptr)
+            return;
+        RestrictOwnerWorkloadSample3D workload;
+        workload.target_dof = source.target_dof;
+        workload.side = source.side;
+        workload.layer = source.layer;
+        workload.query = source.query;
+        workload.lower_stencil_index = source.lower_stencil_index;
+        workload.wrong_side_mask = source.wrong_side_mask;
+        workload.oracle_nodes.reserve(source.decisions.size());
+        for (const RestrictOwnerStagedDecision3D& decision
+             : source.decisions) {
+            if (decision.owner_dof < 0
+                || decision.owner_dof >= surface_size()) {
+                throw std::logic_error(
+                    "restrict-owner workload owner DOF is invalid");
+            }
+            RestrictOwnerOracleNode3D oracle;
+            oracle.slot = decision.slot;
+            oracle.owner_dof = decision.owner_dof;
+            oracle.owner_class = decision.owner_class;
+            if (decision.foreign_crossing_index >= 0) {
+                if (decision.foreign_crossing_index
+                    >= static_cast<int>(
+                        source.foreign_crossings.size())) {
+                    throw std::logic_error(
+                        "restrict-owner workload crossing is invalid");
+                }
+                oracle.crossing_patch = source.foreign_crossings[
+                    static_cast<std::size_t>(
+                        decision.foreign_crossing_index)].patch_index;
+            }
+            if (decision.legacy_decision_kind >= 0) {
+                oracle.legacy_decision_kind =
+                    static_cast<app3d::RestrictOwnerDecisionKind3D>(
+                        decision.legacy_decision_kind);
+            }
+            workload.oracle_nodes.push_back(std::move(oracle));
+        }
+        if (workload.oracle_nodes.size()
+            != static_cast<std::size_t>(
+                restrict_owner_mask_count_3d(
+                    workload.wrong_side_mask))) {
+            throw std::logic_error(
+                "restrict-owner workload count is inconsistent");
+        }
+        workload_capture_->push_back(std::move(workload));
+    }
+
+    void build_trace_templates()
     {
         trace_samples_.reserve(
             static_cast<std::size_t>(surface_size() * 2 * 4));
         for (int center = 0; center < surface_size(); ++center) {
             for (int side = 0; side < 2; ++side) {
-                const bool desired_inside = side == 0;
-                const double sign = desired_inside ? -1.0 : 1.0;
-                for (double layer : normal_layers_)
+                for (int layer = 0;
+                     layer < static_cast<int>(normal_layers_.size());
+                     ++layer) {
                     trace_samples_.push_back(
-                        build_trace_sample(
-                            center, desired_inside, sign * layer,
-                            restrict_intersector));
+                        build_trace_sample(center, side, layer));
+                }
             }
         }
     }
@@ -1612,9 +2838,19 @@ private:
     const std::vector<geometry3d::NurbsParamTriangle3D>& correction_triangles_;
     const std::vector<geometry3d::NurbsParamTriangle3D>& geometry_triangles_;
     const SurfaceDofCloud& cloud_;
+    app3d::PhaseProfile3D* phase_profile_ = nullptr;
+    RestrictOwnerWorkload3D* workload_capture_ = nullptr;
+    std::unique_ptr<app3d::RestrictOwnerGeometryPreprocessor3D>
+        restrict_owner_preprocessor_;
     bool crossing_owner_templates_built_ = false;
+    std::uint64_t restrict_owner_workload_fingerprint_ =
+        UINT64_C(14695981039346656037);
+    std::uint64_t restrict_owner_output_digest_ =
+        UINT64_C(14695981039346656037);
     double h_ = 0.0;
     PanelCenterCauchyFit3D fit_;
+    std::unique_ptr<app3d::NeumannEdgeAugmentedCauchy3D>
+        neumann_edge_augmented_cauchy_;
     std::unique_ptr<app3d::ExteriorOnlyCubicNormalRestrict3D>
         exterior_only_restrict_;
     LaplaceFftBulkSolverZfft3D bulk_;
@@ -1631,10 +2867,13 @@ class ExteriorZeroTraceOperator3D final : public IKFBIOperator {
 public:
     explicit ExteriorZeroTraceOperator3D(
         const PanelCenterHarmonicJetKFBI3D& pipeline,
-        app3d::ExteriorValueRestrictMode3D mode =
-            app3d::ExteriorValueRestrictMode3D::JointTricubicCauchy)
+        ExteriorValueRestrictMode3D restrict_mode =
+            ExteriorValueRestrictMode3D::JointTricubicCauchy,
+        app3d::NeumannEdgeCauchyMode3D cauchy_mode =
+            app3d::NeumannEdgeCauchyMode3D::None)
         : pipeline_(pipeline)
-        , mode_(mode)
+        , restrict_mode_(restrict_mode)
+        , cauchy_mode_(cauchy_mode)
     {}
 
     int problem_size() const override
@@ -1651,9 +2890,10 @@ public:
         const Eigen::VectorXd value_jump = unknown.head(size);
         const Eigen::VectorXd zero_normal = Eigen::VectorXd::Zero(size);
         const HarmonicJetField3D field =
-            pipeline_.evaluate(value_jump, zero_normal);
+            pipeline_.evaluate(value_jump, zero_normal, cauchy_mode_);
         const Eigen::VectorXd trace =
-            pipeline_.exterior_trace(field, value_jump, zero_normal, mode_);
+            pipeline_.exterior_trace(
+                field, value_jump, zero_normal, restrict_mode_);
         result.resize(size + 1);
         result.head(size) = trace.array() + unknown[size];
         double weighted_mean = 0.0;
@@ -1672,16 +2912,18 @@ public:
             throw std::invalid_argument("prescribed Neumann data has wrong size");
         const Eigen::VectorXd zero_value = Eigen::VectorXd::Zero(size);
         const HarmonicJetField3D field =
-            pipeline_.evaluate(zero_value, prescribed_normal_jump);
+            pipeline_.evaluate(
+                zero_value, prescribed_normal_jump, cauchy_mode_);
         Eigen::VectorXd result = Eigen::VectorXd::Zero(size + 1);
         result.head(size) = -pipeline_.exterior_trace(
-            field, zero_value, prescribed_normal_jump, mode_);
+            field, zero_value, prescribed_normal_jump, restrict_mode_);
         return result;
     }
 
 private:
     const PanelCenterHarmonicJetKFBI3D& pipeline_;
-    app3d::ExteriorValueRestrictMode3D mode_;
+    ExteriorValueRestrictMode3D restrict_mode_;
+    app3d::NeumannEdgeCauchyMode3D cauchy_mode_;
 };
 
 struct ExteriorZeroTraceSolution3D {
@@ -1701,25 +2943,61 @@ ExteriorZeroTraceSolution3D solve_exterior_zero_trace_neumann_3d(
     double tolerance,
     int restart,
     int max_iterations,
-    app3d::ExteriorValueRestrictMode3D mode = app3d::ExteriorValueRestrictMode3D::JointTricubicCauchy)
+    ExteriorValueRestrictMode3D restrict_mode =
+        ExteriorValueRestrictMode3D::JointTricubicCauchy,
+    app3d::NeumannEdgeCauchyMode3D cauchy_mode =
+        app3d::NeumannEdgeCauchyMode3D::None,
+    const app3d::NeumannEdgeContinuityProjector3D*
+        edge_projector = nullptr)
 {
-    ExteriorZeroTraceOperator3D op(pipeline, mode);
-    const Eigen::VectorXd rhs = op.right_hand_side(prescribed_normal_jump);
+    if (edge_projector == nullptr) {
+        ExteriorZeroTraceOperator3D op(
+            pipeline, restrict_mode, cauchy_mode);
+        const Eigen::VectorXd rhs = op.right_hand_side(prescribed_normal_jump);
+        Eigen::VectorXd augmented_unknown = Eigen::VectorXd::Zero(op.problem_size());
+        GMRES gmres(max_iterations, tolerance, restart);
+        ExteriorZeroTraceSolution3D result;
+        result.iterations = gmres.solve(op, rhs, augmented_unknown);
+        result.converged = gmres.converged();
+        result.gmres_residuals = gmres.residuals();
+        const int size = pipeline.surface_size();
+        result.value_jump = augmented_unknown.head(size);
+        result.lagrange_multiplier = augmented_unknown[size];
+        const HarmonicJetField3D field =
+            pipeline.evaluate(
+                result.value_jump, prescribed_normal_jump, cauchy_mode);
+        result.potential = field.potential;
+        result.coefficients = field.coefficients;
+        Eigen::VectorXd applied;
+        op.apply(augmented_unknown, applied);
+        result.augmented_residual = applied - rhs;
+        return result;
+    }
+
+    ExteriorZeroTraceOperator3D op(
+        pipeline, restrict_mode, cauchy_mode);
+    const app3d::NeumannEdgeProjectedAugmentedOperator3D projected_op(
+        op, *edge_projector);
+    const Eigen::VectorXd rhs = projected_op.project_right_hand_side(
+        op.right_hand_side(prescribed_normal_jump));
     Eigen::VectorXd augmented_unknown = Eigen::VectorXd::Zero(op.problem_size());
     GMRES gmres(max_iterations, tolerance, restart);
     ExteriorZeroTraceSolution3D result;
-    result.iterations = gmres.solve(op, rhs, augmented_unknown);
+    result.iterations = gmres.solve(projected_op, rhs, augmented_unknown);
     result.converged = gmres.converged();
     result.gmres_residuals = gmres.residuals();
     const int size = pipeline.surface_size();
-    result.value_jump = augmented_unknown.head(size);
+    result.value_jump = edge_projector->project(
+        augmented_unknown.head(size));
+    augmented_unknown.head(size) = result.value_jump;
     result.lagrange_multiplier = augmented_unknown[size];
     const HarmonicJetField3D field =
-        pipeline.evaluate(result.value_jump, prescribed_normal_jump);
+        pipeline.evaluate(
+            result.value_jump, prescribed_normal_jump, cauchy_mode);
     result.potential = field.potential;
     result.coefficients = field.coefficients;
     Eigen::VectorXd applied;
-    op.apply(augmented_unknown, applied);
+    projected_op.apply(augmented_unknown, applied);
     result.augmented_residual = applied - rhs;
     return result;
 }
@@ -1870,43 +3148,74 @@ SolveMetrics3D run_neumann_case(
     const PanelCenterHarmonicJetKFBI3D& pipeline,
     const app3d::RigidTransform3D& transform,
     int gmres_max_iterations,
-    app3d::ExteriorValueRestrictMode3D mode =
-        app3d::ExteriorValueRestrictMode3D::JointTricubicCauchy,
-    std::vector<double>* residual_history = nullptr)
+    ExteriorValueRestrictMode3D restrict_mode =
+        ExteriorValueRestrictMode3D::JointTricubicCauchy,
+    app3d::NeumannEdgeCauchyMode3D cauchy_mode =
+        app3d::NeumannEdgeCauchyMode3D::None,
+    std::vector<double>* residual_history = nullptr,
+    const app3d::NeumannEdgeContinuityProjector3D*
+        edge_projector = nullptr,
+    Eigen::VectorXd* solved_value_jump = nullptr,
+    Eigen::MatrixXd* solved_coefficients = nullptr,
+    Eigen::VectorXd* prescribed_normal_jump_output = nullptr,
+    Eigen::VectorXd* prescribed_exact_trace_output = nullptr,
+    const Eigen::VectorXd* shared_exact_trace_input = nullptr,
+    const Eigen::VectorXd* shared_normal_jump_input = nullptr)
 {
     const int size = pipeline.surface_size();
-    Eigen::VectorXd exact_trace(size);
-    Eigen::VectorXd normal_data(size);
-    for (int q = 0; q < size; ++q) {
-        const SurfaceDof& dof =
-            pipeline.surface().dofs[static_cast<std::size_t>(q)];
-        exact_trace[q] = app3d::transformed_manufactured_harmonic_value_3d(
-            transform, dof.point);
-        normal_data[q] =
-            app3d::transformed_manufactured_harmonic_gradient_3d(
-                transform, dof.point).dot(dof.normal);
+    if ((shared_exact_trace_input == nullptr)
+        != (shared_normal_jump_input == nullptr)) {
+        throw std::invalid_argument(
+            "shared Neumann exact trace and normal jump must be provided together");
     }
-    // Enforce the discrete compatibility condition.  The exact flux has zero
-    // continuous mean; the tiny quadrature defect is otherwise amplified by
-    // the constant nullspace of the bordered second-kind trace equation.
-    normal_data.array() -= surface_weighted_mean(
-        pipeline.surface(), normal_data);
+    Eigen::VectorXd exact_trace_storage;
+    Eigen::VectorXd normal_data_storage;
+    if (shared_exact_trace_input == nullptr) {
+        exact_trace_storage.resize(size);
+        normal_data_storage.resize(size);
+        for (int q = 0; q < size; ++q) {
+            const SurfaceDof& dof =
+                pipeline.surface().dofs[static_cast<std::size_t>(q)];
+            exact_trace_storage[q] =
+                app3d::transformed_manufactured_harmonic_value_3d(
+                    transform, dof.point);
+            normal_data_storage[q] =
+                app3d::transformed_manufactured_harmonic_gradient_3d(
+                    transform, dof.point).dot(dof.normal);
+        }
+        exact_trace_storage.array() -= surface_weighted_mean(
+            pipeline.surface(), exact_trace_storage);
+        // Enforce the discrete compatibility condition. The exact flux has
+        // zero continuous mean; the quadrature defect is otherwise amplified.
+        normal_data_storage.array() -= surface_weighted_mean(
+            pipeline.surface(), normal_data_storage);
+    } else if (shared_exact_trace_input->size() != size
+               || shared_normal_jump_input->size() != size
+               || !shared_exact_trace_input->allFinite()
+               || !shared_normal_jump_input->allFinite()) {
+        throw std::invalid_argument(
+            "shared Neumann manufactured data has invalid size or values");
+    }
+    const Eigen::VectorXd& exact_trace = shared_exact_trace_input == nullptr
+        ? exact_trace_storage : *shared_exact_trace_input;
+    const Eigen::VectorXd& normal_data = shared_normal_jump_input == nullptr
+        ? normal_data_storage : *shared_normal_jump_input;
 
     const auto solve_start = std::chrono::steady_clock::now();
     const ExteriorZeroTraceSolution3D solution =
         solve_exterior_zero_trace_neumann_3d(
-            pipeline, normal_data, 2.0e-10, 80, gmres_max_iterations, mode);
-    if (residual_history != nullptr)
-        *residual_history = solution.gmres_residuals;
+            pipeline, normal_data, 2.0e-10, 80, gmres_max_iterations,
+            restrict_mode, cauchy_mode, edge_projector);
     const double seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - solve_start).count();
 
     const HarmonicJetField3D field{
         solution.potential, solution.coefficients};
     const Eigen::VectorXd direct_exterior = pipeline.exterior_trace(
-        field, solution.value_jump, normal_data, mode);
+        field, solution.value_jump, normal_data, restrict_mode);
     const Eigen::VectorXd exterior_from_jump = pipeline.interior_trace(
-        field, solution.value_jump, normal_data, mode) - solution.value_jump;
+        field, solution.value_jump, normal_data, restrict_mode)
+        - solution.value_jump;
 
     SolveMetrics3D result;
     result.formulation = "neumann_exterior_zero_value_trace";
@@ -1926,8 +3235,6 @@ SolveMetrics3D run_neumann_case(
     result.density_weighted_mean = surface_weighted_mean(
         pipeline.surface(), solution.value_jump);
 
-    exact_trace.array() -= surface_weighted_mean(
-        pipeline.surface(), exact_trace);
     const Eigen::VectorXd density_error = solution.value_jump - exact_trace;
     result.density_linf = vector_linf(density_error);
     result.density_l2 = vector_rms(density_error);
@@ -1967,6 +3274,16 @@ SolveMetrics3D run_neumann_case(
         interior_error_sq / static_cast<double>(interior_count));
     result.exterior_bulk_l2 = std::sqrt(
         exterior_error_sq / static_cast<double>(exterior_count));
+    if (residual_history != nullptr)
+        *residual_history = solution.gmres_residuals;
+    if (solved_value_jump != nullptr)
+        *solved_value_jump = solution.value_jump;
+    if (solved_coefficients != nullptr)
+        *solved_coefficients = solution.coefficients;
+    if (prescribed_normal_jump_output != nullptr)
+        *prescribed_normal_jump_output = normal_data;
+    if (prescribed_exact_trace_output != nullptr)
+        *prescribed_exact_trace_output = exact_trace;
     return result;
 }
 
@@ -2577,7 +3894,9 @@ ReadinessResult run_readiness_case(GeometryKind kind,
     if (solve_selection == SolveSelection3D::Both) {
         result.neumann = run_neumann_case(
             grid, grid_pair, harmonic_pipeline, transform,
-            gmres_max_iterations);
+            gmres_max_iterations,
+            ExteriorValueRestrictMode3D::JointTricubicCauchy,
+            app3d::NeumannEdgeCauchyMode3D::None);
     }
     result.dirichlet_normal = run_dirichlet_normal_case(
         grid, grid_pair, harmonic_pipeline, transform,
@@ -3549,6 +4868,9 @@ struct NormalRestrictCaseProbe3D {
     std::vector<RestrictOwnerSampleDiagnostics3D> owner_diagnostics;
     std::vector<RestrictOwnerAuditRecord3D> owner_audit_records;
     std::size_t owner_geometry_query_count = 0;
+    std::uint64_t owner_workload_fingerprint = 0;
+    app3d::RestrictOwnerPreprocessDiagnostics3D
+        owner_preprocess_diagnostics;
     double setup_seconds = 0.0;
     double pipeline_setup_seconds = 0.0;
     std::array<NormalRestrictRouteProbe3D, 3> routes;
@@ -3994,566 +5316,9 @@ bool normal_restrict_hypothesis_supported(
     return supported;
 }
 
-constexpr double kNeumannOwnerStudyTolerance = 2.0e-10;
-constexpr int kNeumannOwnerStudyMaxIterations = 80;
-
-std::string neumann_value_route_name(
-    app3d::ExteriorValueRestrictMode3D mode)
-{
-    switch (mode) {
-    case app3d::ExteriorValueRestrictMode3D::JointTricubicCauchy:
-        return "joint_tricubic_cauchy";
-    case app3d::ExteriorValueRestrictMode3D::JointTricubicCrossingOwner:
-        return "joint_tricubic_crossing_owner";
-    }
-    throw std::runtime_error("unknown Neumann exterior-value route");
-}
-
-std::string owner_fingerprint_hex(std::uint64_t fingerprint)
-{
-    std::ostringstream result;
-    result << std::hex << std::setfill('0') << std::setw(16) << fingerprint;
-    return result.str();
-}
-
-struct NeumannOwnerAggregate3D {
-    std::size_t samples = 0;
-    std::size_t wrong_side_count = 0;
-    double wrong_side_sum_abs_weight = 0.0;
-    std::array<std::size_t, kRestrictOwnerDecisionKindCount>
-        decision_counts{};
-    std::array<double, kRestrictOwnerDecisionKindCount>
-        decision_sum_abs_weights{};
-    std::size_t unresolved_fallback_count = 0;
-    double unresolved_fallback_sum_abs_weight = 0.0;
-    std::size_t unrelated_coincidence_fallback_count = 0;
-    double unrelated_coincidence_fallback_sum_abs_weight = 0.0;
-    std::size_t geometry_query_count = 0;
-    std::size_t reroute_terms = 0;
-    std::size_t decision_count_sum = 0;
-    std::size_t exception_fallback_count_sum = 0;
-    std::size_t classified_or_fallback_count = 0;
-};
-
-NeumannOwnerAggregate3D aggregate_neumann_owner_diagnostics(
-    const std::vector<RestrictOwnerSampleDiagnostics3D>& diagnostics,
-    const std::vector<RestrictOwnerAuditRecord3D>& audit_records)
-{
-    NeumannOwnerAggregate3D result;
-    result.samples = diagnostics.size();
-    result.reroute_terms = audit_records.size();
-    for (const RestrictOwnerSampleDiagnostics3D& diagnostic : diagnostics) {
-        result.wrong_side_count +=
-            static_cast<std::size_t>(diagnostic.wrong_side_count);
-        result.wrong_side_sum_abs_weight +=
-            diagnostic.wrong_side_sum_abs_weight;
-        result.geometry_query_count += diagnostic.geometry_query_count;
-        result.unresolved_fallback_count += static_cast<std::size_t>(
-            diagnostic.unresolved_fallback_count);
-        result.unresolved_fallback_sum_abs_weight +=
-            diagnostic.unresolved_fallback_sum_abs_weight;
-        result.unrelated_coincidence_fallback_count +=
-            static_cast<std::size_t>(
-                diagnostic.unrelated_coincidence_fallback_count);
-        result.unrelated_coincidence_fallback_sum_abs_weight +=
-            diagnostic.unrelated_coincidence_fallback_sum_abs_weight;
-        for (std::size_t kind = 0; kind < result.decision_counts.size(); ++kind) {
-            result.decision_counts[kind] += static_cast<std::size_t>(
-                diagnostic.decision_counts[kind]);
-            result.decision_sum_abs_weights[kind] +=
-                diagnostic.decision_sum_abs_weights[kind];
-        }
-    }
-
-    result.decision_count_sum = std::accumulate(
-        result.decision_counts.begin(), result.decision_counts.end(),
-        std::size_t{0});
-    result.exception_fallback_count_sum =
-        result.unresolved_fallback_count
-        + result.unrelated_coincidence_fallback_count;
-    result.classified_or_fallback_count =
-        result.decision_count_sum + result.exception_fallback_count_sum;
-    const std::size_t foreign = result.decision_counts[static_cast<std::size_t>(
-        app3d::RestrictOwnerDecisionKind3D::ForeignNonG1SingleCrossing)];
-    if (result.wrong_side_count != result.geometry_query_count
-        || result.classified_or_fallback_count != result.wrong_side_count) {
-        throw std::runtime_error(
-            "Neumann owner decisions and legal fallbacks do not partition "
-            "all wrong-side queries");
-    }
-    if (foreign != result.reroute_terms) {
-        throw std::runtime_error(
-            "Neumann foreign non-G1 decision count differs from reroute audit");
-    }
-    return result;
-}
-
-struct NeumannOwnerStudyRow3D {
-    std::string case_id;
-    std::string geometry;
-    int N = 0;
-    double h = 0.0;
-    std::string route;
-    std::string setup_mode = "full_certified_nurbs_intersection";
-    int surface_dofs = 0;
-    int correction_panels = 0;
-    int crossing_panels = 0;
-    int label_mismatches = 0;
-    double setup_seconds = 0.0;
-    double pipeline_setup_seconds = 0.0;
-    ConditionStatistics3D cauchy_conditions;
-    NeumannOwnerAggregate3D owner;
-    std::size_t owner_query_before = 0;
-    std::size_t owner_query_after = 0;
-    std::uint64_t owner_fingerprint_before = 0;
-    std::uint64_t owner_fingerprint_after = 0;
-    bool owner_invariants_hold = false;
-    SolveMetrics3D metrics;
-    std::vector<double> residuals;
-    bool has_orders = false;
-    double density_linf_order = 0.0;
-    double density_l2_order = 0.0;
-    double interior_linf_order = 0.0;
-    double interior_l2_order = 0.0;
-};
-
-double neumann_owner_observed_order(double coarse_error,
-                                    double fine_error,
-                                    int coarse_N,
-                                    int fine_N)
-{
-    if (!(coarse_error > 0.0) || !(fine_error > 0.0)
-        || coarse_N <= 0 || fine_N <= coarse_N) {
-        throw std::runtime_error(
-            "invalid data for Neumann owner observed order");
-    }
-    return std::log(coarse_error / fine_error)
-         / std::log(static_cast<double>(fine_N)
-                    / static_cast<double>(coarse_N));
-}
-
-void assign_neumann_owner_orders(
-    NeumannOwnerStudyRow3D& row,
-    const std::vector<NeumannOwnerStudyRow3D>& completed)
-{
-    const NeumannOwnerStudyRow3D* previous = nullptr;
-    for (const NeumannOwnerStudyRow3D& candidate : completed) {
-        if (candidate.case_id == row.case_id
-            && candidate.route == row.route
-            && candidate.N < row.N
-            && (previous == nullptr || candidate.N > previous->N)) {
-            previous = &candidate;
-        }
-    }
-    if (previous == nullptr)
-        return;
-    row.has_orders = true;
-    row.density_linf_order = neumann_owner_observed_order(
-        previous->metrics.density_linf, row.metrics.density_linf,
-        previous->N, row.N);
-    row.density_l2_order = neumann_owner_observed_order(
-        previous->metrics.density_l2, row.metrics.density_l2,
-        previous->N, row.N);
-    row.interior_linf_order = neumann_owner_observed_order(
-        previous->metrics.interior_linf, row.metrics.interior_linf,
-        previous->N, row.N);
-    row.interior_l2_order = neumann_owner_observed_order(
-        previous->metrics.interior_l2, row.metrics.interior_l2,
-        previous->N, row.N);
-}
-
-void write_neumann_owner_study_outputs(
-    const std::filesystem::path& output_dir,
-    const std::vector<NeumannOwnerStudyRow3D>& rows)
-{
-    std::filesystem::create_directories(output_dir);
-    std::ofstream summary = open_output_file(output_dir / "summary.csv");
-    summary << std::setprecision(17) << std::boolalpha;
-    summary
-        << "case_id,geometry,N,h,route,setup_mode,cauchy_policy,"
-           "cauchy_degree,cauchy_value_neighbors,cauchy_normal_neighbors,"
-           "restrict_grid_degree,surface_dofs,correction_panels,"
-           "crossing_panels,label_mismatches,setup_seconds,"
-           "pipeline_setup_seconds,converged,iterations,"
-           "gmres_relative_residual,operator_residual_linf,"
-           "exterior_condition_linf,route_mismatch_linf,density_linf,"
-           "density_l2,density_linf_order,density_l2_order,interior_linf,"
-           "interior_l2,interior_linf_order,interior_l2_order,"
-           "exterior_bulk_linf,exterior_bulk_l2,data_weighted_mean,"
-           "density_weighted_mean,constant_shift,solve_seconds,"
-           "cauchy_condition_median,cauchy_condition_p95,"
-           "cauchy_condition_max,owner_query_before,owner_query_after,"
-           "owner_fingerprint_before,owner_fingerprint_after,"
-           "owner_invariants_hold\n";
-    for (const NeumannOwnerStudyRow3D& row : rows) {
-        const SolveMetrics3D& metric = row.metrics;
-        summary << row.case_id << ',' << row.geometry << ',' << row.N << ','
-                << row.h << ',' << row.route << ',' << row.setup_mode
-                << ",g1_nearest," << kCauchyPolynomialDegree << ','
-                << kCauchyValueNeighborCount << ','
-                << kCauchyDerivativeNeighborCount << ','
-                << kRestrictGridDegree << ',' << row.surface_dofs << ','
-                << row.correction_panels << ',' << row.crossing_panels << ','
-                << row.label_mismatches << ',' << row.setup_seconds << ','
-                << row.pipeline_setup_seconds << ',' << metric.converged << ','
-                << metric.iterations << ',' << metric.gmres_relative_residual
-                << ',' << metric.operator_residual_linf << ','
-                << metric.exterior_condition_linf << ','
-                << metric.route_mismatch_linf << ',' << metric.density_linf
-                << ',' << metric.density_l2 << ',';
-        if (row.has_orders) {
-            summary << row.density_linf_order << ','
-                    << row.density_l2_order;
-        } else {
-            summary << ',';
-        }
-        summary << ',' << metric.interior_linf << ',' << metric.interior_l2
-                << ',';
-        if (row.has_orders) {
-            summary << row.interior_linf_order << ','
-                    << row.interior_l2_order;
-        } else {
-            summary << ',';
-        }
-        summary << ',' << metric.exterior_bulk_linf << ','
-                << metric.exterior_bulk_l2 << ','
-                << metric.data_weighted_mean << ','
-                << metric.density_weighted_mean << ','
-                << metric.constant_shift << ',' << metric.seconds << ','
-                << row.cauchy_conditions.median << ','
-                << row.cauchy_conditions.p95 << ','
-                << row.cauchy_conditions.maximum << ','
-                << row.owner_query_before << ',' << row.owner_query_after
-                << ',' << owner_fingerprint_hex(
-                       row.owner_fingerprint_before)
-                << ',' << owner_fingerprint_hex(row.owner_fingerprint_after)
-                << ',' << row.owner_invariants_hold << '\n';
-    }
-    summary.flush();
-
-    std::ofstream residuals = open_output_file(
-        output_dir / "gmres_residuals.csv");
-    residuals << std::setprecision(17)
-              << "case_id,N,route,iteration,relative_residual\n";
-    for (const NeumannOwnerStudyRow3D& row : rows) {
-        for (std::size_t iteration = 0;
-             iteration < row.residuals.size(); ++iteration) {
-            residuals << row.case_id << ',' << row.N << ',' << row.route
-                      << ',' << iteration << ','
-                      << row.residuals[iteration] << '\n';
-        }
-    }
-    residuals.flush();
-
-    std::ofstream owners = open_output_file(
-        output_dir / "owner_diagnostics.csv");
-    owners << std::setprecision(17) << std::boolalpha
-           << "case_id,N,route,setup_mode,surface_dofs,samples,"
-              "wrong_side_count,wrong_side_sum_abs_weight,"
-              "geometry_query_count,owner_query_before,owner_query_after,"
-              "owner_fingerprint_before,owner_fingerprint_after,"
-              "target_side_count,target_or_g1_count,foreign_non_g1_count,"
-              "no_crossing_fallback_count,multiple_crossing_fallback_count,"
-              "degenerate_crossing_fallback_count,"
-              "ambiguous_edge_fallback_count,decision_count_sum,"
-              "exception_fallback_count_sum,classified_or_fallback_count,"
-              "reroute_terms,unresolved_fallback_count,"
-              "unrelated_coincidence_fallback_count,owner_invariants_hold\n";
-    for (const NeumannOwnerStudyRow3D& row : rows) {
-        const NeumannOwnerAggregate3D& owner = row.owner;
-        owners << row.case_id << ',' << row.N << ',' << row.route << ','
-               << row.setup_mode << ',' << row.surface_dofs << ','
-               << owner.samples << ',' << owner.wrong_side_count << ','
-               << owner.wrong_side_sum_abs_weight << ','
-               << owner.geometry_query_count << ',' << row.owner_query_before
-               << ',' << row.owner_query_after << ','
-               << owner_fingerprint_hex(row.owner_fingerprint_before) << ','
-               << owner_fingerprint_hex(row.owner_fingerprint_after);
-        for (std::size_t kind = 0; kind < owner.decision_counts.size(); ++kind)
-            owners << ',' << owner.decision_counts[kind];
-        owners << ',' << owner.decision_count_sum << ','
-               << owner.exception_fallback_count_sum << ','
-               << owner.classified_or_fallback_count << ','
-               << owner.reroute_terms << ','
-               << owner.unresolved_fallback_count << ','
-               << owner.unrelated_coincidence_fallback_count << ','
-               << row.owner_invariants_hold << '\n';
-    }
-    owners.flush();
-}
-
-bool neumann_owner_metrics_are_finite(const SolveMetrics3D& metric)
-{
-    const std::array<double, 15> values{{
-        metric.seconds,
-        metric.gmres_relative_residual,
-        metric.operator_residual_linf,
-        metric.exterior_condition_linf,
-        metric.route_mismatch_linf,
-        metric.density_linf,
-        metric.density_l2,
-        metric.interior_linf,
-        metric.interior_l2,
-        metric.exterior_bulk_linf,
-        metric.exterior_bulk_l2,
-        metric.data_weighted_mean,
-        metric.density_weighted_mean,
-        metric.constant_shift,
-        metric.boundary_residual_linf}};
-    return std::all_of(values.begin(), values.end(), [](double value) {
-        return std::isfinite(value);
-    });
-}
-
-int run_neumann_owner_study(std::vector<int> levels)
-{
-    std::sort(levels.begin(), levels.end());
-    levels.erase(std::unique(levels.begin(), levels.end()), levels.end());
-    for (int N : levels) {
-        if (N < 16 || !is_power_of_two(N)) {
-            throw std::invalid_argument(
-                "Neumann owner-study N must be a power of two and at least 16");
-        }
-    }
-
-#ifdef KFBIM_APP_OUTPUT_DIR
-    const std::filesystem::path output_dir =
-        std::filesystem::path(KFBIM_APP_OUTPUT_DIR)
-        / "neumann_value_trace_crossing_owner_3d";
-#else
-    const std::filesystem::path output_dir =
-        "output/neumann_value_trace_crossing_owner_3d";
-#endif
-
-    const std::array<std::string, 3> selected_ids{{
-        "baseline", "rot_axis123_17deg",
-        "rot_axis123_17deg_t_xyz_1"}};
-    const std::vector<app3d::DirichletRigidStudyCase3D> all_cases =
-        app3d::make_l_prism_dirichlet_rigid_study_cases_3d();
-    std::vector<app3d::DirichletRigidStudyCase3D> study_cases;
-    for (const std::string& id : selected_ids) {
-        const auto found = std::find_if(
-            all_cases.begin(), all_cases.end(),
-            [&](const app3d::DirichletRigidStudyCase3D& candidate) {
-                return candidate.id == id;
-            });
-        if (found == all_cases.end()) {
-            throw std::runtime_error(
-                "missing Neumann owner-study rigid case: " + id);
-        }
-        study_cases.push_back(*found);
-    }
-
-    const std::array<app3d::ExteriorValueRestrictMode3D, 2> routes{{
-        app3d::ExteriorValueRestrictMode3D::JointTricubicCauchy,
-        app3d::ExteriorValueRestrictMode3D::JointTricubicCrossingOwner}};
-    std::vector<NeumannOwnerStudyRow3D> rows;
-    rows.reserve(levels.size() * study_cases.size() * routes.size());
-    std::set<std::pair<std::string, std::string>> failed_routes;
-    bool all_converged = true;
-    write_neumann_owner_study_outputs(output_dir, rows);
-
-    std::cout
-        << "KFBI3D Neumann exterior-value crossing-owner A/B study\n"
-        << "  geometry=l_prism equation=bordered_second_kind\n"
-        << "  cauchy=g1_nearest/degree3/48/28 restrict=tricubic\n"
-        << "  owner_setup=full_certified_nurbs_intersection\n"
-        << "  gmres_tolerance=" << kNeumannOwnerStudyTolerance
-        << " restart=80 cap=" << kNeumannOwnerStudyMaxIterations
-        << " levels=";
-    for (std::size_t q = 0; q < levels.size(); ++q) {
-        if (q != 0)
-            std::cout << ',';
-        std::cout << levels[q];
-    }
-    std::cout << '\n';
-
-    for (int N : levels) {
-        const double h = kBoxSide / static_cast<double>(N);
-        for (const app3d::DirichletRigidStudyCase3D& study_case
-             : study_cases) {
-            const bool every_route_failed = std::all_of(
-                routes.begin(), routes.end(),
-                [&](app3d::ExteriorValueRestrictMode3D mode) {
-                    return failed_routes.count(
-                        {study_case.id, neumann_value_route_name(mode)}) != 0;
-                });
-            if (every_route_failed)
-                continue;
-
-            const auto setup_start = std::chrono::steady_clock::now();
-            CartesianGrid3D grid({kBoxMin, kBoxMin, kBoxMin},
-                                 {h, h, h}, {N, N, N}, DofLayout3D::Node);
-            GeometryBundle geometry = make_geometry(
-                GeometryKind::LPrism, h, study_case.transform);
-            const auto domain = std::make_shared<const
-                geometry3d::NurbsCartesianDomain3D>(
-                    grid, geometry.native_surface.geometry_model());
-            const SurfaceDofCloud surface_dofs =
-                app3d::make_native_surface_dofs_3d(
-                    geometry.native_surface, h);
-            validate_surface_dofs(surface_dofs, h);
-            const CauchyStencilSet cauchy_stencils = build_cauchy_stencils(
-                geometry.native_surface, surface_dofs, h,
-                kCauchyValueNeighborCount,
-                kCauchyDerivativeNeighborCount,
-                CauchyStencilPolicy3D::G1Nearest);
-            GridPair3D grid_pair(grid,
-                                 geometry.correction_interface,
-                                 geometry.crossing_interface,
-                                 domain);
-            int label_mismatches = 0;
-            for (int node = 0; node < grid.num_dofs(); ++node) {
-                const bool numerical_inside = grid_pair.domain_label(node) > 0;
-                if (numerical_inside
-                    != geometry.exact_inside(grid_point(grid, node))) {
-                    ++label_mismatches;
-                }
-            }
-            if (label_mismatches != 0) {
-                throw std::runtime_error(
-                    "Neumann owner-study native NURBS label mismatch");
-            }
-
-            const auto pipeline_start = std::chrono::steady_clock::now();
-            PanelCenterHarmonicJetKFBI3D pipeline(
-                grid, grid_pair, geometry.native_surface,
-                geometry.correction_triangles,
-                geometry.geometry_triangles,
-                surface_dofs, cauchy_stencils, false, true);
-            const double pipeline_setup_seconds =
-                std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - pipeline_start).count();
-            const std::vector<RestrictOwnerSampleDiagnostics3D> diagnostics =
-                pipeline.restrict_owner_sample_diagnostics();
-            const std::vector<RestrictOwnerAuditRecord3D> audit_records =
-                pipeline.restrict_owner_audit_records();
-            if (diagnostics.empty()) {
-                throw std::runtime_error(
-                    "Neumann owner-study diagnostics are empty");
-            }
-            const NeumannOwnerAggregate3D owner =
-                aggregate_neumann_owner_diagnostics(
-                    diagnostics, audit_records);
-            if (owner.geometry_query_count == 0) {
-                throw std::runtime_error(
-                    "Neumann owner-study made no preprocessing queries");
-            }
-            const ConditionStatistics3D conditions = summarize_conditions(
-                pipeline.cauchy_condition_values());
-            const std::size_t setup_query_count =
-                pipeline.restrict_owner_geometry_query_count();
-            const std::uint64_t setup_fingerprint =
-                pipeline.restrict_owner_template_fingerprint();
-            if (setup_query_count != owner.geometry_query_count) {
-                throw std::runtime_error(
-                    "Neumann owner-study aggregate query count mismatch");
-            }
-            const double setup_seconds = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - setup_start).count();
-
-            for (app3d::ExteriorValueRestrictMode3D mode : routes) {
-                const std::string route = neumann_value_route_name(mode);
-                if (failed_routes.count({study_case.id, route}) != 0) {
-                    std::cout << "[neumann-owner-skip] case="
-                              << study_case.id << " N=" << N
-                              << " route=" << route
-                              << " reason=coarser_level_failed\n";
-                    continue;
-                }
-
-                NeumannOwnerStudyRow3D row;
-                row.case_id = study_case.id;
-                row.geometry = geometry.name;
-                row.N = N;
-                row.h = h;
-                row.route = route;
-                row.surface_dofs = pipeline.surface_size();
-                row.correction_panels =
-                    geometry.correction_interface.num_panels();
-                row.crossing_panels =
-                    geometry.crossing_interface.num_panels();
-                row.label_mismatches = label_mismatches;
-                row.setup_seconds = setup_seconds;
-                row.pipeline_setup_seconds = pipeline_setup_seconds;
-                row.cauchy_conditions = conditions;
-                row.owner = owner;
-                row.owner_query_before =
-                    pipeline.restrict_owner_geometry_query_count();
-                row.owner_fingerprint_before =
-                    pipeline.restrict_owner_template_fingerprint();
-                row.metrics = run_neumann_case(
-                    grid, grid_pair, pipeline, study_case.transform,
-                    kNeumannOwnerStudyMaxIterations, mode, &row.residuals);
-                row.owner_query_after =
-                    pipeline.restrict_owner_geometry_query_count();
-                row.owner_fingerprint_after =
-                    pipeline.restrict_owner_template_fingerprint();
-                row.owner_invariants_hold =
-                    row.owner_query_before == setup_query_count
-                    && row.owner_query_after == setup_query_count
-                    && row.owner_fingerprint_before == setup_fingerprint
-                    && row.owner_fingerprint_after == setup_fingerprint;
-                if (row.residuals.size()
-                    != static_cast<std::size_t>(row.metrics.iterations + 1)) {
-                    throw std::runtime_error(
-                        "Neumann owner-study residual history is incomplete");
-                }
-                if (!neumann_owner_metrics_are_finite(row.metrics)
-                    || !std::all_of(
-                        row.residuals.begin(), row.residuals.end(),
-                        [](double value) { return std::isfinite(value); })) {
-                    throw std::runtime_error(
-                        "Neumann owner-study produced NaN/Inf");
-                }
-                assign_neumann_owner_orders(row, rows);
-                rows.push_back(std::move(row));
-                write_neumann_owner_study_outputs(output_dir, rows);
-                const NeumannOwnerStudyRow3D& stored = rows.back();
-                std::cout << "[neumann-owner] case=" << stored.case_id
-                          << " N=" << stored.N
-                          << " route=" << stored.route
-                          << " converged/iterations="
-                          << stored.metrics.converged << '/'
-                          << stored.metrics.iterations
-                          << " gmres="
-                          << stored.metrics.gmres_relative_residual
-                          << " interior_linf="
-                          << stored.metrics.interior_linf
-                          << " density_linf="
-                          << stored.metrics.density_linf
-                          << " exterior_trace="
-                          << stored.metrics.exterior_condition_linf
-                          << " route_mismatch="
-                          << stored.metrics.route_mismatch_linf
-                          << " owner_queries="
-                          << stored.owner_query_before << '/'
-                          << stored.owner_query_after
-                          << " fingerprint="
-                          << owner_fingerprint_hex(
-                                 stored.owner_fingerprint_before)
-                          << " setup/solve_seconds=" << stored.setup_seconds
-                          << '/' << stored.metrics.seconds << '\n';
-                if (!stored.owner_invariants_hold) {
-                    throw std::runtime_error(
-                        "GMRES changed Neumann owner templates or query count");
-                }
-                if (!stored.metrics.converged
-                    || stored.metrics.gmres_relative_residual
-                       > kNeumannOwnerStudyTolerance) {
-                    failed_routes.insert({stored.case_id, stored.route});
-                    all_converged = false;
-                }
-            }
-        }
-    }
-
-    std::cout << "Neumann owner-study output: " << output_dir.string()
-              << '\n';
-    return all_converged ? 0 : 2;
-}
-
-int run_normal_restrict_causal_probe(std::vector<int> levels, bool owner_only)
+int run_normal_restrict_causal_probe(std::vector<int> levels,
+                                     bool owner_only,
+                                     bool phase_profile = false)
 {
     std::sort(levels.begin(), levels.end());
     levels.erase(std::unique(levels.begin(), levels.end()), levels.end());
@@ -4562,19 +5327,34 @@ int run_normal_restrict_causal_probe(std::vector<int> levels, bool owner_only)
             throw std::invalid_argument(
                 "restrict-probe N must be a power of two and at least 16");
     }
+    if (phase_profile && !owner_only)
+        throw std::invalid_argument(
+            "phase profiling requires the crossing-owner-only route");
+    if (phase_profile && levels.size() != 1)
+        throw std::invalid_argument(
+            "phase profiling accepts exactly one grid level");
+
+    const app3d::RestrictOwnerPreprocessMode3D owner_preprocess_mode =
+        selected_restrict_owner_preprocess_mode();
+
+    const std::string output_leaf = phase_profile
+        ? "dirichlet_normal_restrict_crossing_owner_profile_3d"
+        : owner_only
+            ? "dirichlet_normal_restrict_crossing_owner_3d"
+            : "dirichlet_normal_restrict_causal_probe_3d";
 #ifdef KFBIM_APP_OUTPUT_DIR
     const std::filesystem::path output_dir =
         std::filesystem::path(KFBIM_APP_OUTPUT_DIR)
-        / (owner_only ? "dirichlet_normal_restrict_crossing_owner_3d"
-                      : "dirichlet_normal_restrict_causal_probe_3d");
+        / output_leaf;
 #else
     const std::filesystem::path output_dir =
-        owner_only ? "output/dirichlet_normal_restrict_crossing_owner_3d"
-                   : "output/dirichlet_normal_restrict_causal_probe_3d";
+        std::filesystem::path("output") / output_leaf;
 #endif
-    const std::array<std::string, 3> selected_ids{{
-        "baseline", "rot_axis123_17deg",
-        "rot_axis123_17deg_t_xyz_1"}};
+    const std::vector<std::string> selected_ids = phase_profile
+        ? std::vector<std::string>{"rot_axis123_17deg"}
+        : std::vector<std::string>{
+            "baseline", "rot_axis123_17deg",
+            "rot_axis123_17deg_t_xyz_1"};
     const std::vector<app3d::DirichletRigidStudyCase3D> all_cases =
         app3d::make_l_prism_dirichlet_rigid_study_cases_3d();
     std::vector<app3d::DirichletRigidStudyCase3D> study_cases;
@@ -4590,15 +5370,50 @@ int run_normal_restrict_causal_probe(std::vector<int> levels, bool owner_only)
     }
 
     std::vector<NormalRestrictCaseProbe3D> results;
-    write_all_normal_restrict_probe_outputs(output_dir, results);
-    write_restrict_owner_probe_outputs(output_dir, results);
+    if (!phase_profile) {
+        write_all_normal_restrict_probe_outputs(output_dir, results);
+        write_restrict_owner_probe_outputs(output_dir, results);
+    }
+    const double seconds_per_clock_read = phase_profile
+        ? app3d::calibrate_steady_clock_read_seconds_3d() : 0.0;
     std::cout << "KFBI3D exterior-normal restrict causal probe\n"
               << "  geometry=l_prism cauchy=g1_nearest/degree3/48/28\n"
-              << "  gmres_tolerance=2e-10 restart=0 cap=160\n";
+              << "  gmres_tolerance=2e-10 restart=0 cap=160\n"
+              << "  restrict_owner_preprocess_mode="
+              << app3d::restrict_owner_preprocess_mode_name_3d(
+                     owner_preprocess_mode) << '\n';
     for (int N : levels) {
         const double h = kBoxSide / static_cast<double>(N);
         for (const auto& study_case : study_cases) {
+            app3d::PhaseProfile3D profile_storage;
+            app3d::PhaseProfile3D* profile =
+                phase_profile ? &profile_storage : nullptr;
+            const ProfileClock3D::time_point profile_wall_start =
+                profile_timer_start_3d(profile);
+            if (profile != nullptr) {
+                profile_phase_3d(
+                    profile, PhaseProfileKind3D::DiagnosticOutput, 1,
+                    [&] {
+                        std::filesystem::remove(
+                            output_dir / "phase_profile.csv");
+                    });
+                profile_phase_3d(
+                    profile, PhaseProfileKind3D::DiagnosticOutput, 1,
+                    [&] {
+                        write_all_normal_restrict_probe_outputs(
+                            output_dir, results);
+                    });
+                profile_phase_3d(
+                    profile, PhaseProfileKind3D::DiagnosticOutput, 1,
+                    [&] {
+                        write_restrict_owner_probe_outputs(
+                            output_dir, results);
+                    });
+            }
+
             const auto setup_start = std::chrono::steady_clock::now();
+            const ProfileClock3D::time_point geometry_start =
+                profile_timer_start_3d(profile);
             CartesianGrid3D grid({kBoxMin, kBoxMin, kBoxMin},
                                  {h, h, h}, {N, N, N}, DofLayout3D::Node);
             GeometryBundle geometry = make_geometry(
@@ -4606,6 +5421,12 @@ int run_normal_restrict_causal_probe(std::vector<int> levels, bool owner_only)
             const auto domain = std::make_shared<const
                 geometry3d::NurbsCartesianDomain3D>(
                     grid, geometry.native_surface.geometry_model());
+            profile_add_elapsed_3d(
+                profile, PhaseProfileKind3D::GeometryAndDomain,
+                geometry_start);
+
+            const ProfileClock3D::time_point surface_start =
+                profile_timer_start_3d(profile);
             const SurfaceDofCloud surface_dofs =
                 app3d::make_native_surface_dofs_3d(
                     geometry.native_surface, h);
@@ -4615,6 +5436,12 @@ int run_normal_restrict_causal_probe(std::vector<int> levels, bool owner_only)
                 kCauchyValueNeighborCount,
                 kCauchyDerivativeNeighborCount,
                 CauchyStencilPolicy3D::G1Nearest);
+            profile_add_elapsed_3d(
+                profile, PhaseProfileKind3D::SurfaceDofsAndStencils,
+                surface_start);
+
+            const ProfileClock3D::time_point grid_pair_start =
+                profile_timer_start_3d(profile);
             GridPair3D grid_pair(grid,
                                  geometry.correction_interface,
                                  geometry.crossing_interface,
@@ -4627,16 +5454,79 @@ int run_normal_restrict_causal_probe(std::vector<int> levels, bool owner_only)
                         "restrict-probe native NURBS label mismatch");
                 }
             }
+            profile_add_elapsed_3d(
+                profile, PhaseProfileKind3D::GridPairAndLabelValidation,
+                grid_pair_start);
+
+            const double crossing_rows_before = profile != nullptr
+                ? profile->record(
+                    PhaseProfileKind3D::CrossingRows).seconds : 0.0;
+            const double intersections_before = profile != nullptr
+                ? profile->record(
+                    PhaseProfileKind3D::NurbsSegmentIntersections).seconds
+                : 0.0;
+            const double owner_preprocess_before = profile != nullptr
+                ? profile->record(
+                    PhaseProfileKind3D::
+                        RestrictOwnerGeometryPreprocessing).seconds : 0.0;
+            const double trace_assembly_before = profile != nullptr
+                ? profile->record(
+                    PhaseProfileKind3D::TraceOwnerTemplateAssembly).seconds
+                : 0.0;
+            if (profile != nullptr)
+                profile->note_timer_reads(1);
             const auto pipeline_start = std::chrono::steady_clock::now();
+            RestrictOwnerWorkload3D workload_capture;
+            RestrictOwnerPipelinePreprocessTiming3D
+                phase_pipeline_timing;
             PanelCenterHarmonicJetKFBI3D pipeline(
                 grid, grid_pair, geometry.native_surface,
                 geometry.correction_triangles,
                 geometry.geometry_triangles,
-                surface_dofs, cauchy_stencils, !owner_only, true);
-            const double pipeline_setup_seconds =
+                surface_dofs, cauchy_stencils, !owner_only,
+                owner_preprocess_mode,
+                profile, &workload_capture,
+                profile != nullptr
+                    ? std::addressof(phase_pipeline_timing) : nullptr);
+            if (profile != nullptr)
+                profile->note_timer_reads(1);
+            const auto pipeline_end = std::chrono::steady_clock::now();
+            const double pipeline_wall_seconds =
                 std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - pipeline_start).count();
+                    pipeline_end - pipeline_start).count();
+            const double pipeline_setup_seconds =
+                profile != nullptr
+                    ? production_pipeline_setup_seconds_3d(
+                        pipeline_wall_seconds, phase_pipeline_timing)
+                    : pipeline_wall_seconds;
+            if (profile != nullptr) {
+                const double child_seconds =
+                    profile->record(
+                        PhaseProfileKind3D::CrossingRows).seconds
+                    - crossing_rows_before
+                    + profile->record(
+                        PhaseProfileKind3D::NurbsSegmentIntersections).seconds
+                    - intersections_before
+                    + profile->record(
+                        PhaseProfileKind3D::
+                            RestrictOwnerGeometryPreprocessing).seconds
+                    - owner_preprocess_before
+                    + profile->record(
+                        PhaseProfileKind3D::TraceOwnerTemplateAssembly).seconds
+                    - trace_assembly_before;
+                profile->add(
+                    PhaseProfileKind3D::PipelineFixedInitialization,
+                    nonnegative_profile_remainder_3d(
+                        pipeline_setup_seconds, child_seconds,
+                        "pipeline setup"),
+                    1);
+            }
 
+            const ProfileClock3D::time_point other_setup_start =
+                profile_timer_start_3d(profile);
+            const double setup_coefficients_before = profile != nullptr
+                ? profile->record(
+                    PhaseProfileKind3D::CauchyCoefficients).seconds : 0.0;
             NormalRestrictCaseProbe3D probe_case;
             probe_case.case_id = study_case.id;
             probe_case.N = N;
@@ -4649,21 +5539,53 @@ int run_normal_restrict_causal_probe(std::vector<int> levels, bool owner_only)
                 pipeline.restrict_owner_audit_records();
             probe_case.owner_geometry_query_count =
                 pipeline.restrict_owner_geometry_query_count();
+            probe_case.owner_workload_fingerprint =
+                pipeline.restrict_owner_workload_fingerprint();
+            probe_case.owner_preprocess_diagnostics =
+                pipeline.restrict_owner_preprocess_diagnostics();
             probe_case.pipeline_setup_seconds = pipeline_setup_seconds;
             if (probe_case.owner_diagnostics.empty()
-                || probe_case.owner_geometry_query_count == 0) {
+                || workload_capture.empty()
+                || workload_capture.size()
+                       != probe_case.owner_diagnostics.size()) {
                 throw std::runtime_error(
                     "restrict-probe crossing-owner diagnostics are empty");
             }
             std::size_t classified_queries = 0;
-            for (const RestrictOwnerSampleDiagnostics3D& diagnostic
-                 : probe_case.owner_diagnostics) {
+            for (std::size_t sample = 0;
+                 sample < probe_case.owner_diagnostics.size(); ++sample) {
+                const RestrictOwnerSampleDiagnostics3D& diagnostic =
+                    probe_case.owner_diagnostics[sample];
+                const RestrictOwnerWorkloadSample3D& workload =
+                    workload_capture[sample];
                 classified_queries +=
                     static_cast<std::size_t>(diagnostic.wrong_side_count);
+                if (workload.target_dof != diagnostic.target_dof
+                    || workload.side != diagnostic.side
+                    || workload.layer != diagnostic.layer
+                    || workload.oracle_nodes.size()
+                           != static_cast<std::size_t>(
+                               diagnostic.wrong_side_count)) {
+                    throw std::logic_error(
+                        "restrict-owner workload capture is inconsistent");
+                }
             }
             if (classified_queries != probe_case.owner_geometry_query_count)
                 throw std::logic_error(
                     "crossing-owner probe query count is inconsistent");
+            validate_restrict_owner_preprocess_diagnostics(
+                probe_case.owner_preprocess_diagnostics,
+                probe_case.owner_geometry_query_count);
+            std::cout << "[restrict-owner-preprocess] case="
+                      << probe_case.case_id << " N=" << N
+                      << " mode="
+                      << app3d::restrict_owner_preprocess_mode_name_3d(
+                             owner_preprocess_mode)
+                      << " workload_fingerprint="
+                      << probe_case.owner_workload_fingerprint
+                      << " wrong_side_queries="
+                      << probe_case.owner_preprocess_diagnostics.
+                             wrong_side_queries << '\n';
             const int size = pipeline.surface_size();
             probe_case.patch_ids.reserve(static_cast<std::size_t>(size));
             probe_case.points.reserve(static_cast<std::size_t>(size));
@@ -4715,10 +5637,28 @@ int run_normal_restrict_causal_probe(std::vector<int> levels, bool owner_only)
                     smooth_exact, zero_jump, zero_jump);
             const Eigen::VectorXd common_rhs =
                 make_common_normal_restrict_rhs(size);
+            if (profile != nullptr) {
+                const double other_setup_seconds =
+                    profile_timer_elapsed_3d(profile, other_setup_start);
+                const double coefficient_seconds =
+                    profile->record(
+                        PhaseProfileKind3D::CauchyCoefficients).seconds
+                    - setup_coefficients_before;
+                profile->add(
+                    PhaseProfileKind3D::ExactFieldsAndOtherSetup,
+                    nonnegative_profile_remainder_3d(
+                        other_setup_seconds, coefficient_seconds,
+                        "remaining setup"),
+                    1);
+            }
             probe_case.setup_seconds = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - setup_start).count();
             results.push_back(std::move(probe_case));
-            write_restrict_owner_probe_outputs(output_dir, results);
+            profile_phase_3d(
+                profile, PhaseProfileKind3D::DiagnosticOutput, 1,
+                [&] {
+                    write_restrict_owner_probe_outputs(output_dir, results);
+                });
             NormalRestrictCaseProbe3D& stored = results.back();
 
             const std::vector<ExteriorNormalRestrictMode3D> modes = owner_only
@@ -4729,6 +5669,21 @@ int run_normal_restrict_causal_probe(std::vector<int> levels, bool owner_only)
                     ExteriorNormalRestrictMode3D::JointTricubicCrossingOwner,
                     ExteriorNormalRestrictMode3D::ExteriorOnlyHarmonicCubic};
             for (ExteriorNormalRestrictMode3D mode : modes) {
+                const std::array<PhaseProfileKind3D, 5> route_kinds{{
+                    PhaseProfileKind3D::CauchyCoefficients,
+                    PhaseProfileKind3D::SpreadRhsAssembly,
+                    PhaseProfileKind3D::FftBulkSolve,
+                    PhaseProfileKind3D::RestrictContinuedSamples,
+                    PhaseProfileKind3D::RestrictRecovery,
+                }};
+                std::array<double, 5> route_children_before{};
+                if (profile != nullptr) {
+                    for (std::size_t q = 0; q < route_kinds.size(); ++q) {
+                        route_children_before[q] =
+                            profile->record(route_kinds[q]).seconds;
+                    }
+                    profile->note_timer_reads(1);
+                }
                 const auto route_start = std::chrono::steady_clock::now();
                 NormalRestrictRouteProbe3D& route = stored.routes[
                     static_cast<std::size_t>(normal_restrict_route_index(mode))];
@@ -4752,11 +5707,28 @@ int run_normal_restrict_causal_probe(std::vector<int> levels, bool owner_only)
                     route.smooth_grid_error, stored.weights);
                 route.exact_equation_norms = normal_restrict_weighted_norms(
                     route.exact_equation_residual, stored.weights);
+                const app3d::RestrictOwnerPreprocessDiagnostics3D
+                    diagnostics_before_gmres =
+                        pipeline.restrict_owner_preprocess_diagnostics();
+                const std::size_t queries_before_gmres =
+                    pipeline.restrict_owner_geometry_query_count();
                 route.physical = run_dirichlet_normal_case(
                     grid, grid_pair, pipeline, study_case.transform, 160,
                     mode, &route.physical_residuals);
                 route.common = run_common_normal_restrict_gmres(
                     pipeline, mode, common_rhs);
+                const app3d::RestrictOwnerPreprocessDiagnostics3D
+                    diagnostics_after_gmres =
+                        pipeline.restrict_owner_preprocess_diagnostics();
+                const std::size_t queries_after_gmres =
+                    pipeline.restrict_owner_geometry_query_count();
+                if (!restrict_owner_preprocess_diagnostics_equal(
+                        diagnostics_before_gmres,
+                        diagnostics_after_gmres)) {
+                    throw std::runtime_error(
+                        "GMRES changed restrict-owner preprocessing "
+                        "diagnostics");
+                }
                 route.physical_rho_10_30 =
                     residual_contraction(route.physical_residuals, 10, 30);
                 route.physical_worst_rho_5 =
@@ -4765,15 +5737,38 @@ int run_normal_restrict_causal_probe(std::vector<int> levels, bool owner_only)
                     residual_contraction(route.common.residuals, 10, 30);
                 route.common_worst_rho_5 =
                     worst_five_step_contraction(route.common.residuals);
-                if (pipeline.restrict_owner_geometry_query_count()
+                if (queries_before_gmres != queries_after_gmres
+                    || queries_after_gmres
                     != stored.owner_geometry_query_count) {
                     throw std::runtime_error(
                         "GMRES apply performed a crossing-owner geometry query");
                 }
+                if (profile != nullptr)
+                    profile->note_timer_reads(1);
+                const auto route_end = std::chrono::steady_clock::now();
                 route.seconds = std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - route_start).count();
+                    route_end - route_start).count();
+                if (profile != nullptr) {
+                    double child_seconds = 0.0;
+                    for (std::size_t q = 0; q < route_kinds.size(); ++q) {
+                        child_seconds +=
+                            profile->record(route_kinds[q]).seconds
+                            - route_children_before[q];
+                    }
+                    profile->add(
+                        PhaseProfileKind3D::GmresAndOtherRoute,
+                        nonnegative_profile_remainder_3d(
+                            route.seconds, child_seconds,
+                            "normal-restrict route"),
+                        1);
+                }
                 route.complete = true;
-                write_all_normal_restrict_probe_outputs(output_dir, results);
+                profile_phase_3d(
+                    profile, PhaseProfileKind3D::DiagnosticOutput, 1,
+                    [&] {
+                        write_all_normal_restrict_probe_outputs(
+                            output_dir, results);
+                    });
                 std::cout << "[restrict-probe] case=" << stored.case_id
                           << " N=" << N << " route=" << route.route
                           << " exact_grid_linf="
@@ -4786,6 +5781,10 @@ int run_normal_restrict_causal_probe(std::vector<int> levels, bool owner_only)
                           << route.physical.iterations << '/'
                           << route.physical.interior_linf
                           << " common_iter=" << route.common.iterations
+                          << " preprocess_queries(pre/post)="
+                          << diagnostics_before_gmres.wrong_side_queries
+                          << '/' << diagnostics_after_gmres.wrong_side_queries
+                          << " diagnostics_unchanged=1"
                           << " seconds=" << route.seconds << '\n';
             }
             const double total_seconds = std::chrono::duration<double>(
@@ -4796,6 +5795,42 @@ int run_normal_restrict_causal_probe(std::vector<int> levels, bool owner_only)
                       << " pipeline_setup_seconds="
                       << stored.pipeline_setup_seconds
                       << " total_seconds=" << total_seconds << '\n';
+
+            if (profile != nullptr) {
+                profile->set_seconds_per_clock_read(
+                    seconds_per_clock_read);
+                const double profile_wall_seconds =
+                    profile_timer_elapsed_3d(profile, profile_wall_start);
+                profile->finalize(profile_wall_seconds);
+                double recorded_wall_seconds = 0.0;
+                for (std::size_t q = 0;
+                     q < app3d::phase_profile_kind_count_3d(); ++q) {
+                    recorded_wall_seconds += profile->record(
+                        static_cast<PhaseProfileKind3D>(q)).seconds;
+                }
+                const double exhaustive_tolerance =
+                    std::max(1.0e-6, 1.0e-8 * profile_wall_seconds);
+                if (std::abs(
+                        recorded_wall_seconds - profile_wall_seconds)
+                    > exhaustive_tolerance) {
+                    throw std::logic_error(
+                        "phase-profile leaves are not exhaustive");
+                }
+                app3d::write_phase_profile_csv_3d(
+                    output_dir / "phase_profile.csv",
+                    stored.case_id, N, *profile);
+                const double overhead_percent =
+                    profile_wall_seconds > 0.0
+                    ? 100.0
+                        * profile->estimated_timer_overhead_seconds()
+                        / profile_wall_seconds
+                    : 0.0;
+                std::cout << "[phase-profile] algorithm_seconds="
+                          << profile->algorithm_seconds()
+                          << " wall_seconds=" << profile_wall_seconds
+                          << " estimated_timer_overhead_percent="
+                          << overhead_percent << '\n';
+            }
         }
     }
     if (!owner_only) {
@@ -4808,19 +5843,4072 @@ int run_normal_restrict_causal_probe(std::vector<int> levels, bool owner_only)
     return 0;
 }
 
+using OwnerMode3D = app3d::RestrictOwnerPreprocessMode3D;
+using OwnerClass3D = app3d::RestrictOwnerNormalizedClass3D;
+using OwnerPath3D = app3d::RestrictOwnerQueryPath3D;
+using OwnerFallback3D = app3d::RestrictOwnerFallbackCause3D;
+
+struct OwnerPreprocessStudyCase3D {
+    std::string case_id;
+    std::string geometry;
+    std::string pose;
+    GeometryKind kind = GeometryKind::Torus;
+    app3d::RigidTransform3D transform;
+};
+
+struct PreprocessTimingRepeatRow3D {
+    std::string case_id, geometry, pose, mode;
+    int N = 0, repetition = 0, run_order = 0;
+    double h = 0.0;
+    std::uint64_t wrong_side_queries = 0;
+    double construction_seconds = 0.0, query_seconds = 0.0;
+    double total_preprocess_seconds = 0.0, queries_per_second = 0.0;
+    std::uint64_t peak_working_set_bytes = 0;
+    std::uint64_t working_set_increase_bytes = 0;
+};
+
+struct PreprocessSummaryRow3D {
+    std::string case_id, geometry, pose, mode;
+    int N = 0, repetitions = 0;
+    double h = 0.0;
+    std::uint64_t wrong_side_queries = 0;
+    double construction_seconds_median = 0.0;
+    double query_seconds_median = 0.0, query_seconds_p95 = 0.0;
+    double total_seconds_median = 0.0, total_seconds_p95 = 0.0;
+    double queries_per_second_median = 0.0, speedup_vs_full = 0.0;
+    std::uint64_t peak_working_set_bytes_max = 0;
+    bool accepted = false;
+};
+
+struct PreprocessAccuracyRow3D {
+    std::string case_id, geometry, pose, mode;
+    int N = 0;
+    double h = 0.0;
+    std::uint64_t query_count = 0, oracle_target = 0, oracle_foreign = 0;
+    std::uint64_t owner_mismatch = 0, foreign_true_positive = 0;
+    std::uint64_t foreign_false_positive = 0, foreign_false_negative = 0;
+    std::uint64_t foreign_wrong_owner = 0;
+    double foreign_precision = 0.0, foreign_recall = 0.0;
+    double max_mismatched_abs_weight = 0.0;
+    double max_owner_correction_abs_difference = 0.0;
+    std::uint64_t legacy_reason_mismatch = 0;
+    bool pass = false;
+};
+
+struct PreprocessPathCountRow3D {
+    std::string case_id, geometry, pose, mode, path;
+    int N = 0;
+    double h = 0.0;
+    std::uint64_t count = 0;
+    double fraction = 0.0;
+    app3d::RestrictOwnerPreprocessDiagnostics3D diagnostics;
+};
+
+struct PreprocessMismatchRow3D {
+    std::string case_id, geometry, pose, mode;
+    int N = 0, target_dof = -1, target_patch = -1, side = -1, layer = -1;
+    double h = 0.0;
+    int grid_node = -1;
+    double weight = 0.0;
+    Eigen::Vector3d query = Eigen::Vector3d::Zero();
+    Eigen::Vector3d support = Eigen::Vector3d::Zero();
+    int oracle_owner_dof = -1, oracle_owner_patch = -1;
+    int candidate_owner_dof = -1, candidate_owner_patch = -1;
+    std::string oracle_class, candidate_class, candidate_path;
+    int oracle_crossing_patch = -1, candidate_crossing_patch = -1;
+};
+
+struct KfbiNumericalResultRow3D {
+    std::string case_id, geometry, pose, mode;
+    int N = 0, dofs = 0;
+    double h = 0.0, preprocess_seconds = 0.0;
+    double pipeline_setup_seconds = 0.0, pipeline_speedup_vs_full = 0.0;
+    SolveMetrics3D solve;
+    double interior_order = std::numeric_limits<double>::quiet_NaN();
+    double exact_grid_linf = 0.0, exact_equation_linf = 0.0;
+    double interior_relative_difference_vs_full = 0.0;
+    double exact_grid_relative_difference_vs_full = 0.0;
+    double exact_equation_relative_difference_vs_full = 0.0;
+    std::uint64_t geometry_queries_before_gmres = 0;
+    std::uint64_t geometry_queries_after_gmres = 0;
+    bool pass = false;
+};
+
+struct OwnerPreprocessStudyRows3D {
+    std::vector<PreprocessTimingRepeatRow3D> timing;
+    std::vector<PreprocessSummaryRow3D> summary;
+    std::vector<PreprocessAccuracyRow3D> accuracy;
+    std::vector<PreprocessPathCountRow3D> paths;
+    std::vector<PreprocessMismatchRow3D> mismatches;
+    std::vector<KfbiNumericalResultRow3D> numerical;
+};
+
+struct RestrictOwnerAccuracyComparison3D {
+    PreprocessAccuracyRow3D accuracy;
+    std::vector<PreprocessMismatchRow3D> mismatches;
+};
+
+struct RestrictOwnerReplayResult3D {
+    std::optional<RestrictOwnerAccuracyComparison3D> comparison;
+    app3d::RestrictOwnerPreprocessDiagnostics3D diagnostics;
+    double construction_seconds = 0.0, query_seconds = 0.0;
+    std::uint64_t peak_working_set_bytes = 0;
+    std::uint64_t max_active_increase_bytes = 0;
+    std::uint64_t output_digest = UINT64_C(14695981039346656037);
+};
+
+std::string owner_class_name_3d(OwnerClass3D value)
+{
+    if (value == OwnerClass3D::Target)
+        return "target";
+    if (value == OwnerClass3D::UniqueForeign)
+        return "unique_foreign";
+    return "fail_closed_target";
+}
+
+std::string owner_path_name_3d(OwnerPath3D value)
+{
+    if (value == OwnerPath3D::FullIntersection)
+        return "full_intersection";
+    if (value == OwnerPath3D::SweepTargetOnly)
+        return "sweep_target_only";
+    if (value == OwnerPath3D::SegmentTargetOnly)
+        return "segment_target_only";
+    if (value == OwnerPath3D::ClosestCertifiedMiss)
+        return "closest_certified_miss";
+    if (value == OwnerPath3D::ClosestCertifiedRoot)
+        return "closest_certified_root";
+    if (value == OwnerPath3D::OptimizedIntersection)
+        return "optimized_intersection";
+    return "full_intersection_fallback";
+}
+
+std::string owner_fallback_name_3d(OwnerFallback3D value)
+{
+    if (value == OwnerFallback3D::MultipleCrossings)
+        return "multiple_crossings";
+    if (value == OwnerFallback3D::Unresolved)
+        return "unresolved";
+    if (value == OwnerFallback3D::Overlap)
+        return "overlap";
+    if (value == OwnerFallback3D::Endpoint)
+        return "endpoint";
+    if (value == OwnerFallback3D::NearTangent)
+        return "near_tangent";
+    if (value == OwnerFallback3D::FeatureContact)
+        return "feature_contact";
+    if (value == OwnerFallback3D::ParameterBoundary)
+        return "parameter_boundary";
+    if (value == OwnerFallback3D::Seam)
+        return "seam";
+    if (value == OwnerFallback3D::Coincidence)
+        return "coincidence";
+    return "none";
+}
+
+app3d::DirichletRigidStudyCase3D rigid_case_by_id_3d(
+    std::vector<app3d::DirichletRigidStudyCase3D> cases,
+    std::string id)
+{
+    for (std::size_t index = 0; index not_eq cases.size(); index += 1) {
+        if (cases[index].id == id)
+            return cases[index];
+    }
+    throw std::logic_error("missing rigid study case " + id);
+}
+
+std::vector<OwnerPreprocessStudyCase3D> owner_study_cases_3d()
+{
+    const auto rigid = app3d::make_l_prism_dirichlet_rigid_study_cases_3d();
+    const auto identity = rigid_case_by_id_3d(rigid, "baseline");
+    const auto rotation = rigid_case_by_id_3d(
+        rigid, "rot_axis123_17deg");
+    const auto translated = rigid_case_by_id_3d(
+        rigid, "rot_axis123_17deg_t_xyz_1");
+    std::vector<OwnerPreprocessStudyCase3D> result;
+    result.reserve(7);
+    result.push_back({"torus_identity", "torus", "identity",
+        GeometryKind::Torus, identity.transform});
+    result.push_back({"hollow_cylinder_identity", "hollow_cylinder",
+        "identity", GeometryKind::HollowCylinder, identity.transform});
+    result.push_back({"l_prism_identity", "l_prism", "identity",
+        GeometryKind::LPrism, identity.transform});
+    result.push_back({"torus_rot_axis123_17deg", "torus",
+        "rot_axis123_17deg", GeometryKind::Torus, rotation.transform});
+    result.push_back({"hollow_cylinder_rot_axis123_17deg",
+        "hollow_cylinder", "rot_axis123_17deg",
+        GeometryKind::HollowCylinder, rotation.transform});
+    result.push_back({"l_prism_rot_axis123_17deg", "l_prism",
+        "rot_axis123_17deg", GeometryKind::LPrism, rotation.transform});
+    result.push_back({"l_prism_rot_axis123_17deg_t_xyz_1", "l_prism",
+        "rot_axis123_17deg_t_xyz_1", GeometryKind::LPrism,
+        translated.transform});
+    return result;
+}
+
+bool owner_case_selected_for_level_3d(
+    OwnerPreprocessStudyCase3D study_case, int N)
+{
+    if (N == 16)
+        return study_case.pose == "identity";
+    if (N == 32 or N == 64)
+        return true;
+    return N == 128
+        and study_case.case_id == "l_prism_rot_axis123_17deg";
+}
+
+int owner_candidate_repetitions_3d(int N)
+{
+    if (N <= 32) return 5;
+    if (N == 64) return 3;
+    return 1;
+}
+
+double sorted_median_3d(std::vector<double> values)
+{
+    if (values.empty())
+        return std::numeric_limits<double>::quiet_NaN();
+    std::sort(values.begin(), values.end());
+    const std::size_t middle = values.size() / 2;
+    if (values.size() % 2 == 0)
+        return 0.5 * (values[middle - 1] + values[middle]);
+    return values[middle];
+}
+
+double sorted_nearest_rank_p95_3d(std::vector<double> values)
+{
+    if (values.empty())
+        return std::numeric_limits<double>::quiet_NaN();
+    std::sort(values.begin(), values.end());
+    const std::size_t rank = static_cast<std::size_t>(
+        std::ceil(0.95 * static_cast<double>(values.size())));
+    return values[std::max<std::size_t>(1, rank) - 1];
+}
+
+double symmetric_relative_difference_3d(double a, double b)
+{
+    return std::abs(a - b)
+         / std::max({1.0e-300, std::abs(a), std::abs(b)});
+}
+
+
+double production_pipeline_setup_seconds_3d(
+    double outer_constructor_seconds,
+    const RestrictOwnerPipelinePreprocessTiming3D& timing)
+{
+    if (!std::isfinite(outer_constructor_seconds)
+        || !std::isfinite(timing.workload_capture_seconds)
+        || outer_constructor_seconds <= 0.0
+        || timing.workload_capture_seconds < 0.0
+        || timing.workload_capture_seconds > outer_constructor_seconds) {
+        throw std::logic_error(
+            "invalid production-equivalent pipeline setup timing");
+    }
+    const double result =
+        outer_constructor_seconds - timing.workload_capture_seconds;
+    if (result <= 0.0)
+        throw std::logic_error(
+            "nonpositive production-equivalent pipeline setup timing");
+    return result;
+}
+
+RestrictOwnerAccuracyComparison3D make_owner_accuracy_comparison_3d(
+    const CartesianGrid3D& grid,
+    OwnerPreprocessStudyCase3D study_case,
+    int N,
+    OwnerMode3D mode)
+{
+    RestrictOwnerAccuracyComparison3D result;
+    result.accuracy.case_id = study_case.case_id;
+    result.accuracy.geometry = study_case.geometry;
+    result.accuracy.pose = study_case.pose;
+    result.accuracy.N = N;
+    result.accuracy.h = grid.spacing()[0];
+    result.accuracy.mode =
+        app3d::restrict_owner_preprocess_mode_name_3d(mode);
+    return result;
+}
+
+void accumulate_owner_accuracy_sample_3d(
+    RestrictOwnerAccuracyComparison3D& result,
+    const SurfaceDofCloud& cloud,
+    const RestrictOwnerWorkloadSample3D& sample,
+    const RestrictOwnerTraceStencil3D& trace,
+    const RestrictOwnerPreparedTraceSample3D& candidate_sink)
+{
+    if (candidate_sink.decisions.size() != sample.oracle_nodes.size())
+        throw std::logic_error("candidate replay is incomplete");
+    for (std::size_t index = 0; index < sample.oracle_nodes.size(); ++index) {
+        const RestrictOwnerOracleNode3D& oracle = sample.oracle_nodes[index];
+        const RestrictOwnerStagedDecision3D& candidate =
+            candidate_sink.decisions[index];
+        const std::size_t slot = oracle.slot;
+        if (candidate.slot != oracle.slot)
+            throw std::logic_error("candidate replay slot mismatch");
+        result.accuracy.query_count += 1;
+        const bool oracle_foreign = oracle.owner_class
+            == OwnerClass3D::UniqueForeign;
+        const bool candidate_foreign = candidate.owner_class
+            == OwnerClass3D::UniqueForeign;
+        if (oracle_foreign)
+            result.accuracy.oracle_foreign += 1;
+        else
+            result.accuracy.oracle_target += 1;
+        if (oracle_foreign and candidate_foreign
+            and oracle.owner_dof == candidate.owner_dof) {
+            result.accuracy.foreign_true_positive += 1;
+        } else if (oracle_foreign and candidate_foreign) {
+            result.accuracy.foreign_wrong_owner += 1;
+        } else if (oracle_foreign) {
+            result.accuracy.foreign_false_negative += 1;
+        } else if (candidate_foreign) {
+            result.accuracy.foreign_false_positive += 1;
+        }
+        if (oracle.legacy_decision_kind.has_value()
+            and candidate.legacy_decision_kind >= 0
+            and oracle.legacy_decision_kind.value()
+                not_eq static_cast<app3d::RestrictOwnerDecisionKind3D>(
+                    candidate.legacy_decision_kind)) {
+            result.accuracy.legacy_reason_mismatch += 1;
+        }
+        if (oracle.owner_dof not_eq candidate.owner_dof) {
+            result.accuracy.owner_mismatch += 1;
+            result.accuracy.max_mismatched_abs_weight = std::max(
+                result.accuracy.max_mismatched_abs_weight,
+                std::abs(trace.weights[slot]));
+            PreprocessMismatchRow3D mismatch;
+            mismatch.case_id = result.accuracy.case_id;
+            mismatch.geometry = result.accuracy.geometry;
+            mismatch.pose = result.accuracy.pose;
+            mismatch.mode = result.accuracy.mode;
+            mismatch.N = result.accuracy.N;
+            mismatch.h = result.accuracy.h;
+            mismatch.target_dof = sample.target_dof;
+            mismatch.target_patch = cloud.dofs[
+                static_cast<std::size_t>(sample.target_dof)].patch_id;
+            mismatch.side = sample.side;
+            mismatch.layer = sample.layer;
+            mismatch.grid_node = trace.grid_nodes[slot];
+            mismatch.weight = trace.weights[slot];
+            mismatch.query = sample.query;
+            mismatch.support = trace.owner_input.support_points[slot];
+            mismatch.oracle_owner_dof = oracle.owner_dof;
+            mismatch.candidate_owner_dof = candidate.owner_dof;
+            mismatch.oracle_owner_patch = cloud.dofs[
+                static_cast<std::size_t>(oracle.owner_dof)].patch_id;
+            mismatch.candidate_owner_patch = cloud.dofs[
+                static_cast<std::size_t>(candidate.owner_dof)].patch_id;
+            mismatch.oracle_class = owner_class_name_3d(
+                oracle.owner_class);
+            mismatch.candidate_class = owner_class_name_3d(
+                candidate.owner_class);
+            mismatch.candidate_path = owner_path_name_3d(
+                candidate.query_path);
+            mismatch.oracle_crossing_patch = oracle.crossing_patch;
+            if (candidate.foreign_crossing_index >= 0) {
+                mismatch.candidate_crossing_patch =
+                    candidate_sink.foreign_crossings[
+                        static_cast<std::size_t>(
+                            candidate.foreign_crossing_index)].patch_index;
+            }
+            result.mismatches.push_back(std::move(mismatch));
+        }
+    }
+}
+
+void finalize_owner_accuracy_comparison_3d(
+    RestrictOwnerAccuracyComparison3D& result)
+{
+    const std::uint64_t precision_denominator =
+        result.accuracy.foreign_true_positive
+        + result.accuracy.foreign_false_positive
+        + result.accuracy.foreign_wrong_owner;
+    const std::uint64_t recall_denominator =
+        result.accuracy.foreign_true_positive
+        + result.accuracy.foreign_false_negative
+        + result.accuracy.foreign_wrong_owner;
+    result.accuracy.foreign_precision = precision_denominator == 0
+        ? 1.0
+        : static_cast<double>(result.accuracy.foreign_true_positive)
+          / static_cast<double>(precision_denominator);
+    result.accuracy.foreign_recall = recall_denominator == 0
+        ? 1.0
+        : static_cast<double>(result.accuracy.foreign_true_positive)
+          / static_cast<double>(recall_denominator);
+    result.accuracy.pass = result.accuracy.owner_mismatch == 0
+        and result.accuracy.foreign_false_positive == 0
+        and result.accuracy.foreign_false_negative == 0
+        and result.accuracy.foreign_wrong_owner == 0;
+}
+
+std::uint64_t restrict_owner_oracle_query_count_3d(
+    const RestrictOwnerWorkload3D& workload)
+{
+    return std::accumulate(
+        workload.begin(), workload.end(), std::uint64_t{0},
+        [](std::uint64_t count, const RestrictOwnerWorkloadSample3D& sample) {
+            return count
+                + static_cast<std::uint64_t>(sample.oracle_nodes.size());
+        });
+}
+
+RestrictOwnerReplayResult3D replay_restrict_owner_workload_3d(
+    const CartesianGrid3D& grid,
+    const GridPair3D& grid_pair,
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud& cloud,
+    const RestrictOwnerWorkload3D& workload,
+    OwnerMode3D mode,
+    app3d::RestrictOwnerPreprocessOptions3D options,
+    bool measure_benchmark,
+    const OwnerPreprocessStudyCase3D* study_case = nullptr,
+    int N = 0)
+{
+    RestrictOwnerReplayResult3D result;
+    if (study_case != nullptr) {
+        result.comparison = make_owner_accuracy_comparison_3d(
+            grid, *study_case, N, mode);
+    }
+    const std::uint64_t expected_queries =
+        restrict_owner_oracle_query_count_3d(workload);
+    RestrictOwnerPreparedTraceSample3D candidate_sink;
+    candidate_sink.decisions.reserve(64);
+    candidate_sink.foreign_crossings.reserve(64);
+    std::unique_ptr<WorkingSetPeakSampler3D> memory_sampler;
+    if (measure_benchmark) {
+        memory_sampler = std::make_unique<WorkingSetPeakSampler3D>();
+        memory_sampler->resume();
+        memory_sampler->checkpoint();
+    }
+    std::unique_ptr<app3d::RestrictOwnerGeometryPreprocessor3D>
+        preprocessor;
+    try {
+        const auto construction_start =
+            std::chrono::steady_clock::now();
+        preprocessor = std::make_unique<
+            app3d::RestrictOwnerGeometryPreprocessor3D>(
+                surface, cloud, grid.spacing()[0], mode, options);
+        const auto construction_end =
+            std::chrono::steady_clock::now();
+        if (measure_benchmark) {
+            memory_sampler->checkpoint();
+            memory_sampler->pause();
+            result.construction_seconds =
+                std::chrono::duration<double>(
+                    construction_end - construction_start).count();
+        }
+    } catch (...) {
+        if (memory_sampler != nullptr)
+            memory_sampler->pause();
+        throw;
+    }
+    for (const RestrictOwnerWorkloadSample3D& sample : workload) {
+        candidate_sink.target_dof = sample.target_dof;
+        candidate_sink.side = sample.side;
+        candidate_sink.layer = sample.layer;
+        candidate_sink.query = sample.query;
+        candidate_sink.lower_stencil_index = sample.lower_stencil_index;
+        candidate_sink.wrong_side_mask = sample.wrong_side_mask;
+        prepare_restrict_owner_result_sink_3d(candidate_sink);
+        if (measure_benchmark) {
+            result.query_seconds += run_restrict_owner_timed_sample_3d(
+                grid, *preprocessor, candidate_sink,
+                memory_sampler.get());
+        } else {
+            run_restrict_owner_sample_core_3d(
+                grid, *preprocessor, candidate_sink);
+        }
+        restrict_owner_fingerprint_append(
+            result.output_digest, candidate_sink.output_digest);
+        if (result.comparison.has_value()) {
+            const RestrictOwnerTraceStencil3D trace =
+                build_restrict_owner_trace_stencil_3d(
+                    grid, grid_pair, sample.target_dof,
+                    sample.side == 0, sample.query,
+                    sample.lower_stencil_index);
+            std::uint64_t trace_mask = 0;
+            for (std::size_t slot = 0; slot < 64; ++slot) {
+                if (trace.owner_input.wrong_side[slot]) {
+                    trace_mask |= UINT64_C(1)
+                        << static_cast<unsigned>(slot);
+                }
+            }
+            if (trace_mask != sample.wrong_side_mask)
+                throw std::logic_error(
+                    "candidate replay seed mask mismatch");
+            accumulate_owner_accuracy_sample_3d(
+                result.comparison.value(), cloud, sample, trace,
+                candidate_sink);
+        }
+    }
+    if (measure_benchmark) {
+        memory_sampler->finish();
+        result.peak_working_set_bytes = memory_sampler->peak_bytes();
+        result.max_active_increase_bytes =
+            memory_sampler->max_active_increase_bytes();
+    }
+    result.diagnostics = preprocessor->diagnostics();
+    validate_restrict_owner_preprocess_diagnostics(
+        result.diagnostics, expected_queries);
+    if (result.comparison.has_value()) {
+        if (result.comparison->accuracy.query_count != expected_queries)
+            throw std::logic_error("candidate comparison query count mismatch");
+        finalize_owner_accuracy_comparison_3d(
+            result.comparison.value());
+    }
+    return result;
+}
+
+void write_owner_study_checkpoints_3d(
+    const std::filesystem::path& output_dir,
+    const OwnerPreprocessStudyRows3D& rows)
+{
+    std::filesystem::create_directories(output_dir);
+    std::ofstream timing = open_output_file(
+        output_dir / "preprocess_timing_repeats.csv");
+    timing << std::setprecision(17)
+        << "case_id,geometry,pose,N,h,mode,repetition,run_order,"
+           "wrong_side_queries,construction_seconds,query_seconds,"
+           "total_preprocess_seconds,queries_per_second,"
+           "peak_working_set_bytes,working_set_increase_bytes"
+        << std::endl;
+    for (const auto& row : rows.timing) {
+        timing << row.case_id << ',' << row.geometry << ',' << row.pose << ','
+               << row.N << ',' << row.h << ',' << row.mode << ','
+               << row.repetition << ',' << row.run_order << ','
+               << row.wrong_side_queries << ',' << row.construction_seconds
+               << ',' << row.query_seconds << ','
+               << row.total_preprocess_seconds << ','
+               << row.queries_per_second << ','
+               << row.peak_working_set_bytes << ','
+               << row.working_set_increase_bytes << '\n';
+    }
+    std::ofstream summary = open_output_file(
+        output_dir / "preprocess_summary.csv");
+    summary << std::setprecision(17)
+        << "case_id,geometry,pose,N,h,mode,repetitions,wrong_side_queries,"
+           "construction_seconds_median,query_seconds_median,"
+           "query_seconds_p95,total_seconds_median,total_seconds_p95,"
+           "queries_per_second_median,speedup_vs_full,"
+           "peak_working_set_bytes_max,accepted" << std::endl;
+    for (const auto& row : rows.summary) {
+        summary << row.case_id << ',' << row.geometry << ',' << row.pose << ','
+                << row.N << ',' << row.h << ',' << row.mode << ','
+                << row.repetitions << ',' << row.wrong_side_queries << ','
+                << row.construction_seconds_median << ','
+                << row.query_seconds_median << ',' << row.query_seconds_p95
+                << ',' << row.total_seconds_median << ','
+                << row.total_seconds_p95 << ','
+                << row.queries_per_second_median << ',' << row.speedup_vs_full
+                << ',' << row.peak_working_set_bytes_max << ','
+                << row.accepted << '\n';
+    }
+    std::ofstream accuracy = open_output_file(
+        output_dir / "preprocess_accuracy.csv");
+    accuracy << std::setprecision(17)
+        << "case_id,geometry,pose,N,h,mode,query_count,oracle_target,"
+           "oracle_foreign,owner_mismatch,foreign_true_positive,"
+           "foreign_false_positive,foreign_false_negative,"
+           "foreign_wrong_owner,foreign_precision,foreign_recall,"
+           "max_mismatched_abs_weight,max_owner_correction_abs_difference,"
+           "legacy_reason_mismatch,pass" << std::endl;
+    for (const auto& row : rows.accuracy) {
+        accuracy << row.case_id << ',' << row.geometry << ',' << row.pose << ','
+                 << row.N << ',' << row.h << ',' << row.mode << ','
+                 << row.query_count << ',' << row.oracle_target << ','
+                 << row.oracle_foreign << ',' << row.owner_mismatch << ','
+                 << row.foreign_true_positive << ','
+                 << row.foreign_false_positive << ','
+                 << row.foreign_false_negative << ','
+                 << row.foreign_wrong_owner << ',' << row.foreign_precision
+                 << ',' << row.foreign_recall << ','
+                 << row.max_mismatched_abs_weight << ','
+                 << row.max_owner_correction_abs_difference << ','
+                 << row.legacy_reason_mismatch << ',' << row.pass << '\n';
+    }
+    std::ofstream paths = open_output_file(
+        output_dir / "preprocess_path_counts.csv");
+    paths << std::setprecision(17)
+        << "case_id,geometry,pose,N,h,mode,path,count,fraction,"
+           "compatible_aabb_candidates,foreign_aabb_candidates,"
+           "control_hull_rejections,closest_attempts,closest_converged,"
+           "closest_iterations,closest_certified_misses,"
+           "closest_certified_roots,closest_unresolved,optimized_calls,"
+           "full_fallback_calls,region_seconds,closest_seconds,"
+           "optimized_seconds,full_fallback_seconds" << std::endl;
+    for (const auto& row : rows.paths) {
+        const auto& d = row.diagnostics;
+        paths << row.case_id << ',' << row.geometry << ',' << row.pose << ','
+              << row.N << ',' << row.h << ',' << row.mode << ',' << row.path
+              << ',' << row.count << ',' << row.fraction << ','
+              << d.compatible_aabb_candidates << ','
+              << d.foreign_aabb_candidates << ','
+              << d.control_hull_rejections << ','
+              << d.closest_point_attempts << ',' << d.closest_point_converged
+              << ',' << d.closest_point_iterations << ','
+              << d.closest_certified_misses << ','
+              << d.closest_certified_roots << ',' << d.closest_unresolved
+              << ',' << d.optimized_intersection_calls << ','
+              << d.full_fallback_calls << ',' << d.region_seconds << ','
+              << d.closest_point_seconds << ','
+              << d.optimized_intersection_seconds << ','
+              << d.full_fallback_seconds << '\n';
+    }
+    std::ofstream mismatches = open_output_file(
+        output_dir / "preprocess_mismatches.csv");
+    mismatches << std::setprecision(17)
+        << "case_id,geometry,pose,N,h,mode,target_dof,target_patch,side,layer,"
+           "grid_node,weight,query_x,query_y,query_z,support_x,support_y,"
+           "support_z,oracle_owner_dof,oracle_owner_patch,"
+           "candidate_owner_dof,candidate_owner_patch,oracle_class,"
+           "candidate_class,candidate_path,oracle_crossing_patch,"
+           "candidate_crossing_patch" << std::endl;
+    for (const auto& row : rows.mismatches) {
+        mismatches << row.case_id << ',' << row.geometry << ',' << row.pose
+                   << ',' << row.N << ',' << row.h << ',' << row.mode << ','
+                   << row.target_dof << ',' << row.target_patch << ','
+                   << row.side << ',' << row.layer << ',' << row.grid_node
+                   << ',' << row.weight << ',' << row.query.x() << ','
+                   << row.query.y() << ',' << row.query.z() << ','
+                   << row.support.x() << ',' << row.support.y() << ','
+                   << row.support.z() << ',' << row.oracle_owner_dof << ','
+                   << row.oracle_owner_patch << ','
+                   << row.candidate_owner_dof << ','
+                   << row.candidate_owner_patch << ',' << row.oracle_class
+                   << ',' << row.candidate_class << ',' << row.candidate_path
+                   << ',' << row.oracle_crossing_patch << ','
+                   << row.candidate_crossing_patch << '\n';
+    }
+    std::ofstream numerical = open_output_file(
+        output_dir / "kfbi_numerical_results.csv");
+    numerical << std::setprecision(17)
+        << "case_id,geometry,pose,N,h,mode,dofs,preprocess_seconds,"
+           "pipeline_setup_seconds,pipeline_speedup_vs_full,solve_seconds,"
+           "converged,iterations,final_residual,operator_residual_linf,"
+           "exterior_condition_linf,boundary_residual_linf,"
+           "route_mismatch_linf,interior_linf,interior_order,"
+           "exact_grid_linf,exact_equation_linf,"
+           "interior_relative_difference_vs_full,"
+           "exact_grid_relative_difference_vs_full,"
+           "exact_equation_relative_difference_vs_full,"
+           "geometry_queries_before_gmres,geometry_queries_after_gmres,pass"
+        << std::endl;
+    for (const auto& row : rows.numerical) {
+        numerical << row.case_id << ',' << row.geometry << ',' << row.pose
+                  << ',' << row.N << ',' << row.h << ',' << row.mode << ','
+                  << row.dofs << ',' << row.preprocess_seconds << ','
+                  << row.pipeline_setup_seconds << ','
+                  << row.pipeline_speedup_vs_full << ',' << row.solve.seconds
+                  << ',' << row.solve.converged << ',' << row.solve.iterations
+                  << ',' << row.solve.gmres_relative_residual << ','
+                  << row.solve.operator_residual_linf << ','
+                  << row.solve.exterior_condition_linf << ','
+                  << row.solve.boundary_residual_linf << ','
+                  << row.solve.route_mismatch_linf << ','
+                  << row.solve.interior_linf << ',' << row.interior_order << ','
+                  << row.exact_grid_linf << ',' << row.exact_equation_linf
+                  << ',' << row.interior_relative_difference_vs_full << ','
+                  << row.exact_grid_relative_difference_vs_full << ','
+                  << row.exact_equation_relative_difference_vs_full << ','
+                  << row.geometry_queries_before_gmres << ','
+                  << row.geometry_queries_after_gmres << ',' << row.pass
+                  << '\n';
+    }
+}
+
+struct OwnerNumericalEvaluation3D {
+    SolveMetrics3D solve;
+    double exact_grid_linf = 0.0;
+    double exact_equation_linf = 0.0;
+    std::uint64_t geometry_queries_before_gmres = 0;
+    std::uint64_t geometry_queries_after_gmres = 0;
+};
+
+OwnerNumericalEvaluation3D evaluate_owner_pipeline_numerics_3d(
+    const CartesianGrid3D& grid,
+    const GridPair3D& grid_pair,
+    const PanelCenterHarmonicJetKFBI3D& pipeline,
+    const app3d::RigidTransform3D& transform,
+    int gmres_max_iterations)
+{
+    const int size = pipeline.surface_size();
+    Eigen::VectorXd value_data(size), exact_normal(size);
+    for (int q = 0; q < size; q += 1) {
+        const SurfaceDof& dof = pipeline.surface().dofs[
+            static_cast<std::size_t>(q)];
+        value_data[q] = app3d::transformed_manufactured_harmonic_value_3d(
+            transform, dof.point);
+        exact_normal[q] =
+            app3d::transformed_manufactured_harmonic_gradient_3d(
+                transform, dof.point).dot(dof.normal);
+    }
+    Eigen::VectorXd piecewise_exact(grid.num_dofs());
+    for (int node = 0; node < grid.num_dofs(); node += 1) {
+        const double value =
+            app3d::transformed_manufactured_harmonic_value_3d(
+                transform, grid_point(grid, node));
+        piecewise_exact[node] = grid_pair.domain_label(node) > 0
+            ? value : 0.0;
+    }
+    const HarmonicJetField3D field = pipeline.field_from_grid_and_jumps(
+        piecewise_exact, value_data, exact_normal);
+    const auto restrict_mode =
+        ExteriorNormalRestrictMode3D::JointTricubicCrossingOwner;
+    const Eigen::VectorXd exact_grid = pipeline.exterior_normal_trace(
+        field, value_data, exact_normal, restrict_mode);
+    ExteriorNormalTraceOperator3D op(pipeline, restrict_mode);
+    Eigen::VectorXd applied;
+    op.apply(exact_normal, applied);
+    const Eigen::VectorXd exact_equation =
+        applied - op.right_hand_side(value_data);
+
+    OwnerNumericalEvaluation3D result;
+    result.exact_grid_linf = vector_linf(exact_grid);
+    result.exact_equation_linf = vector_linf(exact_equation);
+    const auto before = pipeline.restrict_owner_preprocess_diagnostics();
+    result.geometry_queries_before_gmres =
+        pipeline.restrict_owner_geometry_query_count();
+    result.solve = run_dirichlet_normal_case(
+        grid, grid_pair, pipeline, transform, gmres_max_iterations,
+        restrict_mode);
+    const auto after = pipeline.restrict_owner_preprocess_diagnostics();
+    result.geometry_queries_after_gmres =
+        pipeline.restrict_owner_geometry_query_count();
+    if (restrict_owner_preprocess_diagnostics_equal(before, after) == false)
+        throw std::logic_error("GMRES changed owner preprocessing diagnostics");
+    return result;
+}
+
+void append_owner_path_rows_3d(
+    OwnerPreprocessStudyRows3D& rows,
+    OwnerPreprocessStudyCase3D study_case,
+    int N,
+    double h,
+    OwnerMode3D mode,
+    app3d::RestrictOwnerPreprocessDiagnostics3D diagnostics)
+{
+    const std::string mode_name =
+        app3d::restrict_owner_preprocess_mode_name_3d(mode);
+    for (std::size_t index = 0;
+         index not_eq diagnostics.path_counts.size(); index += 1) {
+        PreprocessPathCountRow3D row;
+        row.case_id = study_case.case_id;
+        row.geometry = study_case.geometry;
+        row.pose = study_case.pose;
+        row.mode = mode_name;
+        row.N = N;
+        row.h = h;
+        row.path = owner_path_name_3d(static_cast<OwnerPath3D>(index));
+        row.count = diagnostics.path_counts[index];
+        row.fraction = diagnostics.wrong_side_queries == 0 ? 0.0
+            : static_cast<double>(row.count)
+              / static_cast<double>(diagnostics.wrong_side_queries);
+        row.diagnostics = diagnostics;
+        rows.paths.push_back(std::move(row));
+    }
+    for (std::size_t index = 1;
+         index not_eq diagnostics.fallback_counts.size(); index += 1) {
+        PreprocessPathCountRow3D row;
+        row.case_id = study_case.case_id;
+        row.geometry = study_case.geometry;
+        row.pose = study_case.pose;
+        row.mode = mode_name;
+        row.N = N;
+        row.h = h;
+        row.path = "full_intersection_fallback:"
+            + owner_fallback_name_3d(static_cast<OwnerFallback3D>(index));
+        row.count = diagnostics.fallback_counts[index];
+        row.fraction = diagnostics.wrong_side_queries == 0 ? 0.0
+            : static_cast<double>(row.count)
+              / static_cast<double>(diagnostics.wrong_side_queries);
+        row.diagnostics = diagnostics;
+        rows.paths.push_back(std::move(row));
+    }
+}
+
+void append_owner_summary_row_3d(
+    OwnerPreprocessStudyRows3D& rows,
+    OwnerPreprocessStudyCase3D study_case,
+    int N,
+    double h,
+    OwnerMode3D mode,
+    bool accepted,
+    double full_total_median)
+{
+    const std::string mode_name =
+        app3d::restrict_owner_preprocess_mode_name_3d(mode);
+    std::vector<double> construction, query, total, throughput;
+    std::uint64_t queries = 0, peak = 0;
+    for (const auto& timing : rows.timing) {
+        if (timing.case_id == study_case.case_id
+            and timing.N == N and timing.mode == mode_name) {
+            construction.push_back(timing.construction_seconds);
+            query.push_back(timing.query_seconds);
+            total.push_back(timing.total_preprocess_seconds);
+            throughput.push_back(timing.queries_per_second);
+            queries = timing.wrong_side_queries;
+            peak = std::max(peak, timing.peak_working_set_bytes);
+        }
+    }
+    if (total.empty())
+        throw std::logic_error("missing owner timing rows");
+    PreprocessSummaryRow3D row;
+    row.case_id = study_case.case_id;
+    row.geometry = study_case.geometry;
+    row.pose = study_case.pose;
+    row.mode = mode_name;
+    row.N = N;
+    row.h = h;
+    row.repetitions = static_cast<int>(total.size());
+    row.wrong_side_queries = queries;
+    row.construction_seconds_median = sorted_median_3d(construction);
+    row.query_seconds_median = sorted_median_3d(query);
+    row.query_seconds_p95 = sorted_nearest_rank_p95_3d(query);
+    row.total_seconds_median = sorted_median_3d(total);
+    row.total_seconds_p95 = sorted_nearest_rank_p95_3d(total);
+    row.queries_per_second_median = sorted_median_3d(throughput);
+    row.speedup_vs_full = full_total_median / row.total_seconds_median;
+    row.peak_working_set_bytes_max = peak;
+    row.accepted = accepted;
+    rows.summary.push_back(std::move(row));
+}
+
+void append_owner_timing_row_3d(
+    OwnerPreprocessStudyRows3D& rows,
+    OwnerPreprocessStudyCase3D study_case,
+    int N,
+    OwnerMode3D mode,
+    int repetition,
+    int run_order,
+    std::uint64_t queries,
+    double construction_seconds,
+    double query_seconds,
+    std::uint64_t peak_bytes,
+    std::uint64_t max_active_increase_bytes)
+{
+    PreprocessTimingRepeatRow3D row;
+    row.case_id = study_case.case_id;
+    row.geometry = study_case.geometry;
+    row.pose = study_case.pose;
+    row.mode = app3d::restrict_owner_preprocess_mode_name_3d(mode);
+    row.N = N;
+    row.h = kBoxSide / static_cast<double>(N);
+    row.repetition = repetition;
+    row.run_order = run_order;
+    row.wrong_side_queries = queries;
+    row.construction_seconds = construction_seconds;
+    row.query_seconds = query_seconds;
+    row.total_preprocess_seconds = construction_seconds + query_seconds;
+    row.queries_per_second = query_seconds > 0.0
+        ? static_cast<double>(queries) / query_seconds : 0.0;
+    row.peak_working_set_bytes = peak_bytes;
+    row.working_set_increase_bytes =
+        max_active_increase_bytes;
+    rows.timing.push_back(std::move(row));
+}
+
+KfbiNumericalResultRow3D make_owner_numerical_row_3d(
+    OwnerPreprocessStudyCase3D study_case,
+    int N,
+    OwnerMode3D mode,
+    const CartesianGrid3D& grid,
+    const GridPair3D& grid_pair,
+    const PanelCenterHarmonicJetKFBI3D& pipeline,
+    double preprocess_seconds,
+    double pipeline_setup_seconds,
+    double full_pipeline_setup_seconds,
+    int gmres_max_iterations)
+{
+    const OwnerNumericalEvaluation3D evaluated =
+        evaluate_owner_pipeline_numerics_3d(
+            grid, grid_pair, pipeline, study_case.transform,
+            gmres_max_iterations);
+    KfbiNumericalResultRow3D row;
+    row.case_id = study_case.case_id;
+    row.geometry = study_case.geometry;
+    row.pose = study_case.pose;
+    row.mode = app3d::restrict_owner_preprocess_mode_name_3d(mode);
+    row.N = N;
+    row.h = grid.spacing()[0];
+    row.dofs = pipeline.surface_size();
+    row.preprocess_seconds = preprocess_seconds;
+    row.pipeline_setup_seconds = pipeline_setup_seconds;
+    row.pipeline_speedup_vs_full =
+        full_pipeline_setup_seconds / pipeline_setup_seconds;
+    row.solve = evaluated.solve;
+    row.exact_grid_linf = evaluated.exact_grid_linf;
+    row.exact_equation_linf = evaluated.exact_equation_linf;
+    row.geometry_queries_before_gmres =
+        evaluated.geometry_queries_before_gmres;
+    row.geometry_queries_after_gmres =
+        evaluated.geometry_queries_after_gmres;
+    row.pass = row.solve.converged
+        and row.solve.gmres_relative_residual <= 2.0e-10
+        and row.geometry_queries_before_gmres
+            == row.geometry_queries_after_gmres;
+    return row;
+}
+
+void assign_owner_interior_order_3d(
+    KfbiNumericalResultRow3D& row,
+    const std::vector<KfbiNumericalResultRow3D>& previous_rows)
+{
+    const KfbiNumericalResultRow3D* previous = nullptr;
+    for (const auto& candidate : previous_rows) {
+        if (candidate.case_id == row.case_id and candidate.mode == row.mode
+            and candidate.N < row.N
+            and (previous == nullptr or candidate.N > previous->N)) {
+            previous = std::addressof(candidate);
+        }
+    }
+    if (previous != nullptr) {
+        row.interior_order = observed_order(
+            previous->solve.interior_linf, row.solve.interior_linf,
+            previous->h, row.h);
+    }
+}
+
+bool run_owner_preprocess_case_3d(
+    OwnerPreprocessStudyCase3D study_case,
+    int N,
+    int gmres_max_iterations,
+    OwnerPreprocessStudyRows3D& rows)
+{
+    const double h = kBoxSide / static_cast<double>(N);
+    CartesianGrid3D grid({kBoxMin, kBoxMin, kBoxMin},
+                         {h, h, h}, {N, N, N}, DofLayout3D::Node);
+    GeometryBundle geometry = make_geometry(
+        study_case.kind, h, study_case.transform);
+    const auto domain = std::make_shared<const
+        geometry3d::NurbsCartesianDomain3D>(
+            grid, geometry.native_surface.geometry_model());
+    const SurfaceDofCloud surface_dofs =
+        app3d::make_native_surface_dofs_3d(geometry.native_surface, h);
+    validate_surface_dofs(surface_dofs, h);
+    const CauchyStencilSet cauchy_stencils = build_cauchy_stencils(
+        geometry.native_surface, surface_dofs, h,
+        kCauchyValueNeighborCount, kCauchyDerivativeNeighborCount,
+        CauchyStencilPolicy3D::G1Nearest);
+    GridPair3D grid_pair(grid, geometry.correction_interface,
+                         geometry.crossing_interface, domain);
+    for (int node = 0; node < grid.num_dofs(); node += 1) {
+        const bool numerical_inside = grid_pair.domain_label(node) > 0;
+        if (numerical_inside
+            not_eq geometry.exact_inside(grid_point(grid, node))) {
+            throw std::runtime_error("owner study native NURBS label mismatch");
+        }
+    }
+
+    RestrictOwnerWorkload3D workload;
+    RestrictOwnerPipelinePreprocessTiming3D full_preprocess_timing;
+    const auto full_pipeline_start = std::chrono::steady_clock::now();
+    PanelCenterHarmonicJetKFBI3D full_pipeline(
+        grid, grid_pair, geometry.native_surface,
+        geometry.correction_triangles, geometry.geometry_triangles,
+        surface_dofs, cauchy_stencils, false,
+        OwnerMode3D::FullIntersectionReference, nullptr, &workload,
+        &full_preprocess_timing);
+    const double full_pipeline_wall_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - full_pipeline_start).count();
+    const double full_pipeline_seconds =
+        production_pipeline_setup_seconds_3d(
+            full_pipeline_wall_seconds, full_preprocess_timing);
+    const auto full_diagnostics =
+        full_pipeline.restrict_owner_preprocess_diagnostics();
+    if (workload.empty())
+        throw std::logic_error("owner study captured an empty workload");
+    const std::uint64_t expected_queries =
+        restrict_owner_oracle_query_count_3d(workload);
+    validate_restrict_owner_preprocess_diagnostics(
+        full_diagnostics, expected_queries);
+    if (full_pipeline.restrict_owner_geometry_query_count()
+        != expected_queries) {
+        throw std::logic_error(
+            "full pipeline geometry query count mismatch");
+    }
+    append_owner_timing_row_3d(
+        rows, study_case, N, OwnerMode3D::FullIntersectionReference,
+        0, 0, full_diagnostics.wrong_side_queries,
+        full_preprocess_timing.construction_seconds,
+        full_preprocess_timing.query_seconds,
+        full_preprocess_timing.peak_working_set_bytes,
+        full_preprocess_timing.max_active_increase_bytes);
+    const std::array<OwnerMode3D, 2> candidates{{
+        OwnerMode3D::OptimizedIntersection,
+        OwnerMode3D::RegionClosestHybrid}};
+    std::array<std::uint64_t, 2> candidate_output_digests{};
+    for (std::size_t index = 0; index < candidates.size(); ++index) {
+        const RestrictOwnerReplayResult3D warmup =
+            replay_restrict_owner_workload_3d(
+            grid, grid_pair, geometry.native_surface, surface_dofs,
+            workload, candidates[index], {}, false);
+        candidate_output_digests[index] = warmup.output_digest;
+    }
+    const int repetitions = owner_candidate_repetitions_3d(N);
+    for (int repetition = 0; repetition < repetitions; repetition += 1) {
+        std::array<OwnerMode3D, 2> order = candidates;
+        if (repetition % 2 == 1)
+            std::reverse(order.begin(), order.end());
+        for (int position = 0; position < 2; position += 1) {
+            const OwnerMode3D mode = order[static_cast<std::size_t>(position)];
+            const RestrictOwnerReplayResult3D replay =
+                replay_restrict_owner_workload_3d(
+                    grid, grid_pair, geometry.native_surface, surface_dofs,
+                    workload, mode, {}, true);
+            const std::size_t mode_index = mode == candidates[0] ? 0 : 1;
+            if (replay.output_digest
+                != candidate_output_digests[mode_index]) {
+                throw std::logic_error(
+                    "candidate timed replay output is nondeterministic");
+            }
+            append_owner_timing_row_3d(
+                rows, study_case, N, mode, repetition,
+                repetition * 2 + position + 1,
+                replay.diagnostics.wrong_side_queries,
+                replay.construction_seconds, replay.query_seconds,
+                replay.peak_working_set_bytes,
+                replay.max_active_increase_bytes);
+        }
+    }
+    std::array<bool, 2> candidate_pass{{false, false}};
+    std::array<std::size_t, 2> accuracy_row_indices{};
+    for (std::size_t index = 0; index not_eq candidates.size(); index += 1) {
+        app3d::RestrictOwnerPreprocessOptions3D instrumented_options;
+        instrumented_options.collect_stage_timings = true;
+        RestrictOwnerReplayResult3D replay =
+            replay_restrict_owner_workload_3d(
+                grid, grid_pair, geometry.native_surface, surface_dofs,
+                workload, candidates[index], instrumented_options, false,
+                std::addressof(study_case), N);
+        if (!replay.comparison.has_value())
+            throw std::logic_error("instrumented replay omitted accuracy");
+        if (replay.output_digest != candidate_output_digests[index])
+            throw std::logic_error(
+                "candidate instrumented replay output is nondeterministic");
+        RestrictOwnerAccuracyComparison3D comparison =
+            std::move(replay.comparison.value());
+        candidate_pass[index] = comparison.accuracy.pass;
+        accuracy_row_indices[index] = rows.accuracy.size();
+        rows.accuracy.push_back(std::move(comparison.accuracy));
+        rows.mismatches.insert(
+            rows.mismatches.end(),
+            std::make_move_iterator(comparison.mismatches.begin()),
+            std::make_move_iterator(comparison.mismatches.end()));
+        append_owner_path_rows_3d(
+            rows, study_case, N, h, candidates[index], replay.diagnostics);
+    }
+    append_owner_path_rows_3d(
+        rows, study_case, N, h, OwnerMode3D::FullIntersectionReference,
+        full_diagnostics);
+    const double full_total = full_preprocess_timing.construction_seconds
+                            + full_preprocess_timing.query_seconds;
+    const bool numerical_gate_required = N >= 32;
+    const std::size_t full_summary_row_index = rows.summary.size();
+    append_owner_summary_row_3d(
+        rows, study_case, N, h, OwnerMode3D::FullIntersectionReference,
+        !numerical_gate_required, full_total);
+    std::array<std::size_t, 2> candidate_summary_row_indices{};
+    for (std::size_t index = 0; index not_eq candidates.size(); index += 1) {
+        candidate_summary_row_indices[index] = rows.summary.size();
+        append_owner_summary_row_3d(
+            rows, study_case, N, h, candidates[index],
+            !numerical_gate_required && candidate_pass[index], full_total);
+    }
+    const bool all_candidates_pass = candidate_pass[0] and candidate_pass[1];
+    if (N < 32 or all_candidates_pass == false)
+        return all_candidates_pass;
+    RestrictOwnerWorkload3D{}.swap(workload);
+    KfbiNumericalResultRow3D full_numerical = make_owner_numerical_row_3d(
+        study_case, N, OwnerMode3D::FullIntersectionReference,
+        grid, grid_pair, full_pipeline, full_total, full_pipeline_seconds,
+        full_pipeline_seconds, gmres_max_iterations);
+    assign_owner_interior_order_3d(full_numerical, rows.numerical);
+    const KfbiNumericalResultRow3D full_reference_numerical = full_numerical;
+    rows.numerical.push_back(std::move(full_numerical));
+    rows.summary[full_summary_row_index].accepted =
+        full_reference_numerical.pass;
+    bool numerical_pass = full_reference_numerical.pass;
+    const double correction_tolerance =
+        64.0 * std::numeric_limits<double>::epsilon()
+        * std::max(1.0, full_pipeline.restrict_owner_correction_linf());
+    for (std::size_t index = 0; index not_eq candidates.size(); index += 1) {
+        RestrictOwnerPipelinePreprocessTiming3D candidate_preprocess_timing;
+        const auto pipeline_start = std::chrono::steady_clock::now();
+        PanelCenterHarmonicJetKFBI3D candidate_pipeline(
+            grid, grid_pair, geometry.native_surface,
+            geometry.correction_triangles, geometry.geometry_triangles,
+            surface_dofs, cauchy_stencils, false, candidates[index], nullptr,
+            nullptr, &candidate_preprocess_timing);
+        const double pipeline_wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - pipeline_start).count();
+        const double pipeline_seconds =
+            production_pipeline_setup_seconds_3d(
+                pipeline_wall_seconds, candidate_preprocess_timing);
+        if (candidate_preprocess_timing.output_digest
+            != candidate_output_digests[index]) {
+            throw std::logic_error(
+                "candidate pipeline output is nondeterministic");
+        }
+        if (candidate_pipeline.restrict_owner_workload_fingerprint()
+            not_eq full_pipeline.restrict_owner_workload_fingerprint()) {
+            throw std::logic_error("owner pipeline workload fingerprint mismatch");
+        }
+        const double correction_difference =
+            full_pipeline.restrict_owner_correction_linf_difference(
+                candidate_pipeline);
+        PreprocessAccuracyRow3D& accuracy = rows.accuracy[
+            accuracy_row_indices[index]];
+        accuracy.max_owner_correction_abs_difference = correction_difference;
+        accuracy.pass = accuracy.pass
+            and correction_difference <= correction_tolerance;
+        const double preprocess_seconds =
+            candidate_preprocess_timing.construction_seconds
+            + candidate_preprocess_timing.query_seconds;
+        KfbiNumericalResultRow3D numerical = make_owner_numerical_row_3d(
+            study_case, N, candidates[index], grid, grid_pair,
+            candidate_pipeline, preprocess_seconds, pipeline_seconds,
+            full_pipeline_seconds, gmres_max_iterations);
+        assign_owner_interior_order_3d(numerical, rows.numerical);
+        numerical.interior_relative_difference_vs_full =
+            symmetric_relative_difference_3d(
+                numerical.solve.interior_linf,
+                full_reference_numerical.solve.interior_linf);
+        numerical.exact_grid_relative_difference_vs_full =
+            symmetric_relative_difference_3d(
+                numerical.exact_grid_linf,
+                full_reference_numerical.exact_grid_linf);
+        numerical.exact_equation_relative_difference_vs_full =
+            symmetric_relative_difference_3d(
+                numerical.exact_equation_linf,
+                full_reference_numerical.exact_equation_linf);
+        numerical.pass = numerical.pass and accuracy.pass
+            and numerical.solve.converged
+                == full_reference_numerical.solve.converged
+            and numerical.solve.iterations
+                == full_reference_numerical.solve.iterations
+            and numerical.interior_relative_difference_vs_full <= 1.0e-12
+            and numerical.exact_grid_relative_difference_vs_full <= 1.0e-12
+            and numerical.exact_equation_relative_difference_vs_full
+                <= 1.0e-12;
+        if (std::isfinite(numerical.interior_order)
+            and std::isfinite(full_reference_numerical.interior_order)) {
+            numerical.pass = numerical.pass
+                and numerical.interior_order + 1.0e-12
+                    >= full_reference_numerical.interior_order;
+        }
+        numerical_pass = numerical_pass and numerical.pass;
+        rows.summary[candidate_summary_row_indices[index]].accepted =
+            numerical.pass;
+        rows.numerical.push_back(std::move(numerical));
+    }
+    return numerical_pass;
+}
+
+std::string owner_preprocess_failure_mode_3d(
+    const OwnerPreprocessStudyRows3D& rows,
+    const OwnerPreprocessStudyCase3D& study_case,
+    int N)
+{
+    for (auto row = rows.numerical.rbegin(); row != rows.numerical.rend();
+         ++row) {
+        if (row->case_id == study_case.case_id && row->N == N
+            && !row->pass) {
+            return row->mode;
+        }
+    }
+    for (auto row = rows.accuracy.rbegin(); row != rows.accuracy.rend();
+         ++row) {
+        if (row->case_id == study_case.case_id && row->N == N
+            && !row->pass) {
+            return row->mode;
+        }
+    }
+    return "unknown";
+}
+
+int run_owner_preprocess_study_3d(std::vector<int> levels)
+{
+    std::sort(levels.begin(), levels.end());
+    levels.erase(std::unique(levels.begin(), levels.end()), levels.end());
+    for (int N : levels) {
+        if (N < 16 or is_power_of_two(N) == false)
+            throw std::invalid_argument(
+                "owner-preprocess-study N must be a power of two and at least 16");
+        if (N > 128)
+            throw std::invalid_argument(
+                "owner-preprocess-study supports levels through 128");
+    }
+    const bool requests_128 = std::binary_search(
+        levels.begin(), levels.end(), 128);
+    if (requests_128) {
+        const bool has_32 = std::binary_search(levels.begin(), levels.end(), 32);
+        const bool has_64 = std::binary_search(levels.begin(), levels.end(), 64);
+        if (has_32 == false or has_64 == false)
+            throw std::invalid_argument(
+                "N=128 requires selected N=32 and N=64 accuracy gates");
+    }
+#ifdef KFBIM_APP_OUTPUT_DIR
+    std::filesystem::path output_dir =
+        std::filesystem::path(KFBIM_APP_OUTPUT_DIR)
+        / "restrict_owner_preprocess_study";
+#else
+    std::filesystem::path output_dir =
+        "output/restrict_owner_preprocess_study";
+#endif
+    const char* output_override = std::getenv(
+        "KFBIM_3D_RESTRICT_OWNER_STUDY_OUTPUT_DIR");
+    if (output_override != nullptr)
+        output_dir = output_override;
+    OwnerPreprocessStudyRows3D rows;
+    write_owner_study_checkpoints_3d(output_dir, rows);
+    const auto cases = owner_study_cases_3d();
+    const int gmres_max_iterations = positive_environment_integer(
+        "KFBIM_3D_GMRES_MAX_ITERATIONS", 160);
+    bool smaller_accuracy_pass = true;
+    bool completed_smaller_level = false;
+    for (int N : levels) {
+        if (N == 128
+            and (completed_smaller_level == false
+                 or smaller_accuracy_pass == false)) {
+            std::cerr << "error: N=128 blocked by smaller accuracy gate" << '\n';
+            return 1;
+        }
+        for (const auto& study_case : cases) {
+            if (owner_case_selected_for_level_3d(study_case, N) == false)
+                continue;
+            std::cout << "[owner-preprocess-study] case="
+                      << study_case.case_id << " N=" << N << '\n';
+            const bool pass = run_owner_preprocess_case_3d(
+                study_case, N, gmres_max_iterations, rows);
+            write_owner_study_checkpoints_3d(output_dir, rows);
+            if (N < 128) {
+                completed_smaller_level = true;
+                smaller_accuracy_pass = smaller_accuracy_pass and pass;
+            }
+            if (pass == false) {
+                std::cerr << "error: owner preprocessing gate failed: case="
+                          << study_case.case_id << " mode="
+                          << owner_preprocess_failure_mode_3d(
+                                 rows, study_case, N)
+                          << " N=" << N << '\n';
+                return 1;
+            }
+        }
+    }
+    std::cout << "Owner preprocessing study output: "
+              << output_dir.string() << '\n';
+    return 0;
+}
+
+const char* exterior_value_restrict_route_name_3d(
+    ExteriorValueRestrictMode3D mode)
+{
+    switch (mode) {
+    case ExteriorValueRestrictMode3D::JointTricubicCauchy:
+        return "joint_tricubic_cauchy";
+    case ExteriorValueRestrictMode3D::JointTricubicCrossingOwner:
+        return "joint_tricubic_crossing_owner";
+    }
+    throw std::logic_error("unknown exterior value restrict mode");
+}
+
+bool bitwise_equal_vector_3d(
+    const Eigen::VectorXd& lhs,
+    const Eigen::VectorXd& rhs) noexcept
+{
+    return lhs.size() == rhs.size()
+        && (lhs.size() == 0
+            || std::memcmp(
+                   lhs.data(), rhs.data(),
+                   static_cast<std::size_t>(lhs.size())
+                       * sizeof(double)) == 0);
+}
+
+bool finite_neumann_owner_metrics_3d(const SolveMetrics3D& metrics)
+{
+    const std::array<double, 15> values{{
+        metrics.seconds,
+        metrics.gmres_relative_residual,
+        metrics.operator_residual_linf,
+        metrics.exterior_condition_linf,
+        metrics.boundary_residual_linf,
+        metrics.route_mismatch_linf,
+        metrics.density_linf,
+        metrics.density_l2,
+        metrics.interior_linf,
+        metrics.interior_l2,
+        metrics.exterior_bulk_linf,
+        metrics.exterior_bulk_l2,
+        metrics.data_weighted_mean,
+        metrics.density_weighted_mean,
+        metrics.constant_shift}};
+    return std::all_of(
+        values.begin(), values.end(),
+        [](double value) { return std::isfinite(value); });
+}
+
+struct NeumannOwnerStudyRow3D {
+    app3d::LPrismRigidStudyCase3D study_case;
+    int N = 0;
+    double h = 0.0;
+    std::string mode;
+    int dofs = 0;
+    double setup_seconds = 0.0;
+    double pipeline_setup_seconds = 0.0;
+    double total_seconds = 0.0;
+    int label_mismatches = 0;
+    int unsafe_label_changing_edges = 0;
+    int gap_crossings = 0;
+    int endpoint_crossings = 0;
+    int triangle_fallback_crossings = 0;
+    SolveMetrics3D solve;
+    double interior_order = std::numeric_limits<double>::quiet_NaN();
+    std::vector<double> residual_history;
+    std::string preprocess_mode;
+    std::uint64_t workload_fingerprint = 0;
+    std::uint64_t output_digest = 0;
+    std::uint64_t wrong_side_queries = 0;
+    std::uint64_t geometry_queries_before_gmres = 0;
+    std::uint64_t geometry_queries_after_gmres = 0;
+    bool diagnostics_unchanged = false;
+    bool default_route_bitwise_equal = false;
+    bool probe_invariants_pass = false;
+    bool pass = false;
+};
+
+void assign_neumann_owner_order_3d(
+    NeumannOwnerStudyRow3D& row,
+    const std::vector<NeumannOwnerStudyRow3D>& previous_rows)
+{
+    const NeumannOwnerStudyRow3D* previous = nullptr;
+    for (const NeumannOwnerStudyRow3D& candidate : previous_rows) {
+        if (candidate.study_case.id == row.study_case.id
+            && candidate.mode == row.mode
+            && candidate.N < row.N
+            && (previous == nullptr || candidate.N > previous->N)) {
+            previous = std::addressof(candidate);
+        }
+    }
+    if (previous != nullptr) {
+        row.interior_order = observed_order(
+            previous->solve.interior_linf,
+            row.solve.interior_linf,
+            previous->h,
+            row.h);
+    }
+}
+
+void write_neumann_owner_study_checkpoints_3d(
+    const std::filesystem::path& output_dir,
+    const std::vector<NeumannOwnerStudyRow3D>& rows)
+{
+    std::filesystem::create_directories(output_dir);
+    std::ofstream summary = open_output_file(output_dir / "summary.csv");
+    summary << std::setprecision(17)
+        << "N,h,mode,dofs,pipeline_setup_seconds,solve_seconds,"
+           "converged,iterations,final_residual,operator_residual_linf,"
+           "exterior_condition_linf,route_mismatch_linf,density_linf,"
+           "density_l2,interior_linf,interior_l2,interior_order,"
+           "geometry_queries_before_gmres,"
+           "geometry_queries_after_gmres,pass\n";
+    for (const NeumannOwnerStudyRow3D& row : rows) {
+        summary << row.N << ',' << row.h << ',' << row.mode << ','
+                << row.dofs << ',' << row.pipeline_setup_seconds << ','
+                << row.solve.seconds << ',' << row.solve.converged << ','
+                << row.solve.iterations << ','
+                << row.solve.gmres_relative_residual << ','
+                << row.solve.operator_residual_linf << ','
+                << row.solve.exterior_condition_linf << ','
+                << row.solve.route_mismatch_linf << ','
+                << row.solve.density_linf << ',' << row.solve.density_l2
+                << ',' << row.solve.interior_linf << ','
+                << row.solve.interior_l2 << ',' << row.interior_order << ','
+                << row.geometry_queries_before_gmres << ','
+                << row.geometry_queries_after_gmres << ',' << row.pass
+                << '\n';
+    }
+
+    std::ofstream residuals = open_output_file(
+        output_dir / "gmres_residuals.csv");
+    residuals << std::setprecision(17)
+              << "N,mode,iteration,residual\n";
+    for (const NeumannOwnerStudyRow3D& row : rows) {
+        for (std::size_t iteration = 0;
+             iteration < row.residual_history.size(); ++iteration) {
+            residuals << row.N << ',' << row.mode << ',' << iteration
+                      << ',' << row.residual_history[iteration] << '\n';
+        }
+    }
+
+    std::ofstream diagnostics = open_output_file(
+        output_dir / "owner_diagnostics.csv");
+    diagnostics << std::setprecision(17)
+        << "N,mode,preprocess_mode,workload_fingerprint,output_digest,"
+           "wrong_side_queries,geometry_queries_before_gmres,"
+           "geometry_queries_after_gmres,diagnostics_unchanged,"
+           "default_route_bitwise_equal\n";
+    for (const NeumannOwnerStudyRow3D& row : rows) {
+        diagnostics << row.N << ',' << row.mode << ','
+                    << row.preprocess_mode << ','
+                    << row.workload_fingerprint << ','
+                    << row.output_digest << ','
+                    << row.wrong_side_queries << ','
+                    << row.geometry_queries_before_gmres << ','
+                    << row.geometry_queries_after_gmres << ','
+                    << row.diagnostics_unchanged << ','
+                    << row.default_route_bitwise_equal << '\n';
+    }
+}
+
+int run_neumann_owner_study_3d(std::vector<int> levels)
+{
+    std::sort(levels.begin(), levels.end());
+    levels.erase(std::unique(levels.begin(), levels.end()), levels.end());
+    for (int N : levels) {
+        if (N < 32 || N > 128 || !is_power_of_two(N)) {
+            throw std::invalid_argument(
+                "neumann-owner-study N must be 32, 64, or 128");
+        }
+    }
+    if (std::binary_search(levels.begin(), levels.end(), 128)
+        && (!std::binary_search(levels.begin(), levels.end(), 32)
+            || !std::binary_search(levels.begin(), levels.end(), 64))) {
+        throw std::invalid_argument(
+            "neumann-owner-study N=128 requires selected N=32 and N=64");
+    }
+
+#ifdef KFBIM_APP_OUTPUT_DIR
+    std::filesystem::path output_dir =
+        std::filesystem::path(KFBIM_APP_OUTPUT_DIR)
+        / "neumann_value_trace_crossing_owner_3d";
+#else
+    std::filesystem::path output_dir =
+        "output/neumann_value_trace_crossing_owner_3d";
+#endif
+    const char* output_override = std::getenv(
+        "KFBIM_3D_NEUMANN_OWNER_STUDY_OUTPUT_DIR");
+    if (output_override != nullptr)
+        output_dir = output_override;
+
+    std::optional<OwnerPreprocessStudyCase3D> selected_case;
+    for (const OwnerPreprocessStudyCase3D& candidate
+         : owner_study_cases_3d()) {
+        if (candidate.case_id == "l_prism_rot_axis123_17deg") {
+            selected_case = candidate;
+            break;
+        }
+    }
+    if (!selected_case.has_value())
+        throw std::logic_error("missing rotated L-prism study case");
+
+    const app3d::LPrismRigidStudyCase3D rigid_case =
+        rigid_case_by_id_3d(
+            app3d::make_l_prism_rigid_study_cases_3d(),
+            selected_case->pose);
+    constexpr int gmres_max_iterations = 80;
+    constexpr double gmres_tolerance = 2.0e-10;
+    const std::array<ExteriorValueRestrictMode3D, 2> modes{{
+        ExteriorValueRestrictMode3D::JointTricubicCauchy,
+        ExteriorValueRestrictMode3D::JointTricubicCrossingOwner}};
+    std::vector<NeumannOwnerStudyRow3D> rows;
+    write_neumann_owner_study_checkpoints_3d(output_dir, rows);
+
+    for (int N : levels) {
+        const double h = kBoxSide / static_cast<double>(N);
+        std::cout << "[neumann-owner-study] N=" << N
+                  << " h=" << h << " setup\n";
+        CartesianGrid3D grid(
+            {kBoxMin, kBoxMin, kBoxMin},
+            {h, h, h},
+            {N, N, N},
+            DofLayout3D::Node);
+        GeometryBundle geometry = make_geometry(
+            GeometryKind::LPrism, h, selected_case->transform);
+        const auto domain = std::make_shared<const
+            geometry3d::NurbsCartesianDomain3D>(
+                grid, geometry.native_surface.geometry_model());
+        const SurfaceDofCloud surface_dofs =
+            app3d::make_native_surface_dofs_3d(
+                geometry.native_surface, h);
+        validate_surface_dofs(surface_dofs, h);
+        const CauchyStencilSet cauchy_stencils = build_cauchy_stencils(
+            geometry.native_surface,
+            surface_dofs,
+            h,
+            kCauchyValueNeighborCount,
+            kCauchyDerivativeNeighborCount,
+            CauchyStencilPolicy3D::G1Nearest);
+        GridPair3D grid_pair(
+            grid,
+            geometry.correction_interface,
+            geometry.crossing_interface,
+            domain);
+        for (int node = 0; node < grid.num_dofs(); ++node) {
+            const bool numerical_inside =
+                grid_pair.domain_label(node) > 0;
+            if (numerical_inside
+                != geometry.exact_inside(grid_point(grid, node))) {
+                throw std::runtime_error(
+                    "neumann owner study native NURBS label mismatch");
+            }
+        }
+
+        RestrictOwnerPipelinePreprocessTiming3D preprocess_timing;
+        const auto setup_start = std::chrono::steady_clock::now();
+        PanelCenterHarmonicJetKFBI3D pipeline(
+            grid,
+            grid_pair,
+            geometry.native_surface,
+            geometry.correction_triangles,
+            geometry.geometry_triangles,
+            surface_dofs,
+            cauchy_stencils,
+            false,
+            OwnerMode3D::RegionClosestHybrid,
+            nullptr,
+            nullptr,
+            &preprocess_timing);
+        const double setup_wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - setup_start).count();
+        const double pipeline_setup_seconds =
+            production_pipeline_setup_seconds_3d(
+                setup_wall_seconds, preprocess_timing);
+        const auto setup_diagnostics =
+            pipeline.restrict_owner_preprocess_diagnostics();
+        const std::uint64_t setup_queries = static_cast<std::uint64_t>(
+            pipeline.restrict_owner_geometry_query_count());
+        if (setup_queries != setup_diagnostics.wrong_side_queries) {
+            throw std::logic_error(
+                "Neumann owner pipeline query-count mismatch");
+        }
+
+        const int surface_size = pipeline.surface_size();
+        Eigen::VectorXd normal_data(surface_size);
+        for (int q = 0; q < surface_size; ++q) {
+            const SurfaceDof& dof =
+                pipeline.surface().dofs[static_cast<std::size_t>(q)];
+            normal_data[q] =
+                app3d::transformed_manufactured_harmonic_gradient_3d(
+                    selected_case->transform, dof.point).dot(dof.normal);
+        }
+        normal_data.array() -= surface_weighted_mean(
+            pipeline.surface(), normal_data);
+        const Eigen::VectorXd zero_value =
+            Eigen::VectorXd::Zero(surface_size);
+        const HarmonicJetField3D probe_field =
+            pipeline.field_from_grid_and_jumps(
+                Eigen::VectorXd::Zero(grid.num_dofs()),
+                zero_value,
+                normal_data);
+        const auto probe_before =
+            pipeline.restrict_owner_preprocess_diagnostics();
+        const Eigen::VectorXd default_probe = pipeline.exterior_trace(
+            probe_field, zero_value, normal_data);
+        const Eigen::VectorXd explicit_legacy_probe =
+            pipeline.exterior_trace(
+                probe_field,
+                zero_value,
+                normal_data,
+                ExteriorValueRestrictMode3D::JointTricubicCauchy);
+        const Eigen::VectorXd crossing_probe = pipeline.exterior_trace(
+            probe_field,
+            zero_value,
+            normal_data,
+            ExteriorValueRestrictMode3D::
+                JointTricubicCrossingOwner);
+        const auto probe_after =
+            pipeline.restrict_owner_preprocess_diagnostics();
+        const bool default_route_bitwise_equal =
+            bitwise_equal_vector_3d(
+                default_probe, explicit_legacy_probe);
+        const bool probe_invariants_pass =
+            default_route_bitwise_equal
+            && crossing_probe.allFinite()
+            && restrict_owner_preprocess_diagnostics_equal(
+                   probe_before, probe_after)
+            && static_cast<std::uint64_t>(
+                   pipeline.restrict_owner_geometry_query_count())
+                   == setup_queries;
+        if (!probe_invariants_pass) {
+            throw std::logic_error(
+                "Neumann value-trace route invariant failed");
+        }
+
+        bool level_pass = true;
+        for (ExteriorValueRestrictMode3D mode : modes) {
+            NeumannOwnerStudyRow3D row;
+            row.study_case = rigid_case;
+            row.N = N;
+            row.h = h;
+            row.mode = exterior_value_restrict_route_name_3d(mode);
+            row.dofs = surface_size;
+            row.pipeline_setup_seconds = pipeline_setup_seconds;
+            row.preprocess_mode =
+                app3d::restrict_owner_preprocess_mode_name_3d(
+                    OwnerMode3D::RegionClosestHybrid);
+            row.workload_fingerprint =
+                pipeline.restrict_owner_workload_fingerprint();
+            row.output_digest = preprocess_timing.output_digest;
+            row.wrong_side_queries =
+                setup_diagnostics.wrong_side_queries;
+            row.default_route_bitwise_equal =
+                default_route_bitwise_equal;
+            row.probe_invariants_pass = probe_invariants_pass;
+
+            const auto before =
+                pipeline.restrict_owner_preprocess_diagnostics();
+            row.geometry_queries_before_gmres =
+                static_cast<std::uint64_t>(
+                    pipeline.restrict_owner_geometry_query_count());
+            row.solve = run_neumann_case(
+                grid,
+                grid_pair,
+                pipeline,
+                selected_case->transform,
+                gmres_max_iterations,
+                mode,
+                app3d::NeumannEdgeCauchyMode3D::None,
+                &row.residual_history);
+            const auto after =
+                pipeline.restrict_owner_preprocess_diagnostics();
+            row.geometry_queries_after_gmres =
+                static_cast<std::uint64_t>(
+                    pipeline.restrict_owner_geometry_query_count());
+            row.diagnostics_unchanged =
+                restrict_owner_preprocess_diagnostics_equal(before, after);
+            assign_neumann_owner_order_3d(row, rows);
+            row.pass = probe_invariants_pass
+                && row.solve.converged
+                && row.solve.iterations <= gmres_max_iterations
+                && row.solve.gmres_relative_residual <= gmres_tolerance
+                && !row.residual_history.empty()
+                && std::all_of(
+                       row.residual_history.begin(),
+                       row.residual_history.end(),
+                       [](double value) {
+                           return std::isfinite(value) && value >= 0.0;
+                       })
+                && finite_neumann_owner_metrics_3d(row.solve)
+                && row.diagnostics_unchanged
+                && row.geometry_queries_before_gmres
+                    == row.geometry_queries_after_gmres;
+            level_pass = level_pass && row.pass;
+            std::cout
+                << "[neumann-owner-study] N=" << row.N
+                << " mode=" << row.mode
+                << " dofs=" << row.dofs
+                << " iter=" << row.solve.iterations
+                << " residual=" << row.solve.gmres_relative_residual
+                << " interior_linf=" << row.solve.interior_linf
+                << " density_linf=" << row.solve.density_linf
+                << " solve_s=" << row.solve.seconds
+                << " pass=" << row.pass << '\n';
+            rows.push_back(std::move(row));
+        }
+        write_neumann_owner_study_checkpoints_3d(output_dir, rows);
+        if (!level_pass) {
+            std::cerr
+                << "error: Neumann owner study gate failed at N="
+                << N << '\n';
+            return 1;
+        }
+    }
+
+    std::cout << "Neumann owner study output: "
+              << output_dir.string() << '\n';
+    return 0;
+}
+
+struct NeumannRigidGeometryDiagnostics3D {
+    int unsafe_label_changing_edges = 0;
+    int gap_crossings = 0;
+    int endpoint_crossings = 0;
+    int triangle_fallback_crossings = 0;
+};
+
+NeumannRigidGeometryDiagnostics3D
+neumann_rigid_geometry_diagnostics_3d(
+    const GridPair3D& grid_pair,
+    const LaplaceCorrectionSupport3D& support)
+{
+    NeumannRigidGeometryDiagnostics3D result;
+    result.unsafe_label_changing_edges =
+        grid_pair.nurbs_domain_diagnostics()
+            .unsafe_label_changing_edge_count;
+    std::set<std::pair<int, int>> crossing_edges;
+    for (const LaplaceCrossingCorrectionOp& op : support.crossing_ops) {
+        const std::pair<int, int> edge{
+            std::min(op.rhs_node, op.correction_node),
+            std::max(op.rhs_node, op.correction_node)};
+        if (!crossing_edges.insert(edge).second)
+            continue;
+        const P2CrossingOwner3D owner =
+            grid_pair.p2_crossing_owner_between(edge.first, edge.second);
+        if (owner.status == P2CrossingOwnerStatus3D::GapFallback)
+            ++result.gap_crossings;
+        else if (owner.status !=
+                 P2CrossingOwnerStatus3D::ExactIntersection)
+            ++result.endpoint_crossings;
+        if (owner.nurbs_patch_index < 0)
+            ++result.triangle_fallback_crossings;
+    }
+    return result;
+}
+
+bool neumann_rigid_geometry_pass_3d(
+    const NeumannOwnerStudyRow3D& row)
+{
+    return row.label_mismatches == 0
+        && row.unsafe_label_changing_edges == 0
+        && row.gap_crossings == 0
+        && row.endpoint_crossings == 0
+        && row.triangle_fallback_crossings == 0;
+}
+
+bool neumann_rigid_owner_invariants_pass_3d(
+    const NeumannOwnerStudyRow3D& row)
+{
+    return row.probe_invariants_pass
+        && row.default_route_bitwise_equal
+        && row.diagnostics_unchanged
+        && row.geometry_queries_before_gmres
+            == row.geometry_queries_after_gmres;
+}
+
+NeumannOwnerStudyRow3D run_neumann_rigid_pose_3d(
+    int N,
+    const app3d::LPrismRigidStudyCase3D& study_case)
+{
+    constexpr int gmres_max_iterations = 80;
+    constexpr double gmres_tolerance = 2.0e-10;
+    constexpr ExteriorValueRestrictMode3D mode =
+        ExteriorValueRestrictMode3D::JointTricubicCrossingOwner;
+    const auto case_start = std::chrono::steady_clock::now();
+    const double h = kBoxSide / static_cast<double>(N);
+    CartesianGrid3D grid(
+        {kBoxMin, kBoxMin, kBoxMin},
+        {h, h, h},
+        {N, N, N},
+        DofLayout3D::Node);
+    GeometryBundle geometry = make_geometry(
+        GeometryKind::LPrism, h, study_case.transform);
+    const auto domain = std::make_shared<const
+        geometry3d::NurbsCartesianDomain3D>(
+            grid, geometry.native_surface.geometry_model());
+    const SurfaceDofCloud surface_dofs =
+        app3d::make_native_surface_dofs_3d(
+            geometry.native_surface, h);
+    validate_surface_dofs(surface_dofs, h);
+    const CauchyStencilSet cauchy_stencils = build_cauchy_stencils(
+        geometry.native_surface,
+        surface_dofs,
+        h,
+        kCauchyValueNeighborCount,
+        kCauchyDerivativeNeighborCount,
+        CauchyStencilPolicy3D::G1Nearest);
+    GridPair3D grid_pair(
+        grid,
+        geometry.correction_interface,
+        geometry.crossing_interface,
+        domain);
+    int label_mismatches = 0;
+    for (int node = 0; node < grid.num_dofs(); ++node) {
+        const bool numerical_inside =
+            grid_pair.domain_label(node) > 0;
+        if (numerical_inside
+            != geometry.exact_inside(grid_point(grid, node))) {
+            ++label_mismatches;
+        }
+    }
+    if (label_mismatches != 0) {
+        throw std::runtime_error(
+            "Neumann rigid study native NURBS label mismatch: case="
+            + study_case.id + " N=" + std::to_string(N));
+    }
+
+    RestrictOwnerPipelinePreprocessTiming3D preprocess_timing;
+    const auto pipeline_start = std::chrono::steady_clock::now();
+    PanelCenterHarmonicJetKFBI3D pipeline(
+        grid,
+        grid_pair,
+        geometry.native_surface,
+        geometry.correction_triangles,
+        geometry.geometry_triangles,
+        surface_dofs,
+        cauchy_stencils,
+        false,
+        OwnerMode3D::RegionClosestHybrid,
+        nullptr,
+        nullptr,
+        &preprocess_timing);
+    const double setup_wall_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - pipeline_start).count();
+    const double pipeline_setup_seconds =
+        production_pipeline_setup_seconds_3d(
+            setup_wall_seconds, preprocess_timing);
+    const auto setup_diagnostics =
+        pipeline.restrict_owner_preprocess_diagnostics();
+    const std::uint64_t setup_queries = static_cast<std::uint64_t>(
+        pipeline.restrict_owner_geometry_query_count());
+    if (setup_queries != setup_diagnostics.wrong_side_queries) {
+        throw std::logic_error(
+            "Neumann rigid pipeline query-count mismatch");
+    }
+    const NeumannRigidGeometryDiagnostics3D geometry_diagnostics =
+        neumann_rigid_geometry_diagnostics_3d(
+            grid_pair, pipeline.correction_support());
+
+    const int surface_size = pipeline.surface_size();
+    Eigen::VectorXd normal_data(surface_size);
+    for (int q = 0; q < surface_size; ++q) {
+        const SurfaceDof& dof =
+            pipeline.surface().dofs[static_cast<std::size_t>(q)];
+        normal_data[q] =
+            app3d::transformed_manufactured_harmonic_gradient_3d(
+                study_case.transform, dof.point).dot(dof.normal);
+    }
+    normal_data.array() -= surface_weighted_mean(
+        pipeline.surface(), normal_data);
+    const Eigen::VectorXd zero_value =
+        Eigen::VectorXd::Zero(surface_size);
+    const HarmonicJetField3D probe_field =
+        pipeline.field_from_grid_and_jumps(
+            Eigen::VectorXd::Zero(grid.num_dofs()),
+            zero_value,
+            normal_data);
+    const auto probe_before =
+        pipeline.restrict_owner_preprocess_diagnostics();
+    const Eigen::VectorXd default_probe = pipeline.exterior_trace(
+        probe_field, zero_value, normal_data);
+    const Eigen::VectorXd explicit_legacy_probe =
+        pipeline.exterior_trace(
+            probe_field,
+            zero_value,
+            normal_data,
+            ExteriorValueRestrictMode3D::JointTricubicCauchy);
+    const Eigen::VectorXd crossing_probe = pipeline.exterior_trace(
+        probe_field, zero_value, normal_data, mode);
+    const auto probe_after =
+        pipeline.restrict_owner_preprocess_diagnostics();
+    const bool default_route_bitwise_equal =
+        bitwise_equal_vector_3d(default_probe, explicit_legacy_probe);
+    const bool probe_invariants_pass =
+        default_route_bitwise_equal
+        && crossing_probe.allFinite()
+        && restrict_owner_preprocess_diagnostics_equal(
+               probe_before, probe_after)
+        && static_cast<std::uint64_t>(
+               pipeline.restrict_owner_geometry_query_count())
+               == setup_queries;
+
+    NeumannOwnerStudyRow3D row;
+    row.study_case = study_case;
+    row.N = N;
+    row.h = h;
+    row.mode = exterior_value_restrict_route_name_3d(mode);
+    row.dofs = surface_size;
+    row.pipeline_setup_seconds = pipeline_setup_seconds;
+    row.preprocess_mode =
+        app3d::restrict_owner_preprocess_mode_name_3d(
+            OwnerMode3D::RegionClosestHybrid);
+    row.workload_fingerprint =
+        pipeline.restrict_owner_workload_fingerprint();
+    row.output_digest = preprocess_timing.output_digest;
+    row.wrong_side_queries =
+        setup_diagnostics.wrong_side_queries;
+    row.label_mismatches = label_mismatches;
+    row.unsafe_label_changing_edges =
+        geometry_diagnostics.unsafe_label_changing_edges;
+    row.gap_crossings = geometry_diagnostics.gap_crossings;
+    row.endpoint_crossings =
+        geometry_diagnostics.endpoint_crossings;
+    row.triangle_fallback_crossings =
+        geometry_diagnostics.triangle_fallback_crossings;
+    row.default_route_bitwise_equal =
+        default_route_bitwise_equal;
+    row.probe_invariants_pass = probe_invariants_pass;
+    row.setup_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - case_start).count();
+
+    const auto before =
+        pipeline.restrict_owner_preprocess_diagnostics();
+    row.geometry_queries_before_gmres =
+        static_cast<std::uint64_t>(
+            pipeline.restrict_owner_geometry_query_count());
+    row.solve = run_neumann_case(
+        grid,
+        grid_pair,
+        pipeline,
+        study_case.transform,
+        gmres_max_iterations,
+        mode,
+        app3d::NeumannEdgeCauchyMode3D::None,
+        &row.residual_history);
+    const auto after =
+        pipeline.restrict_owner_preprocess_diagnostics();
+    row.geometry_queries_after_gmres =
+        static_cast<std::uint64_t>(
+            pipeline.restrict_owner_geometry_query_count());
+    row.diagnostics_unchanged =
+        restrict_owner_preprocess_diagnostics_equal(before, after);
+    row.total_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - case_start).count();
+    row.pass = row.probe_invariants_pass
+        && neumann_rigid_geometry_pass_3d(row)
+        && row.solve.converged
+        && row.solve.iterations <= gmres_max_iterations
+        && row.solve.gmres_relative_residual <= gmres_tolerance
+        && !row.residual_history.empty()
+        && std::all_of(
+               row.residual_history.begin(),
+               row.residual_history.end(),
+               [](double value) {
+                   return std::isfinite(value) && value >= 0.0;
+               })
+        && finite_neumann_owner_metrics_3d(row.solve)
+        && neumann_rigid_owner_invariants_pass_3d(row)
+        && std::isfinite(row.setup_seconds)
+        && std::isfinite(row.pipeline_setup_seconds)
+        && std::isfinite(row.total_seconds);
+    return row;
+}
+
+std::vector<app3d::NeumannRigidStudyMeasurement3D>
+neumann_rigid_measurements_3d(
+    const std::vector<NeumannOwnerStudyRow3D>& rows)
+{
+    std::vector<app3d::NeumannRigidStudyMeasurement3D> result;
+    result.reserve(rows.size());
+    for (const NeumannOwnerStudyRow3D& row : rows) {
+        app3d::NeumannRigidStudyMeasurement3D measurement;
+        measurement.case_id = row.study_case.id;
+        measurement.N = row.N;
+        measurement.h = row.h;
+        measurement.finite_metrics =
+            finite_neumann_owner_metrics_3d(row.solve)
+            && std::isfinite(row.setup_seconds)
+            && std::isfinite(row.pipeline_setup_seconds)
+            && std::isfinite(row.total_seconds);
+        measurement.gmres_converged = row.solve.converged;
+        measurement.gmres_iterations = row.solve.iterations;
+        measurement.gmres_relative_residual =
+            row.solve.gmres_relative_residual;
+        measurement.interior_linf = row.solve.interior_linf;
+        measurement.geometry_diagnostics_pass =
+            neumann_rigid_geometry_pass_3d(row);
+        measurement.owner_invariants_pass =
+            neumann_rigid_owner_invariants_pass_3d(row);
+        result.push_back(std::move(measurement));
+    }
+    return result;
+}
+
+const app3d::NeumannRigidStudyDerivedRow3D*
+find_neumann_rigid_derived_row_3d(
+    const app3d::NeumannRigidStudyEvaluation3D& evaluation,
+    const NeumannOwnerStudyRow3D& raw)
+{
+    const auto found = std::find_if(
+        evaluation.rows.begin(),
+        evaluation.rows.end(),
+        [&](const app3d::NeumannRigidStudyDerivedRow3D& row) {
+            return row.measurement.case_id == raw.study_case.id
+                && row.measurement.N == raw.N;
+        });
+    return found == evaluation.rows.end()
+        ? nullptr : std::addressof(*found);
+}
+
+void write_neumann_rigid_study_checkpoints_3d(
+    const std::filesystem::path& output_dir,
+    const std::vector<NeumannOwnerStudyRow3D>& rows,
+    const app3d::NeumannRigidStudyEvaluation3D& evaluation)
+{
+    std::filesystem::create_directories(output_dir);
+    std::ofstream results = open_output_file(
+        output_dir / "rigid_transform_results.csv");
+    results << std::setprecision(17) << std::boolalpha
+        << "case_id,N,h,mode,preprocess_mode,dofs,setup_seconds,"
+           "pipeline_setup_seconds,solve_seconds,total_seconds,"
+           "rotation_axis_x,rotation_axis_y,rotation_axis_z,"
+           "rotation_angle_degrees,rotation_center_x,rotation_center_y,"
+           "rotation_center_z,translation_x,translation_y,translation_z,"
+           "rotation_00,rotation_01,rotation_02,rotation_10,rotation_11,"
+           "rotation_12,rotation_20,rotation_21,rotation_22,"
+           "converged,iterations,final_residual,operator_residual_linf,"
+           "exterior_condition_linf,route_mismatch_linf,density_linf,"
+           "density_l2,interior_linf,interior_l2,interior_order,"
+           "baseline_error_ratio,baseline_iteration_ratio,"
+           "label_mismatches,unsafe_label_changing_edges,gap_crossings,"
+           "endpoint_crossings,triangle_fallback_crossings,"
+           "geometry_queries_before_gmres,geometry_queries_after_gmres,"
+           "diagnostics_unchanged,default_route_bitwise_equal,"
+           "probe_invariants_pass,row_pass\n";
+    for (const NeumannOwnerStudyRow3D& row : rows) {
+        const auto* derived =
+            find_neumann_rigid_derived_row_3d(evaluation, row);
+        if (derived == nullptr)
+            throw std::logic_error("missing Neumann rigid derived row");
+        const auto& transform = row.study_case.transform;
+        const Eigen::Matrix3d& rotation = transform.rotation();
+        results << row.study_case.id << ',' << row.N << ',' << row.h
+                << ',' << row.mode << ',' << row.preprocess_mode
+                << ',' << row.dofs << ',' << row.setup_seconds
+                << ',' << row.pipeline_setup_seconds
+                << ',' << row.solve.seconds << ',' << row.total_seconds
+                << ',' << row.study_case.rotation_axis.x()
+                << ',' << row.study_case.rotation_axis.y()
+                << ',' << row.study_case.rotation_axis.z()
+                << ',' << row.study_case.rotation_angle_degrees
+                << ',' << transform.center().x()
+                << ',' << transform.center().y()
+                << ',' << transform.center().z()
+                << ',' << transform.translation().x()
+                << ',' << transform.translation().y()
+                << ',' << transform.translation().z();
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j)
+                results << ',' << rotation(i, j);
+        }
+        results << ',' << row.solve.converged
+                << ',' << row.solve.iterations
+                << ',' << row.solve.gmres_relative_residual
+                << ',' << row.solve.operator_residual_linf
+                << ',' << row.solve.exterior_condition_linf
+                << ',' << row.solve.route_mismatch_linf
+                << ',' << row.solve.density_linf
+                << ',' << row.solve.density_l2
+                << ',' << row.solve.interior_linf
+                << ',' << row.solve.interior_l2
+                << ',' << derived->interior_order
+                << ',' << derived->baseline_error_ratio
+                << ',' << derived->baseline_iteration_ratio
+                << ',' << row.label_mismatches
+                << ',' << row.unsafe_label_changing_edges
+                << ',' << row.gap_crossings
+                << ',' << row.endpoint_crossings
+                << ',' << row.triangle_fallback_crossings
+                << ',' << row.geometry_queries_before_gmres
+                << ',' << row.geometry_queries_after_gmres
+                << ',' << row.diagnostics_unchanged
+                << ',' << row.default_route_bitwise_equal
+                << ',' << row.probe_invariants_pass
+                << ',' << criterion_status_name(derived->row_pass)
+                << '\n';
+    }
+
+    std::ofstream residuals = open_output_file(
+        output_dir / "gmres_residuals.csv");
+    residuals << std::setprecision(17)
+              << "case_id,N,mode,iteration,residual\n";
+    for (const NeumannOwnerStudyRow3D& row : rows) {
+        for (std::size_t iteration = 0;
+             iteration < row.residual_history.size(); ++iteration) {
+            residuals << row.study_case.id << ',' << row.N << ','
+                      << row.mode << ',' << iteration << ','
+                      << row.residual_history[iteration] << '\n';
+        }
+    }
+
+    std::ofstream owners = open_output_file(
+        output_dir / "owner_diagnostics.csv");
+    owners << std::setprecision(17) << std::boolalpha
+        << "case_id,N,mode,preprocess_mode,workload_fingerprint,"
+           "output_digest,wrong_side_queries,"
+           "geometry_queries_before_gmres,"
+           "geometry_queries_after_gmres,diagnostics_unchanged,"
+           "default_route_bitwise_equal,probe_invariants_pass\n";
+    for (const NeumannOwnerStudyRow3D& row : rows) {
+        owners << row.study_case.id << ',' << row.N << ',' << row.mode
+               << ',' << row.preprocess_mode
+               << ',' << row.workload_fingerprint
+               << ',' << row.output_digest
+               << ',' << row.wrong_side_queries
+               << ',' << row.geometry_queries_before_gmres
+               << ',' << row.geometry_queries_after_gmres
+               << ',' << row.diagnostics_unchanged
+               << ',' << row.default_route_bitwise_equal
+               << ',' << row.probe_invariants_pass << '\n';
+    }
+
+    std::ofstream acceptance = open_output_file(
+        output_dir / "rigid_transform_acceptance.csv");
+    acceptance
+        << "case_id,completeness_pass,row_pass,gmres_pass,"
+           "monotone_error_pass,order_64_128_pass,baseline_ratio_pass,"
+           "geometry_diagnostics_pass,owner_invariants_pass,overall_pass\n";
+    for (const app3d::NeumannRigidStudyAcceptance3D& item
+         : evaluation.cases) {
+        acceptance << item.case_id
+                   << ',' << criterion_status_name(item.completeness_pass)
+                   << ',' << criterion_status_name(item.row_pass)
+                   << ',' << criterion_status_name(item.gmres_pass)
+                   << ',' << criterion_status_name(
+                          item.monotone_error_pass)
+                   << ',' << criterion_status_name(
+                          item.order_64_128_pass)
+                   << ',' << criterion_status_name(
+                          item.baseline_ratio_pass)
+                   << ',' << criterion_status_name(
+                          item.geometry_diagnostics_pass)
+                   << ',' << criterion_status_name(
+                          item.owner_invariants_pass)
+                   << ',' << criterion_status_name(item.overall_pass)
+                   << '\n';
+    }
+}
+
+int run_neumann_rigid_study_3d(std::vector<int> levels)
+{
+    levels = app3d::normalize_neumann_rigid_levels_3d(
+        std::move(levels));
+    const bool require_complete_acceptance =
+        levels == std::vector<int>({32, 64, 128});
+    const std::vector<app3d::LPrismRigidStudyCase3D> cases =
+        app3d::make_l_prism_rigid_study_cases_3d();
+    std::vector<std::string> case_ids;
+    case_ids.reserve(cases.size());
+    for (const auto& study_case : cases)
+        case_ids.push_back(study_case.id);
+
+#ifdef KFBIM_APP_OUTPUT_DIR
+    std::filesystem::path output_dir =
+        std::filesystem::path(KFBIM_APP_OUTPUT_DIR)
+        / "neumann_rigid_transform_stability_3d";
+#else
+    std::filesystem::path output_dir =
+        "output/neumann_rigid_transform_stability_3d";
+#endif
+    const char* output_override = std::getenv(
+        "KFBIM_3D_NEUMANN_RIGID_STUDY_OUTPUT_DIR");
+    if (output_override != nullptr)
+        output_dir = output_override;
+
+    std::vector<NeumannOwnerStudyRow3D> rows;
+    rows.reserve(levels.size() * cases.size());
+    auto evaluation = app3d::evaluate_neumann_rigid_study_3d(
+        neumann_rigid_measurements_3d(rows),
+        case_ids,
+        require_complete_acceptance);
+    write_neumann_rigid_study_checkpoints_3d(
+        output_dir, rows, evaluation);
+
+    std::cout
+        << "KFBI3D Neumann L-prism rigid-transform stability study\n"
+        << "  route=joint_tricubic_crossing_owner"
+           " owner=region_closest_hybrid"
+           " cauchy=g1_nearest/degree3/48/28\n"
+        << "  gmres_tolerance=2e-10 restart=80 cap=80 levels=";
+    for (std::size_t index = 0; index < levels.size(); ++index) {
+        if (index != 0)
+            std::cout << ',';
+        std::cout << levels[index];
+    }
+    std::cout << " cases=" << cases.size() << '\n';
+
+    for (int N : levels) {
+        for (const auto& study_case : cases) {
+            std::cout << "[neumann-rigid-study] case="
+                      << study_case.id << " N=" << N << " setup\n";
+            NeumannOwnerStudyRow3D row =
+                run_neumann_rigid_pose_3d(N, study_case);
+            assign_neumann_owner_order_3d(row, rows);
+            rows.push_back(std::move(row));
+            evaluation = app3d::evaluate_neumann_rigid_study_3d(
+                neumann_rigid_measurements_3d(rows),
+                case_ids,
+                require_complete_acceptance);
+            write_neumann_rigid_study_checkpoints_3d(
+                output_dir, rows, evaluation);
+
+            const NeumannOwnerStudyRow3D& stored = rows.back();
+            const auto* derived =
+                find_neumann_rigid_derived_row_3d(
+                    evaluation, stored);
+            std::cout << "[neumann-rigid-study] case="
+                      << stored.study_case.id
+                      << " N=" << stored.N
+                      << " iter=" << stored.solve.iterations
+                      << " residual="
+                      << stored.solve.gmres_relative_residual
+                      << " interior_linf="
+                      << stored.solve.interior_linf
+                      << " order="
+                      << (derived == nullptr
+                          ? std::numeric_limits<double>::quiet_NaN()
+                          : derived->interior_order)
+                      << " setup_s=" << stored.setup_seconds
+                      << " solve_s=" << stored.solve.seconds
+                      << " total_s=" << stored.total_seconds
+                      << " pass=" << stored.pass << '\n';
+            if (!stored.pass) {
+                std::cerr
+                    << "error: Neumann rigid execution gate failed: case="
+                    << stored.study_case.id
+                    << " N=" << stored.N << '\n';
+                return 1;
+            }
+        }
+    }
+
+    evaluation = app3d::evaluate_neumann_rigid_study_3d(
+        neumann_rigid_measurements_3d(rows),
+        case_ids,
+        require_complete_acceptance);
+    write_neumann_rigid_study_checkpoints_3d(
+        output_dir, rows, evaluation);
+    for (const auto& item : evaluation.cases) {
+        std::cout << "[neumann-rigid-acceptance] case="
+                  << item.case_id
+                  << " complete="
+                  << criterion_status_name(item.completeness_pass)
+                  << " gmres="
+                  << criterion_status_name(item.gmres_pass)
+                  << " monotone="
+                  << criterion_status_name(item.monotone_error_pass)
+                  << " order_64_128="
+                  << criterion_status_name(item.order_64_128_pass)
+                  << " baseline_ratio="
+                  << criterion_status_name(item.baseline_ratio_pass)
+                  << " geometry="
+                  << criterion_status_name(
+                         item.geometry_diagnostics_pass)
+                  << " owner="
+                  << criterion_status_name(item.owner_invariants_pass)
+                  << " overall="
+                  << criterion_status_name(item.overall_pass)
+                  << '\n';
+    }
+    std::cout << "Neumann rigid-transform study output: "
+              << output_dir.string() << '\n';
+    const bool exit_pass =
+        app3d::neumann_rigid_study_exit_pass_3d(
+            evaluation, require_complete_acceptance);
+    if (!exit_pass) {
+        std::cerr
+            << "error: Neumann rigid-study "
+            << (require_complete_acceptance
+                ? "complete numerical acceptance failed\n"
+                : "execution integrity failed\n");
+        return 1;
+    }
+    if (!require_complete_acceptance) {
+        std::cout
+            << "Neumann rigid-study prefix completed; full numerical "
+               "acceptance is not enforced without N=32,64,128\n";
+    }
+    return 0;
+}
+
+struct NeumannEdgeSampleDiagnostics3D {
+    app3d::NeumannEdgeConstraintSample3D sample;
+    double exact_signed_mismatch = 0.0;
+    double unconstrained_signed_mismatch = 0.0;
+    double projected_signed_mismatch = 0.0;
+};
+
+struct NeumannEdgeStudyRow3D {
+    app3d::LPrismRigidStudyCase3D study_case;
+    int N = 0;
+    double h = 0.0;
+    app3d::NeumannDensitySpace3D density_space = app3d::NeumannDensitySpace3D::PatchIndependent;
+    int dofs = 0;
+    double geometry_setup_seconds = 0.0;
+    double pipeline_setup_seconds = 0.0;
+    double projector_setup_seconds = 0.0;
+    double total_seconds = 0.0;
+    SolveMetrics3D solve;
+    std::vector<double> residual_history;
+    double edge_mismatch_linf = 0.0;
+    double edge_mismatch_weighted_rms = 0.0;
+    double exact_edge_mismatch_linf = 0.0;
+    int expected_non_g1_connections = 0;
+    int covered_non_g1_connections = 0;
+    int duplicate_connection_intervals = 0;
+    int g1_constraint_rows = 0;
+    int unrelated_constraint_rows = 0;
+    int constraint_rows = 0;
+    int constraint_rank = 0;
+    int reduced_order_rows = 0;
+    double constant_constraint_defect = 0.0;
+    double projected_constraint_defect = 0.0;
+    double projection_idempotence_defect = 0.0;
+    double constant_projection_defect = 0.0;
+    int label_mismatches = 0;
+    int unsafe_label_changing_edges = 0;
+    int gap_crossings = 0;
+    int endpoint_crossings = 0;
+    int triangle_fallback_crossings = 0;
+    std::string preprocess_mode;
+    std::uint64_t workload_fingerprint = 0;
+    std::uint64_t output_digest = 0;
+    std::uint64_t wrong_side_queries = 0;
+    std::uint64_t workload_fingerprint_before_gmres = 0;
+    std::uint64_t workload_fingerprint_after_gmres = 0;
+    std::uint64_t output_digest_before_gmres = 0;
+    std::uint64_t output_digest_after_gmres = 0;
+    std::uint64_t wrong_side_queries_before_gmres = 0;
+    std::uint64_t wrong_side_queries_after_gmres = 0;
+    std::uint64_t geometry_queries_before_gmres = 0;
+    std::uint64_t geometry_queries_after_gmres = 0;
+    bool diagnostics_unchanged = false;
+    bool default_route_bitwise_equal = false;
+    bool probe_invariants_pass = false;
+    bool geometry_diagnostics_pass = false;
+    bool owner_invariants_pass = false;
+    bool shared_preprocess_pass = false;
+    std::vector<NeumannEdgeSampleDiagnostics3D> edge_samples;
+};
+
+bool finite_neumann_edge_row_3d(const NeumannEdgeStudyRow3D& row)
+{
+    const std::array<double, 12> values{{row.geometry_setup_seconds,
+        row.pipeline_setup_seconds, row.projector_setup_seconds,
+        row.total_seconds, row.edge_mismatch_linf,
+        row.edge_mismatch_weighted_rms, row.exact_edge_mismatch_linf,
+        row.constant_constraint_defect, row.projected_constraint_defect,
+        row.projection_idempotence_defect, row.constant_projection_defect,
+        row.h}};
+    return finite_neumann_owner_metrics_3d(row.solve)
+        && std::all_of(values.begin(), values.end(), [](double value) {
+               return std::isfinite(value);
+           });
+}
+
+struct NeumannEdgePreprocessSnapshot3D {
+    std::uint64_t workload_fingerprint = 0;
+    std::uint64_t output_digest = 0;
+    std::uint64_t wrong_side_queries = 0;
+    std::uint64_t geometry_queries = 0;
+    app3d::RestrictOwnerPreprocessDiagnostics3D diagnostics;
+};
+
+NeumannEdgePreprocessSnapshot3D capture_neumann_edge_preprocess_snapshot_3d(
+    const PanelCenterHarmonicJetKFBI3D& pipeline)
+{
+    NeumannEdgePreprocessSnapshot3D result;
+    result.workload_fingerprint =
+        pipeline.restrict_owner_workload_fingerprint();
+    result.output_digest = pipeline.restrict_owner_output_digest();
+    result.diagnostics = pipeline.restrict_owner_preprocess_diagnostics();
+    result.wrong_side_queries = result.diagnostics.wrong_side_queries;
+    result.geometry_queries = static_cast<std::uint64_t>(
+        pipeline.restrict_owner_geometry_query_count());
+    return result;
+}
+
+bool neumann_edge_preprocess_snapshot_equal_3d(
+    const NeumannEdgePreprocessSnapshot3D& lhs,
+    const NeumannEdgePreprocessSnapshot3D& rhs)
+{
+    return lhs.workload_fingerprint == rhs.workload_fingerprint
+        && lhs.output_digest == rhs.output_digest
+        && lhs.wrong_side_queries == rhs.wrong_side_queries
+        && lhs.geometry_queries == rhs.geometry_queries
+        && restrict_owner_preprocess_diagnostics_equal(
+               lhs.diagnostics, rhs.diagnostics);
+}
+app3d::NeumannEdgePreprocessInvariantSnapshot3D
+neumann_edge_preprocess_invariant_snapshot_3d(
+    const NeumannEdgePreprocessSnapshot3D& snapshot,
+    const NeumannEdgePreprocessSnapshot3D& reference)
+{
+    app3d::NeumannEdgePreprocessInvariantSnapshot3D result;
+    result.workload_fingerprint = snapshot.workload_fingerprint;
+    result.output_digest = snapshot.output_digest;
+    result.wrong_side_queries = snapshot.wrong_side_queries;
+    result.geometry_queries = snapshot.geometry_queries;
+    result.diagnostics_match_reference =
+        restrict_owner_preprocess_diagnostics_equal(
+            snapshot.diagnostics, reference.diagnostics);
+    return result;
+}
+
+std::array<NeumannEdgeStudyRow3D, 2>
+run_neumann_edge_continuity_pair_3d(
+    int N, const app3d::LPrismRigidStudyCase3D& study_case)
+{
+    constexpr int gmres_max_iterations = 80;
+    constexpr ExteriorValueRestrictMode3D mode =
+        ExteriorValueRestrictMode3D::JointTricubicCrossingOwner;
+    const double h = kBoxSide / static_cast<double>(N);
+    const auto geometry_start = std::chrono::steady_clock::now();
+    CartesianGrid3D grid({kBoxMin, kBoxMin, kBoxMin}, {h, h, h},
+                         {N, N, N}, DofLayout3D::Node);
+    GeometryBundle geometry = make_geometry(
+        GeometryKind::LPrism, h, study_case.transform);
+    const auto domain = std::make_shared<const geometry3d::NurbsCartesianDomain3D>(
+        grid, geometry.native_surface.geometry_model());
+    const SurfaceDofCloud surface_dofs = app3d::make_native_surface_dofs_3d(
+        geometry.native_surface, h);
+    validate_surface_dofs(surface_dofs, h);
+    const CauchyStencilSet cauchy_stencils = build_cauchy_stencils(
+        geometry.native_surface, surface_dofs, h,
+        kCauchyValueNeighborCount, kCauchyDerivativeNeighborCount,
+        CauchyStencilPolicy3D::G1Nearest);
+    GridPair3D grid_pair(grid, geometry.correction_interface,
+                         geometry.crossing_interface, domain);
+    int label_mismatches = 0;
+    for (int node = 0; node < grid.num_dofs(); ++node) {
+        const bool numerical_inside = grid_pair.domain_label(node) > 0;
+        if (numerical_inside != geometry.exact_inside(grid_point(grid, node)))
+            ++label_mismatches;
+    }
+    const double geometry_setup_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - geometry_start).count();
+
+    RestrictOwnerPipelinePreprocessTiming3D preprocess_timing;
+    const auto pipeline_start = std::chrono::steady_clock::now();
+    PanelCenterHarmonicJetKFBI3D pipeline(grid, grid_pair,
+        geometry.native_surface, geometry.correction_triangles,
+        geometry.geometry_triangles, surface_dofs, cauchy_stencils, false,
+        OwnerMode3D::RegionClosestHybrid, nullptr, nullptr, &preprocess_timing);
+    const double pipeline_setup_seconds = production_pipeline_setup_seconds_3d(
+        std::chrono::duration<double>(std::chrono::steady_clock::now()
+            - pipeline_start).count(), preprocess_timing);
+
+    const auto projector_start = std::chrono::steady_clock::now();
+    const app3d::NeumannEdgeConstraintSet3D constraints =
+        app3d::build_neumann_edge_constraints_3d(
+            geometry.native_surface, surface_dofs, h);
+    const app3d::NeumannEdgeContinuityProjector3D projector(
+        constraints, surface_dofs, 1.0e-12);
+    const double projector_setup_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - projector_start).count();
+    const int surface_size = pipeline.surface_size();
+    Eigen::VectorXd exact_density(surface_size);
+    Eigen::VectorXd normal_data(surface_size);
+    for (int q = 0; q < surface_size; ++q) {
+        const SurfaceDof& dof = pipeline.surface().dofs[static_cast<std::size_t>(q)];
+        exact_density[q] = app3d::transformed_manufactured_harmonic_value_3d(
+            study_case.transform, dof.point);
+        normal_data[q] = app3d::transformed_manufactured_harmonic_gradient_3d(
+            study_case.transform, dof.point).dot(dof.normal);
+    }
+    exact_density.array() -= surface_weighted_mean(pipeline.surface(), exact_density);
+    normal_data.array() -= surface_weighted_mean(pipeline.surface(), normal_data);
+
+    const Eigen::VectorXd ones = Eigen::VectorXd::Ones(surface_size);
+    Eigen::VectorXd projector_probe(surface_size);
+    for (int q = 0; q < surface_size; ++q) {
+        projector_probe[q] = std::sin(0.37 * (q + 1))
+                           + 0.2 * std::cos(0.11 * (q + 1));
+    }
+    const Eigen::VectorXd projected_probe = projector.project(projector_probe);
+    const double probe_scale = std::max(1.0, vector_linf(projector_probe));
+    const double projected_constraint_defect = vector_linf(
+        app3d::apply_neumann_edge_constraints_3d(constraints, projected_probe))
+        / probe_scale;
+    const double projection_idempotence_defect = vector_linf(
+        projector.project(projected_probe) - projected_probe) / probe_scale;
+    const double constant_projection_defect = vector_linf(projector.project(ones) - ones);
+    const double constant_constraint_defect = vector_linf(
+        app3d::apply_neumann_edge_constraints_3d(constraints, ones));
+
+    const app3d::NeumannEdgeConstraintAudit3D constraint_audit =
+        app3d::audit_neumann_edge_constraints_3d(
+            geometry.native_surface, surface_dofs, h, constraints);
+
+    const auto setup_diagnostics = pipeline.restrict_owner_preprocess_diagnostics();
+    const std::uint64_t setup_queries = static_cast<std::uint64_t>(
+        pipeline.restrict_owner_geometry_query_count());
+    if (setup_queries != setup_diagnostics.wrong_side_queries)
+        throw std::logic_error("Neumann edge-continuity pipeline query-count mismatch");
+    const NeumannRigidGeometryDiagnostics3D geometry_diagnostics =
+        neumann_rigid_geometry_diagnostics_3d(
+            grid_pair, pipeline.correction_support());
+
+    const Eigen::VectorXd zero_value = Eigen::VectorXd::Zero(surface_size);
+    const HarmonicJetField3D probe_field = pipeline.field_from_grid_and_jumps(
+        Eigen::VectorXd::Zero(grid.num_dofs()), zero_value, normal_data);
+    const auto probe_before = pipeline.restrict_owner_preprocess_diagnostics();
+    const Eigen::VectorXd default_probe = pipeline.exterior_trace(
+        probe_field, zero_value, normal_data);
+    const Eigen::VectorXd explicit_legacy_probe = pipeline.exterior_trace(
+        probe_field, zero_value, normal_data,
+        ExteriorValueRestrictMode3D::JointTricubicCauchy);
+    const Eigen::VectorXd crossing_probe = pipeline.exterior_trace(
+        probe_field, zero_value, normal_data, mode);
+    const auto probe_after = pipeline.restrict_owner_preprocess_diagnostics();
+    const bool default_route_bitwise_equal =
+        bitwise_equal_vector_3d(default_probe, explicit_legacy_probe);
+    const bool probe_invariants_pass = default_route_bitwise_equal
+        && crossing_probe.allFinite()
+        && restrict_owner_preprocess_diagnostics_equal(probe_before, probe_after)
+        && static_cast<std::uint64_t>(pipeline.restrict_owner_geometry_query_count())
+            == setup_queries;
+
+    std::array<NeumannEdgeStudyRow3D, 2> rows;
+    rows[0].density_space = app3d::NeumannDensitySpace3D::PatchIndependent;
+    rows[1].density_space = app3d::NeumannDensitySpace3D::NonG1EdgeProjected;
+    std::array<Eigen::VectorXd, 2> solved_densities;
+    const NeumannEdgePreprocessSnapshot3D stable_snapshot =
+        capture_neumann_edge_preprocess_snapshot_3d(pipeline);
+    if (stable_snapshot.output_digest != preprocess_timing.output_digest
+        || stable_snapshot.wrong_side_queries
+            != setup_diagnostics.wrong_side_queries
+        || stable_snapshot.geometry_queries != setup_queries) {
+        throw std::logic_error(
+            "Neumann edge-continuity setup snapshot mismatch");
+    }
+    std::array<NeumannEdgePreprocessSnapshot3D, 2> before_snapshots;
+    std::array<NeumannEdgePreprocessSnapshot3D, 2> after_snapshots;
+    for (std::size_t index = 0; index < rows.size(); ++index) {
+        NeumannEdgeStudyRow3D& row = rows[index];
+        row.study_case = study_case;
+        row.N = N;
+        row.h = h;
+        row.dofs = surface_size;
+        row.geometry_setup_seconds = geometry_setup_seconds;
+        row.pipeline_setup_seconds = pipeline_setup_seconds;
+        row.projector_setup_seconds = projector_setup_seconds;
+        row.expected_non_g1_connections =
+            constraint_audit.expected_non_g1_connections;
+        row.covered_non_g1_connections =
+            constraint_audit.covered_non_g1_connections;
+        row.duplicate_connection_intervals =
+            constraint_audit.duplicate_connection_intervals;
+        row.g1_constraint_rows = constraint_audit.g1_constraint_rows;
+        row.unrelated_constraint_rows =
+            constraint_audit.unrelated_constraint_rows;
+        row.constraint_rows = constraint_audit.constraint_rows;
+        row.constraint_rank = projector.retained_rank();
+        row.reduced_order_rows = constraint_audit.reduced_order_rows;
+        row.constant_constraint_defect = constant_constraint_defect;
+        row.projected_constraint_defect = projected_constraint_defect;
+        row.projection_idempotence_defect = projection_idempotence_defect;
+        row.constant_projection_defect = constant_projection_defect;
+        row.label_mismatches = label_mismatches;
+        row.unsafe_label_changing_edges = geometry_diagnostics.unsafe_label_changing_edges;
+        row.gap_crossings = geometry_diagnostics.gap_crossings;
+        row.endpoint_crossings = geometry_diagnostics.endpoint_crossings;
+        row.triangle_fallback_crossings = geometry_diagnostics.triangle_fallback_crossings;
+        row.preprocess_mode = app3d::restrict_owner_preprocess_mode_name_3d(
+            OwnerMode3D::RegionClosestHybrid);
+        row.default_route_bitwise_equal = default_route_bitwise_equal;
+        row.probe_invariants_pass = probe_invariants_pass;
+        before_snapshots[index] =
+            capture_neumann_edge_preprocess_snapshot_3d(pipeline);
+        const NeumannEdgePreprocessSnapshot3D& before =
+            before_snapshots[index];
+        row.workload_fingerprint_before_gmres =
+            before.workload_fingerprint;
+        row.output_digest_before_gmres = before.output_digest;
+        row.wrong_side_queries_before_gmres =
+            before.wrong_side_queries;
+        row.geometry_queries_before_gmres = before.geometry_queries;
+        const app3d::NeumannEdgeContinuityProjector3D* solve_projector =
+            row.density_space == app3d::NeumannDensitySpace3D::NonG1EdgeProjected
+                ? std::addressof(projector) : nullptr;
+        row.solve = run_neumann_case(grid, grid_pair, pipeline,
+            study_case.transform, gmres_max_iterations, mode,
+            app3d::NeumannEdgeCauchyMode3D::None,
+            &row.residual_history, solve_projector, &solved_densities[index]);
+        after_snapshots[index] =
+            capture_neumann_edge_preprocess_snapshot_3d(pipeline);
+        const NeumannEdgePreprocessSnapshot3D& after =
+            after_snapshots[index];
+        row.workload_fingerprint_after_gmres =
+            after.workload_fingerprint;
+        row.output_digest_after_gmres = after.output_digest;
+        row.wrong_side_queries_after_gmres =
+            after.wrong_side_queries;
+        row.geometry_queries_after_gmres = after.geometry_queries;
+        row.workload_fingerprint = after.workload_fingerprint;
+        row.output_digest = after.output_digest;
+        row.wrong_side_queries = after.wrong_side_queries;
+        row.diagnostics_unchanged =
+            restrict_owner_preprocess_diagnostics_equal(
+                before.diagnostics, after.diagnostics)
+            && restrict_owner_preprocess_diagnostics_equal(
+                stable_snapshot.diagnostics, after.diagnostics);
+        row.geometry_diagnostics_pass = row.label_mismatches == 0
+            && row.unsafe_label_changing_edges == 0 && row.gap_crossings == 0
+            && row.endpoint_crossings == 0 && row.triangle_fallback_crossings == 0;
+        row.owner_invariants_pass = row.probe_invariants_pass
+            && row.default_route_bitwise_equal
+            && row.diagnostics_unchanged
+            && neumann_edge_preprocess_snapshot_equal_3d(before, after)
+            && neumann_edge_preprocess_snapshot_equal_3d(
+                   stable_snapshot, after);
+        row.edge_mismatch_linf = app3d::neumann_edge_mismatch_linf_3d(
+            constraints, solved_densities[index]);
+        row.edge_mismatch_weighted_rms = app3d::neumann_edge_mismatch_weighted_rms_3d(
+            constraints, solved_densities[index]);
+        row.exact_edge_mismatch_linf = app3d::neumann_edge_mismatch_linf_3d(
+            constraints, exact_density);
+        row.total_seconds = row.geometry_setup_seconds + row.pipeline_setup_seconds
+            + row.projector_setup_seconds + row.solve.seconds;
+    }
+
+    const NeumannEdgePreprocessSnapshot3D final_snapshot =
+        capture_neumann_edge_preprocess_snapshot_3d(pipeline);
+    const std::vector<app3d::NeumannEdgePreprocessInvariantSnapshot3D>
+        invariant_snapshots{
+            neumann_edge_preprocess_invariant_snapshot_3d(
+                stable_snapshot, stable_snapshot),
+            neumann_edge_preprocess_invariant_snapshot_3d(
+                before_snapshots[0], stable_snapshot),
+            neumann_edge_preprocess_invariant_snapshot_3d(
+                after_snapshots[0], stable_snapshot),
+            neumann_edge_preprocess_invariant_snapshot_3d(
+                before_snapshots[1], stable_snapshot),
+            neumann_edge_preprocess_invariant_snapshot_3d(
+                after_snapshots[1], stable_snapshot),
+            neumann_edge_preprocess_invariant_snapshot_3d(
+                final_snapshot, stable_snapshot)};
+    const bool shared_preprocess_pass =
+        app3d::neumann_edge_shared_preprocess_pass_3d(
+            invariant_snapshots);
+    rows[0].shared_preprocess_pass = shared_preprocess_pass;
+    rows[1].shared_preprocess_pass = shared_preprocess_pass;
+
+    const Eigen::VectorXd exact_mismatch = app3d::apply_neumann_edge_constraints_3d(
+        constraints, exact_density);
+    const Eigen::VectorXd unconstrained_mismatch = app3d::apply_neumann_edge_constraints_3d(
+        constraints, solved_densities[0]);
+    const Eigen::VectorXd projected_mismatch = app3d::apply_neumann_edge_constraints_3d(
+        constraints, solved_densities[1]);
+    for (std::size_t q = 0; q < constraints.samples.size(); ++q) {
+        const NeumannEdgeSampleDiagnostics3D item{constraints.samples[q],
+            exact_mismatch[static_cast<Eigen::Index>(q)],
+            unconstrained_mismatch[static_cast<Eigen::Index>(q)],
+            projected_mismatch[static_cast<Eigen::Index>(q)]};
+        rows[0].edge_samples.push_back(item);
+        rows[1].edge_samples.push_back(item);
+    }
+    return rows;
+}
+
+std::vector<app3d::NeumannEdgeContinuityMeasurement3D>
+neumann_edge_measurements_3d(const std::vector<NeumannEdgeStudyRow3D>& rows)
+{
+    std::vector<app3d::NeumannEdgeContinuityMeasurement3D> result;
+    result.reserve(rows.size());
+    for (const NeumannEdgeStudyRow3D& row : rows) {
+        app3d::NeumannEdgeContinuityMeasurement3D m;
+        m.case_id = row.study_case.id;
+        m.N = row.N;
+        m.h = row.h;
+        m.density_space = row.density_space;
+        m.finite_metrics = finite_neumann_edge_row_3d(row);
+        m.gmres_converged = row.solve.converged;
+        m.gmres_iterations = row.solve.iterations;
+        m.gmres_relative_residual = row.solve.gmres_relative_residual;
+        m.density_linf = row.solve.density_linf;
+        m.density_l2 = row.solve.density_l2;
+        m.interior_linf = row.solve.interior_linf;
+        m.interior_l2 = row.solve.interior_l2;
+        m.edge_mismatch_linf = row.edge_mismatch_linf;
+        m.edge_mismatch_weighted_rms = row.edge_mismatch_weighted_rms;
+        m.exact_edge_mismatch_linf = row.exact_edge_mismatch_linf;
+        m.expected_non_g1_connections = row.expected_non_g1_connections;
+        m.covered_non_g1_connections = row.covered_non_g1_connections;
+        m.duplicate_connection_intervals = row.duplicate_connection_intervals;
+        m.g1_constraint_rows = row.g1_constraint_rows;
+        m.unrelated_constraint_rows = row.unrelated_constraint_rows;
+        m.constraint_rows = row.constraint_rows;
+        m.constraint_rank = row.constraint_rank;
+        m.reduced_order_rows = row.reduced_order_rows;
+        m.constant_constraint_defect = row.constant_constraint_defect;
+        m.projected_constraint_defect = row.projected_constraint_defect;
+        m.projection_idempotence_defect = row.projection_idempotence_defect;
+        m.constant_projection_defect = row.constant_projection_defect;
+        m.geometry_diagnostics_pass = row.geometry_diagnostics_pass;
+        m.owner_invariants_pass = row.owner_invariants_pass;
+        m.shared_preprocess_pass = row.shared_preprocess_pass;
+        result.push_back(std::move(m));
+    }
+    return result;
+}
+
+const app3d::NeumannEdgeContinuityDerivedRow3D* find_neumann_edge_derived_row_3d(
+    const app3d::NeumannEdgeContinuityEvaluation3D& evaluation,
+    const NeumannEdgeStudyRow3D& raw)
+{
+    const auto found = std::find_if(evaluation.rows.begin(), evaluation.rows.end(),
+        [&](const app3d::NeumannEdgeContinuityDerivedRow3D& row) {
+            return row.measurement.case_id == raw.study_case.id
+                && row.measurement.N == raw.N
+                && row.measurement.density_space == raw.density_space;
+        });
+    return found == evaluation.rows.end() ? nullptr : std::addressof(*found);
+}
+
+const char* patch_edge_name_3d(app3d::PatchEdge3D edge)
+{
+    switch (edge) {
+    case app3d::PatchEdge3D::UMin: return "u_min";
+    case app3d::PatchEdge3D::UMax: return "u_max";
+    case app3d::PatchEdge3D::VMin: return "v_min";
+    case app3d::PatchEdge3D::VMax: return "v_max";
+    }
+    return "unknown";
+}
+
+void write_neumann_edge_continuity_checkpoints_3d(
+    const std::filesystem::path& output_dir,
+    const std::vector<NeumannEdgeStudyRow3D>& rows,
+    const app3d::NeumannEdgeContinuityEvaluation3D& evaluation)
+{
+    std::filesystem::create_directories(output_dir);
+    std::ofstream summary = open_output_file(output_dir / "summary.csv");
+    summary << std::setprecision(17) << std::boolalpha
+        << "case_id,N,h,density_space,dofs,geometry_setup_seconds,"
+           "pipeline_setup_seconds,projector_setup_seconds,solve_seconds,"
+           "total_seconds,converged,iterations,final_residual,"
+           "operator_residual_linf,density_linf,density_l2,interior_linf,"
+           "interior_l2,density_linf_order,density_l2_order,interior_linf_order,"
+           "interior_l2_order,edge_mismatch_linf,edge_mismatch_weighted_rms,"
+           "exact_edge_mismatch_linf,exact_edge_mismatch_order,edge_reduction_ratio,"
+           "constraint_rows,constraint_rank,expected_non_g1_connections,"
+           "covered_non_g1_connections,duplicate_connection_intervals,"
+           "g1_constraint_rows,unrelated_constraint_rows,reduced_order_rows,"
+           "constant_constraint_defect,projected_constraint_defect,"
+           "projection_idempotence_defect,constant_projection_defect,"
+           "geometry_diagnostics_pass,owner_invariants_pass,shared_preprocess_pass,row_pass\n";
+    for (const NeumannEdgeStudyRow3D& row : rows) {
+        const auto* d = find_neumann_edge_derived_row_3d(evaluation, row);
+        if (d == nullptr) throw std::logic_error("missing Neumann edge derived row");
+        summary << row.study_case.id << ',' << row.N << ',' << row.h << ','
+            << app3d::neumann_density_space_name_3d(row.density_space) << ','
+            << row.dofs << ',' << row.geometry_setup_seconds << ','
+            << row.pipeline_setup_seconds << ',' << row.projector_setup_seconds << ','
+            << row.solve.seconds << ',' << row.total_seconds << ','
+            << row.solve.converged << ',' << row.solve.iterations << ','
+            << row.solve.gmres_relative_residual << ','
+            << row.solve.operator_residual_linf << ',' << row.solve.density_linf << ','
+            << row.solve.density_l2 << ',' << row.solve.interior_linf << ','
+            << row.solve.interior_l2 << ',' << d->density_linf_order << ','
+            << d->density_l2_order << ',' << d->interior_linf_order << ','
+            << d->interior_l2_order << ',' << row.edge_mismatch_linf << ','
+            << row.edge_mismatch_weighted_rms << ',' << row.exact_edge_mismatch_linf << ','
+            << d->exact_edge_mismatch_order << ',' << d->edge_reduction_ratio << ','
+            << row.constraint_rows << ',' << row.constraint_rank << ','
+            << row.expected_non_g1_connections << ',' << row.covered_non_g1_connections << ','
+            << row.duplicate_connection_intervals << ',' << row.g1_constraint_rows << ','
+            << row.unrelated_constraint_rows << ',' << row.reduced_order_rows << ','
+            << row.constant_constraint_defect << ',' << row.projected_constraint_defect << ','
+            << row.projection_idempotence_defect << ',' << row.constant_projection_defect << ','
+            << row.geometry_diagnostics_pass << ',' << row.owner_invariants_pass << ','
+            << row.shared_preprocess_pass << ',' << criterion_status_name(d->row_pass) << '\n';
+    }
+    std::ofstream residuals = open_output_file(output_dir / "gmres_residuals.csv");
+    residuals << std::setprecision(17)
+              << "case_id,N,density_space,iteration,residual\n";
+    for (const NeumannEdgeStudyRow3D& row : rows) {
+        for (std::size_t iteration = 0; iteration < row.residual_history.size(); ++iteration) {
+            residuals << row.study_case.id << ',' << row.N << ','
+                << app3d::neumann_density_space_name_3d(row.density_space) << ','
+                << iteration << ',' << row.residual_history[iteration] << '\n';
+        }
+    }
+
+    std::ofstream edges = open_output_file(output_dir / "edge_diagnostics.csv");
+    edges << std::setprecision(17) << std::boolalpha
+        << "case_id,N,connection_index,sample_index,sample_count,first_patch,first_edge,"
+           "second_patch,second_edge,normalized_parameter,first_parameter,second_parameter,"
+           "physical_weight,mapped_point_gap,first_reduced_order,second_reduced_order,"
+           "exact_signed_mismatch,unconstrained_signed_mismatch,projected_signed_mismatch\n";
+    for (const NeumannEdgeStudyRow3D& row : rows) {
+        if (row.density_space != app3d::NeumannDensitySpace3D::PatchIndependent) continue;
+        for (const auto& item : row.edge_samples) {
+            const auto& x = item.sample;
+            edges << row.study_case.id << ',' << row.N << ',' << x.connection_index << ','
+                << x.sample_index << ',' << x.sample_count << ',' << x.first_patch << ','
+                << patch_edge_name_3d(x.first_edge) << ',' << x.second_patch << ','
+                << patch_edge_name_3d(x.second_edge) << ',' << x.normalized_parameter << ','
+                << x.first_parameter << ',' << x.second_parameter << ','
+                << x.quadrature_weight << ',' << x.mapped_point_gap << ','
+                << x.first_reduced_order << ',' << x.second_reduced_order << ','
+                << item.exact_signed_mismatch << ',' << item.unconstrained_signed_mismatch << ','
+                << item.projected_signed_mismatch << '\n';
+        }
+    }
+
+    std::ofstream owners = open_output_file(output_dir / "owner_diagnostics.csv");
+    owners << std::setprecision(17) << std::boolalpha
+        << "case_id,N,density_space,preprocess_mode,workload_fingerprint,output_digest,"
+           "wrong_side_queries,workload_fingerprint_before_gmres,"
+           "workload_fingerprint_after_gmres,output_digest_before_gmres,"
+           "output_digest_after_gmres,wrong_side_queries_before_gmres,"
+           "wrong_side_queries_after_gmres,label_mismatches,"
+           "unsafe_label_changing_edges,gap_crossings,"
+           "endpoint_crossings,triangle_fallback_crossings,geometry_queries_before_gmres,"
+           "geometry_queries_after_gmres,diagnostics_unchanged,default_route_bitwise_equal,"
+           "probe_invariants_pass,geometry_diagnostics_pass,owner_invariants_pass,"
+           "shared_preprocess_pass\n";
+    for (const NeumannEdgeStudyRow3D& row : rows) {
+        owners << row.study_case.id << ',' << row.N << ','
+            << app3d::neumann_density_space_name_3d(row.density_space) << ','
+            << row.preprocess_mode << ',' << row.workload_fingerprint << ','
+            << row.output_digest << ',' << row.wrong_side_queries << ','
+            << row.workload_fingerprint_before_gmres << ','
+            << row.workload_fingerprint_after_gmres << ','
+            << row.output_digest_before_gmres << ','
+            << row.output_digest_after_gmres << ','
+            << row.wrong_side_queries_before_gmres << ','
+            << row.wrong_side_queries_after_gmres << ','
+            << row.label_mismatches << ',' << row.unsafe_label_changing_edges << ','
+            << row.gap_crossings << ',' << row.endpoint_crossings << ','
+            << row.triangle_fallback_crossings << ',' << row.geometry_queries_before_gmres << ','
+            << row.geometry_queries_after_gmres << ',' << row.diagnostics_unchanged << ','
+            << row.default_route_bitwise_equal << ',' << row.probe_invariants_pass << ','
+            << row.geometry_diagnostics_pass << ',' << row.owner_invariants_pass << ','
+            << row.shared_preprocess_pass << '\n';
+    }
+
+    std::ofstream acceptance = open_output_file(output_dir / "acceptance.csv");
+    acceptance << "completeness_pass,topology_pass,projector_pass,exact_trace_order_pass,"
+                  "gmres_pass,error_guard_pass,edge_reduction_pass,trend_pass,"
+                  "geometry_owner_pass,extended_evidence_pass,overall_pass\n"
+        << criterion_status_name(evaluation.acceptance.completeness_pass) << ','
+        << criterion_status_name(evaluation.acceptance.topology_pass) << ','
+        << criterion_status_name(evaluation.acceptance.projector_pass) << ','
+        << criterion_status_name(evaluation.acceptance.exact_trace_order_pass) << ','
+        << criterion_status_name(evaluation.acceptance.gmres_pass) << ','
+        << criterion_status_name(evaluation.acceptance.error_guard_pass) << ','
+        << criterion_status_name(evaluation.acceptance.edge_reduction_pass) << ','
+        << criterion_status_name(evaluation.acceptance.trend_pass) << ','
+        << criterion_status_name(evaluation.acceptance.geometry_owner_pass) << ','
+        << criterion_status_name(evaluation.acceptance.extended_evidence_pass) << ','
+        << criterion_status_name(evaluation.acceptance.overall_pass) << '\n';
+}
+
+using PhaseRecordArray3D = std::array<
+    app3d::PhaseProfileRecord3D,
+    app3d::phase_profile_kind_count_3d()>;
+
+struct NeumannEdgeCauchyEdgeValueRow3D {
+    int connection_index = -1;
+    int sample_index = -1;
+    int sample_count = 0;
+    int first_owner_dof = -1;
+    int second_owner_dof = -1;
+    double first_value = 0.0;
+    double second_value = 0.0;
+    double shared_auxiliary_value = 0.0;
+    double first_second_difference = 0.0;
+    double first_shared_difference = 0.0;
+    double second_shared_difference = 0.0;
+};
+
+struct NeumannEdgeCauchyPairRun3D {
+    std::array<app3d::NeumannEdgeCauchyMeasurement3D, 2> measurements;
+    std::array<std::vector<double>, 2> residual_histories;
+    std::array<std::vector<NeumannEdgeCauchyEdgeValueRow3D>, 2>
+        edge_value_rows;
+    PhaseRecordArray3D shared_setup_phases{};
+    std::array<PhaseRecordArray3D, 2> runtime_phase_deltas{};
+    std::vector<app3d::NeumannEdgePreprocessInvariantSnapshot3D>
+        owner_snapshots;
+    int setup_factorization_count = 0;
+    std::array<int, 2> factorization_counts_before{};
+    std::array<int, 2> factorization_counts_after{};
+    std::array<bool, 2> shared_exact_trace_bitwise{};
+    std::array<bool, 2> shared_normal_jump_bitwise{};
+};
+
+PhaseRecordArray3D capture_phase_records_3d(
+    const app3d::PhaseProfile3D& profile)
+{
+    PhaseRecordArray3D result{};
+    for (std::size_t q = 0; q < result.size(); ++q) {
+        result[q] = profile.record(static_cast<PhaseProfileKind3D>(q));
+    }
+    return result;
+}
+
+PhaseRecordArray3D subtract_phase_records_3d(
+    const PhaseRecordArray3D& after,
+    const PhaseRecordArray3D& before,
+    const char* context)
+{
+    PhaseRecordArray3D result{};
+    for (std::size_t q = 0; q < result.size(); ++q) {
+        if (after[q].calls < before[q].calls
+            || after[q].seconds < before[q].seconds) {
+            throw std::logic_error(
+                std::string(context) + " phase counters decreased");
+        }
+        result[q].seconds = after[q].seconds - before[q].seconds;
+        result[q].calls = after[q].calls - before[q].calls;
+        if (!std::isfinite(result[q].seconds)
+            || result[q].seconds < 0.0) {
+            throw std::logic_error(
+                std::string(context) + " has invalid phase delta");
+        }
+    }
+    return result;
+}
+
+double phase_record_sum_3d(const PhaseRecordArray3D& records)
+{
+    double result = 0.0;
+    for (const auto& record : records) result += record.seconds;
+    return result;
+}
+
+void require_phase_wall_match_3d(double phase_seconds,
+                                 double wall_seconds,
+                                 const char* context)
+{
+    const double tolerance = std::max(1.0e-9, 1.0e-8 * wall_seconds);
+    if (!std::isfinite(phase_seconds) || !std::isfinite(wall_seconds)
+        || wall_seconds < 0.0
+        || std::abs(phase_seconds - wall_seconds) > tolerance) {
+        throw std::logic_error(
+            std::string(context) + " phase sum does not match wall time");
+    }
+}
+
+bool bitwise_equal_double_3d(double lhs, double rhs) noexcept
+{
+    return std::memcmp(&lhs, &rhs, sizeof(double)) == 0;
+}
+
+bool far_cauchy_rows_bitwise_equal_3d(
+    const Eigen::MatrixXd& legacy,
+    const Eigen::MatrixXd& augmented,
+    const std::vector<bool>& affected)
+{
+    if (legacy.rows() != augmented.rows()
+        || legacy.cols() != augmented.cols()
+        || legacy.rows() != static_cast<Eigen::Index>(affected.size())) {
+        return false;
+    }
+    for (Eigen::Index row = 0; row < legacy.rows(); ++row) {
+        if (affected[static_cast<std::size_t>(row)]) continue;
+        for (Eigen::Index column = 0; column < legacy.cols(); ++column) {
+            if (!bitwise_equal_double_3d(
+                    legacy(row, column), augmented(row, column))) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+double evaluate_edge_owner_value_3d(
+    const SurfaceDofCloud& surface,
+    int owner_dof,
+    const Eigen::Vector3d& point,
+    double h,
+    const Eigen::MatrixXd& coefficients)
+{
+    if (owner_dof < 0
+        || owner_dof >= static_cast<int>(surface.dofs.size())
+        || owner_dof >= coefficients.rows()) {
+        throw std::logic_error("invalid edge owner DOF");
+    }
+    const SurfaceDof& owner =
+        surface.dofs[static_cast<std::size_t>(owner_dof)];
+    const Eigen::Vector3d d = (point - owner.point) / h;
+    const Eigen::Vector3d xi(
+        d.dot(owner.tangent1), d.dot(owner.tangent2),
+        d.dot(owner.normal));
+    const app3d::HarmonicPolynomialSpace3D polynomial_space(3);
+    return polynomial_space.basis(xi.x(), xi.y(), xi.z()).dot(
+        coefficients.row(owner_dof).transpose());
+}
+
+NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
+    int N, const app3d::LPrismRigidStudyCase3D& study_case)
+{
+    constexpr int gmres_max_iterations = 80;
+    constexpr ExteriorValueRestrictMode3D restrict_mode =
+        ExteriorValueRestrictMode3D::JointTricubicCrossingOwner;
+    const std::array<app3d::NeumannEdgeCauchyMode3D, 2> modes{{
+        app3d::NeumannEdgeCauchyMode3D::None,
+        app3d::NeumannEdgeCauchyMode3D::NonG1AuxiliaryValues}};
+    const double h = kBoxSide / static_cast<double>(N);
+    app3d::PhaseProfile3D profile;
+    const auto setup_start = std::chrono::steady_clock::now();
+
+    auto phase_start = std::chrono::steady_clock::now();
+    CartesianGrid3D grid({kBoxMin, kBoxMin, kBoxMin}, {h, h, h},
+                         {N, N, N}, DofLayout3D::Node);
+    GeometryBundle geometry = make_geometry(
+        GeometryKind::LPrism, h, study_case.transform);
+    const auto domain = std::make_shared<const
+        geometry3d::NurbsCartesianDomain3D>(
+            grid, geometry.native_surface.geometry_model());
+    profile.add(PhaseProfileKind3D::GeometryAndDomain,
+        std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - phase_start).count(), 1);
+
+    phase_start = std::chrono::steady_clock::now();
+    const SurfaceDofCloud surface_dofs =
+        app3d::make_native_surface_dofs_3d(
+            geometry.native_surface, h);
+    validate_surface_dofs(surface_dofs, h);
+    const CauchyStencilSet cauchy_stencils = build_cauchy_stencils(
+        geometry.native_surface, surface_dofs, h,
+        kCauchyValueNeighborCount, kCauchyDerivativeNeighborCount,
+        CauchyStencilPolicy3D::G1Nearest);
+    profile.add(PhaseProfileKind3D::SurfaceDofsAndStencils,
+        std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - phase_start).count(), 1);
+
+    phase_start = std::chrono::steady_clock::now();
+    GridPair3D grid_pair(grid, geometry.correction_interface,
+                         geometry.crossing_interface, domain);
+    int label_mismatches = 0;
+    for (int node = 0; node < grid.num_dofs(); ++node) {
+        const bool numerical_inside = grid_pair.domain_label(node) > 0;
+        if (numerical_inside
+            != geometry.exact_inside(grid_point(grid, node))) {
+            ++label_mismatches;
+        }
+    }
+    profile.add(PhaseProfileKind3D::GridPairAndLabelValidation,
+        std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - phase_start).count(), 1);
+
+    const std::array<PhaseProfileKind3D, 4> pipeline_children{{
+        PhaseProfileKind3D::CrossingRows,
+        PhaseProfileKind3D::NurbsSegmentIntersections,
+        PhaseProfileKind3D::RestrictOwnerGeometryPreprocessing,
+        PhaseProfileKind3D::TraceOwnerTemplateAssembly}};
+    std::array<double, 4> pipeline_child_before{};
+    for (std::size_t q = 0; q < pipeline_children.size(); ++q) {
+        pipeline_child_before[q] =
+            profile.record(pipeline_children[q]).seconds;
+    }
+    RestrictOwnerPipelinePreprocessTiming3D preprocess_timing;
+    const auto pipeline_start = std::chrono::steady_clock::now();
+    PanelCenterHarmonicJetKFBI3D pipeline(
+        grid, grid_pair, geometry.native_surface,
+        geometry.correction_triangles, geometry.geometry_triangles,
+        surface_dofs, cauchy_stencils, false,
+        OwnerMode3D::RegionClosestHybrid, &profile, nullptr,
+        &preprocess_timing, true);
+    const double pipeline_wall_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - pipeline_start).count();
+    double pipeline_child_seconds = 0.0;
+    for (std::size_t q = 0; q < pipeline_children.size(); ++q) {
+        pipeline_child_seconds += profile.record(pipeline_children[q]).seconds
+            - pipeline_child_before[q];
+    }
+    profile.add(PhaseProfileKind3D::PipelineFixedInitialization,
+        nonnegative_profile_remainder_3d(
+            pipeline_wall_seconds, pipeline_child_seconds,
+            "Neumann edge-Cauchy pipeline setup"), 1);
+
+    const int surface_size = pipeline.surface_size();
+    Eigen::VectorXd shared_exact_trace(surface_size);
+    Eigen::VectorXd prescribed_normal_jump(surface_size);
+    for (int q = 0; q < surface_size; ++q) {
+        const SurfaceDof& dof =
+            pipeline.surface().dofs[static_cast<std::size_t>(q)];
+        shared_exact_trace[q] =
+            app3d::transformed_manufactured_harmonic_value_3d(
+                study_case.transform, dof.point);
+        prescribed_normal_jump[q] =
+            app3d::transformed_manufactured_harmonic_gradient_3d(
+                study_case.transform, dof.point).dot(dof.normal);
+    }
+    shared_exact_trace.array() -= surface_weighted_mean(
+        pipeline.surface(), shared_exact_trace);
+    prescribed_normal_jump.array() -= surface_weighted_mean(
+        pipeline.surface(), prescribed_normal_jump);
+    if (!shared_exact_trace.allFinite()
+        || !prescribed_normal_jump.allFinite()) {
+        throw std::runtime_error(
+            "Neumann edge-Cauchy manufactured data are non-finite");
+    }
+
+    const double setup_wall_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - setup_start).count();
+    const double setup_recorded_before_remainder = phase_record_sum_3d(
+        capture_phase_records_3d(profile));
+    profile.add(PhaseProfileKind3D::ExactFieldsAndOtherSetup,
+        nonnegative_profile_remainder_3d(
+            setup_wall_seconds, setup_recorded_before_remainder,
+            "Neumann edge-Cauchy shared setup"), 1);
+
+    NeumannEdgeCauchyPairRun3D result;
+    result.shared_setup_phases = capture_phase_records_3d(profile);
+    require_phase_wall_match_3d(
+        phase_record_sum_3d(result.shared_setup_phases),
+        setup_wall_seconds, "Neumann edge-Cauchy shared setup");
+
+    const auto& augmented_cauchy =
+        pipeline.neumann_edge_augmented_cauchy();
+    const auto& augmented_diagnostics = augmented_cauchy.diagnostics();
+    result.setup_factorization_count =
+        augmented_diagnostics.factorization_count;
+    const NeumannRigidGeometryDiagnostics3D geometry_diagnostics =
+        neumann_rigid_geometry_diagnostics_3d(
+            grid_pair, pipeline.correction_support());
+    const auto setup_diagnostics =
+        pipeline.restrict_owner_preprocess_diagnostics();
+    const std::uint64_t setup_queries = static_cast<std::uint64_t>(
+        pipeline.restrict_owner_geometry_query_count());
+    if (setup_queries != setup_diagnostics.wrong_side_queries) {
+        throw std::logic_error(
+            "Neumann edge-Cauchy setup query-count mismatch");
+    }
+
+    Eigen::VectorXd value_probe(surface_size);
+    for (int q = 0; q < surface_size; ++q) {
+        value_probe[q] = std::sin(0.37 * (q + 1))
+                       + 0.2 * std::cos(0.11 * (q + 1));
+    }
+    const Eigen::VectorXd zero_grid =
+        Eigen::VectorXd::Zero(grid.num_dofs());
+    const HarmonicJetField3D legacy_probe =
+        pipeline.field_from_grid_and_jumps(
+            zero_grid, value_probe, prescribed_normal_jump,
+            modes[0]);
+    const HarmonicJetField3D augmented_probe =
+        pipeline.field_from_grid_and_jumps(
+            zero_grid, value_probe, prescribed_normal_jump,
+            modes[1]);
+    std::vector<bool> affected(
+        static_cast<std::size_t>(surface_size), false);
+    for (const auto& local_map : augmented_cauchy.local_maps()) {
+        if (local_map.center_dof < 0
+            || local_map.center_dof >= surface_size) {
+            throw std::logic_error(
+                "Neumann edge-Cauchy local map has invalid center");
+        }
+        affected[static_cast<std::size_t>(local_map.center_dof)] = true;
+    }
+    const bool far_centers_bitwise_legacy =
+        far_cauchy_rows_bitwise_equal_3d(
+            legacy_probe.coefficients, augmented_probe.coefficients,
+            affected);
+    if (!far_centers_bitwise_legacy) {
+        throw std::logic_error(
+            "Neumann edge-Cauchy structural probe changed a far center");
+    }
+
+    const NeumannEdgePreprocessSnapshot3D stable_snapshot =
+        capture_neumann_edge_preprocess_snapshot_3d(pipeline);
+    if (stable_snapshot.output_digest != preprocess_timing.output_digest
+        || stable_snapshot.wrong_side_queries
+            != setup_diagnostics.wrong_side_queries
+        || stable_snapshot.geometry_queries != setup_queries) {
+        throw std::logic_error(
+            "Neumann edge-Cauchy stable setup snapshot mismatch");
+    }
+
+    std::array<NeumannEdgePreprocessSnapshot3D, 2> before_snapshots;
+    std::array<NeumannEdgePreprocessSnapshot3D, 2> after_snapshots;
+    std::array<Eigen::VectorXd, 2> solved_value_jumps;
+    std::array<Eigen::MatrixXd, 2> solved_coefficients;
+    std::array<Eigen::VectorXd, 2> solved_normal_jumps;
+    std::array<Eigen::VectorXd, 2> used_exact_traces;
+    for (std::size_t index = 0; index < modes.size(); ++index) {
+        auto& measurement = result.measurements[index];
+        measurement.case_id = study_case.id;
+        measurement.N = N;
+        measurement.h = h;
+        measurement.mode = modes[index];
+        measurement.expected_non_g1_connections =
+            augmented_diagnostics.edge.expected_non_g1_connections;
+        measurement.covered_non_g1_connections =
+            augmented_diagnostics.edge.covered_non_g1_connections;
+        measurement.edge_sample_count =
+            augmented_cauchy.edge_sample_count();
+        measurement.affected_center_count =
+            augmented_diagnostics.affected_center_count;
+        measurement.corner_center_count =
+            augmented_diagnostics.corner_center_count;
+        measurement.unrelated_sample_or_attachment_count =
+            augmented_diagnostics.edge.unrelated_sample_count
+            + augmented_diagnostics.unrelated_attachment_count;
+        measurement.rank_deficient_fit_count =
+            augmented_diagnostics.edge.rank_deficient_fit_count
+            + augmented_diagnostics.rank_deficient_local_fit_count;
+        measurement.harmonic_cubic_reproduction_defect = std::max(
+            augmented_diagnostics.edge.
+                harmonic_cubic_reproduction_defect_max,
+            augmented_diagnostics.
+                harmonic_cubic_reproduction_defect_max);
+        measurement.edge_condition_max =
+            augmented_diagnostics.edge.condition_max;
+        measurement.local_condition_max =
+            augmented_diagnostics.local_condition_max;
+        measurement.shared_setup_seconds = setup_wall_seconds;
+        measurement.far_centers_bitwise_legacy =
+            far_centers_bitwise_legacy;
+        measurement.geometry_diagnostics_pass = label_mismatches == 0
+            && geometry_diagnostics.unsafe_label_changing_edges == 0
+            && geometry_diagnostics.gap_crossings == 0
+            && geometry_diagnostics.endpoint_crossings == 0
+            && geometry_diagnostics.triangle_fallback_crossings == 0;
+
+        before_snapshots[index] =
+            capture_neumann_edge_preprocess_snapshot_3d(pipeline);
+        result.factorization_counts_before[index] =
+            augmented_cauchy.diagnostics().factorization_count;
+        const PhaseRecordArray3D phase_before =
+            capture_phase_records_3d(profile);
+        const auto route_start = std::chrono::steady_clock::now();
+        const SolveMetrics3D solve = run_neumann_case(
+            grid, grid_pair, pipeline, study_case.transform,
+            gmres_max_iterations, restrict_mode, modes[index],
+            &result.residual_histories[index], nullptr,
+            &solved_value_jumps[index], &solved_coefficients[index],
+            &solved_normal_jumps[index], &used_exact_traces[index],
+            &shared_exact_trace, &prescribed_normal_jump);
+        const auto route_end = std::chrono::steady_clock::now();
+        const PhaseRecordArray3D phase_after_children =
+            capture_phase_records_3d(profile);
+        const double mode_wall_seconds = std::chrono::duration<double>(
+            route_end - route_start).count();
+
+        result.shared_exact_trace_bitwise[index] =
+            bitwise_equal_vector_3d(
+                used_exact_traces[index], shared_exact_trace);
+        result.shared_normal_jump_bitwise[index] =
+            bitwise_equal_vector_3d(
+                solved_normal_jumps[index], prescribed_normal_jump);
+        if (index != 0) {
+            result.shared_exact_trace_bitwise[index] =
+                result.shared_exact_trace_bitwise[index]
+                && bitwise_equal_vector_3d(
+                    used_exact_traces[0], used_exact_traces[index]);
+            result.shared_normal_jump_bitwise[index] =
+                result.shared_normal_jump_bitwise[index]
+                && bitwise_equal_vector_3d(
+                    solved_normal_jumps[0], solved_normal_jumps[index]);
+        }
+        if (!result.shared_exact_trace_bitwise[index]
+            || !result.shared_normal_jump_bitwise[index]) {
+            throw std::logic_error(
+                "Neumann edge-Cauchy modes did not share manufactured data bitwise");
+        }
+        after_snapshots[index] =
+            capture_neumann_edge_preprocess_snapshot_3d(pipeline);
+        result.factorization_counts_after[index] =
+            augmented_cauchy.diagnostics().factorization_count;
+        if (result.factorization_counts_after[index]
+                != result.factorization_counts_before[index]
+            || result.factorization_counts_before[index]
+                != result.setup_factorization_count) {
+            throw std::logic_error(
+                "Neumann edge-Cauchy GMRES changed factorization count");
+        }
+
+        const PhaseRecordArray3D child_deltas =
+            subtract_phase_records_3d(
+                phase_after_children, phase_before,
+                "Neumann edge-Cauchy route children");
+        const std::array<PhaseProfileKind3D, 6> route_children{{
+            PhaseProfileKind3D::EdgeAuxiliaryValues,
+            PhaseProfileKind3D::CauchyCoefficients,
+            PhaseProfileKind3D::SpreadRhsAssembly,
+            PhaseProfileKind3D::FftBulkSolve,
+            PhaseProfileKind3D::RestrictContinuedSamples,
+            PhaseProfileKind3D::RestrictRecovery}};
+        double child_seconds = 0.0;
+        for (PhaseProfileKind3D kind : route_children) {
+            child_seconds += child_deltas[static_cast<std::size_t>(kind)].seconds;
+        }
+        profile.add(PhaseProfileKind3D::GmresAndOtherRoute,
+            nonnegative_profile_remainder_3d(
+                mode_wall_seconds, child_seconds,
+                "Neumann edge-Cauchy mode runtime"), 1);
+        const PhaseRecordArray3D phase_after =
+            capture_phase_records_3d(profile);
+        result.runtime_phase_deltas[index] =
+            subtract_phase_records_3d(
+                phase_after, phase_before,
+                "Neumann edge-Cauchy mode runtime");
+        require_phase_wall_match_3d(
+            phase_record_sum_3d(result.runtime_phase_deltas[index]),
+            mode_wall_seconds,
+            "Neumann edge-Cauchy mode runtime");
+
+        measurement.gmres_converged = solve.converged;
+        measurement.gmres_iterations = solve.iterations;
+        measurement.gmres_relative_residual =
+            solve.gmres_relative_residual;
+        measurement.residual_history_valid =
+            app3d::neumann_edge_cauchy_residual_history_valid_3d(
+                result.residual_histories[index], solve.iterations,
+                solve.gmres_relative_residual);
+        if (!measurement.residual_history_valid) {
+            throw std::runtime_error(
+                "Neumann edge-Cauchy GMRES residual history is invalid");
+        }
+        measurement.density_linf = solve.density_linf;
+        measurement.density_l2 = solve.density_l2;
+        measurement.interior_linf = solve.interior_linf;
+        measurement.interior_l2 = solve.interior_l2;
+        measurement.mode_runtime_seconds = mode_wall_seconds;
+        measurement.total_seconds =
+            measurement.shared_setup_seconds
+            + measurement.mode_runtime_seconds;
+
+        const Eigen::VectorXd shared_edge_values =
+            augmented_cauchy.edge_values(
+                solved_value_jumps[index], solved_normal_jumps[index]);
+        const auto& samples =
+            augmented_cauchy.edge_value_map().samples;
+        if (shared_edge_values.size()
+            != static_cast<Eigen::Index>(samples.size())) {
+            throw std::logic_error(
+                "Neumann edge-Cauchy edge-value output has wrong size");
+        }
+        if (!shared_edge_values.allFinite()) {
+            throw std::runtime_error(
+                "Neumann edge-Cauchy auxiliary values are non-finite");
+        }
+        double discrepancy = 0.0;
+        for (std::size_t q = 0; q < samples.size(); ++q) {
+            const auto& sample = samples[q];
+            NeumannEdgeCauchyEdgeValueRow3D edge_row;
+            edge_row.connection_index = sample.connection_index;
+            edge_row.sample_index = sample.sample_index;
+            edge_row.sample_count = sample.sample_count;
+            edge_row.first_owner_dof = sample.first_owner_dof;
+            edge_row.second_owner_dof = sample.second_owner_dof;
+            edge_row.first_value = evaluate_edge_owner_value_3d(
+                pipeline.surface(), sample.first_owner_dof,
+                sample.point, h, solved_coefficients[index]);
+            edge_row.second_value = evaluate_edge_owner_value_3d(
+                pipeline.surface(), sample.second_owner_dof,
+                sample.point, h, solved_coefficients[index]);
+            edge_row.shared_auxiliary_value =
+                shared_edge_values[static_cast<Eigen::Index>(q)];
+            edge_row.first_second_difference = std::abs(
+                edge_row.first_value - edge_row.second_value);
+            edge_row.first_shared_difference = std::abs(
+                edge_row.first_value - edge_row.shared_auxiliary_value);
+            edge_row.second_shared_difference = std::abs(
+                edge_row.second_value - edge_row.shared_auxiliary_value);
+            const std::array<double, 6> edge_values{{
+                edge_row.first_value, edge_row.second_value,
+                edge_row.shared_auxiliary_value,
+                edge_row.first_second_difference,
+                edge_row.first_shared_difference,
+                edge_row.second_shared_difference}};
+            if (!app3d::neumann_edge_cauchy_edge_value_row_finite_3d(
+                    edge_values)) {
+                throw std::runtime_error(
+                    "Neumann edge-Cauchy edge comparison is non-finite");
+            }
+            discrepancy = std::max(
+                discrepancy, edge_row.first_second_difference);
+            result.edge_value_rows[index].push_back(edge_row);
+        }
+        measurement.incident_edge_discrepancy_linf = discrepancy;
+        measurement.finite_metrics = measurement.residual_history_valid
+            && finite_neumann_owner_metrics_3d(solve)
+            && std::isfinite(measurement.shared_setup_seconds)
+            && std::isfinite(measurement.mode_runtime_seconds)
+            && std::isfinite(measurement.total_seconds)
+            && std::isfinite(measurement.incident_edge_discrepancy_linf)
+            && std::isfinite(measurement.edge_condition_max)
+            && std::isfinite(measurement.local_condition_max);
+        measurement.pair_completed = true;
+        measurement.owner_invariants_pass =
+            neumann_edge_preprocess_snapshot_equal_3d(
+                stable_snapshot, before_snapshots[index])
+            && neumann_edge_preprocess_snapshot_equal_3d(
+                stable_snapshot, after_snapshots[index]);
+    }
+
+    const NeumannEdgePreprocessSnapshot3D final_snapshot =
+        capture_neumann_edge_preprocess_snapshot_3d(pipeline);
+    result.owner_snapshots = {
+        neumann_edge_preprocess_invariant_snapshot_3d(
+            stable_snapshot, stable_snapshot),
+        neumann_edge_preprocess_invariant_snapshot_3d(
+            before_snapshots[0], stable_snapshot),
+        neumann_edge_preprocess_invariant_snapshot_3d(
+            after_snapshots[0], stable_snapshot),
+        neumann_edge_preprocess_invariant_snapshot_3d(
+            before_snapshots[1], stable_snapshot),
+        neumann_edge_preprocess_invariant_snapshot_3d(
+            after_snapshots[1], stable_snapshot),
+        neumann_edge_preprocess_invariant_snapshot_3d(
+            final_snapshot, stable_snapshot)};
+    const bool shared_preprocess_pass =
+        app3d::neumann_edge_shared_preprocess_pass_3d(
+            result.owner_snapshots);
+    for (auto& measurement : result.measurements) {
+        measurement.owner_invariants_pass =
+            measurement.owner_invariants_pass && shared_preprocess_pass;
+        measurement.shared_preprocess_pass = shared_preprocess_pass;
+    }
+    return result;
+}
+
+NeumannEdgeCauchyPairRun3D failed_neumann_edge_cauchy_pair_3d(
+    int N, const app3d::LPrismRigidStudyCase3D& study_case)
+{
+    const std::array<app3d::NeumannEdgeCauchyMode3D, 2> modes{{
+        app3d::NeumannEdgeCauchyMode3D::None,
+        app3d::NeumannEdgeCauchyMode3D::NonG1AuxiliaryValues}};
+    NeumannEdgeCauchyPairRun3D result;
+    result.owner_snapshots.resize(6);
+    for (std::size_t index = 0; index < modes.size(); ++index) {
+        auto& measurement = result.measurements[index];
+        measurement.case_id = study_case.id;
+        measurement.N = N;
+        measurement.h = kBoxSide / static_cast<double>(N);
+        measurement.mode = modes[index];
+        measurement.pair_completed = false;
+        measurement.residual_history_valid = false;
+        measurement.finite_metrics = false;
+    }
+    return result;
+}
+
+std::vector<app3d::LPrismRigidStudyCase3D> neumann_edge_pilot_cases_3d()
+{
+    const std::array<std::string, 3> wanted{{
+        "baseline", "ty_m0083", "rot_axis123_17deg"}};
+    const auto available = app3d::make_l_prism_rigid_study_cases_3d();
+    std::vector<app3d::LPrismRigidStudyCase3D> result;
+    for (const std::string& id : wanted) {
+        const auto found = std::find_if(available.begin(), available.end(),
+            [&](const app3d::LPrismRigidStudyCase3D& item) { return item.id == id; });
+        if (found == available.end())
+            throw std::logic_error("missing Neumann edge pilot case: " + id);
+        result.push_back(*found);
+    }
+    return result;
+}
+
+std::vector<app3d::NeumannEdgeCauchyMeasurement3D>
+neumann_edge_cauchy_measurements_3d(
+    const std::vector<NeumannEdgeCauchyPairRun3D>& pairs)
+{
+    std::vector<app3d::NeumannEdgeCauchyMeasurement3D> result;
+    result.reserve(2 * pairs.size());
+    for (const auto& pair : pairs) {
+        result.push_back(pair.measurements[0]);
+        result.push_back(pair.measurements[1]);
+    }
+    return result;
+}
+
+const app3d::NeumannEdgeCauchyDerivedRow3D*
+find_neumann_edge_cauchy_derived_row_3d(
+    const app3d::NeumannEdgeCauchyEvaluation3D& evaluation,
+    const app3d::NeumannEdgeCauchyMeasurement3D& measurement)
+{
+    const auto found = std::find_if(
+        evaluation.rows.begin(), evaluation.rows.end(),
+        [&](const app3d::NeumannEdgeCauchyDerivedRow3D& row) {
+            return row.measurement.case_id == measurement.case_id
+                && row.measurement.N == measurement.N
+                && row.measurement.mode == measurement.mode;
+        });
+    return found == evaluation.rows.end()
+        ? nullptr : std::addressof(*found);
+}
+
+bool neumann_edge_cauchy_pair_execution_pass_3d(
+    const NeumannEdgeCauchyPairRun3D& pair,
+    const app3d::NeumannEdgeCauchyEvaluation3D& evaluation)
+{
+    return std::all_of(
+        pair.measurements.begin(), pair.measurements.end(),
+        [&](const auto& measurement) {
+            const auto* derived =
+                find_neumann_edge_cauchy_derived_row_3d(
+                    evaluation, measurement);
+            return derived != nullptr
+                && derived->row_pass
+                    == app3d::RigidStudyCriterionStatus3D::Pass;
+        });
+}
+
+void write_neumann_edge_cauchy_checkpoints_3d(
+    const std::filesystem::path& output_dir,
+    const std::vector<NeumannEdgeCauchyPairRun3D>& pairs,
+    const app3d::NeumannEdgeCauchyEvaluation3D& evaluation)
+{
+    std::filesystem::create_directories(output_dir);
+    std::ofstream summary = open_output_file(output_dir / "summary.csv");
+    summary << std::setprecision(17) << std::boolalpha
+        << "case_id,N,h,mode,pair_completed,residual_history_valid,"
+           "shared_exact_trace_bitwise,shared_normal_jump_bitwise,"
+           "finite_metrics,gmres_converged,"
+           "gmres_iterations,"
+           "gmres_relative_residual,density_linf,density_l2,interior_linf,"
+           "interior_l2,incident_edge_discrepancy_linf,"
+           "expected_non_g1_connections,covered_non_g1_connections,"
+           "edge_sample_count,affected_center_count,corner_center_count,"
+           "unrelated_sample_or_attachment_count,rank_deficient_fit_count,"
+           "harmonic_cubic_reproduction_defect,edge_condition_max,"
+           "local_condition_max,far_centers_bitwise_legacy,"
+           "geometry_diagnostics_pass,owner_invariants_pass,"
+           "shared_preprocess_pass,density_linf_order,density_l2_order,"
+           "interior_linf_order,interior_l2_order,"
+           "density_linf_ratio_to_legacy,density_l2_ratio_to_legacy,"
+           "interior_linf_ratio_to_legacy,interior_l2_ratio_to_legacy,"
+           "edge_discrepancy_ratio_to_legacy,row_pass,"
+           "shared_setup_seconds,edge_auxiliary_values_seconds,"
+           "cauchy_coefficients_seconds,spread_rhs_assembly_seconds,"
+           "fft_bulk_solve_seconds,restrict_continued_samples_seconds,"
+           "restrict_recovery_seconds,gmres_and_other_route_seconds,"
+           "mode_runtime_seconds,total_seconds\n";
+    for (const auto& pair : pairs) {
+        for (std::size_t mode_index = 0; mode_index < 2; ++mode_index) {
+            const auto& measurement = pair.measurements[mode_index];
+            const auto* derived =
+                find_neumann_edge_cauchy_derived_row_3d(
+                    evaluation, measurement);
+            if (derived == nullptr) {
+                throw std::logic_error(
+                    "missing Neumann edge-Cauchy derived row");
+            }
+            const auto& phases = pair.runtime_phase_deltas[mode_index];
+            const auto seconds = [&](PhaseProfileKind3D kind) {
+                return phases[static_cast<std::size_t>(kind)].seconds;
+            };
+            summary << measurement.case_id << ',' << measurement.N
+                << ',' << measurement.h << ','
+                << app3d::neumann_edge_cauchy_mode_name_3d(
+                       measurement.mode)
+                << ',' << measurement.pair_completed
+                << ',' << measurement.residual_history_valid
+                << ',' << pair.shared_exact_trace_bitwise[mode_index]
+                << ',' << pair.shared_normal_jump_bitwise[mode_index]
+                << ',' << measurement.finite_metrics
+                << ',' << measurement.gmres_converged
+                << ',' << measurement.gmres_iterations
+                << ',' << measurement.gmres_relative_residual
+                << ',' << measurement.density_linf
+                << ',' << measurement.density_l2
+                << ',' << measurement.interior_linf
+                << ',' << measurement.interior_l2
+                << ',' << measurement.incident_edge_discrepancy_linf
+                << ',' << measurement.expected_non_g1_connections
+                << ',' << measurement.covered_non_g1_connections
+                << ',' << measurement.edge_sample_count
+                << ',' << measurement.affected_center_count
+                << ',' << measurement.corner_center_count
+                << ',' << measurement.unrelated_sample_or_attachment_count
+                << ',' << measurement.rank_deficient_fit_count
+                << ',' << measurement.harmonic_cubic_reproduction_defect
+                << ',' << measurement.edge_condition_max
+                << ',' << measurement.local_condition_max
+                << ',' << measurement.far_centers_bitwise_legacy
+                << ',' << measurement.geometry_diagnostics_pass
+                << ',' << measurement.owner_invariants_pass
+                << ',' << measurement.shared_preprocess_pass
+                << ',' << derived->density_linf_order
+                << ',' << derived->density_l2_order
+                << ',' << derived->interior_linf_order
+                << ',' << derived->interior_l2_order
+                << ',' << derived->density_linf_ratio_to_legacy
+                << ',' << derived->density_l2_ratio_to_legacy
+                << ',' << derived->interior_linf_ratio_to_legacy
+                << ',' << derived->interior_l2_ratio_to_legacy
+                << ',' << derived->edge_discrepancy_ratio_to_legacy
+                << ',' << criterion_status_name(derived->row_pass)
+                << ',' << measurement.shared_setup_seconds
+                << ',' << seconds(PhaseProfileKind3D::EdgeAuxiliaryValues)
+                << ',' << seconds(PhaseProfileKind3D::CauchyCoefficients)
+                << ',' << seconds(PhaseProfileKind3D::SpreadRhsAssembly)
+                << ',' << seconds(PhaseProfileKind3D::FftBulkSolve)
+                << ',' << seconds(PhaseProfileKind3D::RestrictContinuedSamples)
+                << ',' << seconds(PhaseProfileKind3D::RestrictRecovery)
+                << ',' << seconds(PhaseProfileKind3D::GmresAndOtherRoute)
+                << ',' << measurement.mode_runtime_seconds
+                << ',' << measurement.total_seconds << '\n';
+        }
+    }
+
+    std::ofstream edges = open_output_file(
+        output_dir / "edge_values.csv");
+    edges << std::setprecision(17)
+        << "case_id,N,mode,connection_index,sample_index,sample_count,"
+           "first_owner_dof,second_owner_dof,first_value,second_value,"
+           "shared_auxiliary_value,first_second_difference,"
+           "first_shared_difference,second_shared_difference\n";
+    for (const auto& pair : pairs) {
+        for (std::size_t mode_index = 0; mode_index < 2; ++mode_index) {
+            const auto& measurement = pair.measurements[mode_index];
+            for (const auto& row : pair.edge_value_rows[mode_index]) {
+                edges << measurement.case_id << ',' << measurement.N
+                    << ',' << app3d::neumann_edge_cauchy_mode_name_3d(
+                           measurement.mode)
+                    << ',' << row.connection_index
+                    << ',' << row.sample_index
+                    << ',' << row.sample_count
+                    << ',' << row.first_owner_dof
+                    << ',' << row.second_owner_dof
+                    << ',' << row.first_value
+                    << ',' << row.second_value
+                    << ',' << row.shared_auxiliary_value
+                    << ',' << row.first_second_difference
+                    << ',' << row.first_shared_difference
+                    << ',' << row.second_shared_difference << '\n';
+            }
+        }
+    }
+
+    std::ofstream residuals = open_output_file(
+        output_dir / "gmres_residuals.csv");
+    residuals << std::setprecision(17)
+              << "case_id,N,mode,iteration,residual\n";
+    for (const auto& pair : pairs) {
+        for (std::size_t mode_index = 0; mode_index < 2; ++mode_index) {
+            const auto& measurement = pair.measurements[mode_index];
+            for (std::size_t iteration = 0;
+                 iteration < pair.residual_histories[mode_index].size();
+                 ++iteration) {
+                residuals << measurement.case_id << ',' << measurement.N
+                    << ',' << app3d::neumann_edge_cauchy_mode_name_3d(
+                           measurement.mode)
+                    << ',' << iteration << ','
+                    << pair.residual_histories[mode_index][iteration]
+                    << '\n';
+            }
+        }
+    }
+
+    std::ofstream owners = open_output_file(
+        output_dir / "owner_diagnostics.csv");
+    owners << std::boolalpha
+        << "case_id,N,mode,pair_completed,shared_exact_trace_bitwise,"
+           "shared_normal_jump_bitwise,stable_workload_fingerprint,"
+           "stable_output_digest,stable_wrong_side_queries,"
+           "stable_geometry_queries,before_workload_fingerprint,"
+           "after_workload_fingerprint,before_output_digest,"
+           "after_output_digest,before_wrong_side_queries,"
+           "after_wrong_side_queries,before_geometry_queries,"
+           "after_geometry_queries,final_workload_fingerprint,"
+           "final_output_digest,final_wrong_side_queries,"
+           "final_geometry_queries,diagnostics_match_reference,"
+           "setup_factorization_count,factorization_count_before_gmres,"
+           "factorization_count_after_gmres,geometry_diagnostics_pass,"
+           "owner_invariants_pass,shared_preprocess_pass\n";
+    for (const auto& pair : pairs) {
+        if (pair.owner_snapshots.size() != 6) {
+            throw std::logic_error(
+                "Neumann edge-Cauchy owner snapshot chain is incomplete");
+        }
+        const auto& stable = pair.owner_snapshots[0];
+        const auto& final = pair.owner_snapshots[5];
+        for (std::size_t mode_index = 0; mode_index < 2; ++mode_index) {
+            const auto& measurement = pair.measurements[mode_index];
+            const auto& before = pair.owner_snapshots[1 + 2 * mode_index];
+            const auto& after = pair.owner_snapshots[2 + 2 * mode_index];
+            owners << measurement.case_id << ',' << measurement.N
+                << ',' << app3d::neumann_edge_cauchy_mode_name_3d(
+                       measurement.mode)
+                << ',' << measurement.pair_completed
+                << ',' << pair.shared_exact_trace_bitwise[mode_index]
+                << ',' << pair.shared_normal_jump_bitwise[mode_index]
+                << ',' << stable.workload_fingerprint
+                << ',' << stable.output_digest
+                << ',' << stable.wrong_side_queries
+                << ',' << stable.geometry_queries
+                << ',' << before.workload_fingerprint
+                << ',' << after.workload_fingerprint
+                << ',' << before.output_digest
+                << ',' << after.output_digest
+                << ',' << before.wrong_side_queries
+                << ',' << after.wrong_side_queries
+                << ',' << before.geometry_queries
+                << ',' << after.geometry_queries
+                << ',' << final.workload_fingerprint
+                << ',' << final.output_digest
+                << ',' << final.wrong_side_queries
+                << ',' << final.geometry_queries
+                << ',' << (stable.diagnostics_match_reference
+                    && before.diagnostics_match_reference
+                    && after.diagnostics_match_reference
+                    && final.diagnostics_match_reference)
+                << ',' << pair.setup_factorization_count
+                << ',' << pair.factorization_counts_before[mode_index]
+                << ',' << pair.factorization_counts_after[mode_index]
+                << ',' << measurement.geometry_diagnostics_pass
+                << ',' << measurement.owner_invariants_pass
+                << ',' << measurement.shared_preprocess_pass << '\n';
+        }
+    }
+
+    std::ofstream phases = open_output_file(
+        output_dir / "phase_profile.csv");
+    phases << std::setprecision(17)
+        << "case_id,N,mode,scope,phase,seconds,calls\n";
+    for (const auto& pair : pairs) {
+        const auto& first = pair.measurements[0];
+        for (std::size_t q = 0;
+             q < app3d::phase_profile_kind_count_3d(); ++q) {
+            const auto kind = static_cast<PhaseProfileKind3D>(q);
+            phases << first.case_id << ',' << first.N
+                << ",shared,shared_setup,"
+                << app3d::phase_profile_name_3d(kind) << ','
+                << pair.shared_setup_phases[q].seconds << ','
+                << pair.shared_setup_phases[q].calls << '\n';
+        }
+        for (std::size_t mode_index = 0; mode_index < 2; ++mode_index) {
+            const auto& measurement = pair.measurements[mode_index];
+            for (std::size_t q = 0;
+                 q < app3d::phase_profile_kind_count_3d(); ++q) {
+                const auto kind = static_cast<PhaseProfileKind3D>(q);
+                phases << measurement.case_id << ',' << measurement.N
+                    << ',' << app3d::neumann_edge_cauchy_mode_name_3d(
+                           measurement.mode)
+                    << ",mode_runtime,"
+                    << app3d::phase_profile_name_3d(kind) << ','
+                    << pair.runtime_phase_deltas[mode_index][q].seconds
+                    << ',' << pair.runtime_phase_deltas[mode_index][q].calls
+                    << '\n';
+            }
+        }
+    }
+
+    std::ofstream acceptance = open_output_file(
+        output_dir / "acceptance.csv");
+    acceptance
+        << "completeness_pass,structure_pass,reproduction_pass,gmres_pass,"
+           "error_guard_pass,order_pass,rigid_spread_pass,"
+           "edge_discrepancy_pass,geometry_owner_pass,"
+           "extended_evidence_pass,overall_pass\n"
+        << criterion_status_name(
+               evaluation.acceptance.completeness_pass) << ','
+        << criterion_status_name(
+               evaluation.acceptance.structure_pass) << ','
+        << criterion_status_name(
+               evaluation.acceptance.reproduction_pass) << ','
+        << criterion_status_name(
+               evaluation.acceptance.gmres_pass) << ','
+        << criterion_status_name(
+               evaluation.acceptance.error_guard_pass) << ','
+        << criterion_status_name(
+               evaluation.acceptance.order_pass) << ','
+        << criterion_status_name(
+               evaluation.acceptance.rigid_spread_pass) << ','
+        << criterion_status_name(
+               evaluation.acceptance.edge_discrepancy_pass) << ','
+        << criterion_status_name(
+               evaluation.acceptance.geometry_owner_pass) << ','
+        << criterion_status_name(
+               evaluation.acceptance.extended_evidence_pass) << ','
+        << criterion_status_name(
+               evaluation.acceptance.overall_pass) << '\n';
+}
+
+int run_neumann_edge_cauchy_study_3d(std::vector<int> levels)
+{
+    try {
+        levels = app3d::normalize_neumann_edge_cauchy_levels_3d(
+            std::move(levels));
+    } catch (const std::invalid_argument& error) {
+        throw std::invalid_argument(std::string(error.what())
+            + "; accepted prefixes: 32; 32 64; 32 64 128");
+    }
+    const auto cases = neumann_edge_pilot_cases_3d();
+    std::vector<std::string> case_ids;
+    for (const auto& study_case : cases)
+        case_ids.push_back(study_case.id);
+#ifdef KFBIM_APP_OUTPUT_DIR
+    std::filesystem::path output_dir =
+        std::filesystem::path(KFBIM_APP_OUTPUT_DIR)
+        / "neumann_edge_cauchy_3d";
+#else
+    std::filesystem::path output_dir =
+        "output/neumann_edge_cauchy_3d";
+#endif
+    const char* output_override = std::getenv(
+        "KFBIM_3D_NEUMANN_EDGE_CAUCHY_OUTPUT_DIR");
+    if (output_override != nullptr) output_dir = output_override;
+
+    const bool require_complete_pilot =
+        std::find(levels.begin(), levels.end(), 64) != levels.end();
+    std::vector<NeumannEdgeCauchyPairRun3D> pairs;
+    app3d::NeumannEdgeCauchyEvaluation3D evaluation =
+        app3d::evaluate_neumann_edge_cauchy_study_3d(
+            {}, case_ids, require_complete_pilot);
+    std::cout << "KFBI3D Neumann non-G1 edge-Cauchy A/B study\n"
+              << "  route=joint_tricubic_crossing_owner"
+                 " owner=region_closest_hybrid"
+                 " cauchy=g1_nearest/degree3/48/28\n"
+              << "  modes=none,non_g1_auxiliary_values"
+                 " gmres_tolerance=2e-10 restart=80 cap=80 levels=";
+    for (std::size_t index = 0; index < levels.size(); ++index) {
+        if (index != 0) std::cout << ',';
+        std::cout << levels[index];
+    }
+    std::cout << " cases=" << cases.size() << '\n';
+
+    for (int N : levels) {
+        if (N == 128) {
+            evaluation = app3d::evaluate_neumann_edge_cauchy_study_3d(
+                neumann_edge_cauchy_measurements_3d(pairs),
+                case_ids, true);
+            write_neumann_edge_cauchy_checkpoints_3d(
+                output_dir, pairs, evaluation);
+            if (!evaluation.all_pass) {
+                std::cerr
+                    << "error: N=128 gated off because the completed N=32/64 "
+                       "Neumann edge-Cauchy pilot did not pass\n";
+                return 1;
+            }
+        }
+        for (const auto& study_case : cases) {
+            std::cout << "[neumann-edge-cauchy-study] case="
+                << study_case.id << " N=" << N << " setup\n";
+            bool pair_execution_pass = false;
+            const auto process =
+                app3d::process_neumann_edge_cauchy_pair_3d(
+                    N,
+                    [&] {
+                        pairs.push_back(run_neumann_edge_cauchy_pair_3d(
+                            N, study_case));
+                    },
+                    [&] {
+                        pairs.push_back(failed_neumann_edge_cauchy_pair_3d(
+                            N, study_case));
+                    },
+                    [&] {
+                        evaluation =
+                            app3d::evaluate_neumann_edge_cauchy_study_3d(
+                                neumann_edge_cauchy_measurements_3d(pairs),
+                                case_ids, require_complete_pilot);
+                        pair_execution_pass =
+                            neumann_edge_cauchy_pair_execution_pass_3d(
+                                pairs.back(), evaluation);
+                        write_neumann_edge_cauchy_checkpoints_3d(
+                            output_dir, pairs, evaluation);
+                        return pair_execution_pass;
+                    });
+            if (!process.evidence_completed) {
+                std::cerr << (N == 128 ? "warning: " : "error: ")
+                    << "N=" << N
+                    << " Neumann edge-Cauchy evidence failed: case="
+                    << study_case.id
+                    << " reason=" << process.failure_message
+                    << "; checkpoint records pair_completed=false\n";
+            }
+
+            const auto& pair = pairs.back();
+            for (const auto& measurement : pair.measurements) {
+                const auto* derived =
+                    find_neumann_edge_cauchy_derived_row_3d(
+                        evaluation, measurement);
+                const bool row_pass = derived != nullptr
+                    && derived->row_pass
+                        == app3d::RigidStudyCriterionStatus3D::Pass;
+                std::cout << "[neumann-edge-cauchy-study] case="
+                    << measurement.case_id << " N=" << measurement.N
+                    << " mode="
+                    << app3d::neumann_edge_cauchy_mode_name_3d(
+                           measurement.mode)
+                    << " iter=" << measurement.gmres_iterations
+                    << " residual="
+                    << measurement.gmres_relative_residual
+                    << " edge_linf="
+                    << measurement.incident_edge_discrepancy_linf
+                    << " setup_s=" << measurement.shared_setup_seconds
+                    << " runtime_s=" << measurement.mode_runtime_seconds
+                    << " pass=" << row_pass << '\n';
+            }
+            if (!pair_execution_pass) {
+                std::cerr << (N == 128 ? "warning: " : "error: ")
+                    << "Neumann edge-Cauchy structural or GMRES row gate "
+                       "failed: case=" << study_case.id
+                    << " N=" << N << '\n';
+            }
+            if (!process.continue_study) return 1;
+        }
+    }
+
+    evaluation = app3d::evaluate_neumann_edge_cauchy_study_3d(
+        neumann_edge_cauchy_measurements_3d(pairs),
+        case_ids, require_complete_pilot);
+    write_neumann_edge_cauchy_checkpoints_3d(
+        output_dir, pairs, evaluation);
+    std::cout << "[neumann-edge-cauchy-acceptance] completeness="
+        << criterion_status_name(evaluation.acceptance.completeness_pass)
+        << " structure="
+        << criterion_status_name(evaluation.acceptance.structure_pass)
+        << " reproduction="
+        << criterion_status_name(evaluation.acceptance.reproduction_pass)
+        << " gmres="
+        << criterion_status_name(evaluation.acceptance.gmres_pass)
+        << " error_guard="
+        << criterion_status_name(evaluation.acceptance.error_guard_pass)
+        << " order="
+        << criterion_status_name(evaluation.acceptance.order_pass)
+        << " rigid_spread="
+        << criterion_status_name(evaluation.acceptance.rigid_spread_pass)
+        << " edge_discrepancy="
+        << criterion_status_name(
+               evaluation.acceptance.edge_discrepancy_pass)
+        << " geometry_owner="
+        << criterion_status_name(evaluation.acceptance.geometry_owner_pass)
+        << " extended_evidence="
+        << criterion_status_name(
+               evaluation.acceptance.extended_evidence_pass)
+        << " overall="
+        << criterion_status_name(evaluation.acceptance.overall_pass)
+        << '\n';
+    std::cout << "Neumann edge-Cauchy study output: "
+              << output_dir.string() << '\n';
+
+    if (evaluation.acceptance.extended_evidence_pass
+        == app3d::RigidStudyCriterionStatus3D::Fail) {
+        std::cerr << "warning: N=128 Neumann edge-Cauchy extended evidence "
+                     "failed; coarse process acceptance is unchanged\n";
+    }
+    const bool exit_pass =
+        app3d::neumann_edge_cauchy_study_exit_pass_3d(
+            evaluation, require_complete_pilot);
+    if (!exit_pass) {
+        std::cerr << "error: Neumann edge-Cauchy study acceptance failed\n";
+        return 1;
+    }
+    if (!require_complete_pilot) {
+        std::cout << "Neumann edge-Cauchy N=32 prefix completed; two-level "
+                     "comparisons and order remain non-gating\n";
+    }
+    return 0;
+}
+
+int run_neumann_edge_continuity_study_3d(std::vector<int> levels){
+    try {
+        levels = app3d::normalize_neumann_edge_continuity_levels_3d(std::move(levels));
+    } catch (const std::invalid_argument& error) {
+        throw std::invalid_argument(std::string(error.what())
+            + "; accepted prefixes: 32; 32 64; 32 64 128");
+    }
+    const std::vector<app3d::LPrismRigidStudyCase3D> cases = neumann_edge_pilot_cases_3d();
+    std::vector<std::string> case_ids;
+    for (const auto& study_case : cases) case_ids.push_back(study_case.id);
+#ifdef KFBIM_APP_OUTPUT_DIR
+    std::filesystem::path output_dir = std::filesystem::path(KFBIM_APP_OUTPUT_DIR)
+        / "neumann_edge_continuity_3d";
+#else
+    std::filesystem::path output_dir = "output/neumann_edge_continuity_3d";
+#endif
+    const char* output_override = std::getenv(
+        "KFBIM_3D_NEUMANN_EDGE_CONTINUITY_OUTPUT_DIR");
+    if (output_override != nullptr) output_dir = output_override;
+
+    const bool require_complete_pilot =
+        std::find(levels.begin(), levels.end(), 64) != levels.end();
+    std::vector<NeumannEdgeStudyRow3D> rows;
+    app3d::NeumannEdgeContinuityEvaluation3D evaluation =
+        app3d::evaluate_neumann_edge_continuity_study_3d(
+            neumann_edge_measurements_3d(rows), case_ids, require_complete_pilot);
+    std::cout << "KFBI3D Neumann non-G1 edge-continuity A/B study\n"
+              << "  route=joint_tricubic_crossing_owner owner=region_closest_hybrid"
+                 " cauchy=g1_nearest/degree3/48/28\n"
+              << "  gmres_tolerance=2e-10 restart=80 cap=80 levels=";
+    for (std::size_t index = 0; index < levels.size(); ++index) {
+        if (index != 0) std::cout << ',';
+        std::cout << levels[index];
+    }
+    std::cout << " cases=" << cases.size() << '\n';
+
+    for (int N : levels) {
+        if (N == 128) {
+            evaluation = app3d::evaluate_neumann_edge_continuity_study_3d(
+                neumann_edge_measurements_3d(rows), case_ids, true);
+            write_neumann_edge_continuity_checkpoints_3d(output_dir, rows, evaluation);
+            if (!evaluation.all_pass) {
+                std::cerr << "error: N=128 gated off because the completed N=32/64 "
+                             "Neumann edge pilot did not pass\n";
+                return 1;
+            }
+        }
+        for (const auto& study_case : cases) {
+            std::cout << "[neumann-edge-continuity-study] case=" << study_case.id
+                      << " N=" << N << " setup\n";
+            std::array<NeumannEdgeStudyRow3D, 2> pair =
+                run_neumann_edge_continuity_pair_3d(N, study_case);
+            for (NeumannEdgeStudyRow3D& row : pair) rows.push_back(std::move(row));
+            evaluation = app3d::evaluate_neumann_edge_continuity_study_3d(
+                neumann_edge_measurements_3d(rows), case_ids, require_complete_pilot);
+            write_neumann_edge_continuity_checkpoints_3d(output_dir, rows, evaluation);
+            bool pair_pass = true;
+            for (std::size_t q = rows.size() - 2; q < rows.size(); ++q) {
+                const NeumannEdgeStudyRow3D& row = rows[q];
+                const auto* derived = find_neumann_edge_derived_row_3d(evaluation, row);
+                const bool row_pass = derived != nullptr
+                    && derived->row_pass == app3d::RigidStudyCriterionStatus3D::Pass;
+                pair_pass = pair_pass && row_pass;
+                std::cout << "[neumann-edge-continuity-study] case=" << row.study_case.id
+                    << " N=" << row.N << " density_space="
+                    << app3d::neumann_density_space_name_3d(row.density_space)
+                    << " iter=" << row.solve.iterations
+                    << " residual=" << row.solve.gmres_relative_residual
+                    << " edge_linf=" << row.edge_mismatch_linf
+                    << " geometry=" << row.geometry_diagnostics_pass
+                    << " owner=" << row.owner_invariants_pass
+                    << " shared=" << row.shared_preprocess_pass
+                    << " pass=" << row_pass << '\n';
+            }
+            if (!pair_pass) {
+                std::cerr << (N == 128 ? "warning: " : "error: ")
+                    << "Neumann edge-continuity structural or GMRES row gate "
+                       "failed: case=" << study_case.id << " N=" << N << '\n';
+                if (N != 128) return 1;
+            }
+        }
+    }
+
+    evaluation = app3d::evaluate_neumann_edge_continuity_study_3d(
+        neumann_edge_measurements_3d(rows), case_ids, require_complete_pilot);
+    write_neumann_edge_continuity_checkpoints_3d(output_dir, rows, evaluation);
+    std::cout << "[neumann-edge-continuity-acceptance] completeness="
+        << criterion_status_name(evaluation.acceptance.completeness_pass)
+        << " topology=" << criterion_status_name(evaluation.acceptance.topology_pass)
+        << " projector=" << criterion_status_name(evaluation.acceptance.projector_pass)
+        << " exact_order=" << criterion_status_name(evaluation.acceptance.exact_trace_order_pass)
+        << " gmres=" << criterion_status_name(evaluation.acceptance.gmres_pass)
+        << " error_guard=" << criterion_status_name(evaluation.acceptance.error_guard_pass)
+        << " edge_reduction=" << criterion_status_name(evaluation.acceptance.edge_reduction_pass)
+        << " trend=" << criterion_status_name(evaluation.acceptance.trend_pass)
+        << " geometry_owner=" << criterion_status_name(evaluation.acceptance.geometry_owner_pass)
+        << " extended_evidence="
+        << criterion_status_name(evaluation.acceptance.extended_evidence_pass)
+        << " overall=" << criterion_status_name(evaluation.acceptance.overall_pass) << '\n';
+    std::cout << "Neumann edge-continuity study output: " << output_dir.string() << '\n';
+    const bool exit_pass =
+        app3d::neumann_edge_continuity_study_exit_pass_3d(
+            evaluation, require_complete_pilot);
+    if (!exit_pass) {
+        std::cerr << "error: Neumann edge-continuity study acceptance failed\n";
+        return 1;
+    }
+    if (!require_complete_pilot && !evaluation.all_pass) {
+        std::cout << "Neumann edge-continuity N=32 prefix completed; comparative "
+                     "A/B hypotheses remain recorded but are not an execution gate\n";
+    }
+    return 0;
+}
 void print_usage(const char* executable)
 {
     std::cout
         << "usage: " << executable
         << " [torus|cylinder|l_prism|all] [N ...]\n"
         << "       " << executable << " --rigid-study [N ...]\n"
-        << "       " << executable << " --neumann-owner-study [N ...]\n"
         << "       " << executable << " --restrict-probe [N ...]\n"
         << "       " << executable << " --restrict-probe-owner [N ...]\n"
+        << "       " << executable << " --restrict-profile-owner [N]\n"
+        << "       " << executable << " --owner-preprocess-study [N ...]\n"
+        << "       " << executable << " --neumann-owner-study [N ...]\n"
+        << "       " << executable << " --neumann-rigid-study [N ...]\n"
+        << "       " << executable << " --neumann-edge-continuity-study [N ...]\n"
+        << "       " << executable << " --neumann-edge-cauchy-study [N ...]\n"
         << "  Each N must be a power of two and at least 16 (default: 32).\n"
         << "  Rigid-study default levels: 32, 64, 128.\n"
-        << "  Neumann-owner-study default levels: 32, 64, 128.\n"
         << "  Restrict-probe default levels: 32, 64.\n"
+        << "  Restrict-profile default level: 128 (one level only).\n"
+        << "  Owner-preprocess-study default levels: 16, 32, 64.\n"
+        << "  Neumann-owner-study default levels: 32, 64, 128.\n"
+        << "  Neumann-rigid-study levels are the refinement prefixes "
+           "32; 32,64; or 32,64,128 (default: 32,64,128).\n"
+        << "  Neumann-edge-continuity-study levels are the refinement prefixes "
+           "32; 32,64; or 32,64,128 (default: 32,64).\n"
+        << "  Neumann-edge-cauchy-study levels are the refinement prefixes "
+           "32; 32,64; or 32,64,128 (default: 32,64).\n"
         << "  This stage builds native NURBS parameter-cell-center surface\n"
         << "  unknowns, topology-filtered 48/28 Cauchy stencils, validates\n"
         << "  fixed transfer routes, and executes the Neumann value-jump and\n"
@@ -4831,7 +9919,11 @@ void print_usage(const char* executable)
         << "  KFBIM_3D_CAUCHY_NORMAL_COUNT select positive stencil counts\n"
         << "  (defaults: 48 and 28; normal count may not exceed value count).\n"
         << "  KFBIM_3D_GMRES_MAX_ITERATIONS selects a positive GMRES cap\n"
-        << "  for both formulations (default: 80).\n";
+        << "  for both formulations (default: 80).\n"
+        << "  KFBIM_3D_RESTRICT_OWNER_MODE selects "
+           "full_intersection_reference\n"
+        << "  (default), optimized_intersection, or "
+           "region_closest_hybrid.\n";
 }
 
 } // namespace
@@ -4842,20 +9934,43 @@ int main(int argc, char** argv)
         std::cout << std::scientific << std::setprecision(6) << std::unitbuf;
         const bool rigid_study = argc >= 2
                               && std::string(argv[1]) == "--rigid-study";
-        const bool neumann_owner_study = argc >= 2
-            && std::string(argv[1]) == "--neumann-owner-study";
         const bool restrict_probe = argc >= 2
                                   && std::string(argv[1]) == "--restrict-probe";
         const bool restrict_probe_owner = argc >= 2
             && std::string(argv[1]) == "--restrict-probe-owner";
+        const bool restrict_profile_owner = argc >= 2
+            && std::string(argv[1]) == "--restrict-profile-owner";
+        const bool owner_preprocess_study = argc >= 2
+            && std::string(argv[1]) == "--owner-preprocess-study";
+        const bool neumann_owner_study = argc >= 2
+            && std::string(argv[1]) == "--neumann-owner-study";
+        const bool neumann_rigid_study = argc >= 2
+            && std::string(argv[1]) == "--neumann-rigid-study";
+        const bool neumann_edge_continuity_study = argc >= 2
+            && std::string(argv[1]) == "--neumann-edge-continuity-study";
+        const bool neumann_edge_cauchy_study = argc >= 2
+            && std::string(argv[1]) == "--neumann-edge-cauchy-study";
         std::string selection = "all";
-        std::vector<int> levels = (rigid_study || neumann_owner_study)
+        std::vector<int> levels = rigid_study
             ? std::vector<int>{32, 64, 128}
-            : (restrict_probe || restrict_probe_owner)
+            : neumann_owner_study
+                ? std::vector<int>{32, 64, 128}
+            : neumann_rigid_study
+                ? std::vector<int>{32, 64, 128}
+            : (neumann_edge_continuity_study || neumann_edge_cauchy_study)
+                ? std::vector<int>{32, 64}
+            : owner_preprocess_study
+                ? std::vector<int>{16, 32, 64}
+            : restrict_profile_owner
+                ? std::vector<int>{128}
+                : (restrict_probe || restrict_probe_owner)
                 ? std::vector<int>{32, 64}
                 : std::vector<int>{32};
-        if (argc >= 2 && !rigid_study && !neumann_owner_study && !restrict_probe
-            && !restrict_probe_owner)
+        if (argc >= 2 && !rigid_study && !restrict_probe
+            && !restrict_probe_owner && !restrict_profile_owner
+            && !owner_preprocess_study && !neumann_owner_study
+            && !neumann_rigid_study && !neumann_edge_continuity_study
+            && !neumann_edge_cauchy_study)
             selection = argv[1];
         if (selection == "--help" || selection == "-h") {
             print_usage(argv[0]);
@@ -4863,20 +9978,25 @@ int main(int argc, char** argv)
         }
         if (argc >= 3) {
             levels.clear();
-            for (int argument = 2; argument < argc; ++argument) {
-                const int N = std::stoi(argv[argument]);
-                if (N < 16 || !is_power_of_two(N)) {
-                    throw std::invalid_argument(
-                        "each N must be a power of two and at least 16");
-                }
-                levels.push_back(N);
-            }
+            for (int argument = 2; argument < argc; ++argument)
+                levels.push_back(parse_grid_level_argument(argv[argument]));
         }
-        if (restrict_probe || restrict_probe_owner)
+        if (restrict_probe || restrict_probe_owner
+            || restrict_profile_owner) {
             return run_normal_restrict_causal_probe(levels,
-                                                     restrict_probe_owner);
+                restrict_probe_owner || restrict_profile_owner,
+                restrict_profile_owner);
+        }
+        if (owner_preprocess_study)
+            return run_owner_preprocess_study_3d(levels);
         if (neumann_owner_study)
-            return run_neumann_owner_study(levels);
+            return run_neumann_owner_study_3d(levels);
+        if (neumann_rigid_study)
+            return run_neumann_rigid_study_3d(levels);
+        if (neumann_edge_continuity_study)
+            return run_neumann_edge_continuity_study_3d(levels);
+        if (neumann_edge_cauchy_study)
+            return run_neumann_edge_cauchy_study_3d(levels);
         const CauchyStencilPolicy3D cauchy_policy = selected_cauchy_policy();
         const int cauchy_value_count = positive_environment_integer(
             "KFBIM_3D_CAUCHY_VALUE_COUNT", kCauchyValueNeighborCount);

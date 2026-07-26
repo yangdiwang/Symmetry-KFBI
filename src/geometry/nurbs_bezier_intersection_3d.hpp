@@ -3,6 +3,7 @@
 #include "rational_bezier_element_3d.hpp"
 
 #include <Eigen/Dense>
+#include <optional>
 #include <stdexcept>
 
 #include <vector>
@@ -66,6 +67,20 @@ struct NurbsElementIntersectionResult3D {
     bool overlap_detected = false;
 };
 
+enum class NurbsElementSegmentCertificateKind3D {
+    CertifiedMiss,
+    CertifiedUniqueTransverseRoot,
+    Unresolved
+};
+
+struct NurbsElementSegmentCertificate3D {
+    NurbsElementSegmentCertificateKind3D kind =
+        NurbsElementSegmentCertificateKind3D::Unresolved;
+    std::optional<NurbsElementRoot3D> root;
+    NurbsElementIntersectionDiagnostics3D diagnostics;
+    bool overlap_detected = false;
+};
+
 class UnresolvedNurbsIntersectionCandidate3D : public std::runtime_error {
 public:
     explicit UnresolvedNurbsIntersectionCandidate3D(
@@ -77,10 +92,15 @@ private:
     NurbsElementIntersectionResult3D partial_result_;
 };
 
+inline constexpr int kDefaultTerminalSeparationSubdivisionDepth3D = 6;
+inline constexpr int kMaximumTerminalSeparationSubdivisionDepth3D = 16;
+
 struct NurbsElementIntersectionOptions3D {
     double geometry_tolerance = 1e-12;
     double parameter_tolerance = 1e-12;
     int max_subdivision_depth = 4;
+    int terminal_separation_subdivision_depth =
+        kDefaultTerminalSeparationSubdivisionDepth3D;
     int max_newton_iterations = 24;
     bool use_triangle_seed = true;
     bool use_early_unique_root_certificate = false;
@@ -88,6 +108,14 @@ struct NurbsElementIntersectionOptions3D {
     bool use_closest_point_prefilter = false;
     std::vector<NurbsElementParameterSeed3D> parameter_seeds;
 };
+
+NurbsElementSegmentCertificate3D certify_nurbs_bezier_element_segment_3d(
+    const RationalBezierElement3D& element,
+    const NurbsSurfacePatch3D& patch,
+    const Eigen::Vector3d& segment_start,
+    const Eigen::Vector3d& segment_end,
+    const NurbsElementIntersectionOptions3D& options,
+    std::optional<Eigen::Vector2d> preferred_seed = std::nullopt);
 
 NurbsElementIntersectionResult3D intersect_nurbs_bezier_element_3d(
     const RationalBezierElement3D& element,

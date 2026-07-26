@@ -1,175 +1,137 @@
 #include "harmonic_trace_correction_3d.hpp"
 
+#include <Eigen/Dense>
+
 #include <cmath>
+#include <functional>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace {
-using kfbim::app3d::HarmonicTraceCorrectionMode3D;
-using kfbim::app3d::HarmonicTraceOwnerTerm3D;
-using kfbim::app3d::apply_harmonic_trace_correction_3d;
-using kfbim::app3d::ExteriorValueRestrictMode3D;
-using kfbim::app3d::exterior_value_restrict_correction_mode_3d;
 
-using kfbim::app3d::apply_exterior_value_trace_correction_3d;
-void require(bool value, const std::string& message)
+using kfbim::app3d::HarmonicTraceCorrectionTermInput3D;
+using kfbim::app3d::TraceCorrectionOwnerMode3D;
+using kfbim::app3d::apply_harmonic_trace_correction_3d;
+
+void require_near(double actual,
+                  double expected,
+                  double tolerance,
+                  const std::string& message)
 {
-    if (!value)
-        throw std::runtime_error(message);
+    if (!std::isfinite(actual) || std::abs(actual - expected) > tolerance) {
+        throw std::runtime_error(
+            message + ": expected " + std::to_string(expected)
+            + ", got " + std::to_string(actual));
+    }
 }
 
 template <class Function>
-void require_invalid(Function&& function, const std::string& message)
+void require_throws(Function&& function, const std::string& message)
 {
     try {
         function();
-    } catch (const std::invalid_argument&) {
+    } catch (const std::exception&) {
         return;
     }
     throw std::runtime_error(message);
 }
 
-Eigen::MatrixXd literal_coefficients()
+Eigen::MatrixXd reference_coefficients()
 {
     Eigen::MatrixXd coefficients(3, 2);
     coefficients << 2.0, 3.0,
-                    4.0, 1.0,
-                    2.0, 5.0;
+                    5.0, 7.0,
+                   11.0, 13.0;
     return coefficients;
 }
 
-void test_maps_value_restrict_modes_to_owner_correction_modes()
+void test_center_route_uses_center_dof()
 {
-    require(exterior_value_restrict_correction_mode_3d(
-                ExteriorValueRestrictMode3D::JointTricubicCauchy)
-                == HarmonicTraceCorrectionMode3D::CenterOwned,
-            "Cauchy value restrict uses center-owned correction");
-    require(exterior_value_restrict_correction_mode_3d(
-                ExteriorValueRestrictMode3D::JointTricubicCrossingOwner)
-                == HarmonicTraceCorrectionMode3D::CrossingOwned,
-            "crossing-owner value restrict uses crossing-owned correction");
+    const Eigen::MatrixXd coefficients = reference_coefficients();
+    Eigen::VectorXd legacy(2);
+    legacy << 17.0, 19.0;
+    const double value = apply_harmonic_trace_correction_3d(
+        1, coefficients, legacy, {},
+        TraceCorrectionOwnerMode3D::CenterDof);
+    require_near(value, 218.0, 0.0,
+                 "center route did not use the center coefficient row");
 }
 
-void test_selects_center_or_precomputed_crossing_owner_rows()
+void test_crossing_route_uses_each_foreign_owner()
 {
-    const Eigen::MatrixXd coefficients = literal_coefficients();
-    const Eigen::VectorXd center_evaluation =
-        (Eigen::Vector2d() << 1.0, 3.0).finished();
-    const std::vector<HarmonicTraceOwnerTerm3D> owner_terms{
-        {1, (Eigen::Vector2d() << 3.0, 1.0).finished()},
-        {2, (Eigen::Vector2d() << 0.0, 2.0).finished()}};
+    const Eigen::MatrixXd coefficients = reference_coefficients();
+    Eigen::VectorXd legacy = Eigen::VectorXd::Zero(2);
+    std::vector<HarmonicTraceCorrectionTermInput3D> terms(2);
+    terms[0].owner_dof = 2;
+    terms[0].evaluation = Eigen::Vector2d(1.0, 2.0);
+    terms[1].owner_dof = 0;
+    terms[1].evaluation = Eigen::Vector2d(-3.0, 4.0);
 
-    const double center_owned = apply_harmonic_trace_correction_3d(
-        0, coefficients, center_evaluation, owner_terms,
-        HarmonicTraceCorrectionMode3D::CenterOwned);
-    const double crossing_owned = apply_harmonic_trace_correction_3d(
-        0, coefficients, center_evaluation, owner_terms,
-        HarmonicTraceCorrectionMode3D::CrossingOwned);
-
-    require(std::abs(center_owned - 11.0) < 1.0e-14,
-            "center-owned correction uses center evaluation");
-    require(std::abs(crossing_owned - 23.0) < 1.0e-14,
-            "crossing-owned correction uses precomputed owner rows");
+    const double value = apply_harmonic_trace_correction_3d(
+        1, coefficients, legacy, terms,
+        TraceCorrectionOwnerMode3D::CrossingOwner);
+    require_near(value, 43.0, 0.0,
+                 "crossing route did not use selected owner rows");
 }
 
-void test_rejects_invalid_owner_indices()
+void test_crossing_route_preserves_term_order()
 {
-    const Eigen::MatrixXd coefficients = literal_coefficients();
-    const Eigen::VectorXd evaluation =
-        (Eigen::Vector2d() << 1.0, 3.0).finished();
+    Eigen::MatrixXd coefficients = Eigen::MatrixXd::Ones(3, 1);
+    Eigen::VectorXd legacy = Eigen::VectorXd::Zero(1);
+    std::vector<HarmonicTraceCorrectionTermInput3D> terms(3);
+    terms[0].owner_dof = 0;
+    terms[0].evaluation = Eigen::VectorXd::Constant(1, 1.0e16);
+    terms[1].owner_dof = 1;
+    terms[1].evaluation = Eigen::VectorXd::Constant(1, -1.0e16);
+    terms[2].owner_dof = 2;
+    terms[2].evaluation = Eigen::VectorXd::Constant(1, 1.0);
 
-    require_invalid(
-        [&] {
-            (void)apply_harmonic_trace_correction_3d(
-                -1, coefficients, evaluation, {},
-                HarmonicTraceCorrectionMode3D::CenterOwned);
-        },
-        "negative center index rejected");
-    require_invalid(
-        [&] {
-            (void)apply_harmonic_trace_correction_3d(
-                3, coefficients, evaluation, {},
-                HarmonicTraceCorrectionMode3D::CenterOwned);
-        },
-        "out-of-range center index rejected");
-    require_invalid(
-        [&] {
-            (void)apply_harmonic_trace_correction_3d(
-                0, coefficients, evaluation,
-                {{-1, evaluation}},
-                HarmonicTraceCorrectionMode3D::CrossingOwned);
-        },
-        "negative owner index rejected");
-    require_invalid(
-        [&] {
-            (void)apply_harmonic_trace_correction_3d(
-                0, coefficients, evaluation,
-                {{3, evaluation}},
-                HarmonicTraceCorrectionMode3D::CrossingOwned);
-        },
-        "out-of-range owner index rejected");
+    const double value = apply_harmonic_trace_correction_3d(
+        0, coefficients, legacy, terms,
+        TraceCorrectionOwnerMode3D::CrossingOwner);
+    require_near(value, 1.0, 0.0,
+                 "crossing route reordered correction terms");
 }
 
-void test_value_trace_dispatch_preserves_legacy_and_selects_crossing_owner()
+void test_crossing_route_accepts_no_wrong_side_terms()
 {
-    const Eigen::MatrixXd coefficients = literal_coefficients();
-    const Eigen::VectorXd center_evaluation =
-        (Eigen::Vector2d() << 1.0, 3.0).finished();
-    const std::vector<HarmonicTraceOwnerTerm3D> owner_terms{
-        {1, (Eigen::Vector2d() << 3.0, 1.0).finished()},
-        {2, (Eigen::Vector2d() << 0.0, 2.0).finished()}};
-
-    const double legacy = apply_exterior_value_trace_correction_3d(
-        0, coefficients, center_evaluation, owner_terms);
-    const double explicit_cauchy = apply_exterior_value_trace_correction_3d(
-        0, coefficients, center_evaluation, owner_terms,
-        ExteriorValueRestrictMode3D::JointTricubicCauchy);
-    const double crossing_owner = apply_exterior_value_trace_correction_3d(
-        0, coefficients, center_evaluation, owner_terms,
-        ExteriorValueRestrictMode3D::JointTricubicCrossingOwner);
-
-    require(std::abs(legacy - explicit_cauchy) < 1.0e-14,
-            "legacy value trace dispatch equals explicit Cauchy dispatch");
-    require(std::abs(crossing_owner - explicit_cauchy) > 1.0e-14,
-            "crossing-owner value trace dispatch selects owner corrections");
+    const Eigen::MatrixXd coefficients = reference_coefficients();
+    Eigen::VectorXd legacy = Eigen::VectorXd::Ones(2);
+    const double value = apply_harmonic_trace_correction_3d(
+        0, coefficients, legacy, {},
+        TraceCorrectionOwnerMode3D::CrossingOwner);
+    require_near(value, 0.0, 0.0,
+                 "empty crossing correction was not zero");
 }
 
-void test_rejects_incompatible_evaluation_dimensions()
+void test_invalid_owner_is_rejected()
 {
-    const Eigen::MatrixXd coefficients = literal_coefficients();
-    const Eigen::VectorXd good_evaluation =
-        (Eigen::Vector2d() << 1.0, 3.0).finished();
-    const Eigen::VectorXd bad_evaluation =
-        (Eigen::Vector3d() << 1.0, 2.0, 3.0).finished();
-
-    require_invalid(
+    const Eigen::MatrixXd coefficients = reference_coefficients();
+    Eigen::VectorXd legacy = Eigen::VectorXd::Zero(2);
+    HarmonicTraceCorrectionTermInput3D term;
+    term.owner_dof = 3;
+    term.evaluation = Eigen::Vector2d::Ones();
+    require_throws(
         [&] {
             (void)apply_harmonic_trace_correction_3d(
-                0, coefficients, bad_evaluation, {},
-                HarmonicTraceCorrectionMode3D::CenterOwned);
+                0, coefficients, legacy, {term},
+                TraceCorrectionOwnerMode3D::CrossingOwner);
         },
-        "incompatible center evaluation rejected");
-    require_invalid(
-        [&] {
-            (void)apply_harmonic_trace_correction_3d(
-                0, coefficients, good_evaluation,
-                {{1, bad_evaluation}},
-                HarmonicTraceCorrectionMode3D::CrossingOwned);
-        },
-        "incompatible owner evaluation rejected");
+        "out-of-range crossing owner was accepted");
 }
+
 } // namespace
 
 int main()
 {
     try {
-        test_value_trace_dispatch_preserves_legacy_and_selects_crossing_owner();
-        test_selects_center_or_precomputed_crossing_owner_rows();
-        test_maps_value_restrict_modes_to_owner_correction_modes();
-        test_rejects_invalid_owner_indices();
-        test_rejects_incompatible_evaluation_dimensions();
+        test_center_route_uses_center_dof();
+        test_crossing_route_uses_each_foreign_owner();
+        test_crossing_route_preserves_term_order();
+        test_crossing_route_accepts_no_wrong_side_terms();
+        test_invalid_owner_is_rejected();
         std::cout << "harmonic trace correction 3D tests passed\n";
         return 0;
     } catch (const std::exception& error) {

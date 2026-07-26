@@ -227,4 +227,3 @@ nonzero on any accuracy mismatch. Timing is not a correctness gate.
   - zero unsafe label-changing edges.
 - The results document reports measured speedups without converting them
   into a brittle pass/fail threshold.
-

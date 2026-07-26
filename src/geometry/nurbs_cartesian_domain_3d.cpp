@@ -28,6 +28,9 @@ double elapsed_seconds(PreprocessClock3D::time_point begin,
 constexpr std::uint64_t kNodeMask =
     (std::uint64_t{1} << 62) - std::uint64_t{1};
 
+constexpr int kTargetedRetryLocalSubdivisionDepth = 6;
+constexpr int kTargetedRetryTerminalSeparationDepth = 12;
+
 struct ClosedIntInterval {
     int lower = 1;
     int upper = 0;
@@ -385,6 +388,11 @@ struct NurbsCartesianDomain3D::Impl {
                     "NurbsCartesianDomain3D requires positive finite Cartesian spacing");
             }
         }
+        if (std::isnan(options.maximum_element_extent_cap)
+            || options.maximum_element_extent_cap <= 0.0) {
+            throw std::invalid_argument(
+                "NURBS maximum element extent cap must be positive");
+        }
         const auto cells = grid.num_cells();
         for (int axis = 0; axis < 3; ++axis) {
             const int cell_count = cells[static_cast<std::size_t>(axis)];
@@ -437,7 +445,9 @@ struct NurbsCartesianDomain3D::Impl {
 
         const double maximum_spacing =
             *std::max_element(spacing.begin(), spacing.end());
-        const double maximum_leaf_extent = 2.0 * maximum_spacing;
+        const double maximum_leaf_extent = std::min(
+            2.0 * maximum_spacing,
+            options.maximum_element_extent_cap);
         if (!std::isfinite(maximum_leaf_extent)) {
             throw std::overflow_error(
                 "NURBS acceleration leaf extent must be finite");
@@ -694,7 +704,10 @@ struct NurbsCartesianDomain3D::Impl {
             if (!retry_intersector) {
                 NurbsSurfaceIntersectorOptions3D retry_options =
                     intersector_options;
-                retry_options.local_max_subdivision_depth = 6;
+                retry_options.local_max_subdivision_depth =
+                    kTargetedRetryLocalSubdivisionDepth;
+                retry_options.terminal_separation_subdivision_depth =
+                    kTargetedRetryTerminalSeparationDepth;
                 retry_intersector =
                     std::make_unique<NurbsSurfaceIntersector3D>(
                         intersector.model(), retry_options);

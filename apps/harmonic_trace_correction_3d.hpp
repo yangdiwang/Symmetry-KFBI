@@ -1,48 +1,26 @@
 #pragma once
 
-#include <Eigen/Dense>
+#include <Eigen/Core>
 
 #include <vector>
 
 namespace kfbim::app3d {
 
-enum class HarmonicTraceCorrectionMode3D {
-    CenterOwned,
-    CrossingOwned,
-};
-enum class ExteriorValueRestrictMode3D {
-    JointTricubicCauchy,
-    JointTricubicCrossingOwner,
+enum class TraceCorrectionOwnerMode3D {
+    CenterDof,
+    CrossingOwner
 };
 
-[[nodiscard]] HarmonicTraceCorrectionMode3D
-exterior_value_restrict_correction_mode_3d(
-    ExteriorValueRestrictMode3D mode);
-
-
-struct HarmonicTraceOwnerTerm3D {
+struct HarmonicTraceCorrectionTermInput3D {
     int owner_dof = -1;
     Eigen::VectorXd evaluation;
 };
 
-[[nodiscard]] double apply_exterior_value_trace_correction_3d(
-    int center_dof,
-    const Eigen::MatrixXd& coefficients,
-    const Eigen::VectorXd& center_evaluation,
-    const std::vector<HarmonicTraceOwnerTerm3D>& owner_terms);
-
-[[nodiscard]] double apply_exterior_value_trace_correction_3d(
-    int center_dof,
-    const Eigen::MatrixXd& coefficients,
-    const Eigen::VectorXd& center_evaluation,
-    const std::vector<HarmonicTraceOwnerTerm3D>& owner_terms,
-    ExteriorValueRestrictMode3D mode);
-
 [[nodiscard]] double apply_harmonic_trace_correction_3d(
     int center_dof,
     const Eigen::MatrixXd& coefficients,
-    const Eigen::VectorXd& center_evaluation,
-    const std::vector<HarmonicTraceOwnerTerm3D>& owner_terms,
-    HarmonicTraceCorrectionMode3D mode);
+    const Eigen::VectorXd& legacy_evaluation,
+    const std::vector<HarmonicTraceCorrectionTermInput3D>& owner_terms,
+    TraceCorrectionOwnerMode3D mode);
 
 } // namespace kfbim::app3d

@@ -1,91 +1,62 @@
 #include "harmonic_trace_correction_3d.hpp"
 
+#include <cmath>
 #include <stdexcept>
 
 namespace kfbim::app3d {
+
 namespace {
 
-void validate_index(int dof, int row_count, const char* description)
-{
-    if (dof < 0 || dof >= row_count)
-        throw std::invalid_argument(description);
-}
-
 void validate_evaluation(const Eigen::VectorXd& evaluation,
-                         int coefficient_count,
-                         const char* description)
+                         int dimension,
+                         const char* context)
 {
-    if (evaluation.size() != coefficient_count)
-        throw std::invalid_argument(description);
+    if (evaluation.size() != dimension || !evaluation.allFinite())
+        throw std::invalid_argument(context);
 }
 
 } // namespace
 
-HarmonicTraceCorrectionMode3D
-exterior_value_restrict_correction_mode_3d(
-    ExteriorValueRestrictMode3D mode)
-{
-    switch (mode) {
-    case ExteriorValueRestrictMode3D::JointTricubicCauchy:
-        return HarmonicTraceCorrectionMode3D::CenterOwned;
-    case ExteriorValueRestrictMode3D::JointTricubicCrossingOwner:
-        return HarmonicTraceCorrectionMode3D::CrossingOwned;
-    }
-    throw std::invalid_argument("unknown exterior value restrict mode");
-}
-
-double apply_exterior_value_trace_correction_3d(
-    int center_dof,
-    const Eigen::MatrixXd& coefficients,
-    const Eigen::VectorXd& center_evaluation,
-    const std::vector<HarmonicTraceOwnerTerm3D>& owner_terms)
-{
-    return apply_exterior_value_trace_correction_3d(
-        center_dof, coefficients, center_evaluation, owner_terms,
-        ExteriorValueRestrictMode3D::JointTricubicCauchy);
-}
-
-double apply_exterior_value_trace_correction_3d(
-    int center_dof,
-    const Eigen::MatrixXd& coefficients,
-    const Eigen::VectorXd& center_evaluation,
-    const std::vector<HarmonicTraceOwnerTerm3D>& owner_terms,
-    ExteriorValueRestrictMode3D mode)
-{
-    return apply_harmonic_trace_correction_3d(
-        center_dof, coefficients, center_evaluation, owner_terms,
-        exterior_value_restrict_correction_mode_3d(mode));
-}
-
 double apply_harmonic_trace_correction_3d(
     int center_dof,
     const Eigen::MatrixXd& coefficients,
-    const Eigen::VectorXd& center_evaluation,
-    const std::vector<HarmonicTraceOwnerTerm3D>& owner_terms,
-    HarmonicTraceCorrectionMode3D mode)
+    const Eigen::VectorXd& legacy_evaluation,
+    const std::vector<HarmonicTraceCorrectionTermInput3D>& owner_terms,
+    TraceCorrectionOwnerMode3D mode)
 {
-    validate_index(center_dof, coefficients.rows(),
-                   "harmonic trace correction center index is invalid");
-    validate_evaluation(
-        center_evaluation, coefficients.cols(),
-        "harmonic trace correction center evaluation has invalid dimension");
-    for (const HarmonicTraceOwnerTerm3D& term : owner_terms) {
-        validate_index(term.owner_dof, coefficients.rows(),
-                       "harmonic trace correction owner index is invalid");
+    if (coefficients.rows() <= 0 || coefficients.cols() <= 0) {
+        throw std::invalid_argument(
+            "harmonic trace correction coefficients are invalid");
+    }
+    if (center_dof < 0 || center_dof >= coefficients.rows())
+        throw std::out_of_range("harmonic trace center DOF is invalid");
+
+    if (mode == TraceCorrectionOwnerMode3D::CenterDof) {
         validate_evaluation(
-            term.evaluation, coefficients.cols(),
-            "harmonic trace correction owner evaluation has invalid dimension");
+            legacy_evaluation, coefficients.cols(),
+            "legacy harmonic trace evaluation is invalid");
+        const double result = legacy_evaluation.dot(
+            coefficients.row(center_dof).transpose());
+        if (!std::isfinite(result))
+            throw std::runtime_error("legacy harmonic trace correction is invalid");
+        return result;
     }
 
-    if (mode == HarmonicTraceCorrectionMode3D::CenterOwned) {
-        return center_evaluation.dot(
-            coefficients.row(center_dof).transpose());
-    }
+    if (mode != TraceCorrectionOwnerMode3D::CrossingOwner)
+        throw std::invalid_argument("unknown harmonic trace correction mode");
+
     double result = 0.0;
-    for (const HarmonicTraceOwnerTerm3D& term : owner_terms) {
+    for (const HarmonicTraceCorrectionTermInput3D& term : owner_terms) {
+        if (term.owner_dof < 0 || term.owner_dof >= coefficients.rows())
+            throw std::out_of_range("harmonic trace owner DOF is invalid");
+        validate_evaluation(
+            term.evaluation, coefficients.cols(),
+            "harmonic trace owner evaluation is invalid");
         result += term.evaluation.dot(
             coefficients.row(term.owner_dof).transpose());
     }
+    if (!std::isfinite(result))
+        throw std::runtime_error("crossing-owner harmonic trace correction is invalid");
     return result;
 }
 

@@ -12,6 +12,7 @@ using kfbim::app3d::DirichletRigidStudyCase3D;
 using kfbim::app3d::RigidStudyCriterionStatus3D;
 using kfbim::app3d::combine_rigid_study_criteria_3d;
 using kfbim::app3d::make_l_prism_dirichlet_rigid_study_cases_3d;
+using kfbim::app3d::make_l_prism_rigid_study_cases_3d;
 using kfbim::app3d::manufactured_harmonic_gradient_3d;
 using kfbim::app3d::manufactured_harmonic_value_3d;
 using kfbim::app3d::transformed_manufactured_harmonic_gradient_3d;
@@ -38,6 +39,10 @@ void test_catalog_metadata()
 {
     const std::vector<DirichletRigidStudyCase3D> cases =
         make_l_prism_dirichlet_rigid_study_cases_3d();
+    const std::vector<DirichletRigidStudyCase3D> shared_cases =
+        make_l_prism_rigid_study_cases_3d();
+    require(shared_cases.size() == cases.size(),
+            "shared and Dirichlet case counts differ");
     const std::vector<std::string> expected_ids = {
         "baseline", "tx_p0137", "ty_m0083", "tz_p0061", "t_xyz_1",
         "t_xyz_2", "rot_axis123_17deg", "rot_axis123_17deg_t_xyz_1"};
@@ -51,7 +56,18 @@ void test_catalog_metadata()
         {-0.109, 0.151, -0.047}, {0.0, 0.0, 0.0}, {0.137, -0.083, 0.061}};
 
     for (std::size_t index = 0; index < cases.size(); ++index) {
+        const auto& shared = shared_cases[index];
         const auto& item = cases[index];
+        require(shared.id == item.id, "shared case ID");
+        require_near(shared.transform.center(), item.transform.center(), 0.0,
+                     "shared rotation center");
+        require_near(shared.transform.translation(),
+                     item.transform.translation(), 0.0,
+                     "shared translation");
+        require_near(shared.rotation_axis, item.rotation_axis, 0.0,
+                     "shared rotation axis");
+        require(shared.rotation_angle_degrees == item.rotation_angle_degrees,
+                "shared rotation angle");
         require(item.id == expected_ids[index], "study case ID");
         require_near(item.transform.center(), center, 0.0, "rotation center");
         require_near(item.transform.translation(), expected_translations[index], 0.0,

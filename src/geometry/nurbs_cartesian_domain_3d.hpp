@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstddef>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -38,6 +39,8 @@ private:
 
 struct NurbsCartesianDomainOptions3D {
     bool use_triangle_seeds = true;
+    double maximum_element_extent_cap =
+        std::numeric_limits<double>::infinity();
     NurbsCartesianPreprocessStrategy3D strategy =
         NurbsCartesianPreprocessStrategy3D::CertifiedBaseline;
 };

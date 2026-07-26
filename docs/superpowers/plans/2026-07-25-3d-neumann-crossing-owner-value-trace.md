@@ -2,201 +2,278 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a crossing-owner exterior-value restriction route to the 3D Neumann solver and compare it with the unchanged legacy route on three L-prism poses at `N=32,64,128`.
+**Goal:** Compare the existing center-owned 3D Neumann exterior value trace with the accepted crossing-owner/RegionClosestHybrid correction on the rotated L-prism through `N=128`.
 
-**Architecture:** Extract the scalar Cauchy-correction ownership choice into a small tested helper, then pass one trace-route enum through the Neumann operator, RHS, solve and diagnostics. A dedicated study route builds one owner-enabled pipeline per pose/level and runs legacy and crossing-owner solves against it, ensuring geometry work remains outside GMRES.
+**Architecture:** Factor the scalar correction accumulation into a small tested app-layer helper, then let the value-trace operator select legacy-center or crossing-owner correction while sharing one owner-preprocessed pipeline. Add a dedicated study route that writes complete comparison CSVs and never changes the first-kind Neumann equation, mean constraint, spread, FFT, Cauchy fit, or GMRES.
 
-**Tech Stack:** C++17, Eigen, existing KFBI3D/NURBS infrastructure, MSVC/CMake, CSV diagnostics.
+**Tech Stack:** C++17, Eigen, existing NURBS geometry and KFBI harmonic-jet pipeline, Visual Studio x64 Release, CMake, zFFT, GMRES, PowerShell.
 
 ## Global Constraints
 
-- Work directly on `main`, preserving unrelated untracked files.
-- Keep Neumann unknown `[u]`, prescribed `[u_n]`, exterior value trace zero, compatibility correction and scalar mean constraint unchanged.
-- Keep Cauchy degree `3`, G1-nearest `48/28`, tricubic interpolation, GMRES tolerance `2e-10`, cap `80`.
-- `JointTricubicCauchy` must remain bitwise/order compatible with the current center-owned correction loop.
-- `JointTricubicCrossingOwner` must use only precomputed owner templates; no geometry query may occur during GMRES.
-- Value traces use `c0_weights_` with scale `1`; normal traces retain `c1_weights_/h`.
-- Operator apply, RHS, final exterior trace and route mismatch must all use the same selected route.
-- Generated experiment outputs remain untracked under `output/neumann_value_trace_crossing_owner_3d`.
+- Work only on `codex/rotated-n128-phase-profile`.
+- Preserve the current default Neumann route.
+- Use degree-3 Cauchy fitting, G1-nearest 48/28 surface stencils, tricubic grid interpolation, and cubic normal-line recovery.
+- Use `RegionClosestHybrid` for the crossing-owner pipeline.
+- Preserve correction accumulation order `q=0..63`.
+- Perform no geometry query during GMRES.
+- Keep GMRES tolerance `2e-10` and cap iterations at `80`.
+- Run the rotated L-prism at `N=32`, `64`, and `128`; do not start `128` unless both smaller levels pass.
+- Keep generated CSV and logs untracked.
+- Use `/m:1`, never `/m`, for Visual Studio builds.
 
 ---
 
-### Task 1: Tested trace-correction ownership kernel
+### Task 1: Add a tested correction-route helper
 
 **Files:**
 - Create: `apps/harmonic_trace_correction_3d.hpp`
 - Create: `apps/harmonic_trace_correction_3d.cpp`
 - Create: `apps/harmonic_trace_correction_3d_test.cpp`
 - Modify: `apps/CMakeLists.txt`
-- Modify: `apps/neumann_exterior_zero_trace_3d.cpp`
 
 **Interfaces:**
-- Produces `HarmonicTraceCorrectionMode3D { CenterOwned, CrossingOwned }`.
-- Produces `HarmonicTraceOwnerTerm3D { int owner_dof; Eigen::VectorXd evaluation; }`.
-- Produces `apply_harmonic_trace_correction_3d(center_dof, coefficients, center_evaluation, owner_terms, mode)`.
-- Consumes only precomputed evaluations; performs no geometry operation.
+- Produces:
+  - `enum class TraceCorrectionOwnerMode3D { CenterDof, CrossingOwner };`
+  - `struct HarmonicTraceCorrectionTermInput3D { int owner_dof; Eigen::VectorXd evaluation; };`
+  - `double apply_harmonic_trace_correction_3d(...)`
+- Consumes coefficient rows and correction terms in their existing stored order.
 
-- [ ] **Step 1: Write the failing unit test**
+- [ ] **Step 1: Write the failing unit tests**
 
-Use literal coefficients and evaluations so center-owned returns `11.0` and crossing-owned returns `23.0`. Add invalid-index and dimension tests. The production mutation caught is selecting the center row when crossing ownership was requested.
-
-- [ ] **Step 2: Run the test target and verify RED**
-
-```powershell
-cmake --build build --config Release --target harmonic_trace_correction_3d_test -- /m:1 /nr:false
-```
-
-Expected: compilation or link failure because the new API is absent.
-
-- [ ] **Step 3: Implement the minimal kernel**
+Test center-owned evaluation, foreign-owner evaluation, ordered accumulation
+with cancellation-sensitive values, empty crossing terms, and invalid owner
+indices. The ordered case computes its expected result with:
 
 ```cpp
-if (mode == HarmonicTraceCorrectionMode3D::CenterOwned)
-    return center_evaluation.dot(coefficients.row(center_dof).transpose());
-double result = 0.0;
-for (const HarmonicTraceOwnerTerm3D& term : owner_terms)
-    result += term.evaluation.dot(coefficients.row(term.owner_dof).transpose());
-return result;
+double expected = 0.0;
+for (const auto& term : terms)
+    expected += term.evaluation.dot(coefficients.row(term.owner_dof));
 ```
 
-Validate all indices and dimensions before evaluating.
-
-- [ ] **Step 4: Integrate the kernel into `continued_samples`**
-
-Replace only the legacy/owner correction branch. Preserve the surrounding `q=0..63` grid-potential accumulation and jump-continuation loops.
-
-- [ ] **Step 5: Verify GREEN and existing owner tests**
-
-Run the new test and `crossing_owner_restrict_3d_test`; both must exit zero.
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 2: Build to verify the test fails**
 
 ```powershell
-git add apps/harmonic_trace_correction_3d.* apps/CMakeLists.txt apps/neumann_exterior_zero_trace_3d.cpp
-git commit -m 'refactor: isolate 3d harmonic trace ownership'
+cmake --build build --config Debug --target harmonic_trace_correction_3d_test -- /m:1
+```
+
+Expected: failure because the helper target or declarations do not exist.
+
+- [ ] **Step 3: Implement the minimal helper**
+
+The center route returns:
+
+```cpp
+legacy_evaluation.dot(coefficients.row(center_dof).transpose())
+```
+
+The crossing route loops over `terms` without sorting, grouping, or summing
+through a different reduction.
+
+- [ ] **Step 4: Build and run the test**
+
+```powershell
+cmake --build build --config Debug --target harmonic_trace_correction_3d_test -- /m:1
+.\build\apps\Debug\harmonic_trace_correction_3d_test.exe
+```
+
+Expected: exit `0`.
+
+- [ ] **Step 5: Commit**
+
+```powershell
+git add apps/harmonic_trace_correction_3d.hpp apps/harmonic_trace_correction_3d.cpp apps/harmonic_trace_correction_3d_test.cpp apps/CMakeLists.txt
+git commit -m "test: add ordered harmonic trace correction routes"
 ```
 
 ---
 
-### Task 2: Neumann crossing-owner operator route
+### Task 2: Make Neumann exterior value restriction mode-selectable
 
 **Files:**
 - Modify: `apps/neumann_exterior_zero_trace_3d.cpp`
 - Test: `apps/harmonic_trace_correction_3d_test.cpp`
 
 **Interfaces:**
-- Produces `ExteriorValueRestrictMode3D { JointTricubicCauchy, JointTricubicCrossingOwner }`.
-- Produces `PanelCenterHarmonicJetKFBI3D::exterior_trace(..., ExteriorValueRestrictMode3D mode)` while retaining the legacy overload.
-- Adds mode parameters to `ExteriorZeroTraceOperator3D`, `solve_exterior_zero_trace_neumann_3d` and `run_neumann_case`.
+- Produces:
+  - `enum class ExteriorValueRestrictMode3D { JointTricubicCauchy, JointTricubicCrossingOwner };`
+  - an `exterior_trace(..., ExteriorValueRestrictMode3D)` overload;
+  - mode parameters on `ExteriorZeroTraceOperator3D`,
+    `solve_exterior_zero_trace_neumann_3d`, and `run_neumann_case`.
+- Preserves no-mode calls as `JointTricubicCauchy`.
 
-- [ ] **Step 1: Write the failing route test**
+- [ ] **Step 1: Add compile-time route calls before the overload exists**
 
-Add a literal mapping test proving `JointTricubicCauchy -> CenterOwned` and `JointTricubicCrossingOwner -> CrossingOwned`. The mutation caught is changing the legacy default or ignoring the crossing mode.
+Add the two route names and invoke both from a focused constant-jump probe in
+the application. Build once and verify the missing overload fails.
 
-- [ ] **Step 2: Verify RED**
+- [ ] **Step 2: Replace local correction accumulation with the helper**
 
-Build the focused target and confirm failure because the value-route mapping/API is missing.
+Convert each existing owner term to
+`HarmonicTraceCorrectionTermInput3D`. In `continued_samples`, select
+`CenterDof` or `CrossingOwner` and call the helper. Do not change the 64 grid
+weight accumulation preceding the correction.
 
-- [ ] **Step 3: Add the exterior-value overload**
+- [ ] **Step 3: Thread the value mode through the Neumann operator**
 
-The legacy overload delegates explicitly to `JointTricubicCauchy`. The new overload calls:
+`ExteriorZeroTraceOperator3D::apply` and `right_hand_side` must call the new
+value-trace overload. The default constructor path remains center-owned.
 
-```cpp
-recover_trace(
-    continued_samples(field, value_jump, normal_jump, false, mapped_mode),
-    c0_weights_, 1.0);
+- [ ] **Step 4: Add runtime invariants**
+
+For an owner-built pipeline require:
+
+- default `exterior_trace` equals explicit `JointTricubicCauchy` bit-for-bit;
+- both routes leave owner diagnostics and query counts unchanged;
+- a crossing-owner call rejects a pipeline without owner templates.
+
+- [ ] **Step 5: Build and run focused tests**
+
+```powershell
+cmake --build build --config Debug --target neumann_exterior_zero_trace_3d crossing_owner_restrict_3d_test restrict_owner_geometry_preprocessor_3d_test harmonic_trace_correction_3d_test -- /m:1
+.\build\apps\Debug\harmonic_trace_correction_3d_test.exe
+.\build\apps\Debug\crossing_owner_restrict_3d_test.exe
+.\build\apps\Debug\restrict_owner_geometry_preprocessor_3d_test.exe
 ```
 
-- [ ] **Step 4: Thread the mode through the full Neumann equation**
-
-Store the mode in `ExteriorZeroTraceOperator3D`; use it in both `apply` and `right_hand_side`. Pass it through solve/run functions and use it again for direct exterior trace and route-mismatch diagnostics. Keep existing call sites compiling with legacy mode.
-
-- [ ] **Step 5: Verify GREEN and legacy behavior**
-
-Run the focused test, Release build of `neumann_exterior_zero_trace_3d`, and one legacy `l_prism 32` smoke. Compare its CSV row with the saved legacy baseline within existing tolerances.
+Expected: all exit `0`.
 
 - [ ] **Step 6: Commit**
 
 ```powershell
 git add apps/neumann_exterior_zero_trace_3d.cpp apps/harmonic_trace_correction_3d_test.cpp
-git commit -m 'feat: add Neumann crossing-owner value trace'
+git commit -m "feat: add crossing-owner Neumann value restriction"
 ```
 
 ---
 
-### Task 3: Dedicated Neumann owner study and diagnostics
+### Task 3: Add the rotated L-prism comparison study
 
 **Files:**
 - Modify: `apps/neumann_exterior_zero_trace_3d.cpp`
-- Create: `docs/superpowers/results/2026-07-25-3d-neumann-crossing-owner-value-trace.md`
 
 **Interfaces:**
 - Produces CLI `--neumann-owner-study [N ...]`.
-- Produces `summary.csv`, `gmres_residuals.csv`, and `owner_diagnostics.csv`.
+- Writes `summary.csv`, `gmres_residuals.csv`, and
+  `owner_diagnostics.csv` below
+  `output/neumann_value_trace_crossing_owner_3d`.
 
-- [ ] **Step 1: Verify the CLI is RED**
+- [ ] **Step 1: Add strict level parsing and usage text**
 
-```powershell
-.\build\apps\Release\neumann_exterior_zero_trace_3d.exe --neumann-owner-study 16
+Accept powers of two from `32` through `128`. If `128` is selected, require
+both `32` and `64`.
+
+- [ ] **Step 2: Build one shared case context per level**
+
+Create the rotated L-prism, NURBS domain, surface DOFs, G1-nearest 48/28
+Cauchy stencils, and one pipeline using `RegionClosestHybrid`. Verify exact
+grid labels and retain the pipeline setup time.
+
+- [ ] **Step 3: Run the two Neumann routes**
+
+Run in this order:
+
+```text
+joint_tricubic_cauchy
+joint_tricubic_crossing_owner
 ```
 
-Expected: nonzero exit because the mode is not recognized.
+Use identical prescribed flux, constant-shift evaluation, GMRES tolerance,
+restart `80`, and maximum `80`. Snapshot owner diagnostics and query counts
+before each GMRES solve and compare after it.
 
-- [ ] **Step 2: Implement the study driver**
+- [ ] **Step 4: Write checkpoint CSVs after each level**
 
-Select rigid cases `baseline`, `rot_axis123_17deg`, and `rot_axis123_17deg_t_xyz_1`. Build one owner-enabled pipeline per case/level, snapshot owner query count and deterministic correction fingerprint, then run both value routes with identical data.
+`summary.csv` includes:
 
-- [ ] **Step 3: Write complete diagnostics incrementally**
+```text
+N,h,mode,dofs,pipeline_setup_seconds,solve_seconds,converged,iterations,
+final_residual,operator_residual_linf,exterior_condition_linf,
+route_mismatch_linf,density_linf,density_l2,interior_linf,interior_l2,
+interior_order,geometry_queries_before_gmres,
+geometry_queries_after_gmres,pass
+```
 
-After each route, flush a summary row and residual history. Record case, N, route, convergence, iterations, final residual, density/interior errors and orders, exterior condition, operator residual, route mismatch, setup/solve time, owner queries and fingerprint before/after GMRES.
+`gmres_residuals.csv` contains `N,mode,iteration,residual`.
+`owner_diagnostics.csv` contains the preprocessing mode, workload
+fingerprint, output digest, wrong-side query count, and pre/post GMRES query
+counts.
 
-- [ ] **Step 4: Verify GREEN at N=16 and N=32**
+- [ ] **Step 5: Enforce per-level gates**
 
-Require finite complete rows, convergence within 80 iterations, final residual at most `2e-10`, unchanged query/fingerprint values, and matching route-independent geometry metadata.
+Require both routes to converge, final residual `<=2e-10`, finite errors,
+unchanged owner query counts, and unchanged owner diagnostics. Stop before
+the next level on failure.
 
-- [ ] **Step 5: Run the formal matrix**
+- [ ] **Step 6: Build Release**
 
-Run `N=32,64,128` for all three poses. If a route fails, preserve its rows and stop only dependent finer levels; do not hide the negative result.
-
-- [ ] **Step 6: Analyze and document**
-
-Compute observed orders per case/route and compare GMRES/setup/solve time. State whether crossing ownership changes numerical behavior and whether a Hybrid owner preprocessor was integrated or remains future performance work.
+```powershell
+cmake --build build --config Release --target neumann_exterior_zero_trace_3d harmonic_trace_correction_3d_test crossing_owner_restrict_3d_test restrict_owner_geometry_preprocessor_3d_test kfbim_phase_profile_3d_test -- /m:1
+```
 
 - [ ] **Step 7: Commit**
 
 ```powershell
-git add apps/neumann_exterior_zero_trace_3d.cpp docs/superpowers/results/2026-07-25-3d-neumann-crossing-owner-value-trace.md
-git commit -m 'test: compare Neumann crossing-owner value trace'
+git add apps/neumann_exterior_zero_trace_3d.cpp
+git commit -m "feat: add Neumann crossing-owner comparison study"
 ```
 
 ---
 
-### Task 4: Full verification and review
+### Task 4: Run the numerical comparison and report
 
 **Files:**
-- Verify all files changed by Tasks 1-3.
+- Generated: `output/neumann_value_trace_crossing_owner_3d/*.csv`
 
 **Interfaces:**
-- Consumes all preceding commits; produces reviewed, reproducible evidence.
+- Consumes the Task 3 study route.
+- Produces accepted N32/N64/N128 evidence and the recommendation.
 
-- [ ] **Step 1: Build serial Release**
+- [ ] **Step 1: Run fresh focused Release tests**
 
 ```powershell
-cmake --build build --config Release -- /m:1 /nr:false
+.\build\apps\Release\harmonic_trace_correction_3d_test.exe
+.\build\apps\Release\crossing_owner_restrict_3d_test.exe
+.\build\apps\Release\restrict_owner_geometry_preprocessor_3d_test.exe
+.\build\apps\Release\kfbim_phase_profile_3d_test.exe
 ```
 
-- [ ] **Step 2: Run focused and geometry regressions**
+- [ ] **Step 2: Run N32 and N64**
 
-Run `harmonic_trace_correction_3d_test`, `crossing_owner_restrict_3d_test`, `native_nurbs_surface_3d_test`, and the existing L-prism legacy smoke.
+```powershell
+$env:KFBIM_3D_NEUMANN_OWNER_STUDY_OUTPUT_DIR='output/neumann_value_trace_crossing_owner_3d'
+.\build\apps\Release\neumann_exterior_zero_trace_3d.exe --neumann-owner-study 32 64
+```
 
-- [ ] **Step 3: Audit generated CSVs**
+Inspect convergence, iteration counts, errors, route mismatch, and the first
+observed order before allowing `N=128`.
 
-Check row counts, finite values, route pairs, residual limits, query/fingerprint invariance and order calculations independently with PowerShell `Import-Csv`.
+- [ ] **Step 3: Run the accepted final chain**
 
-- [ ] **Step 4: Review the complete diff**
+Use a clean output directory and execute:
 
-Require zero Critical/Important findings and resolve any regression in the Neumann compatibility/mean equation before completion.
+```powershell
+$env:KFBIM_3D_NEUMANN_OWNER_STUDY_OUTPUT_DIR='output/neumann_value_trace_crossing_owner_3d'
+.\build\apps\Release\neumann_exterior_zero_trace_3d.exe --neumann-owner-study 32 64 128
+```
 
-- [ ] **Step 5: Final whitespace/status check**
+- [ ] **Step 4: Verify complete results**
 
-Run `git diff --check` and confirm only the two pre-existing unrelated untracked documents remain outside this task.
+Require exactly six summary rows, zero failed rows, two rows per level,
+complete GMRES histories, and identical pre/post geometry-query counts.
+Recompute both orders directly from the maximum errors.
+
+- [ ] **Step 5: Report the result**
+
+Report, per level and route, interior maximum error, observed order, density
+error, exterior trace residual, route mismatch, GMRES iterations/final
+residual, setup time, and solve time. State whether crossing-owner improves
+accuracy or pose stability and whether it changes first-kind GMRES behavior.
+
+- [ ] **Step 6: Final verification**
+
+```powershell
+git diff --check
+git status --short
+```
+
+Generated output must remain ignored and the source worktree must be clean.

@@ -2,125 +2,123 @@
 
 ## Goal
 
-Apply the accepted 3D Dirichlet trace-restriction combination to the
-Neumann exterior-zero-value-trace formulation and measure its numerical
-effect without changing the Neumann boundary equation.
+Apply the currently accepted 3D Dirichlet correction combination to the
+Neumann exterior-zero-value-trace formulation and measure its effect without
+changing the Neumann boundary integral equation.
 
-The transferred combination is:
+The accepted combination is:
 
-- degree-three local harmonic Cauchy reconstruction;
-- G1-nearest surface stencils with 48 value and 28 normal conditions;
-- 4x4x4 tricubic Cartesian interpolation;
-- crossing-aware correction ownership at foreign non-G1 crossings;
-- precomputed owner templates, with no geometry query inside GMRES.
+- degree-3 local harmonic Cauchy polynomial;
+- G1-nearest surface stencil with 48 value and 28 normal conditions;
+- tricubic Cartesian interpolation and cubic normal-line recovery;
+- crossing-aware correction ownership;
+- `RegionClosestHybrid` owner preprocessing.
 
-The existing center-owned value trace remains the reference route.
+The study compares the existing center-owned value-trace restriction with a
+crossing-owned value-trace restriction on the same pipeline, geometry, grid,
+right-hand side, and GMRES settings.
 
-## Boundary Equation
+## Non-goals
 
-Given the compatible Neumann data
+- Do not change the first-kind Neumann equation or its mean-zero constraint.
+- Do not change the box problem, spread, FFT solver, Cauchy fit, surface DOFs,
+  geometry labeling, or GMRES implementation.
+- Do not replace the existing Neumann route or make the new route the default
+  before the comparison is accepted.
+- Do not rerun the three-strategy owner-oracle benchmark: the selected owner
+  workload is identical to the already accepted Dirichlet workload.
+
+## Algorithm
+
+Add a value-trace restriction route with two modes:
+
+1. `JointTricubicCauchy`: the existing correction uses the center surface DOF
+   for every wrong-side interpolation node.
+2. `JointTricubicCrossingOwner`: each wrong-side node uses the owner selected
+   by the precomputed crossing-owner template.
+
+Both modes recover the exterior value with the existing `c0_weights_`; neither
+mode divides by `h`. The normal-trace routes continue to use `c1_weights_/h`.
+The internal corrected-sample assembly is shared so value and normal routes
+cannot diverge in their owner logic.
+
+Construct one `PanelCenterHarmonicJetKFBI3D` pipeline with
+`RegionClosestHybrid`. It precomputes the owner templates once. Execute the
+legacy and crossing-owner Neumann solves against that same pipeline:
+
+- identical Cauchy matrices and surface data;
+- identical bulk operator;
+- identical correction accumulation order `q=0..63`;
+- no geometry query during GMRES.
+
+The Neumann operator remains
 
 \[
-g_N=[u_n],
+u^+|_\Gamma = 0,\qquad [u_n]=g_N,
 \]
 
-solve for the value jump \(f=[u]\) and the scalar gauge multiplier:
-
-\[
-R_u^+P_h(f,0)+\lambda=-R_u^+P_h(0,g_N),\qquad
-\int_\Gamma f\,dS=0.
-\]
-
-The unknown, compatibility correction, mean constraint, FFT box problem,
-spread operator and GMRES implementation remain unchanged.  Because the
-value-jump trace contains the jump term, this is a bordered second-kind
-equation with a constant nullspace; changing the restrict route does not
-change its operator class.
-
-## Trace Routes
-
-The Neumann operator receives one explicit trace mode:
-
-1. `JointTricubicCauchy`: preserve the current behavior, assigning every
-   wrong-side interpolation correction to the target surface DOF.
-2. `JointTricubicCrossingOwner`: use the precomputed owner selected for each
-   wrong-side node.  Foreign non-G1 crossings use the NURBS crossing patch
-   and parameter coordinates; target and G1-compatible crossings retain the
-   target DOF.
-
-Both modes recover the exterior value using the existing `c0_weights_` and
-do not divide by `h`.  Dirichlet normal traces continue to use
-`c1_weights_/h`.  Operator application, right-hand-side construction,
-post-solve exterior-trace validation and route-mismatch diagnostics must all
-receive exactly the same mode.
-
-## Preprocessing
-
-Owner decisions are built once during pipeline setup.  The numerical study
-uses the available crossing-owner template route on `main`; if the
-region-closest Hybrid owner preprocessor can be integrated without changing
-the accepted owner map, it is selected for the timed setup.  Otherwise the
-full certified owner builder remains the correctness reference and the
-Hybrid timing is reported separately rather than inferred.
-
-No owner geometry query is permitted after GMRES begins.  Query counts and
-an owner-template fingerprint are recorded before and after each solve.
+with `[u]` and the scalar mean constraint as unknowns. Only the numerical
+restriction of `u^+|_\Gamma` changes.
 
 ## Study Driver
 
-Add a dedicated application route:
+Add a dedicated route:
 
 ```text
 neumann_exterior_zero_trace_3d.exe --neumann-owner-study 32 64 128
 ```
 
-The study uses the L-prism with three poses:
+The study uses the L-prism rotated by 17 degrees about the normalized
+`(1,2,3)` axis. It runs `N=32`, `64`, and `128`; `N=128` starts only after both
+smaller levels converge and pass route-integrity checks. GMRES is capped at
+80 iterations with relative tolerance `2e-10`.
 
-- identity;
-- rotation by 17 degrees about normalized `(1,2,3)`;
-- the same rotation followed by the existing `(x,y,z)` translation case.
-
-For every pose and level it executes the legacy and crossing-owner Neumann
-routes on one common pipeline.  The two routes therefore share geometry,
-surface DOFs, Cauchy matrices, prescribed data and bulk solver.  GMRES uses
-relative tolerance `2e-10`, maximum 80 iterations and the existing Neumann
-restart/augmentation policy.
-
-Generated files are written below
+Write generated, untracked CSV files under
 `output/neumann_value_trace_crossing_owner_3d`:
 
-- `summary.csv`: errors, orders, iterations, residuals and timing;
-- `gmres_residuals.csv`: complete residual histories;
-- `owner_diagnostics.csv`: owner counts, setup mode, queries and fingerprints.
+- `summary.csv`: one row per level and restriction mode;
+- `gmres_residuals.csv`: complete residual history;
+- `owner_diagnostics.csv`: preprocessing mode, query counts, and pre/post
+  GMRES fingerprints/counters.
 
-## Tests
+## Reported Metrics
 
-Test-driven implementation must first demonstrate these missing behaviors:
+For both restriction modes report:
 
-- requesting crossing-owner exterior value trace fails before the new API
-  exists;
-- the legacy overload gives the same result as explicit
-  `JointTricubicCauchy`;
-- a synthetic foreign non-G1 correction changes the exterior value trace
-  through the selected owner coefficient while preserving deterministic
-  accumulation;
-- the Neumann operator uses one mode consistently in `apply`, RHS and
-  post-solve residual evaluation;
-- owner query count and fingerprint do not change during GMRES;
-- the study CLI emits complete finite rows for a small smoke level.
+- interior maximum and RMS errors after the Neumann constant shift;
+- observed `N32->N64` and `N64->N128` orders;
+- value-jump density maximum and RMS errors;
+- exterior value-trace and operator residuals;
+- direct/opposite-trace route mismatch;
+- GMRES convergence, iteration count, and final residual;
+- pipeline setup and solve times;
+- owner geometry queries before and after GMRES.
 
-Existing crossing-owner, geometry, Dirichlet restrict and native-NURBS tests
-must remain green.
+The numerical comparison uses the existing transformed non-polynomial
+manufactured harmonic solution.
 
-## Acceptance
+## Correctness and Acceptance
 
-- Both routes converge at all requested levels and poses, or the precise
-  failed case and residual are retained as a valid negative result.
-- Every converged result has final relative residual at most `2e-10`.
-- No geometry query occurs inside GMRES.
-- Legacy results remain unchanged within the existing floating-point
-  tolerances.
-- Full and Hybrid owner preprocessing, when both are available, produce the
-  same owner fingerprint and numerical solution.
-- The final report compares interior/density errors, observed orders, GMRES
-  counts and setup/solve time without requiring the new route to win.
+Before numerical conclusions are accepted:
+
+- existing crossing-owner, preprocessor, and phase-profile unit tests pass;
+- a focused value-trace test proves that the legacy route is unchanged;
+- a foreign non-G1 crossing test proves that the new route uses the selected
+  foreign owner while preserving `q=0..63` accumulation order;
+- both modes converge within 80 iterations at every requested level;
+- final GMRES residual is at most `2e-10`;
+- owner diagnostics and query counts are unchanged across GMRES;
+- all reported values are finite and generated rows are complete.
+
+The study does not require the new route to be more accurate. A deterioration
+is a valid result and keeps the route experimental. Recommend it for Neumann
+only if it preserves convergence order, does not destabilize GMRES, and
+materially improves error or pose robustness.
+
+## Expected Outcome
+
+Crossing ownership should mainly alter samples near non-G1 edges and rotated
+wrong-side tricubic supports. It can reduce grid-position and pose sensitivity,
+but the gain should be smaller than for the Dirichlet normal trace because the
+value trace has no `1/h` derivative amplification. The Neumann operator remains
+first-kind, so a large reduction in GMRES iterations is not expected.
