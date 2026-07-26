@@ -1246,8 +1246,9 @@ SurfaceCauchyMap3D select_surface_map_inputs(
         cloud, center_point, result.value_ids, h);
     result.normal_radius_over_h = sample_radius_over_h(
         cloud, center_point, result.normal_ids, h);
-    if (static_cast<int>(result.value_ids.size()) != value_count
-        || static_cast<int>(result.normal_ids.size()) != normal_count) {
+    if (!legacy_policy
+        && (static_cast<int>(result.value_ids.size()) != value_count
+            || static_cast<int>(result.normal_ids.size()) != normal_count)) {
         HarmonicCauchyFailure3D diagnostic;
         diagnostic.stage = "surface_sector_selection";
         diagnostic.entity_kind = "surface_dof";
@@ -1302,11 +1303,15 @@ SurfaceCauchyMap3D build_surface_map(
     frame.col(0) = target.tangent1;
     frame.col(1) = target.tangent2;
     frame.col(2) = target.normal;
+    const int selected_value_count =
+        static_cast<int>(result.value_ids.size());
+    const int selected_normal_count =
+        static_cast<int>(result.normal_ids.size());
     const int edge_count = static_cast<int>(result.edge_point_ids.size());
-    const int rows = value_count + normal_count + edge_count;
+    const int rows = selected_value_count + selected_normal_count + edge_count;
     Eigen::MatrixXd design(rows, space.dimension());
     Eigen::VectorXd sqrt_weights(rows);
-    for (int k = 0; k < value_count; ++k) {
+    for (int k = 0; k < selected_value_count; ++k) {
         const auto& sample = cloud.dofs[static_cast<std::size_t>(
             result.value_ids[static_cast<std::size_t>(k)])];
         const Eigen::Vector3d xi =
@@ -1315,16 +1320,16 @@ SurfaceCauchyMap3D build_surface_map(
             space.basis(xi.x(), xi.y(), xi.z()).transpose();
         sqrt_weights[k] = 1.0 / (0.35 + xi.norm());
     }
-    for (int k = 0; k < normal_count; ++k) {
+    for (int k = 0; k < selected_normal_count; ++k) {
         const auto& sample = cloud.dofs[static_cast<std::size_t>(
             result.normal_ids[static_cast<std::size_t>(k)])];
         const Eigen::Vector3d xi =
             frame.transpose() * (sample.point - target.point) / h;
         const Eigen::Vector3d normal_components =
             frame.transpose() * sample.normal;
-        design.row(value_count + k) = normal_components.transpose()
+        design.row(selected_value_count + k) = normal_components.transpose()
             * space.gradient(xi.x(), xi.y(), xi.z());
-        sqrt_weights[value_count + k] =
+        sqrt_weights[selected_value_count + k] =
             std::sqrt(0.85) / (0.35 + xi.norm());
     }
     double edge_radius_sq = 0.0;
@@ -1345,9 +1350,9 @@ SurfaceCauchyMap3D build_surface_map(
             edge_points->points[static_cast<std::size_t>(point_id)].point
             - target.point;
         const Eigen::Vector3d xi = frame.transpose() * displacement / h;
-        design.row(value_count + normal_count + k) =
+        design.row(selected_value_count + selected_normal_count + k) =
             space.basis(xi.x(), xi.y(), xi.z()).transpose();
-        sqrt_weights[value_count + normal_count + k] =
+        sqrt_weights[selected_value_count + selected_normal_count + k] =
             1.0 / (0.35 + xi.norm());
         edge_radius_sq = std::max(edge_radius_sq, displacement.squaredNorm());
     }
@@ -1374,19 +1379,19 @@ SurfaceCauchyMap3D build_surface_map(
     result.sigma_max = inverse.sigma_max;
     result.sigma_min = inverse.sigma_min;
     result.condition = inverse.condition;
-    result.M_value.resize(space.dimension(), value_count);
-    result.M_normal.resize(space.dimension(), normal_count);
+    result.M_value.resize(space.dimension(), selected_value_count);
+    result.M_normal.resize(space.dimension(), selected_normal_count);
     result.M_edge.resize(space.dimension(), edge_count);
-    for (int k = 0; k < value_count; ++k)
+    for (int k = 0; k < selected_value_count; ++k)
         result.M_value.col(k) = inverse.pinv.col(k) * sqrt_weights[k];
-    for (int k = 0; k < normal_count; ++k) {
-        result.M_normal.col(k) = inverse.pinv.col(value_count + k)
-            * sqrt_weights[value_count + k] * h;
+    for (int k = 0; k < selected_normal_count; ++k) {
+        result.M_normal.col(k) = inverse.pinv.col(selected_value_count + k)
+            * sqrt_weights[selected_value_count + k] * h;
     }
     for (int k = 0; k < edge_count; ++k) {
         result.M_edge.col(k) = inverse.pinv.col(
-            value_count + normal_count + k)
-            * sqrt_weights[value_count + normal_count + k];
+            selected_value_count + selected_normal_count + k)
+            * sqrt_weights[selected_value_count + selected_normal_count + k];
     }
     return result;
 }

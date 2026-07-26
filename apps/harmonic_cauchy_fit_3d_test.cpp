@@ -579,6 +579,36 @@ void test_legacy_policies_keep_two_term_maps_and_publish_summary()
     }
 }
 
+void test_legacy_lprism_n16_keeps_short_actual_stencils()
+{
+    // Catches applying the strict native-route 48/28 selector contract to
+    // legacy fits, whose historical N=16 behavior intentionally records
+    // requested counts while retaining shorter per-center selected rows.
+    constexpr double h = 3.0 / 16.0;
+    const NativeNurbsSurface3D surface =
+        make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
+    const SurfaceDofCloud3D cloud = make_native_surface_dofs_3d(surface, h);
+    const HarmonicCauchyFit3D fit = HarmonicCauchyFit3D::build_legacy(
+        surface, cloud, h, LegacySurfaceCauchyPolicy3D::G1Nearest,
+        3, 48, 28);
+    const auto summary = *fit.legacy_summary();
+    require(summary.value_count == 48 && summary.normal_count == 28,
+            "short legacy summary keeps literal requested 48/28 counts");
+    require(summary.value_count_min < summary.value_count_max
+                && summary.value_count_max == 48
+                && summary.normal_count_min == 28
+                && summary.normal_count_max == 28,
+            "short legacy summary reports actual truncated value min/max");
+    for (int center = 0; center < static_cast<int>(cloud.dofs.size()); ++center) {
+        const auto& map = fit.surface_maps()[static_cast<std::size_t>(center)];
+        require(map.value_ids
+                        == nearest_g1_cauchy_dofs(surface, cloud, center, 48)
+                    && map.normal_ids
+                        == nearest_g1_cauchy_dofs(surface, cloud, center, 28),
+                "short legacy fit preserves ordered selector IDs");
+    }
+}
+
 void test_interval_length_uses_requested_native_subinterval()
 {
     // Catches ignoring begin/end or changing the exact unit-speed integral.
@@ -1542,6 +1572,7 @@ int main()
         test_second_level_routes_reproduce_cubic_and_share_edge_values();
         test_sparse_apply_is_linear_and_preserves_immutable_audit();
         test_legacy_policies_keep_two_term_maps_and_publish_summary();
+        test_legacy_lprism_n16_keeps_short_actual_stencils();
         test_two_level_maps_follow_selector_contracts_after_rigid_transform();
         std::cout << "harmonic_cauchy_fit_3d_test passed" << std::endl;
         return 0;
