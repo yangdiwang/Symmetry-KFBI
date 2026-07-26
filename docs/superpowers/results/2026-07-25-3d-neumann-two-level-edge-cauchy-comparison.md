@@ -2,59 +2,61 @@
 
 ## Decision
 
-**Reject both current candidate routes for adoption.**  The formal evidence is
-complete and all structural and mandatory numerical gates pass, but neither
-candidate passes its complete acceptance gate.  The audited next design is
+**Reject both current candidate study routes for adoption.**  The formal
+evidence is complete and every structural and mandatory numerical gate passes,
+but neither candidate passes the strict near-edge acceptance gate.  With both
+candidates rejected, `decision.json` selects the fallback design
 `sector_polynomials_with_shared_edge_constraints`: sector-wise polynomials
 with explicit shared-edge value and tangential constraints.
 
-The shared-edge route has the best complete iteration metrics and acceptable
-global errors, orders, and shared-edge recovery.  It nevertheless fails all
-six required `N=128` near-edge defect comparisons against the direct route,
-plus the translated-pose weighted-RMS comparison against G1.  The direct route
-also fails its translated-pose near-edge weighted-RMS comparison against G1.
-There is no structural, configuration, solver, or malformed-diagnostic blocker
-that calls for a rerun.
+The shared-edge route has the best complete iteration metrics and passes its
+global-error, finest-grid-order, and shared-edge-recovery gates.  It is,
+however, worse than the direct route in both required `N=128` near-edge defect
+norms for every pose, and it is also worse than G1 in translated-pose weighted
+RMS.  The direct route is better than G1 in five of the six near-edge
+comparisons, but its translated-pose weighted RMS is slightly worse than G1.
+There is no schema, configuration, solver, rank, domain, ownership, sector, or
+nonfinite-data blocker that calls for a rerun.
+
+This fallback selection is a diagnostic design decision, not a production
+route change.  The production Cauchy-policy default remains `g1_nearest`.
 
 ## Evidence identity and execution
 
 - Runtime HEAD recorded immediately before the build/study:
-  `f598930d55252a03f5b62300f743a401df354f12`
-  (`fix: reject orphan Neumann study diagnostics`).  The tracked tree was
-  clean; the two pre-existing unrelated `2026-07-23` documents were untracked
-  and untouched.  The CSV schema does not itself embed a commit identifier,
-  so this provenance comes from the recorded runtime repository state.
+  `1cfb90ff17a4d11324e88acdc6971ca9b6692921` on `main`.  The tracked tree was
+  clean; only the two pre-existing unrelated untracked `2026-07-23` documents
+  remained, and both were untouched.  The CSV schema does not embed a commit
+  identifier, so this provenance comes from the recorded runtime repository
+  state.
 - Branch/worktree: `main`, as required by the Task 6 brief.
-- Build: Visual Studio 2017 MSBuild generator, `Release`; each target was
-  invoked separately with `MSBUILDDISABLENODEREUSE=1`, `/m:2`, and
-  `/nr:false`.
-- Targets: `harmonic_cauchy_fit_3d_test`,
-  `native_nurbs_surface_3d_test`,
-  `neumann_exterior_zero_trace_3d_route_test`, and
-  `neumann_exterior_zero_trace_3d`.
-- Each target printed its successful target/product line.  CMake subsequently
-  returned 1 only because of the known leaked MSBuild-node behavior.  There
-  were no `cl` or `link` processes after any invocation.  Cleanup was limited
-  to each invocation's exact start-time window: 20, 20, 190, and 190 MSBuild
-  nodes respectively.
-- Direct tests:
-  `harmonic_cauchy_fit_3d_test.exe` passed (exit 0),
-  `native_nurbs_surface_3d_test.exe` passed (exit 0), and
-  `neumann_exterior_zero_trace_3d_route_test.exe` passed (exit 0).
+- Exact `Release` application-target build:
+  `neumann_exterior_zero_trace_3d` reported successful/up-to-date target
+  output.  The wrapper's raw exit was 1 only because of the known leaked
+  MSBuild-node behavior.  Cleanup was restricted to the exact build-time
+  window: 190 matching nodes were removed and 0 remained.
+- Final direct regressions all exited 0:
+  `harmonic_cauchy_fit_3d_test.exe` in 11.825 s,
+  `native_nurbs_surface_3d_test.exe` in 56.584 s, and
+  `neumann_exterior_zero_trace_3d_route_test.exe` in 206.458 s.
 - The single formal application command was
   `.\build\apps\Release\neumann_exterior_zero_trace_3d.exe --neumann-edge-cauchy-study 32 64 128`.
-  It ran once from `2026-07-26T18:15:21.2844873+08:00` through
-  `2026-07-26T18:39:11.3140863+08:00` (1430.3 s), exited 0, and wrote all
-  27 configurations.
+  It ran once from `2026-07-26T23:06:02.8184815+08:00` through
+  `2026-07-26T23:29:54.4677293+08:00` (1431.649 s), exited 0, and wrote all
+  27 configurations with `status=ok`.
 - Preserved output:
   `output/neumann_two_level_edge_cauchy_3d/`.
-- Final audit used
-  `-ExpectedLevels @(32,64,128)` and wrote
-  `output/neumann_two_level_edge_cauchy_3d/decision.json`.  The first
-  foreground audit was terminated by the executor's 600 s per-call limit, so
-  the identical audit command was rerun in a monitored background PowerShell
-  and allowed to finish.  The final raw audit exit was 1 solely because seven
-  acceptance predicates failed.
+- The final propagated audit invoked the final script directly:
+  `& .\apps\audit_neumann_two_level_edge_cauchy_3d.ps1 -OutputDirectory .\output\neumann_two_level_edge_cauchy_3d -ExpectedLevels @(32,64,128) -DecisionJson .\output\neumann_two_level_edge_cauchy_3d\decision.json`.
+  It ran from `2026-07-26T23:31:10.8522413+08:00` through
+  `2026-07-26T23:31:46.8895861+08:00` (36.037 s).  Its raw exit was the
+  expected 1 solely because seven acceptance predicates failed; schema,
+  formal-evidence, and mandatory-numerical evaluation completed.
+- Provenance note: the preserved `formal-audit.exit.txt` and
+  `formal-audit.*.log` sidecars are timestamped about 23:02, before this final
+  application run.  They contain the same `27/81/27` and seven-failure outcome
+  but are not the final audit invocation's timing record; `decision.json`
+  written at 23:31 is the final decision artifact.
 
 ## Raw audit decision and mandatory gates
 
@@ -62,33 +64,61 @@ that calls for a rerun.
 |---|---|
 | `schema_pass` | true |
 | `formal_evidence_complete` | true |
+| `expected_levels` | 32, 64, 128 |
 | `summary_row_count` / unique keys | 27 / 27 |
 | `bin_row_count` | 81 |
 | `owner_row_count` | 27 |
 | `all_status_ok` | true |
 | `mandatory_numerical_pass` | true |
+| `numerical_pass` (compatibility alias) | true |
 | `acceptance_pass` | false |
 | mandatory failed predicates | 0 |
 | acceptance failed predicates | 7 |
 | G1 mandatory route gate | true |
 | direct mandatory route gate | true |
 | shared-edge mandatory route gate | true |
-| raw selected route | `sector_polynomials_with_shared_edge_constraints` |
+| selected fallback | `sector_polynomials_with_shared_edge_constraints` |
 
-The mandatory audit additionally established:
+The final artifact cardinalities are:
 
-| mandatory check | observed evidence |
+| artifact | data rows | audited relationship |
 |---|---|
-| both RHS solves present and converged | 27/27 physical and 27/27 common |
-| GMRES cap | maximum physical 57; maximum common 63; both below 80 |
-| final relative residual | maximum physical `1.9757443820796661e-10`; maximum common `1.9322920800965358e-10`; both strictly below `2e-10` |
-| residual histories | every history has exactly `iterations+1` contiguous entries and matches its summary final residual |
-| preprocessing work | minimum Cauchy queries 6104 and minimum Cauchy SVD factorizations 1051; actual route-dependent work retained |
-| runtime work | all runtime geometry-query and runtime-SVD counters are zero |
-| fingerprints and reference data | all pre/post Cauchy and owner fingerprints/digests stable; all 27 raw G1 reference audits equal; label, neighborhood, and common-RHS checks equal |
-| shared-point geometry | 3972 points; max position mismatch `2.6631254232960932e-16`; min mapped tangent dot `1`; max frame orthogonality error `4.980559976921029e-16`; min frame determinant `0.99999999999999978` |
-| shared-edge fits | 3972 fits; all sector counts exactly 24/24 values and 14/14 normals; min `sigma_min=0.61005117842337475`; max edge-fit condition `44.199373078325735` |
-| surface fits | 186120 maps; all have 48 ordinary values and 28 normals; min `sigma_min=0.38990247752928547` |
+| `summary.csv` | 27 | complete 3 poses x 3 levels x 3 routes |
+| `edge_distance_bins.csv` | 81 | exactly 3 bins per summary key |
+| `owner_diagnostics.csv` | 27 | exactly 1 owner row per summary key |
+| `gmres_residuals.csv` | 1843 | 54 complete physical/common histories |
+| `dof_diagnostics.csv` | 186120 | exactly one raw row per surface DOF |
+| `surface_fit_diagnostics.csv` | 186120 | exactly one fit row per surface DOF, with identical ID sets |
+| `edge_point_diagnostics.csv` | 3972 | exactly the shared-route point/map total |
+| `edge_fit_diagnostics.csv` | 3972 | key set exactly equals the edge-point key set |
+
+The structural counts behind those totals are:
+
+| N | h | patches | DOFs / surface / value / normal maps per route | shared points / edge maps |
+|---:|---:|---:|---:|---:|
+| 32 | 0.09375 | 12 | 1050 | 196 on shared route; 0 on controls |
+| 64 | 0.046875 | 12 | 3926 | 376 on shared route; 0 on controls |
+| 128 | 0.0234375 | 12 | 15704 | 752 on shared route; 0 on controls |
+
+The strengthened mandatory audit established all of the following from the raw
+CSV evidence:
+
+| mandatory check | independently recomputed evidence |
+|---|---|
+| both RHS solves | 27/27 physical and 27/27 common converged |
+| GMRES cap and final residual | maximum iterations 57 physical and 63 common; maximum final residuals `1.9757443820796661e-10` physical and `1.9322920800965358e-10` common, all strictly below the 80 / `2e-10` limits |
+| residual histories | all 54 histories, comprising 1843 rows, are finite/nonnegative, have contiguous iterations `0..iterations`, contain exactly `iterations+1` rows, and match the summary final residual |
+| common RHS | maximum absolute mean `4.719377170804526e-16`; maximum RMS deviation from 1 is `6.661338147750939e-16`; all hashes and equality flags agree |
+| raw whole-surface norms | all 186120 DOF rows have finite coordinates/errors, positive weight, nonnegative edge distance, contiguous IDs, and in-range patch IDs; 27 x 4 = **108/108** recomputed density-Linf, unweighted density-L2, defect-Linf, and weighted defect-RMS values match `summary.csv` |
+| raw distance-bin norms | all 81 bins are nonempty and contain 186120 rows in total; for each key the raw `<h`, `[h,2h]`, and `>2h` count/weight/density/defect aggregates match the bin CSV and the partition count matches the surface DOF count: **108/108** checks pass |
+| surface-map domain and sectors | 186120/186120 rows are finite, have contiguous IDs, 48 ordinary values and 28 normals, valid positive serialized sector counts whose totals match, in-range sector patch IDs, nonnegative radii/distances, and route-valid edge counts in `[0,6]` |
+| surface-map SVD and rank | all rows satisfy `sigma_max>0`, `0<sigma_min<=sigma_max`, `condition>=1`, `condition ~= sigma_max/sigma_min`, and `sigma_min>3e-12*sigma_max`; minimum `sigma_min=0.38990247752928547`, minimum rank ratio `0.009322062593572102`, maximum condition `107.27239706473715` |
+| shared-point domain and identity | 3972/3972 rows have finite coordinates/values, valid open-unit fractions and native `[0,1]` coordinates, exact `error=reconstructed-exact`, and raw Linf matching the summary; maximum position mismatch `2.6631254232960932e-16`, minimum mapped tangent dot `1`, maximum frame orthogonality error `4.980559976921029e-16`, minimum determinant `0.99999999999999978` |
+| shared-edge fit sectors, domain, and rank | 3972/3972 rows have exactly 24/24 value and 14/14 normal samples, finite nonnegative radii, valid SVD ordering/condition identity, and pass the same rank cutoff; minimum `sigma_min=0.61005117842337475`, minimum rank ratio `0.02262475529297439`, maximum condition `44.199373078325735` |
+| owner/reference audit | 27/27 owners are available with positive query counts (`178462..2537982`); all before/after owner and Cauchy fingerprints and owner output digests are stable; all owner/summary counters and flags agree; all 27 raw G1 reference audits pass |
+| preprocessing/runtime work | minimum Cauchy queries 6104 and minimum Cauchy SVD factorizations 1051; route-dependent preprocessing work is retained, while all 27 runtime geometry-query and runtime-SVD counters are zero |
+| finite derived arithmetic | all audited sums, products, differences, divisions, square roots, condition ratios, error ratios, and `log2` orders remain finite; no NaN, infinity, overflow, negative-domain, or zero-denominator escape occurs |
+| recorded predicate aggregates | 24525/24525 explicitly recorded mandatory predicates pass; the separate acceptance layer evaluates 58 predicates, of which 51 pass and 7 fail.  Fail-fast schema/domain assertions are additional to these recorded counts |
 
 ## Complete 27-row convergence/error/iteration evidence
 
@@ -255,33 +285,33 @@ time.
 
 | pose | N | route | setup s | fit s | pipeline s | phys solve s | common solve s | neighborhood q | Cauchy q | SVD | runtime q/SVD |
 |---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| baseline | 32 | g1_value_g1_normal | 1.7962518 | 0.1815852 | 6.9648055 | 0.3813751 | 0.3631190 | 6104 | 6104 | 1051 | 0/0 |
-| baseline | 32 | direct_cross_face_value | 1.7962518 | 0.2120789 | 7.0287626 | 0.3118407 | 0.2943311 | 6104 | 6104 | 1051 | 0/0 |
-| baseline | 32 | edge_reconstructed_value | 1.7962518 | 0.2393666 | 7.1228033 | 0.3074084 | 0.2871731 | 6104 | 6518 | 1247 | 0/0 |
-| baseline | 64 | g1_value_g1_normal | 6.7869194 | 0.7809853 | 10.5472382 | 1.8609126 | 1.6809082 | 22672 | 22672 | 3927 | 0/0 |
-| baseline | 64 | direct_cross_face_value | 6.7869194 | 0.9208587 | 10.5628558 | 1.8121178 | 1.6465772 | 22672 | 22672 | 3927 | 0/0 |
-| baseline | 64 | edge_reconstructed_value | 6.7869194 | 1.0367386 | 10.6216630 | 1.7785234 | 1.7620869 | 22672 | 23446 | 4303 | 0/0 |
-| baseline | 128 | g1_value_g1_normal | 27.9844398 | 5.7415057 | 41.1529517 | 28.9143946 | 30.2316977 | 90688 | 90688 | 15705 | 0/0 |
-| baseline | 128 | direct_cross_face_value | 27.9844398 | 6.7345553 | 41.2297815 | 18.4068827 | 17.7749731 | 90688 | 90688 | 15705 | 0/0 |
-| baseline | 128 | edge_reconstructed_value | 27.9844398 | 6.8221841 | 41.6114635 | 16.9306514 | 16.1435926 | 90688 | 92214 | 16457 | 0/0 |
-| rot_axis123_17deg | 32 | g1_value_g1_normal | 3.0995192 | 0.1788833 | 14.0982303 | 0.4694957 | 0.4644838 | 6104 | 6104 | 1051 | 0/0 |
-| rot_axis123_17deg | 32 | direct_cross_face_value | 3.0995192 | 0.2106933 | 13.7283725 | 0.3826404 | 0.3447506 | 6104 | 6104 | 1051 | 0/0 |
-| rot_axis123_17deg | 32 | edge_reconstructed_value | 3.0995192 | 0.2398952 | 14.3331513 | 0.3319607 | 0.3150597 | 6104 | 6518 | 1247 | 0/0 |
-| rot_axis123_17deg | 64 | g1_value_g1_normal | 12.2079718 | 0.7796464 | 27.4007506 | 3.6842082 | 3.4162669 | 22672 | 22672 | 3927 | 0/0 |
-| rot_axis123_17deg | 64 | direct_cross_face_value | 12.2079718 | 0.9165654 | 27.3997515 | 2.9588767 | 2.6967756 | 22672 | 22672 | 3927 | 0/0 |
-| rot_axis123_17deg | 64 | edge_reconstructed_value | 12.2079718 | 0.9676432 | 27.1848785 | 2.0053268 | 1.9193791 | 22672 | 23446 | 4303 | 0/0 |
-| rot_axis123_17deg | 128 | g1_value_g1_normal | 53.0718334 | 5.7428480 | 57.9285420 | 22.1892286 | 21.6008665 | 90688 | 90688 | 15705 | 0/0 |
-| rot_axis123_17deg | 128 | direct_cross_face_value | 53.0718334 | 6.6592221 | 57.8385197 | 16.0332556 | 15.0444478 | 90688 | 90688 | 15705 | 0/0 |
-| rot_axis123_17deg | 128 | edge_reconstructed_value | 53.0718334 | 6.7645370 | 58.4978004 | 15.0760963 | 13.8521005 | 90688 | 92214 | 16457 | 0/0 |
-| rot_axis123_17deg_t_xyz_1 | 32 | g1_value_g1_normal | 3.0803353 | 0.1802942 | 14.0378378 | 0.4333641 | 0.4152221 | 6104 | 6104 | 1051 | 0/0 |
-| rot_axis123_17deg_t_xyz_1 | 32 | direct_cross_face_value | 3.0803353 | 0.2104681 | 13.8426021 | 0.3466800 | 0.3317054 | 6104 | 6104 | 1051 | 0/0 |
-| rot_axis123_17deg_t_xyz_1 | 32 | edge_reconstructed_value | 3.0803353 | 0.2390642 | 14.5693779 | 0.3205444 | 0.2949085 | 6104 | 6518 | 1247 | 0/0 |
-| rot_axis123_17deg_t_xyz_1 | 64 | g1_value_g1_normal | 12.1545693 | 0.7795416 | 27.3555849 | 4.2716553 | 3.7894388 | 22672 | 22672 | 3927 | 0/0 |
-| rot_axis123_17deg_t_xyz_1 | 64 | direct_cross_face_value | 12.1545693 | 0.9153994 | 26.8861628 | 3.1097951 | 2.8451209 | 22672 | 22672 | 3927 | 0/0 |
-| rot_axis123_17deg_t_xyz_1 | 64 | edge_reconstructed_value | 12.1545693 | 0.9561358 | 27.1549162 | 2.1405279 | 1.9732306 | 22672 | 23446 | 4303 | 0/0 |
-| rot_axis123_17deg_t_xyz_1 | 128 | g1_value_g1_normal | 53.4067545 | 5.7233135 | 58.6030829 | 24.3477198 | 23.8660066 | 90688 | 90688 | 15705 | 0/0 |
-| rot_axis123_17deg_t_xyz_1 | 128 | direct_cross_face_value | 53.4067545 | 6.6630835 | 59.1027516 | 18.2979532 | 16.8975427 | 90688 | 90688 | 15705 | 0/0 |
-| rot_axis123_17deg_t_xyz_1 | 128 | edge_reconstructed_value | 53.4067545 | 6.8440407 | 58.3024574 | 16.0152809 | 15.3474420 | 90688 | 92214 | 16457 | 0/0 |
+| baseline | 32 | g1_value_g1_normal | 1.9712537 | 0.2357166 | 7.6864135 | 0.4029564 | 0.3700299 | 6104 | 6104 | 1051 | 0/0 |
+| baseline | 32 | direct_cross_face_value | 1.9712537 | 0.2141921 | 7.0698506 | 0.3082631 | 0.2914167 | 6104 | 6104 | 1051 | 0/0 |
+| baseline | 32 | edge_reconstructed_value | 1.9712537 | 0.2402398 | 7.1935079 | 0.3140346 | 0.2815160 | 6104 | 6518 | 1247 | 0/0 |
+| baseline | 64 | g1_value_g1_normal | 6.6363191 | 0.7801494 | 10.5360248 | 1.8981470 | 1.7067841 | 22672 | 22672 | 3927 | 0/0 |
+| baseline | 64 | direct_cross_face_value | 6.6363191 | 0.9178046 | 10.7399150 | 1.7895064 | 1.7317040 | 22672 | 22672 | 3927 | 0/0 |
+| baseline | 64 | edge_reconstructed_value | 6.6363191 | 0.9610231 | 10.5086126 | 1.7381957 | 1.6417060 | 22672 | 23446 | 4303 | 0/0 |
+| baseline | 128 | g1_value_g1_normal | 27.7805078 | 5.6983902 | 41.2412195 | 28.9773298 | 30.2342297 | 90688 | 90688 | 15705 | 0/0 |
+| baseline | 128 | direct_cross_face_value | 27.7805078 | 6.6622147 | 41.2355910 | 18.4317344 | 17.7929913 | 90688 | 90688 | 15705 | 0/0 |
+| baseline | 128 | edge_reconstructed_value | 27.7805078 | 6.7550604 | 41.2802510 | 16.9781266 | 16.1027436 | 90688 | 92214 | 16457 | 0/0 |
+| rot_axis123_17deg | 32 | g1_value_g1_normal | 3.1041473 | 0.1801334 | 13.7307682 | 0.4585601 | 0.4694762 | 6104 | 6104 | 1051 | 0/0 |
+| rot_axis123_17deg | 32 | direct_cross_face_value | 3.1041473 | 0.2092440 | 13.8081096 | 0.3455769 | 0.3263187 | 6104 | 6104 | 1051 | 0/0 |
+| rot_axis123_17deg | 32 | edge_reconstructed_value | 3.1041473 | 0.2384313 | 14.5313307 | 0.3280835 | 0.3023725 | 6104 | 6518 | 1247 | 0/0 |
+| rot_axis123_17deg | 64 | g1_value_g1_normal | 12.2646032 | 0.7957079 | 27.5304985 | 3.5545877 | 3.3489214 | 22672 | 22672 | 3927 | 0/0 |
+| rot_axis123_17deg | 64 | direct_cross_face_value | 12.2646032 | 0.9208679 | 27.2903870 | 2.8665254 | 2.6604308 | 22672 | 22672 | 3927 | 0/0 |
+| rot_axis123_17deg | 64 | edge_reconstructed_value | 12.2646032 | 0.9575043 | 28.3914778 | 1.9520640 | 1.8449919 | 22672 | 23446 | 4303 | 0/0 |
+| rot_axis123_17deg | 128 | g1_value_g1_normal | 53.4602352 | 5.6759403 | 58.7193045 | 21.9177459 | 21.5951309 | 90688 | 90688 | 15705 | 0/0 |
+| rot_axis123_17deg | 128 | direct_cross_face_value | 53.4602352 | 6.6401975 | 58.2692718 | 15.8955832 | 14.9878870 | 90688 | 90688 | 15705 | 0/0 |
+| rot_axis123_17deg | 128 | edge_reconstructed_value | 53.4602352 | 6.7845252 | 58.5186847 | 15.0210120 | 13.6850630 | 90688 | 92214 | 16457 | 0/0 |
+| rot_axis123_17deg_t_xyz_1 | 32 | g1_value_g1_normal | 3.0864115 | 0.1920110 | 13.8865650 | 0.4379033 | 0.4220683 | 6104 | 6104 | 1051 | 0/0 |
+| rot_axis123_17deg_t_xyz_1 | 32 | direct_cross_face_value | 3.0864115 | 0.2103467 | 13.9642330 | 0.3472149 | 0.3447368 | 6104 | 6104 | 1051 | 0/0 |
+| rot_axis123_17deg_t_xyz_1 | 32 | edge_reconstructed_value | 3.0864115 | 0.2402410 | 14.1883489 | 0.3297302 | 0.2952452 | 6104 | 6518 | 1247 | 0/0 |
+| rot_axis123_17deg_t_xyz_1 | 64 | g1_value_g1_normal | 12.3486805 | 0.8053838 | 27.4101283 | 3.9860328 | 3.7600822 | 22672 | 22672 | 3927 | 0/0 |
+| rot_axis123_17deg_t_xyz_1 | 64 | direct_cross_face_value | 12.3486805 | 0.9216430 | 26.9378496 | 2.9693376 | 2.7077870 | 22672 | 22672 | 3927 | 0/0 |
+| rot_axis123_17deg_t_xyz_1 | 64 | edge_reconstructed_value | 12.3486805 | 0.9600115 | 27.2380026 | 2.2202739 | 1.9013466 | 22672 | 23446 | 4303 | 0/0 |
+| rot_axis123_17deg_t_xyz_1 | 128 | g1_value_g1_normal | 53.6936483 | 5.7523954 | 58.5760832 | 24.1240992 | 23.7010751 | 90688 | 90688 | 15705 | 0/0 |
+| rot_axis123_17deg_t_xyz_1 | 128 | direct_cross_face_value | 53.6936483 | 6.6527943 | 58.7950269 | 18.4009512 | 16.8523760 | 90688 | 90688 | 15705 | 0/0 |
+| rot_axis123_17deg_t_xyz_1 | 128 | edge_reconstructed_value | 53.6936483 | 6.7403982 | 59.0086749 | 16.1336548 | 15.1698695 | 90688 | 92214 | 16457 | 0/0 |
 
 ## Owner diagnostics
 
@@ -302,19 +332,55 @@ value.  `stable` means the before/after values are identical.  All 27
 | rot_axis123_17deg_t_xyz_1 | 64 | 3 | 629984 | 5634170801304089673 (true) | 1057097149718224891 (true) |
 | rot_axis123_17deg_t_xyz_1 | 128 | 3 | 2442549 | 16612621861264341367 (true) | 11736123202450921947 (true) |
 
+The route-specific Cauchy fingerprints below are listed in
+G1/direct/shared order.  Every one is stable before/after; the common-RHS,
+label, and neighborhood fingerprints are shared across the three routes at a
+pose/level, and all corresponding equality flags are 1.
+
+| pose | N | common RHS hash | Cauchy fingerprints: G1 / direct / shared | label fingerprint | neighborhood fingerprint |
+|---|---:|---:|---|---:|---:|
+| baseline | 32 | 16079175247052710992 | 5639469236617086693 / 8174152292102831723 / 15672802201107503855 | 1724317395460990725 | 3751049186055881515 |
+| baseline | 64 | 7596787855201497449 | 14774028472547329738 / 16830639946708989538 / 17550143264517098984 | 13261685383820968469 | 1173252215149370365 |
+| baseline | 128 | 6661903404197365086 | 17102680792084277165 / 5287922929961658613 / 872695794163514194 | 6618804306152956580 | 16701522626696648964 |
+| rot_axis123_17deg | 32 | 10666907554377132852 | 18430049666916496517 / 6778449220741904487 / 14845843076728238251 | 7163140122960463637 | 9946039747877769581 |
+| rot_axis123_17deg | 64 | 15116120696796770994 | 18154736296688221250 / 16193632218696170339 / 7100092838933945520 | 3163106246597024020 | 12098895822565158554 |
+| rot_axis123_17deg | 128 | 5566324866608263457 | 5625913194432563091 / 9626182417284750524 / 7844917853188365741 | 9666602404976367300 | 3965185389810968361 |
+| rot_axis123_17deg_t_xyz_1 | 32 | 6843477761456134420 | 3648505823475949746 / 15066905600092080920 / 1916397439374678753 | 2894092712341586773 | 13393888708251282612 |
+| rot_axis123_17deg_t_xyz_1 | 64 | 15116120696796770994 | 17389037344772898129 / 4598739960063035452 / 15058372405914373524 | 4150622064495768277 | 10149630010630011905 |
+| rot_axis123_17deg_t_xyz_1 | 128 | 5630533462738454872 | 1224561314886550725 / 2265597413797344965 / 1696808030831616507 | 15688534461193308613 | 10133139442506909948 |
+
 ## Failed gates, without omission
 
-The seven failed predicates are all acceptance predicates:
+The seven entries in `acceptance_failed_predicates` (and therefore in
+`failed_predicates`) are all **primary/shared-route** comparisons.  In the
+exact order serialized by `decision.json`, they are:
 
 1. `primary_near_linf:baseline:direct_cross_face_value`
-2. `primary_near_rms:baseline:direct_cross_face_value`
-3. `primary_near_linf:rot_axis123_17deg:direct_cross_face_value`
-4. `primary_near_rms:rot_axis123_17deg:direct_cross_face_value`
-5. `primary_near_linf:rot_axis123_17deg_t_xyz_1:direct_cross_face_value`
+2. `primary_near_linf:rot_axis123_17deg:direct_cross_face_value`
+3. `primary_near_linf:rot_axis123_17deg_t_xyz_1:direct_cross_face_value`
+4. `primary_near_rms:baseline:direct_cross_face_value`
+5. `primary_near_rms:rot_axis123_17deg:direct_cross_face_value`
 6. `primary_near_rms:rot_axis123_17deg_t_xyz_1:direct_cross_face_value`
 7. `primary_near_rms:rot_axis123_17deg_t_xyz_1:g1_value_g1_normal`
 
-No mandatory predicate failed.  The resulting route-level decision fields are:
+Their recomputed values are:
+
+| failed predicate | shared value | control value | shared/control |
+|---|---:|---:|---:|
+| `primary_near_linf:baseline:direct_cross_face_value` | 1.1348548841633166e-7 | 1.1131468096933772e-7 | 1.0195015376955705 |
+| `primary_near_linf:rot_axis123_17deg:direct_cross_face_value` | 4.1431361438859504e-8 | 4.1414868812150729e-8 | 1.0003982296016336 |
+| `primary_near_linf:rot_axis123_17deg_t_xyz_1:direct_cross_face_value` | 4.0883752133735740e-8 | 4.0698901949964839e-8 | 1.0045418960933676 |
+| `primary_near_rms:baseline:direct_cross_face_value` | 4.7096230264552246e-8 | 4.6089840091175414e-8 | 1.0218354017151281 |
+| `primary_near_rms:rot_axis123_17deg:direct_cross_face_value` | 1.1441113855136057e-8 | 1.1416867200523926e-8 | 1.0021237572607500 |
+| `primary_near_rms:rot_axis123_17deg_t_xyz_1:direct_cross_face_value` | 1.1321939939369934e-8 | 1.1312671541388640e-8 | 1.0008192934752311 |
+| `primary_near_rms:rot_axis123_17deg_t_xyz_1:g1_value_g1_normal` | 1.1321939939369934e-8 | 1.1299656115178468e-8 | 1.0019720798548490 |
+
+No mandatory predicate failed.  Separately,
+`direct_near_edge_pass=false`: the direct route's translated-pose weighted RMS
+is `1.1312671541388640e-8`, versus G1's `1.1299656115178468e-8` (ratio
+`1.0011518426824237`).  This derived direct-route gate is not an eighth entry
+in `acceptance_failed_predicates`; the seven recorded failures above all name
+the primary/shared route.  The resulting route-level decision fields are:
 
 | gate | result |
 |---|---|
@@ -334,6 +400,8 @@ No mandatory predicate failed.  The resulting route-level decision fields are:
 | `shared_better_iteration_than_direct` | true |
 | `shared_better_defect_than_direct` | false |
 
-Therefore the explicit Task 6 conclusion is **reject**, with the named next
-design **sector-wise polynomials with explicit shared-edge value and
-tangential constraints**.
+Therefore the explicit Task 6 conclusion is **reject both current candidate
+routes**.  Because neither candidate passes the strict near-edge gate, the
+audit selects the fallback next design **sector-wise polynomials with explicit
+shared-edge value and tangential constraints**.  It does not adopt either
+experimental route, and the production default remains `g1_nearest`.
