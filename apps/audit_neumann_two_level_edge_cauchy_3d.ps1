@@ -9,6 +9,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName Microsoft.VisualBasic
 
 function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) {
@@ -34,6 +35,33 @@ function Assert-Columns($Columns, [string[]]$Required, [string]$Name) {
         $columns[2] -eq 'route') ("$Name does not begin case_id,N,route")
 }
 
+function Assert-RfcCsvRecordWidths(
+    [string]$Path, [string]$Name, [int]$ExpectedWidth) {
+    $parser = New-Object Microsoft.VisualBasic.FileIO.TextFieldParser($Path)
+    try {
+        $parser.TextFieldType = [Microsoft.VisualBasic.FileIO.FieldType]::Delimited
+        $parser.SetDelimiters(',')
+        $parser.HasFieldsEnclosedInQuotes = $true
+        $parser.TrimWhiteSpace = $false
+        $record = 0
+        while (-not $parser.EndOfData) {
+            ++$record
+            try {
+                $fields = @($parser.ReadFields())
+            } catch {
+                throw ("$Name invalid RFC CSV record $record`: " +
+                    $_.Exception.Message)
+            }
+            Assert-True ($fields.Count -eq $ExpectedWidth) `
+                ("$Name record $record has width $($fields.Count); " +
+                 "expected $ExpectedWidth")
+        }
+        Assert-True ($record -ge 1) ("$Name is empty")
+    } finally {
+        $parser.Close()
+    }
+}
+
 function Key($Row) {
     return [string]$Row.case_id + '|' + [string]$Row.N + '|' + [string]$Row.route
 }
@@ -53,7 +81,8 @@ function Number($Value, [string]$Context) {
         [double]::TryParse([string]$Value,
             [Globalization.NumberStyles]::Float,
             [Globalization.CultureInfo]::InvariantCulture,
-            [ref]$parsed)) ("$Context is not numeric")
+            [ref]$parsed) -and -not [double]::IsNaN($parsed) -and
+        -not [double]::IsInfinity($parsed)) ("$Context is not finite numeric")
     return $parsed
 }
 
@@ -68,20 +97,29 @@ function Is-NA($Value) {
     return [string]::IsNullOrWhiteSpace([string]$Value) -or $Value -eq 'NA'
 }
 
-$csvNames = @(
-    'summary.csv', 'gmres_residuals.csv', 'edge_point_diagnostics.csv',
-    'edge_fit_diagnostics.csv', 'surface_fit_diagnostics.csv',
-    'dof_diagnostics.csv', 'edge_distance_bins.csv', 'owner_diagnostics.csv')
+$expectedHeaders = [ordered]@{
+    'summary.csv' = 'case_id,N,route,status,h,patch_count,surface_dof_count,shared_edge_point_count,physical_converged,physical_iterations,physical_final_residual,physical_contraction,common_converged,common_iterations,common_final_residual,common_contraction,common_rhs_mean,common_rhs_rms,common_rhs_hash,density_linf,density_l2,interior_linf,interior_l2,density_linf_order_32_64,density_l2_order_32_64,interior_linf_order_32_64,interior_l2_order_32_64,density_linf_order_64_128,density_l2_order_64_128,interior_linf_order_64_128,interior_l2_order_64_128,defect_linf,defect_rms,edge_value_linf,edge_value_rms,setup_seconds,fit_seconds,pipeline_seconds,physical_solve_seconds,common_solve_seconds,neighborhood_geometry_queries,cauchy_geometry_queries,cauchy_svd_factorizations,runtime_geometry_queries,runtime_svd_factorizations,cauchy_fingerprint_before,cauchy_fingerprint_after,owner_fingerprint_before,owner_fingerprint_after,label_inside_count,label_outside_count,label_fingerprint,neighborhood_fingerprint,reference_equal,label_equal,neighborhood_equal,common_rhs_hash_equal,surface_map_count,value_map_count,normal_map_count,edge_map_count,value_radius_max_over_h,normal_radius_max_over_h,edge_radius_max_over_h,condition_max,failure_stage,failure_message,failure_entity_kind,failure_entity_id,failure_connection_id,failure_incident_sectors,failure_actual_value_counts,failure_actual_normal_counts,failure_required_value_count,failure_required_normal_count,failure_actual_edge_count,failure_value_radius_over_h,failure_normal_radius_over_h,failure_edge_radius_over_h,failure_sigma_max,failure_sigma_min,failure_condition'
+    'gmres_residuals.csv' = 'case_id,N,route,rhs_kind,iteration,relative_residual'
+    'edge_point_diagnostics.csv' = 'case_id,N,route,connection_id,cell_id,fraction,native_parameter_0,native_parameter_1,native_u_0,native_v_0,native_u_1,native_v_1,point_x,point_y,point_z,tangent_x,tangent_y,tangent_z,sectors,position_mismatch,mapped_tangent_dot,frame_orthogonality_error,frame_determinant,exact_value,reconstructed_value,error'
+    'edge_fit_diagnostics.csv' = 'case_id,N,route,connection_id,cell_id,value_sector_0_count,value_sector_1_count,normal_sector_0_count,normal_sector_1_count,value_radius_over_h,normal_radius_over_h,sigma_max,sigma_min,condition'
+    'surface_fit_diagnostics.csv' = 'case_id,N,route,center_dof,ordinary_value_count,normal_count,edge_count,value_sector_patch_ids,value_sector_counts,normal_sector_patch_ids,normal_sector_counts,value_radius_over_h,normal_radius_over_h,edge_radius_over_h,edge_distance_over_h,sigma_max,sigma_min,condition'
+    'dof_diagnostics.csv' = 'case_id,N,route,dof_id,patch_id,point_x,point_y,point_z,weight,edge_distance_over_h,density_error,equation_defect'
+    'edge_distance_bins.csv' = 'case_id,N,route,distance_bin,status,count,weight_sum,density_linf,density_weighted_rms,defect_linf,defect_weighted_rms,empty,failure_stage,failure_message,failure_entity_kind,failure_entity_id,failure_connection_id,failure_incident_sectors,failure_actual_value_counts,failure_actual_normal_counts,failure_required_value_count,failure_required_normal_count,failure_actual_edge_count,failure_value_radius_over_h,failure_normal_radius_over_h,failure_edge_radius_over_h,failure_sigma_max,failure_sigma_min,failure_condition'
+    'owner_diagnostics.csv' = 'case_id,N,route,status,available,owner_query_count,owner_fingerprint_before,owner_fingerprint_after,owner_output_digest_before,owner_output_digest_after,cauchy_geometry_queries,cauchy_svd_factorizations,runtime_geometry_queries,runtime_svd_factorizations,cauchy_fingerprint_before,cauchy_fingerprint_after,reference_equal,label_equal,neighborhood_equal,common_rhs_hash_equal,failure_stage,failure_message,failure_entity_kind,failure_entity_id,failure_connection_id,failure_incident_sectors,failure_actual_value_counts,failure_actual_normal_counts,failure_required_value_count,failure_required_normal_count,failure_actual_edge_count,failure_value_radius_over_h,failure_normal_radius_over_h,failure_edge_radius_over_h,failure_sigma_max,failure_sigma_min,failure_condition'
+}
+$csvNames = @($expectedHeaders.Keys)
 $tables = [ordered]@{}
 $columnsByName = [ordered]@{}
 foreach ($name in $csvNames) {
     $path = Join-Path $OutputDirectory $name
     Assert-True (Test-Path -LiteralPath $path -PathType Leaf) ("missing $name")
-    $tables[$name] = @(Import-Csv -LiteralPath $path)
     $header = Get-Content -LiteralPath $path -TotalCount 1
-    Assert-True ($header.StartsWith('case_id,N,route')) `
-        ("$name header does not begin case_id,N,route")
-    $columnsByName[$name] = @($header.Split(','))
+    Assert-True ($header -ceq $expectedHeaders[$name]) `
+        ("$name header is not the exact ordered schema")
+    $columnsByName[$name] = @($expectedHeaders[$name].Split(','))
+    Assert-RfcCsvRecordWidths -Path $path -Name $name `
+        -ExpectedWidth $columnsByName[$name].Count
+    $tables[$name] = @(Import-Csv -LiteralPath $path)
 }
 
 $summary = @($tables['summary.csv'])
@@ -121,6 +159,15 @@ Assert-UniqueKeys $summary 'summary.csv' { param($row) Key $row }
 Assert-UniqueKeys $owners 'owner_diagnostics.csv' { param($row) Key $row }
 Assert-UniqueKeys $bins 'edge_distance_bins.csv' {
     param($row) (Key $row) + '|' + $row.distance_bin }
+Assert-UniqueKeys $surfaceFits 'surface_fit_diagnostics.csv' {
+    param($row) (Key $row) + '|' + $row.center_dof }
+Assert-UniqueKeys $dofs 'dof_diagnostics.csv' {
+    param($row) (Key $row) + '|' + $row.dof_id }
+Assert-UniqueKeys $edgePoints 'edge_point_diagnostics.csv' {
+    param($row) (Key $row) + '|' + $row.connection_id + '|' + $row.cell_id +
+        '|' + $row.fraction }
+Assert-UniqueKeys $edgeFits 'edge_fit_diagnostics.csv' {
+    param($row) (Key $row) + '|' + $row.connection_id + '|' + $row.cell_id }
 
 $summaryByKey = @{}
 foreach ($row in $summary) {
@@ -185,6 +232,17 @@ foreach ($row in $summary) {
                 "$key $kind residual"
             [void]$recordedResidual
         }
+        $summaryFinal = if ($kind -eq 'physical') {
+            Number $row.physical_final_residual "$key physical final residual"
+        } else {
+            Number $row.common_final_residual "$key common final residual"
+        }
+        $historyFinal = Number $history[-1].relative_residual `
+            "$key $kind history final residual"
+        $finalTolerance = 64.0 * 2.2204460492503131e-16 *
+            [Math]::Max(1.0, [Math]::Abs($summaryFinal))
+        Assert-True ([Math]::Abs($summaryFinal - $historyFinal) -le
+            $finalTolerance) ("final residual mismatch $key $kind")
     }
 }
 
@@ -200,6 +258,20 @@ foreach ($row in @($edgePoints) + @($edgeFits)) {
     Assert-True ($summaryByKey.ContainsKey((Key $row))) `
         ("orphan shared-edge diagnostic " + (Key $row))
 }
+foreach ($row in @($surfaceFits) + @($dofs)) {
+    Assert-True ($summaryByKey.ContainsKey((Key $row))) `
+        ("orphan diagnostic " + (Key $row))
+}
+$edgePointBaseKeys = @($edgePoints | ForEach-Object {
+    (Key $_) + '|' + $_.connection_id + '|' + $_.cell_id } | Sort-Object -Unique)
+$edgeFitKeys = @($edgeFits | ForEach-Object {
+    (Key $_) + '|' + $_.connection_id + '|' + $_.cell_id } | Sort-Object -Unique)
+Assert-True ($edgePointBaseKeys.Count -eq $edgeFitKeys.Count) `
+    'edge point/fit key-set size mismatch'
+for ($index = 0; $index -lt $edgePointBaseKeys.Count; ++$index) {
+    Assert-True ($edgePointBaseKeys[$index] -eq $edgeFitKeys[$index]) `
+        ("edge point/fit key-set mismatch at $index")
+}
 foreach ($row in $summary | Where-Object {
     $_.status -eq 'ok' }) {
     $key = Key $row
@@ -212,6 +284,18 @@ foreach ($row in $summary | Where-Object {
         -eq $expectedSurfaceMaps) ("surface map count mismatch $key")
     Assert-True (@($dofs | Where-Object { (Key $_) -eq $key }).Count `
         -eq $expectedDofs) ("DOF diagnostic count mismatch $key")
+    $surfaceIds = @($surfaceFits | Where-Object { (Key $_) -eq $key } |
+        ForEach-Object { Integer $_.center_dof "$key center_dof" } | Sort-Object)
+    $dofIds = @($dofs | Where-Object { (Key $_) -eq $key } |
+        ForEach-Object { Integer $_.dof_id "$key dof_id" } | Sort-Object)
+    for ($index = 0; $index -lt $surfaceIds.Count; ++$index) {
+        Assert-True ($surfaceIds[$index] -eq $index) `
+            ("surface center IDs are not contiguous $key")
+    }
+    for ($index = 0; $index -lt $dofIds.Count; ++$index) {
+        Assert-True ($dofIds[$index] -eq $index) `
+            ("DOF IDs are not contiguous $key")
+    }
     Assert-True ($expectedValueMaps -eq $expectedSurfaceMaps -and
         $expectedNormalMaps -eq $expectedSurfaceMaps) `
         ("value/normal map count mismatch $key")
@@ -228,22 +312,40 @@ foreach ($row in $summary | Where-Object {
     }
 }
 
+$orderMetrics = @('density_linf','density_l2','interior_linf','interior_l2')
 $order32Columns = @('density_linf_order_32_64','density_l2_order_32_64',
     'interior_linf_order_32_64','interior_l2_order_32_64')
 $order64Columns = @('density_linf_order_64_128','density_l2_order_64_128',
     'interior_linf_order_64_128','interior_l2_order_64_128')
 foreach ($row in $summary | Where-Object status -eq 'ok') {
-    $expects32 = [int]$row.N -eq 64 -and $ExpectedLevels -contains 32
-    $expects64 = [int]$row.N -eq 128 -and $ExpectedLevels -contains 64
-    foreach ($column in $order32Columns) {
-        Assert-True ((-not $expects32 -and (Is-NA $row.$column)) -or
-            ($expects32 -and -not (Is-NA $row.$column))) `
-            ("adjacent order NA semantics mismatch " + (Key $row) + " $column")
-    }
-    foreach ($column in $order64Columns) {
-        Assert-True ((-not $expects64 -and (Is-NA $row.$column)) -or
-            ($expects64 -and -not (Is-NA $row.$column))) `
-            ("adjacent order NA semantics mismatch " + (Key $row) + " $column")
+    for ($metricIndex = 0; $metricIndex -lt $orderMetrics.Count; ++$metricIndex) {
+        $metric = $orderMetrics[$metricIndex]
+        foreach ($pair in @(
+            [ordered]@{coarse=32; fine=64; column=$order32Columns[$metricIndex]},
+            [ordered]@{coarse=64; fine=128; column=$order64Columns[$metricIndex]})) {
+            $expectsOrder = $false
+            if ([int]$row.N -eq $pair.fine -and
+                $ExpectedLevels -contains $pair.coarse) {
+                $coarseKey = "$($row.case_id)|$($pair.coarse)|$($row.route)"
+                if ($summaryByKey.ContainsKey($coarseKey) -and
+                    $summaryByKey[$coarseKey].status -eq 'ok') {
+                    $coarseError = Number $summaryByKey[$coarseKey].$metric `
+                        "$coarseKey $metric"
+                    $fineError = Number $row.$metric ((Key $row) + " $metric")
+                    Assert-True ($coarseError -gt 0.0 -and $fineError -gt 0.0) `
+                        ("adjacent-order errors must be positive $coarseKey $metric")
+                    $expectsOrder = $true
+                }
+            }
+            $column = $pair.column
+            Assert-True ((-not $expectsOrder -and (Is-NA $row.$column)) -or
+                ($expectsOrder -and -not (Is-NA $row.$column))) `
+                ("adjacent order NA semantics mismatch " + (Key $row) +
+                 " $column")
+            if ($expectsOrder) {
+                [void](Number $row.$column ((Key $row) + " $column"))
+            }
+        }
     }
 }
 
@@ -266,8 +368,18 @@ Assert-True ($summary.Count -eq $caseIds.Count * $ExpectedLevels.Count * 3) `
     'summary row count does not equal the complete fixed matrix'
 
 $failedPredicates = New-Object System.Collections.Generic.List[string]
-function Record-Predicate([bool]$Condition, [string]$Name) {
-    if (-not $Condition) { $failedPredicates.Add($Name) }
+$mandatoryFailedPredicates = New-Object System.Collections.Generic.List[string]
+$acceptanceFailedPredicates = New-Object System.Collections.Generic.List[string]
+function Record-Predicate(
+    [bool]$Condition, [string]$Name, [string]$Kind = 'mandatory') {
+    if (-not $Condition) {
+        $failedPredicates.Add($Name)
+        if ($Kind -eq 'acceptance') {
+            $acceptanceFailedPredicates.Add($Name)
+        } else {
+            $mandatoryFailedPredicates.Add($Name)
+        }
+    }
 }
 
 foreach ($row in $summary) {
@@ -387,13 +499,15 @@ for ($index = 1; $index -lt $sortedLevels.Count; ++$index) {
             foreach ($field in $errorFields) {
                 $coarseError = Number $coarse.$field "$caseId $route coarse $field"
                 $fineError = Number $fine.$field "$caseId $route fine $field"
+                Assert-True ($coarseError -gt 0.0 -and $fineError -gt 0.0) `
+                    ("order errors must be positive $caseId $route $field")
                 $order = [Math]::Log($coarseError / $fineError, 2.0)
                 $orders.Add([ordered]@{ case_id=$caseId; route=$route;
                     coarse_N=$coarseN; fine_N=$fineN; metric=$field; order=$order })
                 if ($route -eq 'edge_reconstructed_value' -and
                     $fineN -eq ($sortedLevels | Measure-Object -Maximum).Maximum) {
                     Record-Predicate ($order -ge 0.0) `
-                        ("primary_nonnegative_order:$caseId`:$field")
+                        ("primary_nonnegative_order:$caseId`:$field") acceptance
                 }
             }
         }
@@ -430,11 +544,13 @@ foreach ($row in $summary | Where-Object status -eq 'ok') {
     $linf = 0.0
     foreach ($bin in $near) {
         $w = Number $bin.weight_sum "$key near weight"
+        Assert-True ($w -ge 0.0) ("negative near-edge weight $key")
         $rms = Number $bin.defect_weighted_rms "$key near rms"
         $weight += $w
         $square += $w * $rms * $rms
         $linf = [Math]::Max($linf, (Number $bin.defect_linf "$key near linf"))
     }
+    Assert-True ($weight -gt 0.0) ("nonpositive near-edge combined weight $key")
     $combinedRms = if ($weight -gt 0.0) { [Math]::Sqrt($square / $weight) } else { 0.0 }
     $nearEdge.Add([ordered]@{ case_id=$row.case_id; N=[int]$row.N;
         route=$row.route; weight_sum=$weight; defect_linf=$linf;
@@ -451,22 +567,25 @@ if ($sortedLevels -contains 128) {
             $control = $summaryByKey["$caseId|128|$controlRoute"]
             if ($control.status -ne 'ok') { continue }
             foreach ($field in $errorFields) {
-                $ratio = (Number $primary.$field "$caseId primary $field") /
-                    (Number $control.$field "$caseId control $field")
+                $primaryError = Number $primary.$field "$caseId primary $field"
+                $controlError = Number $control.$field "$caseId control $field"
+                Assert-True ($primaryError -gt 0.0 -and $controlError -gt 0.0) `
+                    ("N128 ratio errors must be positive $caseId $field")
+                $ratio = $primaryError / $controlError
                 $ratios.Add([ordered]@{ case_id=$caseId; control=$controlRoute;
                     metric=$field; ratio=$ratio })
                 Record-Predicate ($ratio -le 1.10) `
-                    ("primary_n128_ratio:$caseId`:$controlRoute`:$field")
+                    ("primary_n128_ratio:$caseId`:$controlRoute`:$field") acceptance
             }
             $primaryNear = @($nearEdge | Where-Object { $_.case_id -eq $caseId -and
                 $_.N -eq 128 -and $_.route -eq 'edge_reconstructed_value' })[0]
             $controlNear = @($nearEdge | Where-Object { $_.case_id -eq $caseId -and
                 $_.N -eq 128 -and $_.route -eq $controlRoute })[0]
             Record-Predicate ($primaryNear.defect_linf -lt $controlNear.defect_linf) `
-                ("primary_near_linf:$caseId`:$controlRoute")
+                ("primary_near_linf:$caseId`:$controlRoute") acceptance
             Record-Predicate ($primaryNear.defect_weighted_rms -lt
                 $controlNear.defect_weighted_rms) `
-                ("primary_near_rms:$caseId`:$controlRoute")
+                ("primary_near_rms:$caseId`:$controlRoute") acceptance
         }
     }
 }
@@ -482,7 +601,7 @@ if ($sortedLevels -contains 64 -and $sortedLevels -contains 128) {
                 (Number $coarse.$field "$caseId coarse edge")
             $edgeTrends.Add([ordered]@{case_id=$caseId; metric=$field;
                 decreased=$decreased})
-            Record-Predicate $decreased ("edge_error_trend:$caseId`:$field")
+            Record-Predicate $decreased ("edge_error_trend:$caseId`:$field") acceptance
         }
     }
 }
@@ -536,10 +655,10 @@ if ($iterationComparisonAvailable) {
                 $directAtLevel.S -le $g1AtLevel.S
         }
     }
-    Record-Predicate $primaryWNoWorse 'primary_W_no_worse'
-    Record-Predicate $primarySNoWorse 'primary_S_no_worse'
-    Record-Predicate $primaryWStrict 'primary_W_strict'
-    Record-Predicate $primarySStrict 'primary_S_strict'
+    Record-Predicate $primaryWNoWorse 'primary_W_no_worse' acceptance
+    Record-Predicate $primarySNoWorse 'primary_S_no_worse' acceptance
+    Record-Predicate $primaryWStrict 'primary_W_strict' acceptance
+    Record-Predicate $primarySStrict 'primary_S_strict' acceptance
 }
 $primaryIterationPass = $primaryWNoWorse -and $primarySNoWorse -and
     $primaryWStrict -and $primarySStrict
@@ -576,9 +695,12 @@ if ($ExpectedLevels -contains 128) {
             continue
         }
         foreach ($field in $errorFields) {
+            $directError = Number $direct.$field "$caseId direct $field"
+            $g1Error = Number $g1.$field "$caseId g1 $field"
+            Assert-True ($directError -gt 0.0 -and $g1Error -gt 0.0) `
+                ("direct ratio errors must be positive $caseId $field")
             $directRatioPass = $directRatioPass -and
-                (Number $direct.$field "$caseId direct $field") /
-                (Number $g1.$field "$caseId g1 $field") -le 1.10
+                $directError / $g1Error -le 1.10
         }
         $g1Near = @($nearEdge | Where-Object { $_.case_id -eq $caseId -and
             $_.N -eq 128 -and $_.route -eq 'g1_value_g1_normal' })[0]
@@ -664,20 +786,31 @@ foreach ($primary in $nearEdge | Where-Object route -eq 'edge_reconstructed_valu
     }
 }
 
-$selectedRoute = 'rerun_after_numerical_failure'
-if ($directPass) { $selectedRoute = 'direct_cross_face_value' }
-if ($sharedPass -and $sharedBetterIterationThanDirect -and
-    $sharedBetterDefectThanDirect) {
-    $selectedRoute = 'edge_reconstructed_value'
-} elseif (-not $directPass -and $sharedPass) {
-    $selectedRoute = 'edge_reconstructed_value'
-} elseif (-not $directPass -and -not $sharedPass -and
-    $failedPredicates.Count -eq 0) {
-    $selectedRoute = 'sector_polynomials_with_shared_edge_constraints'
+$formalEvidenceComplete = $sortedLevels.Count -eq 3 -and
+    $sortedLevels[0] -eq 32 -and $sortedLevels[1] -eq 64 -and
+    $sortedLevels[2] -eq 128
+$mandatoryNumericalPass = $mandatoryFailedPredicates.Count -eq 0
+$acceptancePass = $acceptanceFailedPredicates.Count -eq 0
+$selectedRoute = 'insufficient_evidence'
+if ($formalEvidenceComplete) {
+    $selectedRoute = 'rerun_after_numerical_failure'
+    if ($mandatoryNumericalPass) {
+        $selectedRoute = 'sector_polynomials_with_shared_edge_constraints'
+        if ($directPass) { $selectedRoute = 'direct_cross_face_value' }
+        if ($sharedPass -and $sharedBetterIterationThanDirect -and
+            $sharedBetterDefectThanDirect) {
+            $selectedRoute = 'edge_reconstructed_value'
+        } elseif (-not $directPass -and $sharedPass) {
+            $selectedRoute = 'edge_reconstructed_value'
+        }
+    }
 }
 
 $decision = [ordered]@{
     schema_pass = $true
+    formal_evidence_complete = $formalEvidenceComplete
+    mandatory_numerical_pass = $mandatoryNumericalPass
+    acceptance_pass = $acceptancePass
     expected_levels = @($ExpectedLevels | Sort-Object)
     summary_row_count = $summary.Count
     bin_row_count = $bins.Count
@@ -712,7 +845,9 @@ $decision = [ordered]@{
     shared_better_defect_than_direct = $sharedBetterDefectThanDirect
     selected_route = $selectedRoute
     failed_predicates = @($failedPredicates | Sort-Object)
-    numerical_pass = ($failedPredicates.Count -eq 0)
+    mandatory_failed_predicates = @($mandatoryFailedPredicates | Sort-Object)
+    acceptance_failed_predicates = @($acceptanceFailedPredicates | Sort-Object)
+    numerical_pass = $mandatoryNumericalPass
 }
 
 if ([string]::IsNullOrWhiteSpace($DecisionJson)) {

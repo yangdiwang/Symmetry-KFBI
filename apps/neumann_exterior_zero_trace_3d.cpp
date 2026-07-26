@@ -4615,9 +4615,9 @@ struct TwoLevelEdgePointDiagnostic3D {
     double mapped_tangent_dot = 1.0;
     double frame_orthogonality_error = 0.0;
     double frame_determinant = 1.0;
-    double exact_value = 0.0;
-    double reconstructed_value = 0.0;
-    double error = 0.0;
+    std::optional<double> exact_value;
+    std::optional<double> reconstructed_value;
+    std::optional<double> error;
 };
 
 struct TwoLevelEdgeFitDiagnostic3D {
@@ -4656,8 +4656,8 @@ struct TwoLevelDofDiagnostic3D {
     Eigen::Vector3d point = Eigen::Vector3d::Zero();
     double weight = 0.0;
     double edge_distance_over_h = 0.0;
-    double density_error = 0.0;
-    double equation_defect = 0.0;
+    std::optional<double> density_error;
+    std::optional<double> equation_defect;
 };
 
 struct TwoLevelOwnerDiagnostic3D {
@@ -4686,6 +4686,10 @@ struct TwoLevelNeumannStudyRouteRow3D {
         app3d::HarmonicCauchyRoute3D::G1ValueG1Normal;
     std::string status = "failed";
     app3d::HarmonicCauchyFailure3D failure;
+    bool setup_available = false;
+    bool fit_available = false;
+    bool owner_before_available = false;
+    bool solve_available = false;
     double h = 0.0;
     int patch_count = 0;
     int surface_dof_count = 0;
@@ -4804,6 +4808,29 @@ std::string csv_optional_3d(const std::optional<double>& value)
     std::ostringstream stream;
     stream << std::scientific << std::setprecision(17) << *value;
     return stream.str();
+}
+
+template <class Value>
+void append_csv_available_3d(
+    std::ostream& stream, bool available, const Value& value)
+{
+    stream << ',';
+    if (available) stream << value;
+    else stream << "NA";
+}
+
+void append_csv_available_bool_3d(
+    std::ostream& stream, bool available, bool value)
+{
+    append_csv_available_3d(stream, available, csv_bool_3d(value));
+}
+
+void append_csv_available_optional_3d(
+    std::ostream& stream, bool available, const std::optional<double>& value)
+{
+    stream << ',';
+    if (available) stream << csv_optional_3d(value);
+    else stream << "NA";
 }
 
 class TwoLevelNeumannStudyWriter3D {
@@ -4991,73 +5018,104 @@ void TwoLevelNeumannStudyWriter3D::append(
                << ',' << route;
     };
     const bool ok = row.status == "ok";
+    const bool setupAvailable = ok || row.setup_available;
+    const bool fitAvailable = ok || row.fit_available;
+    const bool ownerBeforeAvailable = ok || row.owner_before_available;
+    const bool solveAvailable = ok || row.solve_available;
     key(streams_[Summary]);
-    streams_[Summary]
-        << ',' << row.status << ',' << row.h << ',' << row.patch_count
-        << ',' << row.surface_dof_count << ',' << row.shared_edge_point_count;
-    if (ok) {
-        streams_[Summary]
-            << ',' << csv_bool_3d(row.physical_converged)
-            << ',' << row.physical_iterations
-            << ',' << row.physical_final_residual
-            << ',' << row.physical_contraction
-            << ',' << csv_bool_3d(row.common_converged)
-            << ',' << row.common_iterations
-            << ',' << row.common_final_residual
-            << ',' << row.common_contraction
-            << ',' << row.common_rhs_mean
-            << ',' << row.common_rhs_rms
-            << ',' << row.common_rhs_hash
-            << ',' << row.density_linf
-            << ',' << row.density_l2
-            << ',' << row.interior_linf
-            << ',' << row.interior_l2
-            << ',' << csv_optional_3d(row.orders_32_64[0])
-            << ',' << csv_optional_3d(row.orders_32_64[1])
-            << ',' << csv_optional_3d(row.orders_32_64[2])
-            << ',' << csv_optional_3d(row.orders_32_64[3])
-            << ',' << csv_optional_3d(row.orders_64_128[0])
-            << ',' << csv_optional_3d(row.orders_64_128[1])
-            << ',' << csv_optional_3d(row.orders_64_128[2])
-            << ',' << csv_optional_3d(row.orders_64_128[3])
-            << ',' << row.defect_linf
-            << ',' << row.defect_rms
-            << ',' << csv_optional_3d(row.edge_value_linf)
-            << ',' << csv_optional_3d(row.edge_value_rms)
-            << ',' << row.setup_seconds
-            << ',' << row.fit_seconds
-            << ',' << row.pipeline_seconds
-            << ',' << row.physical_solve_seconds
-            << ',' << row.common_solve_seconds
-            << ',' << row.neighborhood_geometry_queries
-            << ',' << row.owner.cauchy_geometry_queries
-            << ',' << row.owner.cauchy_svd_factorizations
-            << ',' << row.owner.runtime_geometry_queries
-            << ',' << row.owner.runtime_svd_factorizations
-            << ',' << row.owner.cauchy_fingerprint_before
-            << ',' << row.owner.cauchy_fingerprint_after
-            << ',' << row.owner.owner_fingerprint_before
-            << ',' << row.owner.owner_fingerprint_after
-            << ',' << row.label_inside_count
-            << ',' << row.label_outside_count
-            << ',' << row.label_fingerprint
-            << ',' << row.neighborhood_fingerprint
-            << ',' << csv_bool_3d(row.owner.reference_equal)
-            << ',' << csv_bool_3d(row.owner.label_equal)
-            << ',' << csv_bool_3d(row.owner.neighborhood_equal)
-            << ',' << csv_bool_3d(row.owner.common_rhs_hash_equal)
-            << ',' << row.surface_map_count
-            << ',' << row.value_map_count
-            << ',' << row.normal_map_count
-            << ',' << row.edge_map_count
-            << ',' << row.value_radius_max_over_h
-            << ',' << row.normal_radius_max_over_h
-            << ',' << row.edge_radius_max_over_h
-            << ',' << row.condition_max;
-    } else {
-        for (int field = 0; field < 57; ++field)
-            streams_[Summary] << ",NA";
-    }
+    streams_[Summary] << ',' << row.status << ',' << row.h;
+    append_csv_available_3d(streams_[Summary], setupAvailable, row.patch_count);
+    append_csv_available_3d(
+        streams_[Summary], setupAvailable, row.surface_dof_count);
+    append_csv_available_3d(
+        streams_[Summary], fitAvailable, row.shared_edge_point_count);
+    append_csv_available_bool_3d(
+        streams_[Summary], solveAvailable, row.physical_converged);
+    append_csv_available_3d(
+        streams_[Summary], solveAvailable, row.physical_iterations);
+    append_csv_available_3d(
+        streams_[Summary], solveAvailable, row.physical_final_residual);
+    append_csv_available_3d(
+        streams_[Summary], solveAvailable, row.physical_contraction);
+    append_csv_available_bool_3d(
+        streams_[Summary], solveAvailable, row.common_converged);
+    append_csv_available_3d(
+        streams_[Summary], solveAvailable, row.common_iterations);
+    append_csv_available_3d(
+        streams_[Summary], solveAvailable, row.common_final_residual);
+    append_csv_available_3d(
+        streams_[Summary], solveAvailable, row.common_contraction);
+    append_csv_available_3d(streams_[Summary], solveAvailable, row.common_rhs_mean);
+    append_csv_available_3d(streams_[Summary], solveAvailable, row.common_rhs_rms);
+    append_csv_available_3d(streams_[Summary], solveAvailable, row.common_rhs_hash);
+    append_csv_available_3d(streams_[Summary], solveAvailable, row.density_linf);
+    append_csv_available_3d(streams_[Summary], solveAvailable, row.density_l2);
+    append_csv_available_3d(streams_[Summary], solveAvailable, row.interior_linf);
+    append_csv_available_3d(streams_[Summary], solveAvailable, row.interior_l2);
+    for (const auto& order : row.orders_32_64)
+        append_csv_available_optional_3d(streams_[Summary], solveAvailable, order);
+    for (const auto& order : row.orders_64_128)
+        append_csv_available_optional_3d(streams_[Summary], solveAvailable, order);
+    append_csv_available_3d(streams_[Summary], solveAvailable, row.defect_linf);
+    append_csv_available_3d(streams_[Summary], solveAvailable, row.defect_rms);
+    append_csv_available_optional_3d(
+        streams_[Summary], solveAvailable, row.edge_value_linf);
+    append_csv_available_optional_3d(
+        streams_[Summary], solveAvailable, row.edge_value_rms);
+    append_csv_available_3d(streams_[Summary], setupAvailable, row.setup_seconds);
+    append_csv_available_3d(streams_[Summary], fitAvailable, row.fit_seconds);
+    append_csv_available_3d(
+        streams_[Summary], ownerBeforeAvailable, row.pipeline_seconds);
+    append_csv_available_3d(
+        streams_[Summary], solveAvailable, row.physical_solve_seconds);
+    append_csv_available_3d(
+        streams_[Summary], solveAvailable, row.common_solve_seconds);
+    append_csv_available_3d(streams_[Summary], setupAvailable,
+                            row.neighborhood_geometry_queries);
+    append_csv_available_3d(streams_[Summary], fitAvailable,
+                            row.owner.cauchy_geometry_queries);
+    append_csv_available_3d(streams_[Summary], fitAvailable,
+                            row.owner.cauchy_svd_factorizations);
+    append_csv_available_3d(streams_[Summary], solveAvailable,
+                            row.owner.runtime_geometry_queries);
+    append_csv_available_3d(streams_[Summary], solveAvailable,
+                            row.owner.runtime_svd_factorizations);
+    append_csv_available_3d(streams_[Summary], fitAvailable,
+                            row.owner.cauchy_fingerprint_before);
+    append_csv_available_3d(streams_[Summary], solveAvailable,
+                            row.owner.cauchy_fingerprint_after);
+    append_csv_available_3d(streams_[Summary], ownerBeforeAvailable,
+                            row.owner.owner_fingerprint_before);
+    append_csv_available_3d(streams_[Summary], solveAvailable,
+                            row.owner.owner_fingerprint_after);
+    append_csv_available_3d(
+        streams_[Summary], setupAvailable, row.label_inside_count);
+    append_csv_available_3d(
+        streams_[Summary], setupAvailable, row.label_outside_count);
+    append_csv_available_3d(
+        streams_[Summary], setupAvailable, row.label_fingerprint);
+    append_csv_available_3d(
+        streams_[Summary], setupAvailable, row.neighborhood_fingerprint);
+    append_csv_available_bool_3d(
+        streams_[Summary], solveAvailable, row.owner.reference_equal);
+    append_csv_available_bool_3d(
+        streams_[Summary], solveAvailable, row.owner.label_equal);
+    append_csv_available_bool_3d(
+        streams_[Summary], solveAvailable, row.owner.neighborhood_equal);
+    append_csv_available_bool_3d(
+        streams_[Summary], solveAvailable, row.owner.common_rhs_hash_equal);
+    append_csv_available_3d(
+        streams_[Summary], fitAvailable, row.surface_map_count);
+    append_csv_available_3d(streams_[Summary], fitAvailable, row.value_map_count);
+    append_csv_available_3d(streams_[Summary], fitAvailable, row.normal_map_count);
+    append_csv_available_3d(streams_[Summary], fitAvailable, row.edge_map_count);
+    append_csv_available_3d(
+        streams_[Summary], fitAvailable, row.value_radius_max_over_h);
+    append_csv_available_3d(
+        streams_[Summary], fitAvailable, row.normal_radius_max_over_h);
+    append_csv_available_3d(
+        streams_[Summary], fitAvailable, row.edge_radius_max_over_h);
+    append_csv_available_3d(streams_[Summary], fitAvailable, row.condition_max);
     append_failure_fields(streams_[Summary], row.failure);
     streams_[Summary] << '\n';
 
@@ -5095,9 +5153,9 @@ void TwoLevelNeumannStudyWriter3D::append(
             << ',' << point.mapped_tangent_dot
             << ',' << point.frame_orthogonality_error
             << ',' << point.frame_determinant
-            << ',' << point.exact_value
-            << ',' << point.reconstructed_value
-            << ',' << point.error << '\n';
+            << ',' << csv_optional_3d(point.exact_value)
+            << ',' << csv_optional_3d(point.reconstructed_value)
+            << ',' << csv_optional_3d(point.error) << '\n';
     }
     for (const auto& fit : row.edge_fits) {
         key(streams_[EdgeFits]);
@@ -5136,8 +5194,8 @@ void TwoLevelNeumannStudyWriter3D::append(
             << ',' << dof.point.x() << ',' << dof.point.y()
             << ',' << dof.point.z() << ',' << dof.weight
             << ',' << dof.edge_distance_over_h
-            << ',' << dof.density_error
-            << ',' << dof.equation_defect << '\n';
+            << ',' << csv_optional_3d(dof.density_error)
+            << ',' << csv_optional_3d(dof.equation_defect) << '\n';
     }
 
     const std::array<std::string, 3> expected_bins{{
@@ -5148,7 +5206,7 @@ void TwoLevelNeumannStudyWriter3D::append(
             throw std::logic_error("study row has a missing or reordered bin");
         key(streams_[Bins]);
         streams_[Bins] << ',' << bin.bin << ',' << row.status;
-        if (ok) {
+        if (solveAvailable) {
             streams_[Bins]
                 << ',' << bin.count << ',' << bin.weight_sum
                 << ',' << bin.density_linf
@@ -5165,28 +5223,38 @@ void TwoLevelNeumannStudyWriter3D::append(
 
     key(streams_[Owner]);
     streams_[Owner] << ',' << row.status;
-    if (ok) {
-        streams_[Owner]
-            << ',' << csv_bool_3d(row.owner.available)
-            << ',' << row.owner.owner_query_count
-            << ',' << row.owner.owner_fingerprint_before
-            << ',' << row.owner.owner_fingerprint_after
-            << ',' << row.owner.owner_output_digest_before
-            << ',' << row.owner.owner_output_digest_after
-            << ',' << row.owner.cauchy_geometry_queries
-            << ',' << row.owner.cauchy_svd_factorizations
-            << ',' << row.owner.runtime_geometry_queries
-            << ',' << row.owner.runtime_svd_factorizations
-            << ',' << row.owner.cauchy_fingerprint_before
-            << ',' << row.owner.cauchy_fingerprint_after
-            << ',' << csv_bool_3d(row.owner.reference_equal)
-            << ',' << csv_bool_3d(row.owner.label_equal)
-            << ',' << csv_bool_3d(row.owner.neighborhood_equal)
-            << ',' << csv_bool_3d(row.owner.common_rhs_hash_equal);
-    } else {
-        for (int field = 0; field < 16; ++field)
-            streams_[Owner] << ",NA";
-    }
+    append_csv_available_bool_3d(
+        streams_[Owner], ownerBeforeAvailable, row.owner.available);
+    append_csv_available_3d(
+        streams_[Owner], ownerBeforeAvailable, row.owner.owner_query_count);
+    append_csv_available_3d(streams_[Owner], ownerBeforeAvailable,
+                            row.owner.owner_fingerprint_before);
+    append_csv_available_3d(
+        streams_[Owner], solveAvailable, row.owner.owner_fingerprint_after);
+    append_csv_available_3d(streams_[Owner], ownerBeforeAvailable,
+                            row.owner.owner_output_digest_before);
+    append_csv_available_3d(
+        streams_[Owner], solveAvailable, row.owner.owner_output_digest_after);
+    append_csv_available_3d(
+        streams_[Owner], fitAvailable, row.owner.cauchy_geometry_queries);
+    append_csv_available_3d(
+        streams_[Owner], fitAvailable, row.owner.cauchy_svd_factorizations);
+    append_csv_available_3d(
+        streams_[Owner], solveAvailable, row.owner.runtime_geometry_queries);
+    append_csv_available_3d(
+        streams_[Owner], solveAvailable, row.owner.runtime_svd_factorizations);
+    append_csv_available_3d(streams_[Owner], fitAvailable,
+                            row.owner.cauchy_fingerprint_before);
+    append_csv_available_3d(streams_[Owner], solveAvailable,
+                            row.owner.cauchy_fingerprint_after);
+    append_csv_available_bool_3d(
+        streams_[Owner], solveAvailable, row.owner.reference_equal);
+    append_csv_available_bool_3d(
+        streams_[Owner], solveAvailable, row.owner.label_equal);
+    append_csv_available_bool_3d(
+        streams_[Owner], solveAvailable, row.owner.neighborhood_equal);
+    append_csv_available_bool_3d(
+        streams_[Owner], solveAvailable, row.owner.common_rhs_hash_equal);
     append_failure_fields(streams_[Owner], row.failure);
     streams_[Owner] << '\n';
     flush_all();
@@ -10509,12 +10577,11 @@ double vector_weighted_rms_3d(
 
 void fill_two_level_fit_diagnostics_3d(
     TwoLevelNeumannStudyRouteRow3D& row,
-    const PanelCenterHarmonicJetKFBI3D& pipeline,
-    const NeumannRouteProbe3D& probe,
+    const app3d::HarmonicCauchyFit3D& fit,
+    const SurfaceDofCloud& cloud,
     const NativeNurbsSurface3D& native_surface,
     const app3d::SurfaceNonG1EdgeNeighborhoodSet3D& neighborhoods)
 {
-    const auto& fit = pipeline.cauchy_fit();
     const auto& edgeMaps = fit.edge_maps();
     row.edge_map_count = static_cast<int>(edgeMaps.size());
     for (std::size_t index = 0; index < edgeMaps.size(); ++index) {
@@ -10566,12 +10633,6 @@ void fill_two_level_fit_diagnostics_3d(
             (point.frame.transpose() * point.frame - Eigen::Matrix3d::Identity())
                 .norm();
         diagnostic.frame_determinant = point.frame.determinant();
-        diagnostic.exact_value = probe.exact_input_edge_values[
-            static_cast<int>(index)];
-        diagnostic.error = probe.exact_edge_value_error[
-            static_cast<int>(index)];
-        diagnostic.reconstructed_value =
-            diagnostic.exact_value + diagnostic.error;
         row.edge_points.push_back(std::move(diagnostic));
 
         TwoLevelEdgeFitDiagnostic3D fitDiagnostic;
@@ -10624,7 +10685,7 @@ void fill_two_level_fit_diagnostics_3d(
         diagnostic.condition = map.condition;
         row.surface_fits.push_back(std::move(diagnostic));
 
-        const auto& dof = pipeline.surface().dofs[index];
+        const auto& dof = cloud.dofs[index];
         TwoLevelDofDiagnostic3D dofDiagnostic;
         dofDiagnostic.dof_id = static_cast<int>(index);
         dofDiagnostic.patch_id = dof.patch_id;
@@ -10632,20 +10693,45 @@ void fill_two_level_fit_diagnostics_3d(
         dofDiagnostic.weight = dof.weight;
         dofDiagnostic.edge_distance_over_h =
             neighborhoods.centers[index].nearest_distance_over_h;
-        dofDiagnostic.density_error = probe.density_error[
-            static_cast<int>(index)];
-        dofDiagnostic.equation_defect = probe.exact_equation_defect[
-            static_cast<int>(index)];
         row.dofs.push_back(std::move(dofDiagnostic));
+    }
+}
+
+void fill_two_level_post_solve_diagnostics_3d(
+    TwoLevelNeumannStudyRouteRow3D& row,
+    const NeumannRouteProbe3D& probe)
+{
+    if (row.edge_points.size()
+            != static_cast<std::size_t>(probe.exact_input_edge_values.size())
+        || row.edge_points.size()
+            != static_cast<std::size_t>(probe.exact_edge_value_error.size())
+        || row.dofs.size() != static_cast<std::size_t>(probe.density_error.size())
+        || row.dofs.size()
+            != static_cast<std::size_t>(probe.exact_equation_defect.size())) {
+        throw std::logic_error(
+            "two-level post-solve diagnostics have inconsistent sizes");
+    }
+    for (std::size_t index = 0; index < row.edge_points.size(); ++index) {
+        auto& diagnostic = row.edge_points[index];
+        diagnostic.exact_value = probe.exact_input_edge_values[
+            static_cast<int>(index)];
+        diagnostic.error = probe.exact_edge_value_error[
+            static_cast<int>(index)];
+        diagnostic.reconstructed_value =
+            *diagnostic.exact_value + *diagnostic.error;
+    }
+    for (std::size_t index = 0; index < row.dofs.size(); ++index) {
+        row.dofs[index].density_error = probe.density_error[
+            static_cast<int>(index)];
+        row.dofs[index].equation_defect = probe.exact_equation_defect[
+            static_cast<int>(index)];
     }
 }
 
 void fill_two_level_probe_metrics_3d(
     TwoLevelNeumannStudyRouteRow3D& row,
     const PanelCenterHarmonicJetKFBI3D& pipeline,
-    const NeumannRouteProbe3D& probe,
-    const NativeNurbsSurface3D& native_surface,
-    const app3d::SurfaceNonG1EdgeNeighborhoodSet3D& neighborhoods)
+    const NeumannRouteProbe3D& probe)
 {
     row.status = "ok";
     row.physical_iterations = probe.physical.iterations;
@@ -10676,9 +10762,13 @@ void fill_two_level_probe_metrics_3d(
     row.edge_value_linf = probe.edge_value_linf;
     row.edge_value_rms = probe.edge_value_weighted_rms;
     row.physical_solve_seconds = probe.physical.seconds;
+    row.common_solve_seconds = probe.common.seconds;
+    row.owner.runtime_geometry_queries =
+        probe.runtime_geometry_query_count;
+    row.owner.runtime_svd_factorizations =
+        probe.runtime_svd_factorization_count;
     row.edge_bins = probe.bins;
-    fill_two_level_fit_diagnostics_3d(
-        row, pipeline, probe, native_surface, neighborhoods);
+    row.solve_available = true;
 }
 
 TwoLevelNeumannStudyRouteRow3D failed_two_level_route_row_3d(
@@ -10752,6 +10842,7 @@ int run_neumann_two_level_edge_cauchy_study_3d(std::vector<int> levels)
             std::pair<int, std::array<double, 4>>> previousErrors;
         for (int N : levels) {
             const double h = kBoxSide / static_cast<double>(N);
+            bool setupCompleted = false;
             try {
                 const auto setupStart = std::chrono::steady_clock::now();
                 CartesianGrid3D grid{{kBoxMin, kBoxMin, kBoxMin}, {h, h, h},
@@ -10780,6 +10871,7 @@ int run_neumann_two_level_edge_cauchy_study_3d(std::vector<int> levels)
                     }));
                 const int outsideCount =
                     static_cast<int>(labels.size()) - insideCount;
+                setupCompleted = true;
 
                 std::optional<std::uint64_t> referenceOwnerFingerprint;
                 std::optional<std::uint64_t> referenceOwnerDigest;
@@ -10801,6 +10893,7 @@ int run_neumann_two_level_edge_cauchy_study_3d(std::vector<int> levels)
                     row.label_inside_count = insideCount;
                     row.label_outside_count = outsideCount;
                     row.label_fingerprint = labelFingerprint;
+                    row.setup_available = true;
                     std::string failureStage = "fit";
                     try {
                         const auto fitStart = std::chrono::steady_clock::now();
@@ -10812,6 +10905,16 @@ int run_neumann_two_level_edge_cauchy_study_3d(std::vector<int> levels)
                         row.shared_edge_point_count = static_cast<int>(
                             fit.edge_maps().size());
                         const auto cauchyBefore = fit.audit();
+                        row.owner.cauchy_geometry_queries =
+                            cauchyBefore.geometry_query_count;
+                        row.owner.cauchy_svd_factorizations =
+                            cauchyBefore.svd_factorization_count;
+                        row.owner.cauchy_fingerprint_before =
+                            cauchyBefore.fingerprint;
+                        fill_two_level_fit_diagnostics_3d(
+                            row, fit, cloud, geometry.native_surface,
+                            neighborhoods);
+                        row.fit_available = true;
 
                         failureStage = "pipeline";
                         const auto pipelineStart = std::chrono::steady_clock::now();
@@ -10832,12 +10935,7 @@ int run_neumann_two_level_edge_cauchy_study_3d(std::vector<int> levels)
                             pipeline->restrict_owner_workload_fingerprint();
                         row.owner.owner_output_digest_before =
                             pipeline->restrict_owner_output_digest();
-                        row.owner.cauchy_geometry_queries =
-                            cauchyBefore.geometry_query_count;
-                        row.owner.cauchy_svd_factorizations =
-                            cauchyBefore.svd_factorization_count;
-                        row.owner.cauchy_fingerprint_before =
-                            cauchyBefore.fingerprint;
+                        row.owner_before_available = true;
                         failureStage = "solve";
                         const NeumannRouteProbe3D probe =
                             run_neumann_route_probe_3d(
@@ -10845,9 +10943,7 @@ int run_neumann_two_level_edge_cauchy_study_3d(std::vector<int> levels)
                                 geometry.native_surface, studyCase.transform,
                                 neighborhoods, h, route);
                         fill_two_level_probe_metrics_3d(
-                            row, *pipeline, probe, geometry.native_surface,
-                            neighborhoods);
-                        row.common_solve_seconds = probe.common.seconds;
+                            row, *pipeline, probe);
                         const std::array<double, 4> currentErrors{{
                             row.density_linf, row.density_l2,
                             row.interior_linf, row.interior_l2}};
@@ -10872,10 +10968,6 @@ int run_neumann_two_level_edge_cauchy_study_3d(std::vector<int> levels)
                         }
                         previousErrors[route] = {N, currentErrors};
 
-                        row.owner.runtime_geometry_queries =
-                            probe.runtime_geometry_query_count;
-                        row.owner.runtime_svd_factorizations =
-                            probe.runtime_svd_factorization_count;
                         row.owner.cauchy_fingerprint_after =
                             pipeline->cauchy_fit().audit().fingerprint;
                         row.owner.owner_fingerprint_after =
@@ -10913,6 +11005,8 @@ int run_neumann_two_level_edge_cauchy_study_3d(std::vector<int> levels)
                         row.owner.common_rhs_hash_equal =
                             referenceRhsHash.has_value()
                             && row.common_rhs_hash == *referenceRhsHash;
+                        failureStage = "post_solve_diagnostics";
+                        fill_two_level_post_solve_diagnostics_3d(row, probe);
                         if (!row.physical_converged || !row.common_converged
                             || !(row.physical_final_residual < 2.0e-10)
                             || !(row.common_final_residual < 2.0e-10)
@@ -10951,6 +11045,7 @@ int run_neumann_two_level_edge_cauchy_study_3d(std::vector<int> levels)
                               << " status=" << row.status << '\n';
                 }
             } catch (const std::exception& error) {
+                if (setupCompleted) throw;
                 previousErrors.clear();
                 numericalFailure = true;
                 for (const auto route : routes) {
@@ -11280,7 +11375,9 @@ void print_usage(const char* executable)
         << "       " << executable << " --neumann-rigid-study [N ...]\n"
         << "       " << executable << " --neumann-edge-continuity-study [N ...]\n"
         << "       " << executable
-        << " --neumann-edge-cauchy-study [--force-extended] [N ...]\n"
+        << " --neumann-edge-cauchy-study [N ...]\n"
+        << "       " << executable
+        << " --neumann-edge-cauchy-study --force-extended [N ...]\n"
         << "  Each N must be a power of two and at least 16 (default: 32).\n"
         << "  Rigid-study default levels: 32, 64, 128.\n"
         << "  Restrict-probe default levels: 32, 64.\n"
@@ -11291,9 +11388,10 @@ void print_usage(const char* executable)
            "32; 32,64; or 32,64,128 (default: 32,64,128).\n"
         << "  Neumann-edge-continuity-study levels are the refinement prefixes "
            "32; 32,64; or 32,64,128 (default: 32,64).\n"
-        << "  Unforced Neumann-edge-cauchy-study accepts powers of two >=16 "
-           "(default: 32,64,128); --force-extended preserves the legacy "
-           "prefix/gated study (default: 32,64).\n"
+        << "  Unforced Neumann-edge-cauchy-study default levels: 32, 64, 128.\n"
+        << "  It accepts arbitrary explicit powers of two at least 16.\n"
+        << "  Legacy --force-extended levels are the gated prefixes 32; "
+           "32,64; or 32,64,128 (default: 32,64).\n"
         << "  --force-extended records N=128 evidence after a failed coarse "
            "gate without changing acceptance.\n"
         << "  This stage builds native NURBS parameter-cell-center surface\n"

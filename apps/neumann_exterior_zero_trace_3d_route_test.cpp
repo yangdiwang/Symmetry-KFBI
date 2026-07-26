@@ -550,6 +550,109 @@ std::string read_text_file(const std::filesystem::path& path)
                        std::istreambuf_iterator<char>());
 }
 
+std::vector<std::vector<std::string>> parse_csv_records_3d(
+    const std::string& text)
+{
+    std::vector<std::vector<std::string>> records;
+    std::vector<std::string> record;
+    std::string field;
+    bool quoted = false;
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        const char character = text[index];
+        if (character == static_cast<char>(34)) {
+            if (quoted && index + 1 < text.size()
+                && text[index + 1] == static_cast<char>(34)) {
+                field.push_back(character);
+                ++index;
+            } else {
+                quoted = !quoted;
+            }
+        } else if (character == ',' && !quoted) {
+            record.push_back(field);
+            field.clear();
+        } else if (character == static_cast<char>(10) && !quoted) {
+            if (!field.empty() || !record.empty()) {
+                record.push_back(field);
+                records.push_back(record);
+            }
+            field.clear();
+            record.clear();
+        } else if (character != static_cast<char>(13) || quoted) {
+            field.push_back(character);
+        }
+    }
+    require(!quoted, "test CSV parser found an unterminated quote");
+    return records;
+}
+
+std::string csv_value_3d(
+    const std::vector<std::vector<std::string>>& records,
+    const std::string& caseId,
+    const std::string& column)
+{
+    require(!records.empty(), "CSV lookup received no records");
+    const auto columnIt = std::find(records.front().begin(), records.front().end(),
+                                    column);
+    require(columnIt != records.front().end(), "CSV lookup missing column " + column);
+    const std::size_t columnIndex = static_cast<std::size_t>(
+        std::distance(records.front().begin(), columnIt));
+    for (std::size_t row = 1; row < records.size(); ++row) {
+        if (!records[row].empty() && records[row][0] == caseId) {
+            require(columnIndex < records[row].size(),
+                    "CSV lookup found a short record for " + caseId);
+            return records[row][columnIndex];
+        }
+    }
+    throw std::runtime_error("CSV lookup missing case " + caseId);
+}
+
+void write_csv_records_3d(
+    const std::filesystem::path& path,
+    const std::vector<std::vector<std::string>>& records)
+{
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    for (const auto& record : records) {
+        for (std::size_t column = 0; column < record.size(); ++column) {
+            if (column != 0) output << ',';
+            output << csv_field_3d(record[column]);
+        }
+        output << '\n';
+    }
+}
+
+void mutate_csv_field_3d(
+    const std::filesystem::path& path, std::size_t dataRow,
+    const std::string& column, const std::string& value)
+{
+    auto records = parse_csv_records_3d(read_text_file(path));
+    require(dataRow > 0 && dataRow < records.size(),
+            "CSV field mutation has no requested data row");
+    const auto found = std::find(
+        records.front().begin(), records.front().end(), column);
+    require(found != records.front().end(),
+            "CSV field mutation missing column " + column);
+    const std::size_t index = static_cast<std::size_t>(
+        std::distance(records.front().begin(), found));
+    records[dataRow][index] = value;
+    write_csv_records_3d(path, records);
+}
+
+void mutate_csv_column_all_data_3d(
+    const std::filesystem::path& path,
+    const std::string& column, const std::string& value)
+{
+    auto records = parse_csv_records_3d(read_text_file(path));
+    const auto found = std::find(
+        records.front().begin(), records.front().end(), column);
+    require(found != records.front().end(),
+            "CSV column mutation missing column " + column);
+    const std::size_t index = static_cast<std::size_t>(
+        std::distance(records.front().begin(), found));
+    for (std::size_t row = 1; row < records.size(); ++row)
+        records[row][index] = value;
+    write_csv_records_3d(path, records);
+}
+
 TwoLevelNeumannStudyRouteRow3D make_shared_writer_fixture_3d()
 {
     TwoLevelNeumannStudyRouteRow3D row;
@@ -559,6 +662,10 @@ TwoLevelNeumannStudyRouteRow3D make_shared_writer_fixture_3d()
     row.status = "ok";
     row.physical_iterations = 2;
     row.common_iterations = 1;
+    row.physical_converged = true;
+    row.common_converged = true;
+    row.physical_final_residual = 0.01;
+    row.common_final_residual = 0.02;
     row.physical_residuals = {1.0, 0.1, 0.01};
     row.common_residuals = {1.0, 0.02};
     row.edge_bins = {{
@@ -598,11 +705,19 @@ TwoLevelNeumannStudyRouteRow3D make_shared_writer_fixture_3d()
     fit.sigma_min = 0.5;
     fit.condition = 4.0;
     row.edge_fits.push_back(fit);
-    row.surface_dof_count = 1;
-    row.surface_map_count = 1;
-    row.value_map_count = 1;
-    row.normal_map_count = 1;
-    row.edge_map_count = 1;
+    TwoLevelEdgePointDiagnostic3D secondPoint = point;
+    secondPoint.cell_id = 7;
+    secondPoint.fraction = 0.75;
+    secondPoint.native_parameters = {{0.75, 0.25}};
+    row.edge_points.push_back(secondPoint);
+    TwoLevelEdgeFitDiagnostic3D secondFit = fit;
+    secondFit.cell_id = 7;
+    row.edge_fits.push_back(secondFit);
+    row.surface_dof_count = 2;
+    row.surface_map_count = 2;
+    row.value_map_count = 2;
+    row.normal_map_count = 2;
+    row.edge_map_count = 2;
     TwoLevelSurfaceFitDiagnostic3D surfaceFit;
     surfaceFit.center_dof = 0;
     surfaceFit.ordinary_value_count = 48;
@@ -612,12 +727,400 @@ TwoLevelNeumannStudyRouteRow3D make_shared_writer_fixture_3d()
     surfaceFit.sigma_max = 2.0;
     surfaceFit.condition = 4.0;
     row.surface_fits.push_back(surfaceFit);
+    TwoLevelSurfaceFitDiagnostic3D secondSurfaceFit = surfaceFit;
+    secondSurfaceFit.center_dof = 1;
+    row.surface_fits.push_back(secondSurfaceFit);
     TwoLevelDofDiagnostic3D dof;
     dof.dof_id = 0;
     dof.patch_id = 0;
     dof.weight = 1.0;
     row.dofs.push_back(dof);
+    TwoLevelDofDiagnostic3D secondDof = dof;
+    secondDof.dof_id = 1;
+    row.dofs.push_back(secondDof);
     return row;
+}
+
+void duplicate_first_csv_data_record_over_second_3d(
+    const std::filesystem::path& path)
+{
+    std::string text = read_study_test_file_3d(path);
+    const std::size_t headerEnd = text.find(static_cast<char>(10));
+    const std::size_t firstEnd = text.find(static_cast<char>(10), headerEnd + 1);
+    const std::size_t secondEnd = text.find(static_cast<char>(10), firstEnd + 1);
+    require(headerEnd != std::string::npos && firstEnd != std::string::npos
+                && secondEnd != std::string::npos,
+            "duplicate-record mutation requires two data records");
+    text.replace(firstEnd + 1, secondEnd - firstEnd,
+                 text.substr(headerEnd + 1, firstEnd - headerEnd));
+    write_study_test_file_3d(path, text);
+}
+
+void require_review_schema_negative_mutations_3d(
+    const std::filesystem::path& script,
+    const std::filesystem::path& source)
+{
+    const auto exercise = [&](const std::string& name,
+                              const std::function<void(
+                                  const std::filesystem::path&)>& mutate) {
+        const std::filesystem::path destination =
+            source.parent_path() / (source.filename().string() + '_' + name);
+        std::error_code error;
+        std::filesystem::remove_all(destination, error);
+        std::filesystem::copy(source, destination,
+            std::filesystem::copy_options::recursive);
+        mutate(destination);
+        require(run_two_level_neumann_schema_audit_3d(script, destination) != 0,
+                "schema audit accepted review mutation: " + name);
+        std::filesystem::remove_all(destination, error);
+    };
+    exercise("reordered_header", [](const std::filesystem::path& directory) {
+        const auto path = directory / "summary.csv";
+        std::string text = read_study_test_file_3d(path);
+        const std::string ordered = ",setup_seconds,fit_seconds,";
+        const std::size_t offset = text.find(ordered);
+        require(offset != std::string::npos,
+                "reordered-header mutation found no target");
+        text.replace(offset, ordered.size(), ",fit_seconds,setup_seconds,");
+        write_study_test_file_3d(path, text);
+    });
+    exercise("bad_record_width", [](const std::filesystem::path& directory) {
+        const auto path = directory / "summary.csv";
+        std::string text = read_study_test_file_3d(path);
+        const std::size_t headerEnd = text.find(static_cast<char>(10));
+        const std::size_t firstEnd = text.find(static_cast<char>(10), headerEnd + 1);
+        require(firstEnd != std::string::npos,
+                "bad-width mutation found no data record");
+        text.insert(firstEnd, ",unexpected_field");
+        write_study_test_file_3d(path, text);
+    });
+    for (const std::string& nonfinite : {"NaN", "Infinity", "-Infinity"}) {
+        exercise("nonfinite_residual_" + nonfinite,
+            [nonfinite](const std::filesystem::path& directory) {
+                mutate_csv_field_3d(directory / "gmres_residuals.csv", 1,
+                                    "relative_residual", nonfinite);
+            });
+    }
+    const std::array<std::string, 4> duplicateFiles{{
+        "surface_fit_diagnostics.csv", "dof_diagnostics.csv",
+        "edge_point_diagnostics.csv", "edge_fit_diagnostics.csv"}};
+    for (const std::string& filename : duplicateFiles) {
+        exercise("duplicate_" + filename,
+            [filename](const std::filesystem::path& directory) {
+                duplicate_first_csv_data_record_over_second_3d(
+                    directory / filename);
+            });
+    }
+    exercise("orphan_surface_fit", [](const std::filesystem::path& directory) {
+        const auto path = directory / "surface_fit_diagnostics.csv";
+        std::string text = read_study_test_file_3d(path);
+        const std::size_t headerEnd = text.find(static_cast<char>(10));
+        const std::size_t caseEnd = text.find(',', headerEnd + 1);
+        require(caseEnd != std::string::npos,
+                "orphan mutation found no surface-fit record");
+        text.replace(headerEnd + 1, caseEnd - headerEnd - 1, "orphan_case");
+        write_study_test_file_3d(path, text);
+    });
+    exercise("mismatched_edge_key_set", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_3d(directory / "edge_point_diagnostics.csv", 2,
+                            "cell_id", "8");
+    });
+    exercise("surface_id_gap", [](const std::filesystem::path& directory) {
+        mutate_csv_field_3d(directory / "surface_fit_diagnostics.csv", 2,
+                            "center_dof", "2");
+    });
+    exercise("dof_id_gap", [](const std::filesystem::path& directory) {
+        mutate_csv_field_3d(directory / "dof_diagnostics.csv", 2,
+                            "dof_id", "2");
+    });
+    exercise("summary_residual_mismatch", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_3d(directory / "summary.csv", 1,
+                            "physical_final_residual", "5.0e-1");
+    });
+}
+
+int run_two_level_neumann_audit_command_3d(
+    const std::filesystem::path& script,
+    const std::filesystem::path& outputDirectory,
+    const std::string& expectedLevels,
+    bool schemaOnly,
+    const std::filesystem::path& decision = {})
+{
+    std::ostringstream command;
+    command << "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
+            << static_cast<char>(34) << "& { & '" << script.string()
+            << "' -OutputDirectory '" << outputDirectory.string()
+            << "' -ExpectedLevels @(" << expectedLevels
+            << ") -AllowNumericalFailure";
+    if (schemaOnly) command << " -SchemaOnly";
+    if (!decision.empty())
+        command << " -DecisionJson '" << decision.string() << "'";
+    command << " }" << static_cast<char>(34);
+    return std::system(command.str().c_str());
+}
+
+TwoLevelNeumannStudyRouteRow3D make_failed_writer_fixture_3d(
+    std::size_t index, const std::string& stage);
+
+void test_failed_coarse_requires_na_adjacent_order()
+{
+    const std::filesystem::path root =
+        std::filesystem::current_path() / "task5_failed_pair_test_output";
+    std::error_code error;
+    std::filesystem::remove_all(root, error);
+    TwoLevelNeumannStudyWriter3D writer(root);
+    auto coarse = make_failed_writer_fixture_3d(20, "solve");
+    coarse.case_id = "failed_pair";
+    coarse.route = app3d::HarmonicCauchyRoute3D::EdgeReconstructedValue;
+    coarse.N = 32;
+    writer.append(coarse);
+    auto fine = make_shared_writer_fixture_3d();
+    fine.case_id = coarse.case_id;
+    fine.N = 64;
+    writer.append(fine);
+    writer.close();
+    const auto script = std::filesystem::current_path()
+        / "apps/audit_neumann_two_level_edge_cauchy_3d.ps1";
+    require(run_two_level_neumann_audit_command_3d(
+                script, root, "32,64", true) == 0,
+            "failed coarse row must make fine adjacent orders explicitly NA");
+    std::filesystem::remove_all(root, error);
+}
+
+void test_nonpositive_adjacent_order_error_is_rejected()
+{
+    const std::filesystem::path root =
+        std::filesystem::current_path() / "task5_bad_order_test_output";
+    std::error_code error;
+    std::filesystem::remove_all(root, error);
+    TwoLevelNeumannStudyWriter3D writer(root);
+    auto coarse = make_shared_writer_fixture_3d();
+    coarse.case_id = "bad_order_pair";
+    coarse.N = 32;
+    coarse.density_linf = 0.0;
+    coarse.density_l2 = 0.0;
+    coarse.interior_linf = 0.0;
+    coarse.interior_l2 = 0.0;
+    writer.append(coarse);
+    auto fine = coarse;
+    fine.N = 64;
+    for (auto& order : fine.orders_32_64) order = 1.0;
+    writer.append(fine);
+    writer.close();
+    const auto script = std::filesystem::current_path()
+        / "apps/audit_neumann_two_level_edge_cauchy_3d.ps1";
+    require(run_two_level_neumann_audit_command_3d(
+                script, root, "32,64", true) != 0,
+            "audit accepted nonpositive adjacent-order error denominator");
+    std::filesystem::remove_all(root, error);
+}
+
+void test_two_level_help_separates_unforced_and_legacy_modes()
+{
+    std::ostringstream output;
+    std::streambuf* previous = std::cout.rdbuf(output.rdbuf());
+    print_usage("neumann_app");
+    std::cout.rdbuf(previous);
+    const std::string text = output.str();
+    require(text.find(
+                "neumann_app --neumann-edge-cauchy-study [N ...]")
+                    != std::string::npos
+                && text.find(
+                "neumann_app --neumann-edge-cauchy-study --force-extended [N ...]")
+                    != std::string::npos,
+            "help does not expose distinct unforced and legacy forced commands");
+    require(text.find(
+                "Unforced Neumann-edge-cauchy-study default levels: 32, 64, 128.")
+                    != std::string::npos
+                && text.find(
+                "Legacy --force-extended levels are the gated prefixes 32; "
+                "32,64; or 32,64,128 (default: 32,64).")
+                    != std::string::npos,
+            "help does not distinguish new and legacy defaults/gates");
+}
+
+TwoLevelNeumannStudyRouteRow3D make_decision_writer_fixture_3d(
+    const std::string& caseId, int N,
+    app3d::HarmonicCauchyRoute3D route, int poseIndex)
+{
+    auto row = make_shared_writer_fixture_3d();
+    row.case_id = caseId;
+    row.N = N;
+    row.route = route;
+    row.setup_available = true;
+    row.fit_available = true;
+    row.owner_before_available = true;
+    row.solve_available = true;
+    row.physical_iterations = 1;
+    row.common_iterations = 1;
+    row.physical_residuals = {1.0, 1.0e-12};
+    row.common_residuals = {1.0, 1.0e-12};
+    row.physical_final_residual = 1.0e-12;
+    row.common_final_residual = 1.0e-12;
+    row.physical_converged = true;
+    row.common_converged = true;
+    row.physical_contraction = 1.0e-12;
+    row.common_contraction = 1.0e-12;
+    row.common_rhs_rms = 1.0;
+    row.common_rhs_hash = static_cast<std::uint64_t>(10000 + 10 * poseIndex + N);
+    const double error = 32.0 / static_cast<double>(N);
+    row.density_linf = error;
+    row.density_l2 = error;
+    row.interior_linf = error;
+    row.interior_l2 = error;
+    if (N == 64)
+        for (auto& order : row.orders_32_64) order = 1.0;
+    if (N == 128)
+        for (auto& order : row.orders_64_128) order = 1.0;
+    row.defect_linf = 0.5;
+    row.defect_rms = 0.25;
+    row.edge_value_linf = 1.0 / static_cast<double>(N);
+    row.edge_value_rms = 0.5 / static_cast<double>(N);
+    row.label_inside_count = 20 + poseIndex;
+    row.label_outside_count = 80 - poseIndex;
+    row.label_fingerprint = static_cast<std::uint64_t>(300 + poseIndex);
+    row.neighborhood_fingerprint = static_cast<std::uint64_t>(400 + poseIndex);
+    row.owner.available = true;
+    row.owner.owner_query_count = 17;
+    row.owner.owner_fingerprint_before =
+        static_cast<std::uint64_t>(500 + poseIndex);
+    row.owner.owner_fingerprint_after = row.owner.owner_fingerprint_before;
+    row.owner.owner_output_digest_before =
+        static_cast<std::uint64_t>(600 + poseIndex);
+    row.owner.owner_output_digest_after = row.owner.owner_output_digest_before;
+    row.owner.cauchy_geometry_queries = 9;
+    row.owner.cauchy_svd_factorizations = 3;
+    row.owner.cauchy_fingerprint_before = static_cast<std::uint64_t>(
+        700 + static_cast<int>(route));
+    row.owner.cauchy_fingerprint_after = row.owner.cauchy_fingerprint_before;
+    row.owner.reference_equal = true;
+    row.owner.label_equal = true;
+    row.owner.neighborhood_equal = true;
+    row.owner.common_rhs_hash_equal = true;
+    if (route != app3d::HarmonicCauchyRoute3D::EdgeReconstructedValue) {
+        row.shared_edge_point_count = 0;
+        row.edge_map_count = 0;
+        row.edge_points.clear();
+        row.edge_fits.clear();
+        row.edge_value_linf.reset();
+        row.edge_value_rms.reset();
+    }
+    return row;
+}
+
+void write_decision_fixture_3d(
+    const std::filesystem::path& root,
+    const std::vector<int>& levels,
+    bool failBaselineG1Coarse)
+{
+    const std::array<std::string, 3> cases{{
+        "baseline", "rot_axis123_17deg", "rot_axis123_17deg_t_xyz_1"}};
+    const std::array<app3d::HarmonicCauchyRoute3D, 3> routes{{
+        app3d::HarmonicCauchyRoute3D::G1ValueG1Normal,
+        app3d::HarmonicCauchyRoute3D::DirectCrossFaceValue,
+        app3d::HarmonicCauchyRoute3D::EdgeReconstructedValue}};
+    TwoLevelNeumannStudyWriter3D writer(root);
+    for (std::size_t pose = 0; pose < cases.size(); ++pose) {
+        for (int N : levels) {
+            for (const auto route : routes) {
+                if (failBaselineG1Coarse && pose == 0 && N == 32
+                    && route == app3d::HarmonicCauchyRoute3D::G1ValueG1Normal) {
+                    auto failed = make_failed_writer_fixture_3d(30, "solve");
+                    failed.case_id = cases[pose];
+                    failed.N = N;
+                    failed.route = route;
+                    writer.append(failed);
+                    continue;
+                }
+                auto row = make_decision_writer_fixture_3d(
+                    cases[pose], N, route, static_cast<int>(pose));
+                if (failBaselineG1Coarse && pose == 0 && N == 64
+                    && route == app3d::HarmonicCauchyRoute3D::G1ValueG1Normal) {
+                    for (auto& order : row.orders_32_64) order.reset();
+                }
+                writer.append(row);
+            }
+        }
+    }
+    writer.close();
+}
+
+void require_json_state_3d(
+    const std::filesystem::path& decision,
+    const std::string& selectedRoute,
+    const std::string& formalEvidence,
+    const std::string& mandatoryPass)
+{
+    const std::string json = read_text_file(decision);
+    const std::string quote(1, static_cast<char>(34));
+    require(json.find(static_cast<char>(34) + selectedRoute
+                + static_cast<char>(34)) != std::string::npos,
+            "decision JSON has wrong selected route");
+    require(json.find(quote + "formal_evidence_complete" + quote + ":  "
+                + formalEvidence)
+                != std::string::npos
+                && json.find(quote + "mandatory_numerical_pass" + quote + ":  "
+                    + mandatoryPass)
+                    != std::string::npos,
+            "decision JSON has wrong formal/mandatory state");
+}
+
+void test_decision_state_distinguishes_partial_performance_and_failure()
+{
+    const auto script = std::filesystem::current_path()
+        / "apps/audit_neumann_two_level_edge_cauchy_3d.ps1";
+    std::error_code error;
+    const auto partial = std::filesystem::current_path()
+        / "task5_partial_decision_test_output";
+    std::filesystem::remove_all(partial, error);
+    write_decision_fixture_3d(partial, {32}, false);
+    const auto partialDecision = partial / "decision.json";
+    require(run_two_level_neumann_audit_command_3d(
+                script, partial, "32", false, partialDecision) == 0,
+            "partial N32 decision audit failed");
+    require_json_state_3d(
+        partialDecision, "insufficient_evidence", "false", "true");
+    const auto zeroWeight = std::filesystem::current_path()
+        / "task5_zero_weight_test_output";
+    std::filesystem::remove_all(zeroWeight, error);
+    std::filesystem::copy(partial, zeroWeight,
+        std::filesystem::copy_options::recursive);
+    mutate_csv_column_all_data_3d(
+        zeroWeight / "edge_distance_bins.csv", "weight_sum", "0");
+    require(run_two_level_neumann_audit_command_3d(
+                script, zeroWeight, "32", false,
+                zeroWeight / "decision.json") != 0,
+            "audit accepted zero combined near-edge weight");
+
+    const auto performance = std::filesystem::current_path()
+        / "task5_formal_performance_test_output";
+    std::filesystem::remove_all(performance, error);
+    write_decision_fixture_3d(performance, {32, 64, 128}, false);
+    const auto performanceDecision = performance / "decision.json";
+    require(run_two_level_neumann_audit_command_3d(
+                script, performance, "32,64,128", false,
+                performanceDecision) == 0,
+            "formal performance decision audit failed");
+    require_json_state_3d(performanceDecision,
+        "sector_polynomials_with_shared_edge_constraints", "true", "true");
+
+    const auto failed = std::filesystem::current_path()
+        / "task5_formal_failure_test_output";
+    std::filesystem::remove_all(failed, error);
+    write_decision_fixture_3d(failed, {32, 64, 128}, true);
+    const auto failedDecision = failed / "decision.json";
+    require(run_two_level_neumann_audit_command_3d(
+                script, failed, "32,64,128", false, failedDecision) == 0,
+            "formal failed-pair decision audit did not produce JSON");
+    require_json_state_3d(failedDecision,
+        "rerun_after_numerical_failure", "true", "false");
+
+    std::filesystem::remove_all(partial, error);
+    std::filesystem::remove_all(zeroWeight, error);
+    std::filesystem::remove_all(performance, error);
+    std::filesystem::remove_all(failed, error);
 }
 
 TwoLevelNeumannStudyRouteRow3D make_failed_writer_fixture_3d(
@@ -666,6 +1169,28 @@ void test_two_level_study_writer_and_schema_audit()
         "unrelated_selection"}};
     for (std::size_t index = 0; index < stages.size(); ++index)
         writer.append(make_failed_writer_fixture_3d(index, stages[index]));
+    auto solveFailure = make_shared_writer_fixture_3d();
+    solveFailure.case_id = "solve_available";
+    solveFailure.status = "failed";
+    solveFailure.failure.stage = "solve";
+    solveFailure.failure.message = "synthetic solve failure";
+    solveFailure.fit_available = true;
+    solveFailure.owner_before_available = true;
+    solveFailure.solve_available = false;
+    solveFailure.owner.cauchy_geometry_queries = 9;
+    solveFailure.owner.cauchy_svd_factorizations = 3;
+    solveFailure.physical_residuals.clear();
+    solveFailure.common_residuals.clear();
+    for (auto& point : solveFailure.edge_points) {
+        point.exact_value.reset();
+        point.reconstructed_value.reset();
+        point.error.reset();
+    }
+    for (auto& dof : solveFailure.dofs) {
+        dof.density_error.reset();
+        dof.equation_defect.reset();
+    }
+    writer.append(solveFailure);
     writer.close();
 
     for (const std::string& filename : two_level_neumann_study_csv_files_3d()) {
@@ -729,11 +1254,43 @@ void test_two_level_study_writer_and_schema_audit()
                 && edgeFits.find("direct_cross_face_value")
                     == std::string::npos,
             "control routes invented edge-point or edge-fit rows");
+    const auto summaryRecords = parse_csv_records_3d(summary);
+    require(csv_value_3d(summaryRecords, "solve_available", "physical_iterations")
+                == "NA"
+                && csv_value_3d(summaryRecords, "solve_available",
+                                "surface_map_count") == "2"
+                && csv_value_3d(summaryRecords, "solve_available",
+                                "edge_map_count") == "2"
+                && csv_value_3d(summaryRecords, "solve_available",
+                                "cauchy_geometry_queries") == "9",
+            "solve failure did not preserve only its available summary blocks");
+    const auto ownerRecords = parse_csv_records_3d(
+        read_text_file(root / "owner_diagnostics.csv"));
+    require(csv_value_3d(ownerRecords, "solve_available", "available") == "1"
+                && csv_value_3d(ownerRecords, "solve_available",
+                                "owner_query_count") == "17"
+                && csv_value_3d(ownerRecords, "solve_available",
+                                "owner_fingerprint_before") == "101"
+                && csv_value_3d(ownerRecords, "solve_available",
+                                "owner_fingerprint_after") == "NA"
+                && csv_value_3d(ownerRecords, "solve_available",
+                                "cauchy_fingerprint_before") == "202"
+                && csv_value_3d(ownerRecords, "solve_available",
+                                "cauchy_fingerprint_after") == "NA",
+            "solve failure did not preserve owner/Cauchy before-only fields");
+    const auto pointRecords = parse_csv_records_3d(edgePoints);
+    const auto dofRecords = parse_csv_records_3d(
+        read_text_file(root / "dof_diagnostics.csv"));
+    require(csv_value_3d(pointRecords, "solve_available", "exact_value") == "NA"
+                && csv_value_3d(dofRecords, "solve_available", "density_error")
+                    == "NA",
+            "solve failure invented unavailable post-solve diagnostic values");
     const std::filesystem::path script = std::filesystem::current_path()
         / "apps/audit_neumann_two_level_edge_cauchy_3d.ps1";
     require(run_two_level_neumann_schema_audit_3d(script, root) == 0,
             "valid synthetic study directory failed schema audit");
     require_schema_negative_mutations_3d(script, root);
+    require_review_schema_negative_mutations_3d(script, root);
     std::filesystem::remove_all(root, error);
 }
 
@@ -750,6 +1307,10 @@ int main()
         test_common_neumann_rhs_uses_native_parameters_and_surface_weights();
         test_detailed_neumann_probe_uses_literal_defect_and_exact_edge_fit();
         test_two_level_study_writer_and_schema_audit();
+        test_failed_coarse_requires_na_adjacent_order();
+        test_nonpositive_adjacent_order_error_is_rejected();
+        test_two_level_help_separates_unforced_and_legacy_modes();
+        test_decision_state_distinguishes_partial_performance_and_failure();
         std::cout << "Neumann exterior value route integration test passed\n";
         return 0;
     } catch (const std::exception& error) {
