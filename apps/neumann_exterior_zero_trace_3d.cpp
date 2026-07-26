@@ -2815,6 +2815,100 @@ double surface_weighted_mean(const SurfaceDofCloud& surface,
     return weighted_sum / weight_sum;
 }
 
+struct NeumannManufacturedData3D {
+    Eigen::VectorXd prescribed_normal_jump;
+    Eigen::VectorXd exact_density;
+    double density_mean_shift = 0.0;
+};
+
+NeumannManufacturedData3D make_neumann_manufactured_data_3d(
+    const SurfaceDofCloud& surface,
+    const app3d::RigidTransform3D& transform)
+{
+    const int size = static_cast<int>(surface.dofs.size());
+    NeumannManufacturedData3D result;
+    result.prescribed_normal_jump.resize(size);
+    result.exact_density.resize(size);
+    for (int q = 0; q < size; ++q) {
+        const SurfaceDof& dof = surface.dofs[static_cast<std::size_t>(q)];
+        result.exact_density[q] =
+            app3d::transformed_manufactured_harmonic_value_3d(
+                transform, dof.point);
+        result.prescribed_normal_jump[q] =
+            app3d::transformed_manufactured_harmonic_gradient_3d(
+                transform, dof.point).dot(dof.normal);
+    }
+    result.density_mean_shift = surface_weighted_mean(
+        surface, result.exact_density);
+    result.exact_density.array() -= result.density_mean_shift;
+    result.prescribed_normal_jump.array() -= surface_weighted_mean(
+        surface, result.prescribed_normal_jump);
+    if (!result.exact_density.allFinite()
+        || !result.prescribed_normal_jump.allFinite()
+        || !std::isfinite(result.density_mean_shift)) {
+        throw std::runtime_error("Neumann manufactured data are non-finite");
+    }
+    return result;
+}
+
+Eigen::VectorXd make_common_neumann_augmented_rhs_3d(
+    const NativeNurbsSurface3D& native_surface,
+    const SurfaceDofCloud& surface)
+{
+    const int size = static_cast<int>(surface.dofs.size());
+    Eigen::VectorXd result = Eigen::VectorXd::Zero(size + 1);
+    const double pi = std::acos(-1.0);
+    for (int q = 0; q < size; ++q) {
+        const SurfaceDof& dof = surface.dofs[static_cast<std::size_t>(q)];
+        if (dof.patch_id < 0
+            || dof.patch_id >= static_cast<int>(native_surface.patches.size())) {
+            throw std::invalid_argument(
+                "common Neumann RHS has an invalid patch ID");
+        }
+        const auto& patch = native_surface.patches[
+            static_cast<std::size_t>(dof.patch_id)];
+        const double u_length = patch.domain_end_u() - patch.domain_start_u();
+        const double v_length = patch.domain_end_v() - patch.domain_start_v();
+        if (!(u_length > 0.0) || !(v_length > 0.0)) {
+            throw std::invalid_argument(
+                "common Neumann RHS has a degenerate native domain");
+        }
+        const double normalized_u =
+            (dof.u - patch.domain_start_u()) / u_length;
+        const double normalized_v =
+            (dof.v - patch.domain_start_v()) / v_length;
+        const double parameter_tolerance =
+            64.0 * std::numeric_limits<double>::epsilon();
+        if (normalized_u < -parameter_tolerance
+            || normalized_u > 1.0 + parameter_tolerance
+            || normalized_v < -parameter_tolerance
+            || normalized_v > 1.0 + parameter_tolerance) {
+            throw std::invalid_argument(
+                "common Neumann RHS has an out-of-domain native parameter");
+        }
+        const double uhat = std::clamp(normalized_u, 0.0, 1.0);
+        const double vhat = std::clamp(normalized_v, 0.0, 1.0);
+        const double patch_phase = static_cast<double>(dof.patch_id + 1);
+        result[q] = std::sin(2.0 * pi * uhat + 0.37 * patch_phase)
+            + 0.5 * std::cos(2.0 * pi * vhat - 0.23 * patch_phase)
+            + 0.25 * std::sin(2.0 * pi * (uhat + vhat));
+    }
+    result.head(size).array() -= surface_weighted_mean(
+        surface, result.head(size));
+    double weighted_square_sum = 0.0;
+    double weight_sum = 0.0;
+    for (int q = 0; q < size; ++q) {
+        const double weight = surface.dofs[static_cast<std::size_t>(q)].weight;
+        weighted_square_sum += weight * result[q] * result[q];
+        weight_sum += weight;
+    }
+    const double weighted_rms = std::sqrt(weighted_square_sum / weight_sum);
+    if (!(weighted_rms > 0.0) || !std::isfinite(weighted_rms))
+        throw std::runtime_error("common Neumann RHS has invalid weighted RMS");
+    result.head(size) /= weighted_rms;
+    return result;
+}
+
 SolveMetrics3D run_neumann_case(
     const CartesianGrid3D& grid,
     const GridPair3D& grid_pair,
@@ -2842,24 +2936,10 @@ SolveMetrics3D run_neumann_case(
     Eigen::VectorXd exact_trace_storage;
     Eigen::VectorXd normal_data_storage;
     if (shared_exact_trace_input == nullptr) {
-        exact_trace_storage.resize(size);
-        normal_data_storage.resize(size);
-        for (int q = 0; q < size; ++q) {
-            const SurfaceDof& dof =
-                pipeline.surface().dofs[static_cast<std::size_t>(q)];
-            exact_trace_storage[q] =
-                app3d::transformed_manufactured_harmonic_value_3d(
-                    transform, dof.point);
-            normal_data_storage[q] =
-                app3d::transformed_manufactured_harmonic_gradient_3d(
-                    transform, dof.point).dot(dof.normal);
-        }
-        exact_trace_storage.array() -= surface_weighted_mean(
-            pipeline.surface(), exact_trace_storage);
-        // Enforce the discrete compatibility condition. The exact flux has
-        // zero continuous mean; the quadrature defect is otherwise amplified.
-        normal_data_storage.array() -= surface_weighted_mean(
-            pipeline.surface(), normal_data_storage);
+        const NeumannManufacturedData3D manufactured =
+            make_neumann_manufactured_data_3d(pipeline.surface(), transform);
+        exact_trace_storage = manufactured.exact_density;
+        normal_data_storage = manufactured.prescribed_normal_jump;
     } else if (shared_exact_trace_input->size() != size
                || shared_normal_jump_input->size() != size
                || !shared_exact_trace_input->allFinite()
@@ -4468,7 +4548,243 @@ struct CommonRhsGmresProbe3D {
     int iterations = 0;
     double final_residual = 0.0;
     std::vector<double> residuals;
+    Eigen::VectorXd right_hand_side;
+    double rhs_weighted_mean = 0.0;
+    double rhs_weighted_rms = 0.0;
 };
+
+struct EdgeBinMetrics3D {
+    std::string bin;
+    int count = 0;
+    double weight_sum = 0.0;
+    double density_linf = 0.0;
+    double density_weighted_rms = 0.0;
+    double defect_linf = 0.0;
+    double defect_weighted_rms = 0.0;
+    bool empty = true;
+};
+
+struct NeumannRouteProbe3D {
+    SolveMetrics3D physical;
+    std::vector<double> physical_residuals;
+    CommonRhsGmresProbe3D common;
+    Eigen::VectorXd density_error;
+    Eigen::VectorXd exact_equation_defect;
+    Eigen::VectorXd exact_input_edge_values;
+    Eigen::VectorXd exact_edge_value_error;
+    Eigen::VectorXd exact_edge_quadrature_weights;
+    std::optional<double> edge_value_linf;
+    std::optional<double> edge_value_weighted_rms;
+    double exact_mean_row_defect = 0.0;
+    std::array<EdgeBinMetrics3D, 3> bins;
+};
+
+double surface_weighted_rms_3d(const SurfaceDofCloud& surface,
+                               const Eigen::VectorXd& values)
+{
+    if (values.size() != static_cast<int>(surface.dofs.size())) {
+        throw std::invalid_argument(
+            "surface weighted RMS received wrong size");
+    }
+    double weighted_square_sum = 0.0;
+    double weight_sum = 0.0;
+    for (int q = 0; q < values.size(); ++q) {
+        const double weight = surface.dofs[static_cast<std::size_t>(q)].weight;
+        weighted_square_sum += weight * values[q] * values[q];
+        weight_sum += weight;
+    }
+    return std::sqrt(weighted_square_sum / weight_sum);
+}
+
+CommonRhsGmresProbe3D run_common_neumann_gmres_3d(
+    const PanelCenterHarmonicJetKFBI3D& pipeline,
+    const Eigen::VectorXd& augmented_rhs,
+    ExteriorValueRestrictMode3D restrict_mode)
+{
+    ExteriorZeroTraceOperator3D op(pipeline, restrict_mode);
+    const int size = pipeline.surface_size();
+    if (augmented_rhs.size() != op.problem_size()
+        || augmented_rhs[size] != 0.0
+        || !augmented_rhs.allFinite()) {
+        throw std::invalid_argument(
+            "common Neumann augmented RHS is invalid");
+    }
+    CommonRhsGmresProbe3D result;
+    result.right_hand_side = augmented_rhs;
+    result.rhs_weighted_mean = surface_weighted_mean(
+        pipeline.surface(), augmented_rhs.head(size));
+    result.rhs_weighted_rms = surface_weighted_rms_3d(
+        pipeline.surface(), augmented_rhs.head(size));
+    if (std::abs(result.rhs_weighted_mean) > 5.0e-13
+        || std::abs(result.rhs_weighted_rms - 1.0) > 5.0e-13) {
+        throw std::runtime_error(
+            "common Neumann RHS failed weighted mean/RMS audit");
+    }
+    Eigen::VectorXd unknown = Eigen::VectorXd::Zero(op.problem_size());
+    GMRES gmres(80, 2.0e-10, 80);
+    result.iterations = gmres.solve(op, augmented_rhs, unknown);
+    result.converged = gmres.converged();
+    result.residuals = gmres.residuals();
+    result.final_residual = result.residuals.empty()
+        ? std::numeric_limits<double>::quiet_NaN()
+        : result.residuals.back();
+    if (result.residuals.size()
+        != static_cast<std::size_t>(result.iterations + 1)) {
+        throw std::runtime_error(
+            "common Neumann GMRES residual history has wrong length");
+    }
+    return result;
+}
+
+NeumannRouteProbe3D run_neumann_route_probe_3d(
+    const CartesianGrid3D& grid,
+    const GridPair3D& grid_pair,
+    const PanelCenterHarmonicJetKFBI3D& pipeline,
+    const NativeNurbsSurface3D& native_surface,
+    const app3d::RigidTransform3D& transform,
+    const app3d::SurfaceNonG1EdgeNeighborhoodSet3D& neighborhoods,
+    double h,
+    app3d::HarmonicCauchyRoute3D route)
+{
+    const int size = pipeline.surface_size();
+    if (!std::isfinite(h) || !(h > 0.0))
+        throw std::invalid_argument("Neumann route probe requires positive h");
+    const auto& maps = pipeline.cauchy_fit().surface_maps();
+    if (maps.size() != neighborhoods.centers.size()
+        || maps.size() != static_cast<std::size_t>(size)) {
+        throw std::invalid_argument(
+            "Neumann route probe requires complete shared neighborhoods");
+    }
+    for (int q = 0; q < size; ++q) {
+        const auto& map = maps[static_cast<std::size_t>(q)];
+        const auto& neighborhood =
+            neighborhoods.centers[static_cast<std::size_t>(q)];
+        if (map.neighborhood_fingerprint != neighborhoods.fingerprint
+            || neighborhood.center_dof != q
+            || map.nearest_edge_distance_over_h
+                != neighborhood.nearest_distance_over_h
+            || map.relevant_connection_ids
+                != neighborhood.relevant_connection_ids) {
+            throw std::logic_error(
+                "Neumann route map changed the shared edge neighborhood");
+        }
+    }
+
+    const NeumannManufacturedData3D data =
+        make_neumann_manufactured_data_3d(pipeline.surface(), transform);
+    NeumannRouteProbe3D result;
+    Eigen::VectorXd solved_density;
+    result.physical = run_neumann_case(
+        grid, grid_pair, pipeline, transform, 80,
+        ExteriorValueRestrictMode3D::JointTricubicCrossingOwner,
+        &result.physical_residuals, nullptr, &solved_density,
+        nullptr, nullptr, nullptr,
+        &data.exact_density, &data.prescribed_normal_jump);
+    if (result.physical_residuals.size()
+        != static_cast<std::size_t>(result.physical.iterations + 1)) {
+        throw std::runtime_error(
+            "physical Neumann GMRES residual history has wrong length");
+    }
+    result.density_error = solved_density - data.exact_density;
+
+    ExteriorZeroTraceOperator3D op(
+        pipeline, ExteriorValueRestrictMode3D::JointTricubicCrossingOwner);
+    Eigen::VectorXd exact_augmented = Eigen::VectorXd::Zero(op.problem_size());
+    exact_augmented.head(size) = data.exact_density;
+    Eigen::VectorXd applied;
+    op.apply(exact_augmented, applied);
+    const Eigen::VectorXd residual =
+        applied - op.right_hand_side(data.prescribed_normal_jump);
+    result.exact_equation_defect = residual.head(size);
+    result.exact_mean_row_defect = residual[size];
+
+    const Eigen::VectorXd common_rhs =
+        make_common_neumann_augmented_rhs_3d(
+            native_surface, pipeline.surface());
+    result.common = run_common_neumann_gmres_3d(
+        pipeline, common_rhs,
+        ExteriorValueRestrictMode3D::JointTricubicCrossingOwner);
+
+    result.bins[0].bin = "lt_h";
+    result.bins[1].bin = "h_to_2h";
+    result.bins[2].bin = "gt_2h";
+    std::array<double, 3> density_squares{{0.0, 0.0, 0.0}};
+    std::array<double, 3> defect_squares{{0.0, 0.0, 0.0}};
+    for (int q = 0; q < size; ++q) {
+        const double distance = neighborhoods.centers[
+            static_cast<std::size_t>(q)].nearest_distance_over_h;
+        const int bin = distance < 1.0 ? 0 : distance <= 2.0 ? 1 : 2;
+        EdgeBinMetrics3D& metrics =
+            result.bins[static_cast<std::size_t>(bin)];
+        const double weight =
+            pipeline.surface().dofs[static_cast<std::size_t>(q)].weight;
+        const double density = result.density_error[q];
+        const double defect = result.exact_equation_defect[q];
+        metrics.empty = false;
+        ++metrics.count;
+        metrics.weight_sum += weight;
+        metrics.density_linf = std::max(
+            metrics.density_linf, std::abs(density));
+        metrics.defect_linf = std::max(
+            metrics.defect_linf, std::abs(defect));
+        density_squares[static_cast<std::size_t>(bin)] +=
+            weight * density * density;
+        defect_squares[static_cast<std::size_t>(bin)] +=
+            weight * defect * defect;
+    }
+    for (int bin = 0; bin < 3; ++bin) {
+        EdgeBinMetrics3D& metrics =
+            result.bins[static_cast<std::size_t>(bin)];
+        if (metrics.empty)
+            continue;
+        metrics.density_weighted_rms = std::sqrt(
+            density_squares[static_cast<std::size_t>(bin)]
+            / metrics.weight_sum);
+        metrics.defect_weighted_rms = std::sqrt(
+            defect_squares[static_cast<std::size_t>(bin)]
+            / metrics.weight_sum);
+    }
+
+    if (route == app3d::HarmonicCauchyRoute3D::EdgeReconstructedValue) {
+        const auto exact_fit = pipeline.cauchy_fit().apply(
+            data.exact_density, data.prescribed_normal_jump);
+        const auto& edge_maps = pipeline.cauchy_fit().edge_maps();
+        const int edge_count = static_cast<int>(edge_maps.size());
+        result.exact_input_edge_values.resize(edge_count);
+        result.exact_edge_value_error.resize(edge_count);
+        result.exact_edge_quadrature_weights.resize(edge_count);
+        double weighted_square_sum = 0.0;
+        double weight_sum = 0.0;
+        double linf = 0.0;
+        for (int q = 0; q < edge_count; ++q) {
+            const auto& point = edge_maps[static_cast<std::size_t>(q)].point;
+            const double exact =
+                app3d::transformed_manufactured_harmonic_value_3d(
+                    transform, point.point) - data.density_mean_shift;
+            const double error = exact_fit.edge_values[q] - exact;
+            result.exact_input_edge_values[q] = exact;
+            result.exact_edge_value_error[q] = error;
+            result.exact_edge_quadrature_weights[q] = point.quadrature_weight;
+            linf = std::max(linf, std::abs(error));
+            weighted_square_sum += point.quadrature_weight * error * error;
+            weight_sum += point.quadrature_weight;
+        }
+        if (!(weight_sum > 0.0)) {
+            throw std::runtime_error(
+                "shared-edge Neumann probe has no edge quadrature weight");
+        }
+        result.edge_value_linf = linf;
+        result.edge_value_weighted_rms =
+            std::sqrt(weighted_square_sum / weight_sum);
+    } else {
+        result.exact_input_edge_values.resize(0);
+        result.exact_edge_value_error.resize(0);
+        result.exact_edge_quadrature_weights.resize(0);
+        result.edge_value_linf.reset();
+        result.edge_value_weighted_rms.reset();
+    }
+    return result;
+}
 
 double residual_contraction(
     const std::vector<double>& residuals,

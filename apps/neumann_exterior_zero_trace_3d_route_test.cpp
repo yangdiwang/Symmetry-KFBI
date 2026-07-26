@@ -49,6 +49,36 @@ struct LPrismFitFixture3D {
             geometry.native_surface, cloud, h);
 };
 
+struct DetailedNeumannRouteFixture3D {
+    static constexpr int N = 32;
+    double h = kBoxSide / static_cast<double>(N);
+    CartesianGrid3D grid{{kBoxMin, kBoxMin, kBoxMin}, {h, h, h},
+                         {N, N, N}, DofLayout3D::Node};
+    GeometryBundle geometry = make_geometry(
+        GeometryKind::LPrism, h, app3d::RigidTransform3D());
+    std::shared_ptr<const geometry3d::NurbsCartesianDomain3D> domain =
+        std::make_shared<const geometry3d::NurbsCartesianDomain3D>(
+            grid, geometry.native_surface.geometry_model());
+    GridPair3D grid_pair{grid, geometry.correction_interface,
+                         geometry.crossing_interface, domain};
+    SurfaceDofCloud cloud = app3d::make_native_surface_dofs_3d(
+        geometry.native_surface, h);
+    app3d::SurfaceNonG1EdgeNeighborhoodSet3D neighborhoods =
+        app3d::build_surface_non_g1_edge_neighborhoods_3d(
+            geometry.native_surface, cloud, h);
+
+    std::unique_ptr<PanelCenterHarmonicJetKFBI3D> make_pipeline(
+        app3d::HarmonicCauchyRoute3D route)
+    {
+        auto fit = app3d::HarmonicCauchyFit3D::build(
+            geometry.native_surface, cloud, neighborhoods, h, route);
+        return std::make_unique<PanelCenterHarmonicJetKFBI3D>(
+            grid, grid_pair, geometry.native_surface,
+            geometry.correction_triangles, geometry.geometry_triangles,
+            cloud, std::move(fit), false, true);
+    }
+};
+
 void test_harmonic_cauchy_route_names_are_exact()
 {
     require(std::string(harmonic_cauchy_route_name_3d(
@@ -330,6 +360,187 @@ void test_owner_pipeline_and_bordered_operator_split_mu_eta()
             "owner query count and fingerprints are immutable at runtime");
 }
 
+void test_common_neumann_rhs_uses_native_parameters_and_surface_weights()
+{
+    LPrismFitFixture3D fixture;
+    const Eigen::VectorXd first = make_common_neumann_augmented_rhs_3d(
+        fixture.geometry.native_surface, fixture.cloud);
+    const Eigen::VectorXd second = make_common_neumann_augmented_rhs_3d(
+        fixture.geometry.native_surface, fixture.cloud);
+    const Eigen::VectorXd third = make_common_neumann_augmented_rhs_3d(
+        fixture.geometry.native_surface, fixture.cloud);
+    const int size = static_cast<int>(fixture.cloud.dofs.size());
+    require(first.size() == size + 1 && first[size] == 0.0,
+            "common Neumann RHS has one exactly-zero augmented tail");
+    require((first.array() == second.array()).all()
+                && (first.array() == third.array()).all(),
+            "all three routes receive the identical deterministic RHS");
+    require(std::abs(surface_weighted_mean(
+                fixture.cloud, first.head(size))) <= 5.0e-13,
+            "common Neumann RHS is surface-weighted demeaned");
+    double weighted_square_sum = 0.0;
+    double weight_sum = 0.0;
+    for (int q = 0; q < size; ++q) {
+        const double weight =
+            fixture.cloud.dofs[static_cast<std::size_t>(q)].weight;
+        weighted_square_sum += weight * first[q] * first[q];
+        weight_sum += weight;
+    }
+    require(std::abs(std::sqrt(weighted_square_sum / weight_sum) - 1.0)
+                <= 5.0e-13,
+            "common Neumann RHS has unit surface-weighted RMS");
+
+    Eigen::VectorXd expected(size);
+    const double pi = std::acos(-1.0);
+    for (int q = 0; q < size; ++q) {
+        const SurfaceDof& dof =
+            fixture.cloud.dofs[static_cast<std::size_t>(q)];
+        const auto& patch = fixture.geometry.native_surface.patches[
+            static_cast<std::size_t>(dof.patch_id)];
+        const double uhat = (dof.u - patch.domain_start_u())
+            / (patch.domain_end_u() - patch.domain_start_u());
+        const double vhat = (dof.v - patch.domain_start_v())
+            / (patch.domain_end_v() - patch.domain_start_v());
+        expected[q] = std::sin(2.0 * pi * uhat
+                               + 0.37 * static_cast<double>(dof.patch_id + 1))
+            + 0.5 * std::cos(2.0 * pi * vhat
+                            - 0.23 * static_cast<double>(dof.patch_id + 1))
+            + 0.25 * std::sin(2.0 * pi * (uhat + vhat));
+    }
+    expected.array() -= surface_weighted_mean(fixture.cloud, expected);
+    weighted_square_sum = 0.0;
+    for (int q = 0; q < size; ++q) {
+        weighted_square_sum +=
+            fixture.cloud.dofs[static_cast<std::size_t>(q)].weight
+            * expected[q] * expected[q];
+    }
+    expected /= std::sqrt(weighted_square_sum / weight_sum);
+    require((first.head(size) - expected).lpNorm<Eigen::Infinity>()
+                <= 5.0e-15,
+            "common Neumann RHS follows the specified native-parameter formula");
+}
+
+void test_detailed_neumann_probe_uses_literal_defect_and_exact_edge_fit()
+{
+    DetailedNeumannRouteFixture3D fixture;
+    auto pipeline = fixture.make_pipeline(
+        app3d::HarmonicCauchyRoute3D::EdgeReconstructedValue);
+    const app3d::RigidTransform3D transform;
+    const NeumannRouteProbe3D probe = run_neumann_route_probe_3d(
+        fixture.grid, fixture.grid_pair, *pipeline,
+        fixture.geometry.native_surface, transform,
+        fixture.neighborhoods, fixture.h,
+        app3d::HarmonicCauchyRoute3D::EdgeReconstructedValue);
+    const int size = pipeline->surface_size();
+    require(probe.physical_residuals.size()
+                    == static_cast<std::size_t>(probe.physical.iterations + 1)
+                && probe.common.residuals.size()
+                    == static_cast<std::size_t>(probe.common.iterations + 1),
+            "physical and common probes retain iterations+1 residuals");
+    require(probe.density_error.size() == size
+                && probe.exact_equation_defect.size() == size
+                && std::isfinite(probe.exact_mean_row_defect),
+            "detailed probe stores surface-sized density/defect vectors and "
+            "a finite mean-row defect");
+
+    const NeumannManufacturedData3D data =
+        make_neumann_manufactured_data_3d(pipeline->surface(), transform);
+    ExteriorZeroTraceOperator3D op(
+        *pipeline, ExteriorValueRestrictMode3D::JointTricubicCrossingOwner);
+    Eigen::VectorXd exact_augmented = Eigen::VectorXd::Zero(op.problem_size());
+    exact_augmented.head(size) = data.exact_density;
+    Eigen::VectorXd applied;
+    op.apply(exact_augmented, applied);
+    const Eigen::VectorXd literal =
+        applied - op.right_hand_side(data.prescribed_normal_jump);
+    require((probe.exact_equation_defect - literal.head(size))
+                    .lpNorm<Eigen::Infinity>() == 0.0
+                && probe.exact_mean_row_defect == literal[size],
+            "exact-density defect is the literal bordered operator residual");
+
+    const auto exact_fit = pipeline->cauchy_fit().apply(
+        data.exact_density, data.prescribed_normal_jump);
+    const auto& edge_maps = pipeline->cauchy_fit().edge_maps();
+    require(probe.exact_input_edge_values.size()
+                    == static_cast<int>(edge_maps.size())
+                && probe.exact_edge_value_error.size()
+                    == static_cast<int>(edge_maps.size())
+                && probe.exact_edge_quadrature_weights.size()
+                    == static_cast<int>(edge_maps.size())
+                && probe.edge_value_linf.has_value()
+                && probe.edge_value_weighted_rms.has_value(),
+            "shared-edge probe stores exact inputs, errors, native weights, "
+            "and finite metrics");
+    for (int q = 0; q < static_cast<int>(edge_maps.size()); ++q) {
+        const auto& point = edge_maps[static_cast<std::size_t>(q)].point;
+        const double exact =
+            app3d::transformed_manufactured_harmonic_value_3d(
+                transform, point.point) - data.density_mean_shift;
+        require(probe.exact_input_edge_values[q] == exact
+                    && probe.exact_edge_quadrature_weights[q]
+                           == point.quadrature_weight
+                    && probe.exact_edge_value_error[q]
+                           == exact_fit.edge_values[q] - exact,
+                "shared-edge exact comparison uses corrected data and native "
+                "interval_length/cell_count weights");
+    }
+
+    int total_count = 0;
+    for (int bin = 0; bin < 3; ++bin) {
+        const EdgeBinMetrics3D& metrics =
+            probe.bins[static_cast<std::size_t>(bin)];
+        total_count += metrics.count;
+        require(metrics.empty == (metrics.count == 0),
+                "edge bin exposes its empty state explicitly");
+    }
+    require(probe.bins[0].bin == "lt_h"
+                && probe.bins[1].bin == "h_to_2h"
+                && probe.bins[2].bin == "gt_2h"
+                && total_count == size,
+            "edge-distance bins are exact, named, disjoint, and exhaustive");
+    for (const auto& map : pipeline->cauchy_fit().surface_maps()) {
+        require(map.neighborhood_fingerprint == fixture.neighborhoods.fingerprint,
+                "probe route retains the shared neighborhood fingerprint");
+    }
+
+    const Eigen::VectorXd edge_common_rhs = probe.common.right_hand_side;
+    pipeline.reset();
+    auto g1_pipeline = fixture.make_pipeline(
+        app3d::HarmonicCauchyRoute3D::G1ValueG1Normal);
+    const NeumannRouteProbe3D g1_probe = run_neumann_route_probe_3d(
+        fixture.grid, fixture.grid_pair, *g1_pipeline,
+        fixture.geometry.native_surface, transform,
+        fixture.neighborhoods, fixture.h,
+        app3d::HarmonicCauchyRoute3D::G1ValueG1Normal);
+    require(g1_probe.exact_input_edge_values.size() == 0
+                && g1_probe.exact_edge_value_error.size() == 0
+                && g1_probe.exact_edge_quadrature_weights.size() == 0
+                && !g1_probe.edge_value_linf.has_value()
+                && !g1_probe.edge_value_weighted_rms.has_value(),
+            "G1 control stores empty edge vectors and explicit N/A metrics");
+    require((g1_probe.common.right_hand_side.array()
+                == edge_common_rhs.array()).all(),
+            "G1 and shared-edge routes solve the identical common RHS");
+    g1_pipeline.reset();
+
+    auto direct_pipeline = fixture.make_pipeline(
+        app3d::HarmonicCauchyRoute3D::DirectCrossFaceValue);
+    const NeumannRouteProbe3D direct_probe = run_neumann_route_probe_3d(
+        fixture.grid, fixture.grid_pair, *direct_pipeline,
+        fixture.geometry.native_surface, transform,
+        fixture.neighborhoods, fixture.h,
+        app3d::HarmonicCauchyRoute3D::DirectCrossFaceValue);
+    require(direct_probe.exact_input_edge_values.size() == 0
+                && direct_probe.exact_edge_value_error.size() == 0
+                && direct_probe.exact_edge_quadrature_weights.size() == 0
+                && !direct_probe.edge_value_linf.has_value()
+                && !direct_probe.edge_value_weighted_rms.has_value(),
+            "direct control stores empty edge vectors and explicit N/A metrics");
+    require((direct_probe.common.right_hand_side.array()
+                == edge_common_rhs.array()).all(),
+            "direct and shared-edge routes solve the identical common RHS");
+}
+
 } // namespace
 
 int main()
@@ -340,6 +551,8 @@ int main()
         test_legacy_g1_fixture_is_preserved_by_public_fit();
         test_legacy_n16_short_sectors_preserve_requested_and_actual_counts();
         test_owner_pipeline_and_bordered_operator_split_mu_eta();
+        test_common_neumann_rhs_uses_native_parameters_and_surface_weights();
+        test_detailed_neumann_probe_uses_literal_defect_and_exact_edge_fit();
         std::cout << "Neumann exterior value route integration test passed\n";
         return 0;
     } catch (const std::exception& error) {
