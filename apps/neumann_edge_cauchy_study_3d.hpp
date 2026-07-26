@@ -94,6 +94,10 @@ bool neumann_edge_cauchy_residual_history_valid_3d(
     int gmres_iterations,
     double terminal_residual);
 
+bool neumann_edge_cauchy_should_enter_n128_3d(
+    bool coarse_all_pass,
+    bool force_extended);
+
 NeumannEdgeCauchyPairProcessResult3D process_neumann_edge_cauchy_pair_3d(
     int N,
     const std::function<void()>& run_pair,
