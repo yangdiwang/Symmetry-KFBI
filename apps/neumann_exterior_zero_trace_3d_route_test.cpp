@@ -5,6 +5,8 @@
 #undef main
 
 #include <algorithm>
+#include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -541,6 +543,200 @@ void test_detailed_neumann_probe_uses_literal_defect_and_exact_edge_fit()
             "direct and shared-edge routes solve the identical common RHS");
 }
 
+std::string read_text_file(const std::filesystem::path& path)
+{
+    std::ifstream input(path);
+    return std::string(std::istreambuf_iterator<char>(input),
+                       std::istreambuf_iterator<char>());
+}
+
+TwoLevelNeumannStudyRouteRow3D make_shared_writer_fixture_3d()
+{
+    TwoLevelNeumannStudyRouteRow3D row;
+    row.case_id = "synthetic";
+    row.N = 32;
+    row.route = app3d::HarmonicCauchyRoute3D::EdgeReconstructedValue;
+    row.status = "ok";
+    row.physical_iterations = 2;
+    row.common_iterations = 1;
+    row.physical_residuals = {1.0, 0.1, 0.01};
+    row.common_residuals = {1.0, 0.02};
+    row.edge_bins = {{
+        {"lt_h", 2, 1.0, 0.2, 0.1, 0.3, 0.15, false},
+        {"h_to_2h", 3, 2.0, 0.4, 0.2, 0.5, 0.25, false},
+        {"gt_2h", 4, 3.0, 0.6, 0.3, 0.7, 0.35, false}}};
+    row.owner.available = true;
+    row.owner.owner_query_count = 17;
+    row.owner.owner_fingerprint_before = 101;
+    row.owner.owner_fingerprint_after = 101;
+    row.owner.cauchy_fingerprint_before = 202;
+    row.owner.cauchy_fingerprint_after = 202;
+    row.owner.reference_equal = true;
+    row.owner.common_rhs_hash_equal = true;
+    TwoLevelEdgePointDiagnostic3D point;
+    point.connection_id = 5;
+    point.cell_id = 6;
+    point.fraction = 0.25;
+    point.native_parameters = {{0.25, 0.75}};
+    point.native_uv[0] = Eigen::Vector2d(0.25, 0.0);
+    point.native_uv[1] = Eigen::Vector2d(0.75, 0.0);
+    point.point = Eigen::Vector3d(0.25, 0.0, 0.0);
+    point.tangent = Eigen::Vector3d::UnitX();
+    point.sectors = "{{0},{1}}";
+    point.exact_value = 1.25;
+    point.reconstructed_value = 1.20;
+    point.error = -0.05;
+    row.edge_points.push_back(point);
+    TwoLevelEdgeFitDiagnostic3D fit;
+    fit.connection_id = 5;
+    fit.cell_id = 6;
+    fit.value_sector_counts = {{24, 24}};
+    fit.normal_sector_counts = {{14, 14}};
+    fit.value_radius_over_h = 1.1;
+    fit.normal_radius_over_h = 1.2;
+    fit.sigma_max = 2.0;
+    fit.sigma_min = 0.5;
+    fit.condition = 4.0;
+    row.edge_fits.push_back(fit);
+    row.surface_dof_count = 1;
+    row.surface_map_count = 1;
+    row.value_map_count = 1;
+    row.normal_map_count = 1;
+    row.edge_map_count = 1;
+    TwoLevelSurfaceFitDiagnostic3D surfaceFit;
+    surfaceFit.center_dof = 0;
+    surfaceFit.ordinary_value_count = 48;
+    surfaceFit.normal_count = 28;
+    surfaceFit.edge_count = 1;
+    surfaceFit.sigma_min = 0.5;
+    surfaceFit.sigma_max = 2.0;
+    surfaceFit.condition = 4.0;
+    row.surface_fits.push_back(surfaceFit);
+    TwoLevelDofDiagnostic3D dof;
+    dof.dof_id = 0;
+    dof.patch_id = 0;
+    dof.weight = 1.0;
+    row.dofs.push_back(dof);
+    return row;
+}
+
+TwoLevelNeumannStudyRouteRow3D make_failed_writer_fixture_3d(
+    std::size_t index, const std::string& stage)
+{
+    TwoLevelNeumannStudyRouteRow3D row;
+    row.case_id = "failed_" + std::to_string(index);
+    row.N = 32;
+    row.route = index % 2 == 0
+        ? app3d::HarmonicCauchyRoute3D::G1ValueG1Normal
+        : app3d::HarmonicCauchyRoute3D::DirectCrossFaceValue;
+    row.status = "failed";
+    row.failure.stage = stage;
+    row.failure.entity_kind = "surface,center";
+    row.failure.entity_id = static_cast<int>(100 + index);
+    row.failure.connection_id = static_cast<int>(200 + index);
+    row.failure.incident_sectors = {{1, 2}, {3}};
+    row.failure.actual_value_counts = {7, 8};
+    row.failure.actual_normal_counts = {5, 6};
+    row.failure.required_value_count = 48;
+    row.failure.required_normal_count = 28;
+    row.failure.actual_edge_count = 2;
+    row.failure.value_radius_over_h = 1.5;
+    row.failure.normal_radius_over_h = 1.6;
+    row.failure.edge_radius_over_h = 1.7;
+    row.failure.sigma_max = 9.0;
+    row.failure.sigma_min = 0.25;
+    row.failure.condition = 36.0;
+    row.failure.message = std::string("failure, with ")
+        + static_cast<char>(34) + "quoted" + static_cast<char>(34)
+        + " detail";
+    row.edge_bins = {{{"lt_h"}, {"h_to_2h"}, {"gt_2h"}}};
+    return row;
+}
+
+void test_two_level_study_writer_and_schema_audit()
+{
+    const std::filesystem::path root =
+        std::filesystem::current_path() / "task5_writer_test_output";
+    std::error_code error;
+    std::filesystem::remove_all(root, error);
+    TwoLevelNeumannStudyWriter3D writer(root);
+    writer.append(make_shared_writer_fixture_3d());
+    const std::array<std::string, 5> stages{{
+        "first_level", "second_level", "frame", "rank",
+        "unrelated_selection"}};
+    for (std::size_t index = 0; index < stages.size(); ++index)
+        writer.append(make_failed_writer_fixture_3d(index, stages[index]));
+    writer.close();
+
+    for (const std::string& filename : two_level_neumann_study_csv_files_3d()) {
+        const std::string text = read_text_file(root / filename);
+        require(text.rfind("case_id,N,route", 0) == 0,
+                filename + " does not begin with the common key");
+    }
+    const std::string summary = read_text_file(root / "summary.csv");
+    const std::string quoted = std::string(1, static_cast<char>(34))
+        + "failure, with " + std::string(2, static_cast<char>(34))
+        + "quoted" + std::string(2, static_cast<char>(34)) + " detail"
+        + std::string(1, static_cast<char>(34));
+    require(summary.find(quoted) != std::string::npos,
+            "CSV quoting did not preserve commas and quotes");
+    for (const std::string& stage : stages)
+        require(summary.find(stage) != std::string::npos,
+                "structured failure stage did not round-trip: " + stage);
+    for (std::size_t index = 0; index < stages.size(); ++index) {
+        const std::string entity = std::string(1, static_cast<char>(34))
+            + "surface,center" + std::string(1, static_cast<char>(34))
+            + ',' + std::to_string(100 + index) + ','
+            + std::to_string(200 + index);
+        require(summary.find(entity) != std::string::npos,
+                "failure entity/connection IDs did not round-trip");
+    }
+    require(summary.find("{{1;2};{3}}") != std::string::npos
+                && summary.find("{7;8},{5;6},48,28,2")
+                    != std::string::npos
+                && summary.find("1.50000000000000000e+00,")
+                    != std::string::npos
+                && summary.find("1.60000000000000009e+00,")
+                    != std::string::npos
+                && summary.find("1.69999999999999996e+00,")
+                    != std::string::npos
+                && summary.find("9.00000000000000000e+00,")
+                    != std::string::npos
+                && summary.find("2.50000000000000000e-01,")
+                    != std::string::npos
+                && summary.find("3.60000000000000000e+01")
+                    != std::string::npos,
+            "structured sectors/counts/radii/singular extrema/condition "
+            "did not round-trip");
+    const std::string residuals = read_text_file(root / "gmres_residuals.csv");
+    require(residuals.find(",physical,") != std::string::npos
+                && residuals.find(",common,") != std::string::npos,
+            "residual rows do not distinguish physical/common histories");
+    const std::string edgePoints =
+        read_text_file(root / "edge_point_diagnostics.csv");
+    const std::string edgeFits =
+        read_text_file(root / "edge_fit_diagnostics.csv");
+    require(edgePoints.find("synthetic,32,edge_reconstructed_value")
+                    != std::string::npos
+                && edgeFits.find("synthetic,32,edge_reconstructed_value")
+                    != std::string::npos,
+            "successful shared-edge diagnostics are incomplete");
+    require(edgePoints.find("g1_value_g1_normal") == std::string::npos
+                && edgePoints.find("direct_cross_face_value")
+                    == std::string::npos
+                && edgeFits.find("g1_value_g1_normal")
+                    == std::string::npos
+                && edgeFits.find("direct_cross_face_value")
+                    == std::string::npos,
+            "control routes invented edge-point or edge-fit rows");
+    const std::filesystem::path script = std::filesystem::current_path()
+        / "apps/audit_neumann_two_level_edge_cauchy_3d.ps1";
+    require(run_two_level_neumann_schema_audit_3d(script, root) == 0,
+            "valid synthetic study directory failed schema audit");
+    require_schema_negative_mutations_3d(script, root);
+    std::filesystem::remove_all(root, error);
+}
+
 } // namespace
 
 int main()
@@ -553,6 +749,7 @@ int main()
         test_owner_pipeline_and_bordered_operator_split_mu_eta();
         test_common_neumann_rhs_uses_native_parameters_and_surface_weights();
         test_detailed_neumann_probe_uses_literal_defect_and_exact_edge_fit();
+        test_two_level_study_writer_and_schema_audit();
         std::cout << "Neumann exterior value route integration test passed\n";
         return 0;
     } catch (const std::exception& error) {

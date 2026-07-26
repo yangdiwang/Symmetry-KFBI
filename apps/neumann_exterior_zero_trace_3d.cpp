@@ -1738,6 +1738,16 @@ public:
         return result;
     }
 
+    std::size_t cauchy_runtime_geometry_query_count() const noexcept
+    {
+        return cauchy_runtime_geometry_query_count_;
+    }
+
+    std::size_t cauchy_runtime_svd_factorization_count() const noexcept
+    {
+        return cauchy_runtime_svd_factorization_count_;
+    }
+
     HarmonicJetField3D evaluate(
         const Eigen::VectorXd& value_jump,
         const Eigen::VectorXd& normal_jump) const
@@ -1748,6 +1758,10 @@ public:
             [&] {
                 return fit_.apply(value_jump, normal_jump);
             });
+        cauchy_runtime_geometry_query_count_ +=
+            applied.runtime_geometry_query_count;
+        cauchy_runtime_svd_factorization_count_ +=
+            applied.runtime_svd_factorization_count;
         result.coefficients = std::move(applied.coefficients);
         Eigen::VectorXd rhs = Eigen::VectorXd::Zero(grid_.num_dofs());
         profile_phase_3d(
@@ -1786,6 +1800,10 @@ public:
             [&] {
                 return fit_.apply(value_jump, normal_jump);
             });
+        cauchy_runtime_geometry_query_count_ +=
+            applied.runtime_geometry_query_count;
+        cauchy_runtime_svd_factorization_count_ +=
+            applied.runtime_svd_factorization_count;
         return {potential, std::move(applied.coefficients)};
     }
 
@@ -2535,6 +2553,8 @@ private:
         UINT64_C(14695981039346656037);
     double h_ = 0.0;
     app3d::HarmonicCauchyFit3D fit_;
+    mutable std::size_t cauchy_runtime_geometry_query_count_ = 0;
+    mutable std::size_t cauchy_runtime_svd_factorization_count_ = 0;
     std::unique_ptr<app3d::ExteriorOnlyCubicNormalRestrict3D>
         exterior_only_restrict_;
     LaplaceFftBulkSolverZfft3D bulk_;
@@ -4547,6 +4567,7 @@ struct CommonRhsGmresProbe3D {
     bool converged = false;
     int iterations = 0;
     double final_residual = 0.0;
+    double seconds = 0.0;
     std::vector<double> residuals;
     Eigen::VectorXd right_hand_side;
     double rhs_weighted_mean = 0.0;
@@ -4576,8 +4597,683 @@ struct NeumannRouteProbe3D {
     std::optional<double> edge_value_linf;
     std::optional<double> edge_value_weighted_rms;
     double exact_mean_row_defect = 0.0;
+    std::size_t runtime_geometry_query_count = 0;
+    std::size_t runtime_svd_factorization_count = 0;
     std::array<EdgeBinMetrics3D, 3> bins;
 };
+
+struct TwoLevelEdgePointDiagnostic3D {
+    int connection_id = -1;
+    int cell_id = -1;
+    double fraction = 0.0;
+    std::array<double, 2> native_parameters{{0.0, 0.0}};
+    std::array<Eigen::Vector2d, 2> native_uv;
+    Eigen::Vector3d point = Eigen::Vector3d::Zero();
+    Eigen::Vector3d tangent = Eigen::Vector3d::Zero();
+    std::string sectors;
+    double position_mismatch = 0.0;
+    double mapped_tangent_dot = 1.0;
+    double frame_orthogonality_error = 0.0;
+    double frame_determinant = 1.0;
+    double exact_value = 0.0;
+    double reconstructed_value = 0.0;
+    double error = 0.0;
+};
+
+struct TwoLevelEdgeFitDiagnostic3D {
+    int connection_id = -1;
+    int cell_id = -1;
+    std::array<int, 2> value_sector_counts{{0, 0}};
+    std::array<int, 2> normal_sector_counts{{0, 0}};
+    double value_radius_over_h = 0.0;
+    double normal_radius_over_h = 0.0;
+    double sigma_max = 0.0;
+    double sigma_min = 0.0;
+    double condition = 0.0;
+};
+
+struct TwoLevelSurfaceFitDiagnostic3D {
+    int center_dof = -1;
+    int ordinary_value_count = 0;
+    int normal_count = 0;
+    int edge_count = 0;
+    std::string value_sector_patch_ids;
+    std::string value_sector_counts;
+    std::string normal_sector_patch_ids;
+    std::string normal_sector_counts;
+    double value_radius_over_h = 0.0;
+    double normal_radius_over_h = 0.0;
+    double edge_radius_over_h = 0.0;
+    double edge_distance_over_h = 0.0;
+    double sigma_max = 0.0;
+    double sigma_min = 0.0;
+    double condition = 0.0;
+};
+
+struct TwoLevelDofDiagnostic3D {
+    int dof_id = -1;
+    int patch_id = -1;
+    Eigen::Vector3d point = Eigen::Vector3d::Zero();
+    double weight = 0.0;
+    double edge_distance_over_h = 0.0;
+    double density_error = 0.0;
+    double equation_defect = 0.0;
+};
+
+struct TwoLevelOwnerDiagnostic3D {
+    bool available = false;
+    std::size_t owner_query_count = 0;
+    std::uint64_t owner_fingerprint_before = 0;
+    std::uint64_t owner_fingerprint_after = 0;
+    std::uint64_t owner_output_digest_before = 0;
+    std::uint64_t owner_output_digest_after = 0;
+    std::size_t cauchy_geometry_queries = 0;
+    std::size_t cauchy_svd_factorizations = 0;
+    std::size_t runtime_geometry_queries = 0;
+    std::size_t runtime_svd_factorizations = 0;
+    std::uint64_t cauchy_fingerprint_before = 0;
+    std::uint64_t cauchy_fingerprint_after = 0;
+    bool reference_equal = false;
+    bool label_equal = false;
+    bool neighborhood_equal = false;
+    bool common_rhs_hash_equal = false;
+};
+
+struct TwoLevelNeumannStudyRouteRow3D {
+    std::string case_id;
+    int N = 0;
+    app3d::HarmonicCauchyRoute3D route =
+        app3d::HarmonicCauchyRoute3D::G1ValueG1Normal;
+    std::string status = "failed";
+    app3d::HarmonicCauchyFailure3D failure;
+    double h = 0.0;
+    int patch_count = 0;
+    int surface_dof_count = 0;
+    int shared_edge_point_count = 0;
+    int surface_map_count = 0;
+    int value_map_count = 0;
+    int normal_map_count = 0;
+    int edge_map_count = 0;
+    double value_radius_max_over_h = 0.0;
+    double normal_radius_max_over_h = 0.0;
+    double edge_radius_max_over_h = 0.0;
+    double condition_max = 0.0;
+    int physical_iterations = -1;
+    int common_iterations = -1;
+    bool physical_converged = false;
+    bool common_converged = false;
+    double physical_final_residual = 0.0;
+    double common_final_residual = 0.0;
+    double physical_contraction = 0.0;
+    double common_contraction = 0.0;
+    double common_rhs_mean = 0.0;
+    double common_rhs_rms = 0.0;
+    std::uint64_t common_rhs_hash = 0;
+    double density_linf = 0.0;
+    double density_l2 = 0.0;
+    double interior_linf = 0.0;
+    double interior_l2 = 0.0;
+    std::array<std::optional<double>, 4> orders_32_64;
+    std::array<std::optional<double>, 4> orders_64_128;
+    double defect_linf = 0.0;
+    double defect_rms = 0.0;
+    std::optional<double> edge_value_linf;
+    std::optional<double> edge_value_rms;
+    double setup_seconds = 0.0;
+    double fit_seconds = 0.0;
+    double pipeline_seconds = 0.0;
+    double physical_solve_seconds = 0.0;
+    double common_solve_seconds = 0.0;
+    std::size_t neighborhood_geometry_queries = 0;
+    std::uint64_t neighborhood_fingerprint = 0;
+    int label_inside_count = 0;
+    int label_outside_count = 0;
+    std::uint64_t label_fingerprint = 0;
+    TwoLevelOwnerDiagnostic3D owner;
+    std::vector<double> physical_residuals;
+    std::vector<double> common_residuals;
+    std::array<EdgeBinMetrics3D, 3> edge_bins{{
+        {"lt_h"}, {"h_to_2h"}, {"gt_2h"}}};
+    std::vector<TwoLevelEdgePointDiagnostic3D> edge_points;
+    std::vector<TwoLevelEdgeFitDiagnostic3D> edge_fits;
+    std::vector<TwoLevelSurfaceFitDiagnostic3D> surface_fits;
+    std::vector<TwoLevelDofDiagnostic3D> dofs;
+};
+
+const std::array<std::string, 8>& two_level_neumann_study_csv_files_3d()
+{
+    static const std::array<std::string, 8> files{{
+        "summary.csv", "gmres_residuals.csv",
+        "edge_point_diagnostics.csv", "edge_fit_diagnostics.csv",
+        "surface_fit_diagnostics.csv", "dof_diagnostics.csv",
+        "edge_distance_bins.csv", "owner_diagnostics.csv"}};
+    return files;
+}
+
+std::string csv_field_3d(const std::string& value)
+{
+    const char quote = static_cast<char>(34);
+    if (value.find(',') == std::string::npos
+        && value.find(quote) == std::string::npos
+        && value.find(static_cast<char>(10)) == std::string::npos
+        && value.find(static_cast<char>(13)) == std::string::npos)
+        return value;
+    std::string result(1, quote);
+    for (char character : value) {
+        if (character == quote) result.push_back(quote);
+        result.push_back(character);
+    }
+    result.push_back(quote);
+    return result;
+}
+
+template <class T>
+std::string joined_values_3d(const std::vector<T>& values)
+{
+    std::ostringstream stream;
+    stream << '{';
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        if (index != 0) stream << ';';
+        stream << values[index];
+    }
+    stream << '}';
+    return stream.str();
+}
+
+std::string joined_sectors_3d(
+    const std::vector<std::vector<int>>& sectors)
+{
+    std::ostringstream stream;
+    stream << '{';
+    for (std::size_t index = 0; index < sectors.size(); ++index) {
+        if (index != 0) stream << ';';
+        stream << joined_values_3d(sectors[index]);
+    }
+    stream << '}';
+    return stream.str();
+}
+
+const char* csv_bool_3d(bool value) noexcept
+{
+    return value ? "1" : "0";
+}
+
+std::string csv_optional_3d(const std::optional<double>& value)
+{
+    if (!value.has_value()) return "NA";
+    std::ostringstream stream;
+    stream << std::scientific << std::setprecision(17) << *value;
+    return stream.str();
+}
+
+class TwoLevelNeumannStudyWriter3D {
+public:
+    explicit TwoLevelNeumannStudyWriter3D(
+        const std::filesystem::path& output_directory);
+    void append(const TwoLevelNeumannStudyRouteRow3D& row);
+    void close();
+
+private:
+    enum File : std::size_t {
+        Summary, Residuals, EdgePoints, EdgeFits,
+        SurfaceFits, Dofs, Bins, Owner
+    };
+    void append_failure_fields(
+        std::ostream& stream,
+        const app3d::HarmonicCauchyFailure3D& failure) const;
+    void flush_all();
+    std::array<std::ofstream, 8> streams_;
+    bool closed_ = false;
+};
+
+TwoLevelNeumannStudyWriter3D::TwoLevelNeumannStudyWriter3D(
+    const std::filesystem::path& output_directory)
+{
+    std::filesystem::create_directories(output_directory);
+    const auto& files = two_level_neumann_study_csv_files_3d();
+    for (std::size_t index = 0; index < files.size(); ++index) {
+        streams_[index].open(output_directory / files[index],
+            std::ios::out | std::ios::trunc);
+        streams_[index] << std::scientific << std::setprecision(17);
+        if (!streams_[index])
+            throw std::system_error(
+                std::make_error_code(std::errc::io_error), files[index]);
+    }
+    streams_[Summary]
+        << "case_id,N,route,status,h,patch_count,surface_dof_count,"
+           "shared_edge_point_count,physical_converged,physical_iterations,"
+           "physical_final_residual,physical_contraction,common_converged,"
+           "common_iterations,common_final_residual,common_contraction,"
+           "common_rhs_mean,common_rhs_rms,common_rhs_hash,density_linf,"
+           "density_l2,interior_linf,interior_l2,density_linf_order_32_64,"
+           "density_l2_order_32_64,interior_linf_order_32_64,"
+           "interior_l2_order_32_64,density_linf_order_64_128,"
+           "density_l2_order_64_128,interior_linf_order_64_128,"
+           "interior_l2_order_64_128,"
+           "defect_linf,defect_rms,edge_value_linf,edge_value_rms,"
+           "setup_seconds,fit_seconds,pipeline_seconds,physical_solve_seconds,"
+           "common_solve_seconds,neighborhood_geometry_queries,"
+           "cauchy_geometry_queries,cauchy_svd_factorizations,"
+           "runtime_geometry_queries,runtime_svd_factorizations,"
+           "cauchy_fingerprint_before,cauchy_fingerprint_after,"
+           "owner_fingerprint_before,owner_fingerprint_after,"
+           "label_inside_count,label_outside_count,label_fingerprint,"
+           "neighborhood_fingerprint,reference_equal,label_equal,"
+           "neighborhood_equal,common_rhs_hash_equal,surface_map_count,"
+           "value_map_count,normal_map_count,edge_map_count,"
+           "value_radius_max_over_h,normal_radius_max_over_h,"
+           "edge_radius_max_over_h,condition_max,failure_stage,"
+           "failure_message,failure_entity_kind,failure_entity_id,"
+           "failure_connection_id,failure_incident_sectors,"
+           "failure_actual_value_counts,failure_actual_normal_counts,"
+           "failure_required_value_count,failure_required_normal_count,"
+           "failure_actual_edge_count,failure_value_radius_over_h,"
+           "failure_normal_radius_over_h,failure_edge_radius_over_h,"
+           "failure_sigma_max,failure_sigma_min,failure_condition"
+        << '\n';
+    streams_[Residuals]
+        << "case_id,N,route,rhs_kind,iteration,relative_residual" << '\n';
+    streams_[EdgePoints]
+        << "case_id,N,route,connection_id,cell_id,fraction,native_parameter_0,"
+           "native_parameter_1,native_u_0,native_v_0,native_u_1,native_v_1,"
+           "point_x,point_y,point_z,tangent_x,tangent_y,tangent_z,sectors,"
+           "position_mismatch,mapped_tangent_dot,frame_orthogonality_error,"
+           "frame_determinant,exact_value,reconstructed_value,error"
+        << '\n';
+    streams_[EdgeFits]
+        << "case_id,N,route,connection_id,cell_id,value_sector_0_count,"
+           "value_sector_1_count,normal_sector_0_count,normal_sector_1_count,"
+           "value_radius_over_h,normal_radius_over_h,sigma_max,sigma_min,condition"
+        << '\n';
+    streams_[SurfaceFits]
+        << "case_id,N,route,center_dof,ordinary_value_count,normal_count,"
+           "edge_count,value_sector_patch_ids,value_sector_counts,"
+           "normal_sector_patch_ids,normal_sector_counts,value_radius_over_h,"
+           "normal_radius_over_h,edge_radius_over_h,edge_distance_over_h,"
+           "sigma_max,sigma_min,condition" << '\n';
+    streams_[Dofs]
+        << "case_id,N,route,dof_id,patch_id,point_x,point_y,point_z,weight,"
+           "edge_distance_over_h,density_error,equation_defect" << '\n';
+    streams_[Bins]
+        << "case_id,N,route,distance_bin,status,count,weight_sum,density_linf,"
+           "density_weighted_rms,defect_linf,defect_weighted_rms,empty,"
+           "failure_stage,failure_message,failure_entity_kind,"
+           "failure_entity_id,failure_connection_id,failure_incident_sectors,"
+           "failure_actual_value_counts,failure_actual_normal_counts,"
+           "failure_required_value_count,failure_required_normal_count,"
+           "failure_actual_edge_count,failure_value_radius_over_h,"
+           "failure_normal_radius_over_h,failure_edge_radius_over_h,"
+           "failure_sigma_max,failure_sigma_min,failure_condition" << '\n';
+    streams_[Owner]
+        << "case_id,N,route,status,available,owner_query_count,"
+           "owner_fingerprint_before,owner_fingerprint_after,"
+           "owner_output_digest_before,owner_output_digest_after,"
+           "cauchy_geometry_queries,cauchy_svd_factorizations,"
+           "runtime_geometry_queries,runtime_svd_factorizations,"
+           "cauchy_fingerprint_before,cauchy_fingerprint_after,"
+           "reference_equal,label_equal,neighborhood_equal,"
+           "common_rhs_hash_equal,failure_stage,failure_message,"
+           "failure_entity_kind,failure_entity_id,failure_connection_id,"
+           "failure_incident_sectors,failure_actual_value_counts,"
+           "failure_actual_normal_counts,failure_required_value_count,"
+           "failure_required_normal_count,failure_actual_edge_count,"
+           "failure_value_radius_over_h,failure_normal_radius_over_h,"
+           "failure_edge_radius_over_h,failure_sigma_max,failure_sigma_min,"
+           "failure_condition" << '\n';
+    flush_all();
+}
+
+void TwoLevelNeumannStudyWriter3D::append_failure_fields(
+    std::ostream& stream,
+    const app3d::HarmonicCauchyFailure3D& failure) const
+{
+    if (failure.stage.empty()) {
+        for (int field = 0; field < 17; ++field) stream << ",NA";
+        return;
+    }
+    stream << ',' << csv_field_3d(failure.stage)
+           << ',' << csv_field_3d(failure.message);
+    if (failure.entity_kind.empty()) {
+        for (int field = 0; field < 15; ++field) stream << ",NA";
+        return;
+    }
+    stream << ',' << csv_field_3d(failure.entity_kind)
+           << ',' << failure.entity_id
+           << ',' << failure.connection_id
+           << ',' << csv_field_3d(joined_sectors_3d(
+                          failure.incident_sectors))
+           << ',' << csv_field_3d(joined_values_3d(
+                          failure.actual_value_counts))
+           << ',' << csv_field_3d(joined_values_3d(
+                          failure.actual_normal_counts))
+           << ',' << failure.required_value_count
+           << ',' << failure.required_normal_count
+           << ',' << failure.actual_edge_count
+           << ',' << failure.value_radius_over_h
+           << ',' << failure.normal_radius_over_h
+           << ',' << failure.edge_radius_over_h
+           << ',' << failure.sigma_max
+           << ',' << failure.sigma_min
+           << ',' << failure.condition;
+}
+
+void TwoLevelNeumannStudyWriter3D::flush_all()
+{
+    for (auto& stream : streams_) {
+        stream.flush();
+        if (!stream)
+            throw std::system_error(
+                std::make_error_code(std::errc::io_error),
+                "two-level Neumann study CSV flush");
+    }
+}
+
+void TwoLevelNeumannStudyWriter3D::close()
+{
+    if (closed_) return;
+    flush_all();
+    for (auto& stream : streams_) stream.close();
+    closed_ = true;
+}
+
+void TwoLevelNeumannStudyWriter3D::append(
+    const TwoLevelNeumannStudyRouteRow3D& row)
+{
+    if (closed_)
+        throw std::logic_error("cannot append to a closed study writer");
+    if (row.case_id.empty() || row.N <= 0
+        || (row.status != "ok" && row.status != "failed")) {
+        throw std::invalid_argument("invalid two-level Neumann study row");
+    }
+    const std::string route = harmonic_cauchy_route_name_3d(row.route);
+    const auto key = [&](std::ostream& stream) {
+        stream << csv_field_3d(row.case_id) << ',' << row.N
+               << ',' << route;
+    };
+    const bool ok = row.status == "ok";
+    key(streams_[Summary]);
+    streams_[Summary]
+        << ',' << row.status << ',' << row.h << ',' << row.patch_count
+        << ',' << row.surface_dof_count << ',' << row.shared_edge_point_count;
+    if (ok) {
+        streams_[Summary]
+            << ',' << csv_bool_3d(row.physical_converged)
+            << ',' << row.physical_iterations
+            << ',' << row.physical_final_residual
+            << ',' << row.physical_contraction
+            << ',' << csv_bool_3d(row.common_converged)
+            << ',' << row.common_iterations
+            << ',' << row.common_final_residual
+            << ',' << row.common_contraction
+            << ',' << row.common_rhs_mean
+            << ',' << row.common_rhs_rms
+            << ',' << row.common_rhs_hash
+            << ',' << row.density_linf
+            << ',' << row.density_l2
+            << ',' << row.interior_linf
+            << ',' << row.interior_l2
+            << ',' << csv_optional_3d(row.orders_32_64[0])
+            << ',' << csv_optional_3d(row.orders_32_64[1])
+            << ',' << csv_optional_3d(row.orders_32_64[2])
+            << ',' << csv_optional_3d(row.orders_32_64[3])
+            << ',' << csv_optional_3d(row.orders_64_128[0])
+            << ',' << csv_optional_3d(row.orders_64_128[1])
+            << ',' << csv_optional_3d(row.orders_64_128[2])
+            << ',' << csv_optional_3d(row.orders_64_128[3])
+            << ',' << row.defect_linf
+            << ',' << row.defect_rms
+            << ',' << csv_optional_3d(row.edge_value_linf)
+            << ',' << csv_optional_3d(row.edge_value_rms)
+            << ',' << row.setup_seconds
+            << ',' << row.fit_seconds
+            << ',' << row.pipeline_seconds
+            << ',' << row.physical_solve_seconds
+            << ',' << row.common_solve_seconds
+            << ',' << row.neighborhood_geometry_queries
+            << ',' << row.owner.cauchy_geometry_queries
+            << ',' << row.owner.cauchy_svd_factorizations
+            << ',' << row.owner.runtime_geometry_queries
+            << ',' << row.owner.runtime_svd_factorizations
+            << ',' << row.owner.cauchy_fingerprint_before
+            << ',' << row.owner.cauchy_fingerprint_after
+            << ',' << row.owner.owner_fingerprint_before
+            << ',' << row.owner.owner_fingerprint_after
+            << ',' << row.label_inside_count
+            << ',' << row.label_outside_count
+            << ',' << row.label_fingerprint
+            << ',' << row.neighborhood_fingerprint
+            << ',' << csv_bool_3d(row.owner.reference_equal)
+            << ',' << csv_bool_3d(row.owner.label_equal)
+            << ',' << csv_bool_3d(row.owner.neighborhood_equal)
+            << ',' << csv_bool_3d(row.owner.common_rhs_hash_equal)
+            << ',' << row.surface_map_count
+            << ',' << row.value_map_count
+            << ',' << row.normal_map_count
+            << ',' << row.edge_map_count
+            << ',' << row.value_radius_max_over_h
+            << ',' << row.normal_radius_max_over_h
+            << ',' << row.edge_radius_max_over_h
+            << ',' << row.condition_max;
+    } else {
+        for (int field = 0; field < 57; ++field)
+            streams_[Summary] << ",NA";
+    }
+    append_failure_fields(streams_[Summary], row.failure);
+    streams_[Summary] << '\n';
+
+    const auto append_residuals = [&](const char* kind,
+                                      const std::vector<double>& values) {
+        for (std::size_t iteration = 0; iteration < values.size(); ++iteration) {
+            key(streams_[Residuals]);
+            streams_[Residuals] << ',' << kind << ',' << iteration
+                                << ',' << values[iteration] << '\n';
+        }
+    };
+    append_residuals("physical", row.physical_residuals);
+    append_residuals("common", row.common_residuals);
+
+    if (row.route != app3d::HarmonicCauchyRoute3D::EdgeReconstructedValue
+        && (!row.edge_points.empty() || !row.edge_fits.empty())) {
+        throw std::logic_error("control route has invented shared-edge rows");
+    }
+    for (const auto& point : row.edge_points) {
+        key(streams_[EdgePoints]);
+        streams_[EdgePoints]
+            << ',' << point.connection_id << ',' << point.cell_id
+            << ',' << point.fraction
+            << ',' << point.native_parameters[0]
+            << ',' << point.native_parameters[1]
+            << ',' << point.native_uv[0].x()
+            << ',' << point.native_uv[0].y()
+            << ',' << point.native_uv[1].x()
+            << ',' << point.native_uv[1].y()
+            << ',' << point.point.x() << ',' << point.point.y()
+            << ',' << point.point.z() << ',' << point.tangent.x()
+            << ',' << point.tangent.y() << ',' << point.tangent.z()
+            << ',' << csv_field_3d(point.sectors)
+            << ',' << point.position_mismatch
+            << ',' << point.mapped_tangent_dot
+            << ',' << point.frame_orthogonality_error
+            << ',' << point.frame_determinant
+            << ',' << point.exact_value
+            << ',' << point.reconstructed_value
+            << ',' << point.error << '\n';
+    }
+    for (const auto& fit : row.edge_fits) {
+        key(streams_[EdgeFits]);
+        streams_[EdgeFits]
+            << ',' << fit.connection_id << ',' << fit.cell_id
+            << ',' << fit.value_sector_counts[0]
+            << ',' << fit.value_sector_counts[1]
+            << ',' << fit.normal_sector_counts[0]
+            << ',' << fit.normal_sector_counts[1]
+            << ',' << fit.value_radius_over_h
+            << ',' << fit.normal_radius_over_h
+            << ',' << fit.sigma_max << ',' << fit.sigma_min
+            << ',' << fit.condition << '\n';
+    }
+    for (const auto& fit : row.surface_fits) {
+        key(streams_[SurfaceFits]);
+        streams_[SurfaceFits]
+            << ',' << fit.center_dof
+            << ',' << fit.ordinary_value_count
+            << ',' << fit.normal_count << ',' << fit.edge_count
+            << ',' << csv_field_3d(fit.value_sector_patch_ids)
+            << ',' << csv_field_3d(fit.value_sector_counts)
+            << ',' << csv_field_3d(fit.normal_sector_patch_ids)
+            << ',' << csv_field_3d(fit.normal_sector_counts)
+            << ',' << fit.value_radius_over_h
+            << ',' << fit.normal_radius_over_h
+            << ',' << fit.edge_radius_over_h
+            << ',' << fit.edge_distance_over_h
+            << ',' << fit.sigma_max << ',' << fit.sigma_min
+            << ',' << fit.condition << '\n';
+    }
+    for (const auto& dof : row.dofs) {
+        key(streams_[Dofs]);
+        streams_[Dofs]
+            << ',' << dof.dof_id << ',' << dof.patch_id
+            << ',' << dof.point.x() << ',' << dof.point.y()
+            << ',' << dof.point.z() << ',' << dof.weight
+            << ',' << dof.edge_distance_over_h
+            << ',' << dof.density_error
+            << ',' << dof.equation_defect << '\n';
+    }
+
+    const std::array<std::string, 3> expected_bins{{
+        "lt_h", "h_to_2h", "gt_2h"}};
+    for (std::size_t index = 0; index < row.edge_bins.size(); ++index) {
+        const auto& bin = row.edge_bins[index];
+        if (bin.bin != expected_bins[index])
+            throw std::logic_error("study row has a missing or reordered bin");
+        key(streams_[Bins]);
+        streams_[Bins] << ',' << bin.bin << ',' << row.status;
+        if (ok) {
+            streams_[Bins]
+                << ',' << bin.count << ',' << bin.weight_sum
+                << ',' << bin.density_linf
+                << ',' << bin.density_weighted_rms
+                << ',' << bin.defect_linf
+                << ',' << bin.defect_weighted_rms
+                << ',' << csv_bool_3d(bin.empty);
+        } else {
+            streams_[Bins] << ",NA,NA,NA,NA,NA,NA,NA";
+        }
+        append_failure_fields(streams_[Bins], row.failure);
+        streams_[Bins] << '\n';
+    }
+
+    key(streams_[Owner]);
+    streams_[Owner] << ',' << row.status;
+    if (ok) {
+        streams_[Owner]
+            << ',' << csv_bool_3d(row.owner.available)
+            << ',' << row.owner.owner_query_count
+            << ',' << row.owner.owner_fingerprint_before
+            << ',' << row.owner.owner_fingerprint_after
+            << ',' << row.owner.owner_output_digest_before
+            << ',' << row.owner.owner_output_digest_after
+            << ',' << row.owner.cauchy_geometry_queries
+            << ',' << row.owner.cauchy_svd_factorizations
+            << ',' << row.owner.runtime_geometry_queries
+            << ',' << row.owner.runtime_svd_factorizations
+            << ',' << row.owner.cauchy_fingerprint_before
+            << ',' << row.owner.cauchy_fingerprint_after
+            << ',' << csv_bool_3d(row.owner.reference_equal)
+            << ',' << csv_bool_3d(row.owner.label_equal)
+            << ',' << csv_bool_3d(row.owner.neighborhood_equal)
+            << ',' << csv_bool_3d(row.owner.common_rhs_hash_equal);
+    } else {
+        for (int field = 0; field < 16; ++field)
+            streams_[Owner] << ",NA";
+    }
+    append_failure_fields(streams_[Owner], row.failure);
+    streams_[Owner] << '\n';
+    flush_all();
+}
+
+int run_two_level_neumann_schema_audit_3d(
+    const std::filesystem::path& script,
+    const std::filesystem::path& output_directory)
+{
+    std::ostringstream command;
+    command << "powershell.exe -NoProfile -ExecutionPolicy Bypass -File "
+            << static_cast<char>(34) << script.string()
+            << static_cast<char>(34) << " -OutputDirectory "
+            << static_cast<char>(34) << output_directory.string()
+            << static_cast<char>(34)
+            << " -ExpectedLevels 32 -AllowNumericalFailure -SchemaOnly";
+    return std::system(command.str().c_str());
+}
+
+std::string read_study_test_file_3d(const std::filesystem::path& path)
+{
+    std::ifstream input(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(input),
+                       std::istreambuf_iterator<char>());
+}
+
+void write_study_test_file_3d(
+    const std::filesystem::path& path, const std::string& text)
+{
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output << text;
+}
+
+void require_schema_negative_mutations_3d(
+    const std::filesystem::path& script,
+    const std::filesystem::path& source)
+{
+    const auto exercise = [&](const std::string& name,
+                              const std::function<void(
+                                  const std::filesystem::path&)>& mutate) {
+        const std::filesystem::path destination =
+            source.parent_path() / (source.filename().string() + '_' + name);
+        std::error_code error;
+        std::filesystem::remove_all(destination, error);
+        std::filesystem::copy(source, destination,
+            std::filesystem::copy_options::recursive);
+        mutate(destination);
+        if (run_two_level_neumann_schema_audit_3d(script, destination) == 0)
+            throw std::runtime_error(
+                "schema audit accepted negative mutation: " + name);
+        std::filesystem::remove_all(destination, error);
+    };
+    exercise("duplicate", [](const std::filesystem::path& directory) {
+        const auto path = directory / "summary.csv";
+        std::string text = read_study_test_file_3d(path);
+        const std::size_t first = text.find(static_cast<char>(10));
+        const std::size_t second = text.find(static_cast<char>(10), first + 1);
+        text.append(text.substr(first + 1, second - first));
+        write_study_test_file_3d(path, text);
+    });
+    exercise("missing_failure_field", [](
+        const std::filesystem::path& directory) {
+        const auto path = directory / "summary.csv";
+        std::string text = read_study_test_file_3d(path);
+        const std::string field = "failure_condition";
+        text.replace(text.find(field), field.size(), "removed_condition");
+        write_study_test_file_3d(path, text);
+    });
+    exercise("missing_bin", [](const std::filesystem::path& directory) {
+        const auto path = directory / "edge_distance_bins.csv";
+        std::string text = read_study_test_file_3d(path);
+        const std::size_t last = text.find_last_of(static_cast<char>(10));
+        const std::size_t previous = text.find_last_of(
+            static_cast<char>(10), last - 1);
+        text.erase(previous + 1);
+        write_study_test_file_3d(path, text);
+    });
+    exercise("history_mismatch", [](const std::filesystem::path& directory) {
+        const auto path = directory / "gmres_residuals.csv";
+        std::string text = read_study_test_file_3d(path);
+        const std::size_t last = text.find_last_of(static_cast<char>(10));
+        const std::size_t previous = text.find_last_of(
+            static_cast<char>(10), last - 1);
+        text.erase(previous + 1);
+        write_study_test_file_3d(path, text);
+    });
+}
 
 double surface_weighted_rms_3d(const SurfaceDofCloud& surface,
                                const Eigen::VectorXd& values)
@@ -4622,7 +5318,10 @@ CommonRhsGmresProbe3D run_common_neumann_gmres_3d(
     }
     Eigen::VectorXd unknown = Eigen::VectorXd::Zero(op.problem_size());
     GMRES gmres(80, 2.0e-10, 80);
+    const auto solve_start = std::chrono::steady_clock::now();
     result.iterations = gmres.solve(op, augmented_rhs, unknown);
+    result.seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - solve_start).count();
     result.converged = gmres.converged();
     result.residuals = gmres.residuals();
     result.final_residual = result.residuals.empty()
@@ -4748,6 +5447,10 @@ NeumannRouteProbe3D run_neumann_route_probe_3d(
     if (route == app3d::HarmonicCauchyRoute3D::EdgeReconstructedValue) {
         const auto exact_fit = pipeline.cauchy_fit().apply(
             data.exact_density, data.prescribed_normal_jump);
+        result.runtime_geometry_query_count +=
+            exact_fit.runtime_geometry_query_count;
+        result.runtime_svd_factorization_count +=
+            exact_fit.runtime_svd_factorization_count;
         const auto& edge_maps = pipeline.cauchy_fit().edge_maps();
         const int edge_count = static_cast<int>(edge_maps.size());
         result.exact_input_edge_values.resize(edge_count);
@@ -4783,6 +5486,10 @@ NeumannRouteProbe3D run_neumann_route_probe_3d(
         result.edge_value_linf.reset();
         result.edge_value_weighted_rms.reset();
     }
+    result.runtime_geometry_query_count +=
+        pipeline.cauchy_runtime_geometry_query_count();
+    result.runtime_svd_factorization_count +=
+        pipeline.cauchy_runtime_svd_factorization_count();
     return result;
 }
 
@@ -9765,6 +10472,500 @@ void write_neumann_edge_cauchy_checkpoints_3d(
                evaluation.acceptance.overall_pass) << '\n';
 }
 
+std::uint64_t stable_int_vector_hash_3d(const std::vector<int>& values)
+{
+    std::uint64_t hash = UINT64_C(14695981039346656037);
+    constexpr std::uint64_t prime = UINT64_C(1099511628211);
+    for (int value : values) {
+        const std::uint32_t bits = static_cast<std::uint32_t>(value);
+        for (int byte = 0; byte < 4; ++byte) {
+            hash ^= static_cast<std::uint8_t>(bits >> (8 * byte));
+            hash *= prime;
+        }
+    }
+    return hash;
+}
+
+std::uint64_t stable_double_vector_hash_3d(const Eigen::VectorXd& values)
+{
+    std::uint64_t hash = UINT64_C(14695981039346656037);
+    constexpr std::uint64_t prime = UINT64_C(1099511628211);
+    for (int index = 0; index < values.size(); ++index) {
+        std::uint64_t bits = 0;
+        std::memcpy(&bits, std::addressof(values[index]), sizeof(bits));
+        for (int byte = 0; byte < 8; ++byte) {
+            hash ^= static_cast<std::uint8_t>(bits >> (8 * byte));
+            hash *= prime;
+        }
+    }
+    return hash;
+}
+
+double vector_weighted_rms_3d(
+    const SurfaceDofCloud& cloud, const Eigen::VectorXd& values)
+{
+    return surface_weighted_rms_3d(cloud, values);
+}
+
+void fill_two_level_fit_diagnostics_3d(
+    TwoLevelNeumannStudyRouteRow3D& row,
+    const PanelCenterHarmonicJetKFBI3D& pipeline,
+    const NeumannRouteProbe3D& probe,
+    const NativeNurbsSurface3D& native_surface,
+    const app3d::SurfaceNonG1EdgeNeighborhoodSet3D& neighborhoods)
+{
+    const auto& fit = pipeline.cauchy_fit();
+    const auto& edgeMaps = fit.edge_maps();
+    row.edge_map_count = static_cast<int>(edgeMaps.size());
+    for (std::size_t index = 0; index < edgeMaps.size(); ++index) {
+        const auto& map = edgeMaps[index];
+        row.value_radius_max_over_h = std::max(
+            row.value_radius_max_over_h, map.value_radius_over_h);
+        row.normal_radius_max_over_h = std::max(
+            row.normal_radius_max_over_h, map.normal_radius_over_h);
+        row.condition_max = std::max(row.condition_max, map.condition);
+        const auto& point = map.point;
+        TwoLevelEdgePointDiagnostic3D diagnostic;
+        diagnostic.connection_id = point.connection_id;
+        diagnostic.cell_id = point.cell_id;
+        diagnostic.fraction = point.fraction;
+        diagnostic.native_parameters = point.native_parameters;
+        diagnostic.native_uv = point.native_uv;
+        diagnostic.point = point.point;
+        diagnostic.tangent = point.tangent;
+        diagnostic.sectors = joined_sectors_3d({
+            point.sector_patch_ids[0], point.sector_patch_ids[1]});
+        const auto& connection = native_surface.geometric_connections[
+            static_cast<std::size_t>(point.connection_id)];
+        const auto firstDerivatives = native_surface.patches[
+            static_cast<std::size_t>(connection.first.patch)]
+                .evaluate_with_derivatives(
+                    point.native_uv[0].x(), point.native_uv[0].y());
+        const auto secondDerivatives = native_surface.patches[
+            static_cast<std::size_t>(connection.second.patch)]
+                .evaluate_with_derivatives(
+                    point.native_uv[1].x(), point.native_uv[1].y());
+        diagnostic.position_mismatch =
+            (firstDerivatives.point - secondDerivatives.point).norm();
+        const auto edgeTangent = [](const auto& derivatives,
+                                    geometry3d::NurbsPatchEdge3D edge) {
+            return edge == geometry3d::NurbsPatchEdge3D::UMin
+                    || edge == geometry3d::NurbsPatchEdge3D::UMax
+                ? derivatives.dv : derivatives.du;
+        };
+        Eigen::Vector3d firstTangent =
+            (connection.first.end - connection.first.begin)
+            * edgeTangent(firstDerivatives, connection.first.edge);
+        Eigen::Vector3d secondTangent =
+            (connection.reversed ? -1.0 : 1.0)
+            * (connection.second.end - connection.second.begin)
+            * edgeTangent(secondDerivatives, connection.second.edge);
+        diagnostic.mapped_tangent_dot =
+            firstTangent.normalized().dot(secondTangent.normalized());
+        diagnostic.frame_orthogonality_error =
+            (point.frame.transpose() * point.frame - Eigen::Matrix3d::Identity())
+                .norm();
+        diagnostic.frame_determinant = point.frame.determinant();
+        diagnostic.exact_value = probe.exact_input_edge_values[
+            static_cast<int>(index)];
+        diagnostic.error = probe.exact_edge_value_error[
+            static_cast<int>(index)];
+        diagnostic.reconstructed_value =
+            diagnostic.exact_value + diagnostic.error;
+        row.edge_points.push_back(std::move(diagnostic));
+
+        TwoLevelEdgeFitDiagnostic3D fitDiagnostic;
+        fitDiagnostic.connection_id = point.connection_id;
+        fitDiagnostic.cell_id = point.cell_id;
+        fitDiagnostic.value_sector_counts = map.value_sector_counts;
+        fitDiagnostic.normal_sector_counts = map.normal_sector_counts;
+        fitDiagnostic.value_radius_over_h = map.value_radius_over_h;
+        fitDiagnostic.normal_radius_over_h = map.normal_radius_over_h;
+        fitDiagnostic.sigma_max = map.sigma_max;
+        fitDiagnostic.sigma_min = map.sigma_min;
+        fitDiagnostic.condition = map.condition;
+        row.edge_fits.push_back(std::move(fitDiagnostic));
+    }
+
+    const auto& surfaceMaps = fit.surface_maps();
+    row.surface_map_count = static_cast<int>(surfaceMaps.size());
+    row.surface_fits.reserve(surfaceMaps.size());
+    row.dofs.reserve(surfaceMaps.size());
+    for (std::size_t index = 0; index < surfaceMaps.size(); ++index) {
+        const auto& map = surfaceMaps[index];
+        if (!map.value_ids.empty()) ++row.value_map_count;
+        if (!map.normal_ids.empty()) ++row.normal_map_count;
+        row.value_radius_max_over_h = std::max(
+            row.value_radius_max_over_h, map.value_radius_over_h);
+        row.normal_radius_max_over_h = std::max(
+            row.normal_radius_max_over_h, map.normal_radius_over_h);
+        row.edge_radius_max_over_h = std::max(
+            row.edge_radius_max_over_h, map.edge_radius_over_h);
+        row.condition_max = std::max(row.condition_max, map.condition);
+        TwoLevelSurfaceFitDiagnostic3D diagnostic;
+        diagnostic.center_dof = static_cast<int>(index);
+        diagnostic.ordinary_value_count = static_cast<int>(map.value_ids.size());
+        diagnostic.normal_count = static_cast<int>(map.normal_ids.size());
+        diagnostic.edge_count = static_cast<int>(map.edge_point_ids.size());
+        diagnostic.value_sector_patch_ids =
+            joined_sectors_3d(map.value_sector_patch_ids);
+        diagnostic.value_sector_counts =
+            joined_values_3d(map.value_sector_counts);
+        diagnostic.normal_sector_patch_ids =
+            joined_sectors_3d(map.normal_sector_patch_ids);
+        diagnostic.normal_sector_counts =
+            joined_values_3d(map.normal_sector_counts);
+        diagnostic.value_radius_over_h = map.value_radius_over_h;
+        diagnostic.normal_radius_over_h = map.normal_radius_over_h;
+        diagnostic.edge_radius_over_h = map.edge_radius_over_h;
+        diagnostic.edge_distance_over_h = map.nearest_edge_distance_over_h;
+        diagnostic.sigma_max = map.sigma_max;
+        diagnostic.sigma_min = map.sigma_min;
+        diagnostic.condition = map.condition;
+        row.surface_fits.push_back(std::move(diagnostic));
+
+        const auto& dof = pipeline.surface().dofs[index];
+        TwoLevelDofDiagnostic3D dofDiagnostic;
+        dofDiagnostic.dof_id = static_cast<int>(index);
+        dofDiagnostic.patch_id = dof.patch_id;
+        dofDiagnostic.point = dof.point;
+        dofDiagnostic.weight = dof.weight;
+        dofDiagnostic.edge_distance_over_h =
+            neighborhoods.centers[index].nearest_distance_over_h;
+        dofDiagnostic.density_error = probe.density_error[
+            static_cast<int>(index)];
+        dofDiagnostic.equation_defect = probe.exact_equation_defect[
+            static_cast<int>(index)];
+        row.dofs.push_back(std::move(dofDiagnostic));
+    }
+}
+
+void fill_two_level_probe_metrics_3d(
+    TwoLevelNeumannStudyRouteRow3D& row,
+    const PanelCenterHarmonicJetKFBI3D& pipeline,
+    const NeumannRouteProbe3D& probe,
+    const NativeNurbsSurface3D& native_surface,
+    const app3d::SurfaceNonG1EdgeNeighborhoodSet3D& neighborhoods)
+{
+    row.status = "ok";
+    row.physical_iterations = probe.physical.iterations;
+    row.common_iterations = probe.common.iterations;
+    row.physical_converged = probe.physical.converged;
+    row.common_converged = probe.common.converged;
+    row.physical_final_residual = probe.physical.gmres_relative_residual;
+    row.common_final_residual = probe.common.final_residual;
+    row.physical_residuals = probe.physical_residuals;
+    row.common_residuals = probe.common.residuals;
+    row.physical_contraction = residual_contraction(
+        row.physical_residuals, 0,
+        row.physical_residuals.empty() ? 0 : row.physical_residuals.size() - 1);
+    row.common_contraction = residual_contraction(
+        row.common_residuals, 0,
+        row.common_residuals.empty() ? 0 : row.common_residuals.size() - 1);
+    row.common_rhs_mean = probe.common.rhs_weighted_mean;
+    row.common_rhs_rms = probe.common.rhs_weighted_rms;
+    row.common_rhs_hash = stable_double_vector_hash_3d(
+        probe.common.right_hand_side);
+    row.density_linf = probe.physical.density_linf;
+    row.density_l2 = probe.physical.density_l2;
+    row.interior_linf = probe.physical.interior_linf;
+    row.interior_l2 = probe.physical.interior_l2;
+    row.defect_linf = probe.exact_equation_defect.lpNorm<Eigen::Infinity>();
+    row.defect_rms = vector_weighted_rms_3d(
+        pipeline.surface(), probe.exact_equation_defect);
+    row.edge_value_linf = probe.edge_value_linf;
+    row.edge_value_rms = probe.edge_value_weighted_rms;
+    row.physical_solve_seconds = probe.physical.seconds;
+    row.edge_bins = probe.bins;
+    fill_two_level_fit_diagnostics_3d(
+        row, pipeline, probe, native_surface, neighborhoods);
+}
+
+TwoLevelNeumannStudyRouteRow3D failed_two_level_route_row_3d(
+    const std::string& case_id, int N,
+    app3d::HarmonicCauchyRoute3D route,
+    const std::string& stage, const std::string& message,
+    double h = 0.0)
+{
+    TwoLevelNeumannStudyRouteRow3D row;
+    row.case_id = case_id;
+    row.N = N;
+    row.route = route;
+    row.status = "failed";
+    row.h = h;
+    row.failure.stage = stage;
+    row.failure.message = message;
+    return row;
+}
+
+std::vector<app3d::DirichletRigidStudyCase3D>
+two_level_neumann_study_cases_3d()
+{
+    const auto all = app3d::make_l_prism_dirichlet_rigid_study_cases_3d();
+    return {
+        rigid_case_by_id_3d(all, "baseline"),
+        rigid_case_by_id_3d(all, "rot_axis123_17deg"),
+        rigid_case_by_id_3d(all, "rot_axis123_17deg_t_xyz_1")};
+}
+
+std::vector<int> normalize_two_level_neumann_levels_3d(
+    std::vector<int> levels)
+{
+    if (levels.empty()) levels = {32, 64, 128};
+    std::sort(levels.begin(), levels.end());
+    levels.erase(std::unique(levels.begin(), levels.end()), levels.end());
+    for (int N : levels) {
+        if (N < 16 || (N & (N - 1)) != 0)
+            throw std::invalid_argument(
+                "two-level Neumann study levels must be powers of two at least 16");
+    }
+    return levels;
+}
+
+int run_neumann_two_level_edge_cauchy_study_3d(std::vector<int> levels)
+{
+    levels = normalize_two_level_neumann_levels_3d(std::move(levels));
+#ifdef KFBIM_APP_OUTPUT_DIR
+    std::filesystem::path outputDirectory =
+        std::filesystem::path(KFBIM_APP_OUTPUT_DIR)
+        / "neumann_two_level_edge_cauchy_3d";
+#else
+    std::filesystem::path outputDirectory =
+        "output/neumann_two_level_edge_cauchy_3d";
+#endif
+    TwoLevelNeumannStudyWriter3D writer(outputDirectory);
+    const auto cases = two_level_neumann_study_cases_3d();
+    const std::array<app3d::HarmonicCauchyRoute3D, 3> routes{{
+        app3d::HarmonicCauchyRoute3D::G1ValueG1Normal,
+        app3d::HarmonicCauchyRoute3D::DirectCrossFaceValue,
+        app3d::HarmonicCauchyRoute3D::EdgeReconstructedValue}};
+    bool numericalFailure = false;
+    std::cout << "KFBI3D two-level Neumann shared-edge Cauchy study levels=";
+    for (std::size_t index = 0; index < levels.size(); ++index) {
+        if (index != 0) std::cout << ',';
+        std::cout << levels[index];
+    }
+    std::cout << " cases=3 routes=3" << '\n';
+
+    for (const auto& studyCase : cases) {
+        std::map<app3d::HarmonicCauchyRoute3D,
+            std::pair<int, std::array<double, 4>>> previousErrors;
+        for (int N : levels) {
+            const double h = kBoxSide / static_cast<double>(N);
+            try {
+                const auto setupStart = std::chrono::steady_clock::now();
+                CartesianGrid3D grid{{kBoxMin, kBoxMin, kBoxMin}, {h, h, h},
+                                     {N, N, N}, DofLayout3D::Node};
+                GeometryBundle geometry = make_geometry(
+                    GeometryKind::LPrism, h, studyCase.transform);
+                auto domain = std::make_shared<const
+                    geometry3d::NurbsCartesianDomain3D>(
+                        grid, geometry.native_surface.geometry_model());
+                GridPair3D gridPair{grid, geometry.correction_interface,
+                    geometry.crossing_interface, domain};
+                SurfaceDofCloud cloud = app3d::make_native_surface_dofs_3d(
+                    geometry.native_surface, h);
+                const auto neighborhoods =
+                    app3d::build_surface_non_g1_edge_neighborhoods_3d(
+                        geometry.native_surface, cloud, h);
+                const double commonSetupSeconds =
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - setupStart).count();
+                const std::vector<int>& labels = domain->labels();
+                const std::uint64_t labelFingerprint =
+                    stable_int_vector_hash_3d(labels);
+                const int insideCount = static_cast<int>(std::count_if(
+                    labels.begin(), labels.end(), [](int label) {
+                        return label > 0;
+                    }));
+                const int outsideCount =
+                    static_cast<int>(labels.size()) - insideCount;
+
+                std::optional<std::uint64_t> referenceOwnerFingerprint;
+                std::optional<std::uint64_t> referenceOwnerDigest;
+                std::optional<std::size_t> referenceOwnerQueries;
+                std::optional<std::uint64_t> referenceRhsHash;
+                for (const auto route : routes) {
+                    TwoLevelNeumannStudyRouteRow3D row;
+                    row.case_id = studyCase.id;
+                    row.N = N;
+                    row.route = route;
+                    row.h = h;
+                    row.patch_count = static_cast<int>(
+                        geometry.native_surface.patches.size());
+                    row.surface_dof_count = static_cast<int>(cloud.dofs.size());
+                    row.setup_seconds = commonSetupSeconds;
+                    row.neighborhood_geometry_queries =
+                        neighborhoods.geometry_query_count;
+                    row.neighborhood_fingerprint = neighborhoods.fingerprint;
+                    row.label_inside_count = insideCount;
+                    row.label_outside_count = outsideCount;
+                    row.label_fingerprint = labelFingerprint;
+                    std::string failureStage = "fit";
+                    try {
+                        const auto fitStart = std::chrono::steady_clock::now();
+                        auto fit = app3d::HarmonicCauchyFit3D::build(
+                            geometry.native_surface, cloud, neighborhoods,
+                            h, route);
+                        row.fit_seconds = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - fitStart).count();
+                        row.shared_edge_point_count = static_cast<int>(
+                            fit.edge_maps().size());
+                        const auto cauchyBefore = fit.audit();
+
+                        failureStage = "pipeline";
+                        const auto pipelineStart = std::chrono::steady_clock::now();
+                        auto pipeline = std::make_unique<
+                            PanelCenterHarmonicJetKFBI3D>(
+                                grid, gridPair, geometry.native_surface,
+                                geometry.correction_triangles,
+                                geometry.geometry_triangles, cloud,
+                                std::move(fit), false,
+                                app3d::RestrictOwnerPreprocessMode3D::
+                                    RegionClosestHybrid);
+                        row.pipeline_seconds = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - pipelineStart).count();
+                        row.owner.available = true;
+                        row.owner.owner_query_count =
+                            pipeline->restrict_owner_geometry_query_count();
+                        row.owner.owner_fingerprint_before =
+                            pipeline->restrict_owner_workload_fingerprint();
+                        row.owner.owner_output_digest_before =
+                            pipeline->restrict_owner_output_digest();
+                        row.owner.cauchy_geometry_queries =
+                            cauchyBefore.geometry_query_count;
+                        row.owner.cauchy_svd_factorizations =
+                            cauchyBefore.svd_factorization_count;
+                        row.owner.cauchy_fingerprint_before =
+                            cauchyBefore.fingerprint;
+                        failureStage = "solve";
+                        const NeumannRouteProbe3D probe =
+                            run_neumann_route_probe_3d(
+                                grid, gridPair, *pipeline,
+                                geometry.native_surface, studyCase.transform,
+                                neighborhoods, h, route);
+                        fill_two_level_probe_metrics_3d(
+                            row, *pipeline, probe, geometry.native_surface,
+                            neighborhoods);
+                        row.common_solve_seconds = probe.common.seconds;
+                        const std::array<double, 4> currentErrors{{
+                            row.density_linf, row.density_l2,
+                            row.interior_linf, row.interior_l2}};
+                        const auto previous = previousErrors.find(route);
+                        if (previous != previousErrors.end()) {
+                            std::array<std::optional<double>, 4>* target = nullptr;
+                            if (previous->second.first == 32 && N == 64)
+                                target = std::addressof(row.orders_32_64);
+                            if (previous->second.first == 64 && N == 128)
+                                target = std::addressof(row.orders_64_128);
+                            if (target != nullptr) {
+                                for (std::size_t metric = 0;
+                                     metric < currentErrors.size(); ++metric) {
+                                    const double coarse =
+                                        previous->second.second[metric];
+                                    const double fine = currentErrors[metric];
+                                    if (coarse > 0.0 && fine > 0.0)
+                                        (*target)[metric] =
+                                            std::log2(coarse / fine);
+                                }
+                            }
+                        }
+                        previousErrors[route] = {N, currentErrors};
+
+                        row.owner.runtime_geometry_queries =
+                            probe.runtime_geometry_query_count;
+                        row.owner.runtime_svd_factorizations =
+                            probe.runtime_svd_factorization_count;
+                        row.owner.cauchy_fingerprint_after =
+                            pipeline->cauchy_fit().audit().fingerprint;
+                        row.owner.owner_fingerprint_after =
+                            pipeline->restrict_owner_workload_fingerprint();
+                        row.owner.owner_output_digest_after =
+                            pipeline->restrict_owner_output_digest();
+                        row.owner.label_equal =
+                            labelFingerprint == stable_int_vector_hash_3d(
+                                domain->labels());
+                        row.owner.neighborhood_equal = std::all_of(
+                            pipeline->cauchy_fit().surface_maps().begin(),
+                            pipeline->cauchy_fit().surface_maps().end(),
+                            [&](const auto& map) {
+                                return map.neighborhood_fingerprint
+                                    == neighborhoods.fingerprint;
+                            });
+
+                        if (route
+                            == app3d::HarmonicCauchyRoute3D::G1ValueG1Normal) {
+                            referenceOwnerFingerprint =
+                                row.owner.owner_fingerprint_before;
+                            referenceOwnerDigest =
+                                row.owner.owner_output_digest_before;
+                            referenceOwnerQueries = row.owner.owner_query_count;
+                            referenceRhsHash = row.common_rhs_hash;
+                        }
+                        row.owner.reference_equal =
+                            referenceOwnerFingerprint.has_value()
+                            && row.owner.owner_fingerprint_before
+                                == *referenceOwnerFingerprint
+                            && row.owner.owner_output_digest_before
+                                == *referenceOwnerDigest
+                            && row.owner.owner_query_count
+                                == *referenceOwnerQueries;
+                        row.owner.common_rhs_hash_equal =
+                            referenceRhsHash.has_value()
+                            && row.common_rhs_hash == *referenceRhsHash;
+                        if (!row.physical_converged || !row.common_converged
+                            || !(row.physical_final_residual < 2.0e-10)
+                            || !(row.common_final_residual < 2.0e-10)
+                            || row.owner.runtime_geometry_queries != 0
+                            || row.owner.runtime_svd_factorizations != 0
+                            || row.owner.cauchy_fingerprint_before
+                                != row.owner.cauchy_fingerprint_after
+                            || row.owner.owner_fingerprint_before
+                                != row.owner.owner_fingerprint_after
+                            || !row.owner.reference_equal
+                            || !row.owner.label_equal
+                            || !row.owner.neighborhood_equal
+                            || !row.owner.common_rhs_hash_equal) {
+                            numericalFailure = true;
+                        }
+                    } catch (const app3d::HarmonicCauchyError3D& error) {
+                        previousErrors.erase(route);
+                        row.status = "failed";
+                        row.failure = error.diagnostic();
+                        if (row.failure.stage.empty())
+                            row.failure.stage = failureStage;
+                        if (row.failure.message.empty())
+                            row.failure.message = error.what();
+                        numericalFailure = true;
+                    } catch (const std::exception& error) {
+                        previousErrors.erase(route);
+                        row.status = "failed";
+                        row.failure.stage = failureStage;
+                        row.failure.message = error.what();
+                        numericalFailure = true;
+                    }
+                    writer.append(row);
+                    std::cout << "[two-level-neumann] case=" << row.case_id
+                              << " N=" << row.N << " route="
+                              << harmonic_cauchy_route_name_3d(row.route)
+                              << " status=" << row.status << '\n';
+                }
+            } catch (const std::exception& error) {
+                previousErrors.clear();
+                numericalFailure = true;
+                for (const auto route : routes) {
+                    writer.append(failed_two_level_route_row_3d(
+                        studyCase.id, N, route, "setup", error.what(), h));
+                }
+            }
+        }
+    }
+    writer.close();
+    std::cout << "Two-level Neumann study output: "
+              << outputDirectory.string() << '\n';
+    return numericalFailure ? 2 : 0;
+}
+
 int run_neumann_edge_cauchy_study_3d(
     std::vector<int> levels,
     bool force_extended)
@@ -10090,8 +11291,9 @@ void print_usage(const char* executable)
            "32; 32,64; or 32,64,128 (default: 32,64,128).\n"
         << "  Neumann-edge-continuity-study levels are the refinement prefixes "
            "32; 32,64; or 32,64,128 (default: 32,64).\n"
-        << "  Neumann-edge-cauchy-study levels are the refinement prefixes "
-           "32; 32,64; or 32,64,128 (default: 32,64).\n"
+        << "  Unforced Neumann-edge-cauchy-study accepts powers of two >=16 "
+           "(default: 32,64,128); --force-extended preserves the legacy "
+           "prefix/gated study (default: 32,64).\n"
         << "  --force-extended records N=128 evidence after a failed coarse "
            "gate without changing acceptance.\n"
         << "  This stage builds native NURBS parameter-cell-center surface\n"
@@ -10147,7 +11349,11 @@ int main(int argc, char** argv)
                 ? std::vector<int>{32, 64, 128}
             : neumann_rigid_study
                 ? std::vector<int>{32, 64, 128}
-            : (neumann_edge_continuity_study || neumann_edge_cauchy_study)
+            : neumann_edge_cauchy_study
+                ? (force_neumann_edge_cauchy_extended
+                    ? std::vector<int>{32, 64}
+                    : std::vector<int>{32, 64, 128})
+            : neumann_edge_continuity_study
                 ? std::vector<int>{32, 64}
             : owner_preprocess_study
                 ? std::vector<int>{16, 32, 64}
@@ -10185,9 +11391,13 @@ int main(int argc, char** argv)
             return run_neumann_rigid_study_3d(levels);
         if (neumann_edge_continuity_study)
             return run_neumann_edge_continuity_study_3d(levels);
-        if (neumann_edge_cauchy_study)
-            return run_neumann_edge_cauchy_study_3d(
-                levels, force_neumann_edge_cauchy_extended);
+        if (neumann_edge_cauchy_study) {
+            if (force_neumann_edge_cauchy_extended) {
+                return run_neumann_edge_cauchy_study_3d(
+                    levels, true);
+            }
+            return run_neumann_two_level_edge_cauchy_study_3d(levels);
+        }
         const app3d::LegacySurfaceCauchyPolicy3D cauchy_policy = selected_cauchy_policy();
         const int cauchy_value_count = positive_environment_integer(
             "KFBIM_3D_CAUCHY_VALUE_COUNT", kCauchyValueNeighborCount);
