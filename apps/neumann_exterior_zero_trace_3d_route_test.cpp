@@ -669,9 +669,9 @@ TwoLevelNeumannStudyRouteRow3D make_shared_writer_fixture_3d()
     row.physical_residuals = {1.0, 0.1, 0.01};
     row.common_residuals = {1.0, 0.02};
     row.edge_bins = {{
-        {"lt_h", 2, 1.0, 0.2, 0.1, 0.3, 0.15, false},
-        {"h_to_2h", 3, 2.0, 0.4, 0.2, 0.5, 0.25, false},
-        {"gt_2h", 4, 3.0, 0.6, 0.3, 0.7, 0.35, false}}};
+        {"lt_h", 1, 1.0, 0.2, 0.2, 0.3, 0.3, false},
+        {"h_to_2h", 1, 2.0, 0.4, 0.4, 0.5, 0.5, false},
+        {"gt_2h", 0, 0.0, 0.0, 0.0, 0.0, 0.0, true}}};
     row.owner.available = true;
     row.owner.owner_query_count = 17;
     row.owner.owner_fingerprint_before = 101;
@@ -718,6 +718,7 @@ TwoLevelNeumannStudyRouteRow3D make_shared_writer_fixture_3d()
     row.value_map_count = 2;
     row.normal_map_count = 2;
     row.edge_map_count = 2;
+    row.condition_max = 4.0;
     TwoLevelSurfaceFitDiagnostic3D surfaceFit;
     surfaceFit.center_dof = 0;
     surfaceFit.ordinary_value_count = 48;
@@ -733,10 +734,19 @@ TwoLevelNeumannStudyRouteRow3D make_shared_writer_fixture_3d()
     TwoLevelDofDiagnostic3D dof;
     dof.dof_id = 0;
     dof.patch_id = 0;
+    dof.point = Eigen::Vector3d(0.25, 0.0, 0.0);
     dof.weight = 1.0;
+    dof.edge_distance_over_h = 0.5;
+    dof.density_error = 0.2;
+    dof.equation_defect = 0.3;
     row.dofs.push_back(dof);
     TwoLevelDofDiagnostic3D secondDof = dof;
     secondDof.dof_id = 1;
+    secondDof.point = Eigen::Vector3d(0.75, 0.0, 0.0);
+    secondDof.weight = 2.0;
+    secondDof.edge_distance_over_h = 1.5;
+    secondDof.density_error = 0.4;
+    secondDof.equation_defect = 0.5;
     row.dofs.push_back(secondDof);
     return row;
 }
@@ -833,6 +843,46 @@ void mutate_csv_field_for_case_and_kind_3d(
     write_csv_records_3d(path, records);
 }
 
+void mutate_csv_field_matching_3d(
+    const std::filesystem::path& path,
+    const std::vector<std::pair<std::string, std::string>>& matches,
+    const std::string& column, const std::string& value)
+{
+    auto records = parse_csv_records_3d(read_text_file(path));
+    const auto targetIt = std::find(
+        records.front().begin(), records.front().end(), column);
+    require(targetIt != records.front().end(),
+            "matching mutation missing target column " + column);
+    const std::size_t targetIndex = static_cast<std::size_t>(
+        std::distance(records.front().begin(), targetIt));
+    std::vector<std::pair<std::size_t, std::string>> indexedMatches;
+    for (const auto& match : matches) {
+        const auto found = std::find(
+            records.front().begin(), records.front().end(), match.first);
+        require(found != records.front().end(),
+                "matching mutation missing selector column " + match.first);
+        indexedMatches.emplace_back(
+            static_cast<std::size_t>(
+                std::distance(records.front().begin(), found)),
+            match.second);
+    }
+    auto row = records.end();
+    for (auto candidate = records.begin() + 1;
+         candidate != records.end(); ++candidate) {
+        bool equal = candidate->size() > targetIndex;
+        for (const auto& match : indexedMatches)
+            equal = equal && candidate->size() > match.first
+                && (*candidate)[match.first] == match.second;
+        if (equal) {
+            row = candidate;
+            break;
+        }
+    }
+    require(row != records.end(), "matching mutation found no requested row");
+    (*row)[targetIndex] = value;
+    write_csv_records_3d(path, records);
+}
+
 void require_review_schema_negative_mutations_3d(
     const std::filesystem::path& script,
     const std::filesystem::path& source)
@@ -878,6 +928,46 @@ void require_review_schema_negative_mutations_3d(
                                     "relative_residual", nonfinite);
             });
     }
+    exercise("negative_intermediate_residual", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_matching_3d(
+            directory / "gmres_residuals.csv",
+            {{"case_id", "synthetic"}, {"rhs_kind", "physical"},
+             {"iteration", "1"}},
+            "relative_residual", "-1.0e-1");
+    });
+    exercise("negative_edge_radius", [](const std::filesystem::path& directory) {
+        mutate_csv_field_matching_3d(
+            directory / "edge_fit_diagnostics.csv",
+            {{"case_id", "synthetic"}, {"cell_id", "6"}},
+            "value_radius_over_h", "-1.0");
+    });
+    exercise("negative_frame_error", [](const std::filesystem::path& directory) {
+        mutate_csv_field_matching_3d(
+            directory / "edge_point_diagnostics.csv",
+            {{"case_id", "synthetic"}, {"cell_id", "6"},
+             {"fraction", "2.50000000000000000e-01"}},
+            "frame_orthogonality_error", "-1.0");
+    });
+    exercise("successful_owner_unavailable", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_matching_3d(
+            directory / "owner_diagnostics.csv",
+            {{"case_id", "synthetic"}}, "available", "0");
+    });
+    exercise("negative_dof_weight", [](const std::filesystem::path& directory) {
+        mutate_csv_field_matching_3d(
+            directory / "dof_diagnostics.csv",
+            {{"case_id", "synthetic"}, {"dof_id", "0"}},
+            "weight", "-1.0");
+    });
+    exercise("negative_dof_edge_distance", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_matching_3d(
+            directory / "dof_diagnostics.csv",
+            {{"case_id", "synthetic"}, {"dof_id", "0"}},
+            "edge_distance_over_h", "-1.0");
+    });
     const std::array<std::string, 4> duplicateFiles{{
         "surface_fit_diagnostics.csv", "dof_diagnostics.csv",
         "edge_point_diagnostics.csv", "edge_fit_diagnostics.csv"}};
@@ -1220,6 +1310,56 @@ void test_decision_state_distinguishes_partial_performance_and_failure()
             "formal performance decision audit failed");
     require_json_state_3d(performanceDecision,
         "sector_polynomials_with_shared_edge_constraints", "true", "true");
+
+    const auto exerciseFormalMandatoryFailure = [&performance, &script, &error](
+        const std::string& name,
+        const std::function<void(const std::filesystem::path&)>& mutate) {
+        const auto destination = performance.parent_path()
+            / (performance.filename().string() + "_" + name);
+        std::filesystem::remove_all(destination, error);
+        std::filesystem::copy(performance, destination,
+            std::filesystem::copy_options::recursive);
+        mutate(destination);
+        const auto decision = destination / "decision.json";
+        require(run_two_level_neumann_audit_command_3d(
+                    script, destination, "32,64,128", false, decision) == 0,
+                "formal mandatory mutation did not write decision: " + name);
+        require_json_state_3d(
+            decision, "rerun_after_numerical_failure", "true", "false");
+        std::filesystem::remove_all(destination, error);
+    };
+    exerciseFormalMandatoryFailure("edge_near_rank_cutoff", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_matching_3d(
+            directory / "edge_fit_diagnostics.csv",
+            {{"case_id", "baseline"}, {"N", "32"},
+             {"route", "edge_reconstructed_value"}, {"cell_id", "6"}},
+            "sigma_min", "5.0e-12");
+    });
+    exerciseFormalMandatoryFailure("surface_near_rank_cutoff", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_matching_3d(
+            directory / "surface_fit_diagnostics.csv",
+            {{"case_id", "baseline"}, {"N", "32"},
+             {"route", "g1_value_g1_normal"}, {"center_dof", "0"}},
+            "sigma_min", "5.0e-12");
+    });
+    exerciseFormalMandatoryFailure("raw_bin_count_mismatch", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_matching_3d(
+            directory / "edge_distance_bins.csv",
+            {{"case_id", "baseline"}, {"N", "32"},
+             {"route", "g1_value_g1_normal"}, {"distance_bin", "lt_h"}},
+            "count", "2");
+    });
+    exerciseFormalMandatoryFailure("raw_bin_norm_mismatch", [](
+        const std::filesystem::path& directory) {
+        mutate_csv_field_matching_3d(
+            directory / "edge_distance_bins.csv",
+            {{"case_id", "baseline"}, {"N", "32"},
+             {"route", "g1_value_g1_normal"}, {"distance_bin", "lt_h"}},
+            "density_linf", "2.5e-1");
+    });
 
     const auto failed = std::filesystem::current_path()
         / "task5_formal_failure_test_output";

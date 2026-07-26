@@ -11,6 +11,172 @@ param(
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName Microsoft.VisualBasic
 
+$domainAuditSource = @'
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using Microsoft.VisualBasic.FileIO;
+
+public sealed class NeumannDofBinAggregate {
+    public string Key;
+    public string Bin;
+    public int Count;
+    public double WeightSum;
+    public double DensityLinf;
+    public double DensitySquare;
+    public double DefectLinf;
+    public double DefectSquare;
+}
+
+public sealed class NeumannSurfaceAuditResult {
+    public readonly List<string> MandatoryFailures = new List<string>();
+}
+
+public static class NeumannEvidenceDomainAudit {
+    private static Dictionary<string, int> Header(string[] fields) {
+        Dictionary<string, int> result = new Dictionary<string, int>();
+        for (int index = 0; index < fields.Length; ++index)
+            result.Add(fields[index], index);
+        return result;
+    }
+
+    private static string Key(string[] row, Dictionary<string, int> columns) {
+        return row[columns["case_id"]] + "|" + row[columns["N"]] + "|"
+            + row[columns["route"]];
+    }
+
+    private static double Number(string text, string context) {
+        double value;
+        if (text == "NA" || !double.TryParse(text, NumberStyles.Float,
+                CultureInfo.InvariantCulture, out value)
+            || Double.IsNaN(value) || Double.IsInfinity(value))
+            throw new InvalidDataException(context + " is not finite numeric");
+        return value;
+    }
+
+    private static int Integer(string text, string context) {
+        int value;
+        if (!Int32.TryParse(text, out value))
+            throw new InvalidDataException(context + " is not an integer");
+        return value;
+    }
+
+    private static TextFieldParser Parser(string path) {
+        TextFieldParser parser = new TextFieldParser(path);
+        parser.TextFieldType = FieldType.Delimited;
+        parser.SetDelimiters(",");
+        parser.HasFieldsEnclosedInQuotes = true;
+        parser.TrimWhiteSpace = false;
+        return parser;
+    }
+
+    public static NeumannSurfaceAuditResult AuditSurfaceFits(
+            string path, string[] successfulKeys) {
+        HashSet<string> successful = new HashSet<string>(successfulKeys);
+        NeumannSurfaceAuditResult result = new NeumannSurfaceAuditResult();
+        using (TextFieldParser parser = Parser(path)) {
+            Dictionary<string, int> columns = Header(parser.ReadFields());
+            while (!parser.EndOfData) {
+                string[] row = parser.ReadFields();
+                string key = Key(row, columns);
+                string entity = key + "|" + row[columns["center_dof"]];
+                int edgeCount = Integer(row[columns["edge_count"]],
+                    entity + " edge_count");
+                if (edgeCount < 0)
+                    throw new InvalidDataException(
+                        "negative surface edge count " + entity);
+                foreach (string field in new string[] { "value_radius_over_h",
+                        "normal_radius_over_h", "edge_radius_over_h",
+                        "edge_distance_over_h" }) {
+                    if (Number(row[columns[field]], entity + " " + field) < 0.0)
+                        throw new InvalidDataException(
+                            "negative surface fit radius " + entity + " " + field);
+                }
+                double sigmaMax = Number(row[columns["sigma_max"]],
+                    entity + " sigma_max");
+                double sigmaMin = Number(row[columns["sigma_min"]],
+                    entity + " sigma_min");
+                double condition = Number(row[columns["condition"]],
+                    entity + " condition");
+                if (!(sigmaMax > 0.0 && sigmaMin >= 0.0 && condition >= 1.0))
+                    throw new InvalidDataException(
+                        "invalid surface fit SVD domain " + entity);
+                if (!successful.Contains(key)) continue;
+                int values = Integer(row[columns["ordinary_value_count"]],
+                    entity + " values");
+                int normals = Integer(row[columns["normal_count"]],
+                    entity + " normals");
+                if (values != 48 || normals != 28)
+                    result.MandatoryFailures.Add("surface_fit_counts:" + entity);
+                if (!(sigmaMin > 3.0e-12 * sigmaMax))
+                    result.MandatoryFailures.Add("surface_fit_rank:" + entity);
+            }
+        }
+        return result;
+    }
+
+    public static List<NeumannDofBinAggregate> AuditDofs(
+            string path, string[] successfulKeys) {
+        HashSet<string> successful = new HashSet<string>(successfulKeys);
+        Dictionary<string, NeumannDofBinAggregate> bins =
+            new Dictionary<string, NeumannDofBinAggregate>();
+        foreach (string key in successful) {
+            foreach (string bin in new string[] { "lt_h", "h_to_2h", "gt_2h" }) {
+                NeumannDofBinAggregate aggregate = new NeumannDofBinAggregate();
+                aggregate.Key = key;
+                aggregate.Bin = bin;
+                bins.Add(key + "|" + bin, aggregate);
+            }
+        }
+        using (TextFieldParser parser = Parser(path)) {
+            Dictionary<string, int> columns = Header(parser.ReadFields());
+            while (!parser.EndOfData) {
+                string[] row = parser.ReadFields();
+                string key = Key(row, columns);
+                string entity = key + "|" + row[columns["dof_id"]];
+                foreach (string field in new string[] { "point_x", "point_y", "point_z" })
+                    Number(row[columns[field]], entity + " " + field);
+                double weight = Number(row[columns["weight"]], entity + " weight");
+                double distance = Number(row[columns["edge_distance_over_h"]],
+                    entity + " edge_distance_over_h");
+                if (!(weight > 0.0))
+                    throw new InvalidDataException("nonpositive DOF weight " + entity);
+                if (distance < 0.0)
+                    throw new InvalidDataException(
+                        "negative DOF edge distance " + entity);
+                string densityText = row[columns["density_error"]];
+                string defectText = row[columns["equation_defect"]];
+                if (densityText != "NA") Number(densityText, entity + " density_error");
+                if (defectText != "NA") Number(defectText, entity + " equation_defect");
+                if (!successful.Contains(key)) continue;
+                if (densityText == "NA" || defectText == "NA")
+                    throw new InvalidDataException(
+                        "successful DOF lacks post-solve values " + entity);
+                double density = Number(densityText, entity + " density_error");
+                double defect = Number(defectText, entity + " equation_defect");
+                string bin = distance < 1.0 ? "lt_h"
+                    : (distance <= 2.0 ? "h_to_2h" : "gt_2h");
+                NeumannDofBinAggregate aggregate = bins[key + "|" + bin];
+                ++aggregate.Count;
+                aggregate.WeightSum += weight;
+                aggregate.DensityLinf = Math.Max(
+                    aggregate.DensityLinf, Math.Abs(density));
+                aggregate.DensitySquare += weight * density * density;
+                aggregate.DefectLinf = Math.Max(
+                    aggregate.DefectLinf, Math.Abs(defect));
+                aggregate.DefectSquare += weight * defect * defect;
+            }
+        }
+        return new List<NeumannDofBinAggregate>(bins.Values);
+    }
+}
+'@
+if (-not ('NeumannEvidenceDomainAudit' -as [type])) {
+    Add-Type -TypeDefinition $domainAuditSource -Language CSharp `
+        -ReferencedAssemblies Microsoft.VisualBasic.dll
+}
+
 function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) {
         if ([string]::IsNullOrWhiteSpace($Message)) {
@@ -95,6 +261,24 @@ function Integer($Value, [string]$Context) {
 
 function Is-NA($Value) {
     return [string]::IsNullOrWhiteSpace([string]$Value) -or $Value -eq 'NA'
+}
+
+function Add-IndexedRow($Index, [string]$IndexKey, $Row) {
+    if (-not $Index.ContainsKey($IndexKey)) {
+        $Index[$IndexKey] = New-Object System.Collections.ArrayList
+    }
+    [void]$Index[$IndexKey].Add($Row)
+}
+
+function Indexed-Rows($Index, [string]$IndexKey) {
+    if ($Index.ContainsKey($IndexKey)) { return @($Index[$IndexKey]) }
+    return @()
+}
+
+function Nearly-Equal([double]$Left, [double]$Right) {
+    $scale = [Math]::Max(1.0, [Math]::Max([Math]::Abs($Left),
+        [Math]::Abs($Right)))
+    return [Math]::Abs($Left - $Right) -le 1.0e-12 * $scale
 }
 
 $expectedHeaders = [ordered]@{
@@ -182,10 +366,27 @@ foreach ($row in $summary) {
     $summaryByKey[(Key $row)] = $row
 }
 
+$ownerByKey = @{}
+foreach ($row in $owners) { $ownerByKey[(Key $row)] = $row }
+$binsByKey = @{}
+foreach ($row in $bins) { Add-IndexedRow $binsByKey (Key $row) $row }
+$residualsByKeyKind = @{}
+foreach ($row in $residuals) {
+    Add-IndexedRow $residualsByKeyKind ((Key $row) + '|' + $row.rhs_kind) $row
+}
+$surfaceFitsByKey = @{}
+foreach ($row in $surfaceFits) { Add-IndexedRow $surfaceFitsByKey (Key $row) $row }
+$dofsByKey = @{}
+foreach ($row in $dofs) { Add-IndexedRow $dofsByKey (Key $row) $row }
+$edgePointsByKey = @{}
+foreach ($row in $edgePoints) { Add-IndexedRow $edgePointsByKey (Key $row) $row }
+$edgeFitsByKey = @{}
+foreach ($row in $edgeFits) { Add-IndexedRow $edgeFitsByKey (Key $row) $row }
+
 foreach ($key in $summaryByKey.Keys) {
-    Assert-True (@($owners | Where-Object { (Key $_) -eq $key }).Count -eq 1) `
+    Assert-True ($ownerByKey.ContainsKey($key)) `
         ("missing owner row $key")
-    $keyBins = @($bins | Where-Object { (Key $_) -eq $key })
+    $keyBins = @(Indexed-Rows $binsByKey $key)
     Assert-True ($keyBins.Count -eq 3) ("missing bin row $key")
     foreach ($bin in @('lt_h','h_to_2h','gt_2h')) {
         Assert-True (@($keyBins | Where-Object distance_bin -eq $bin).Count -eq 1) `
@@ -207,8 +408,8 @@ foreach ($row in $bins) {
 
 foreach ($row in $summary) {
     $key = Key $row
-    $matchingOwner = @($owners | Where-Object { (Key $_) -eq $key })[0]
-    $matchingBins = @($bins | Where-Object { (Key $_) -eq $key })
+    $matchingOwner = $ownerByKey[$key]
+    $matchingBins = @(Indexed-Rows $binsByKey $key)
     if ($row.status -eq 'failed') {
         Assert-True (-not (Is-NA $row.failure_stage)) `
             ("failed summary missing failure_stage $key")
@@ -235,8 +436,7 @@ foreach ($row in $summary) {
         } else {
             Integer $row.common_iterations "$key common_iterations"
         }
-        $history = @($residuals | Where-Object {
-            (Key $_) -eq $key -and $_.rhs_kind -eq $kind } |
+        $history = @(Indexed-Rows $residualsByKeyKind "$key|$kind" |
             Sort-Object { [int]$_.iteration })
         Assert-True ($history.Count -eq $iterations + 1) `
             ("residual history length mismatch $key $kind")
@@ -247,13 +447,16 @@ foreach ($row in $summary) {
                 ("residual iteration mismatch $key $kind")
             $recordedResidual = Number $history[$iteration].relative_residual `
                 "$key $kind residual"
-            [void]$recordedResidual
+            Assert-True ($recordedResidual -ge 0.0) `
+                ("negative residual $key $kind iteration=$iteration")
         }
         $summaryFinal = if ($kind -eq 'physical') {
             Number $row.physical_final_residual "$key physical final residual"
         } else {
             Number $row.common_final_residual "$key common final residual"
         }
+        Assert-True ($summaryFinal -ge 0.0) `
+            ("negative final residual $key $kind")
         $historyFinal = Number $history[-1].relative_residual `
             "$key $kind history final residual"
         $finalTolerance = 64.0 * 2.2204460492503131e-16 *
@@ -272,16 +475,17 @@ foreach ($row in $residuals) {
 foreach ($row in $summary | Where-Object status -eq 'failed') {
     $key = Key $row
     foreach ($kind in @('physical','common')) {
-        $history = @($residuals | Where-Object {
-            (Key $_) -eq $key -and $_.rhs_kind -eq $kind } |
+        $history = @(Indexed-Rows $residualsByKeyKind "$key|$kind" |
             Sort-Object { [int]$_.iteration })
         for ($iteration = 0; $iteration -lt $history.Count; ++$iteration) {
             $recordedIteration = Integer $history[$iteration].iteration `
                 "$key $kind iteration"
             Assert-True ($recordedIteration -eq $iteration) `
                 ("residual iteration mismatch $key $kind")
-            [void](Number $history[$iteration].relative_residual `
-                "$key $kind residual")
+            $failedResidual = Number $history[$iteration].relative_residual `
+                "$key $kind residual"
+            Assert-True ($failedResidual -ge 0.0) `
+                ("negative residual $key $kind iteration=$iteration")
         }
         $iterationValue = if ($kind -eq 'physical') {
             $row.physical_iterations
@@ -306,6 +510,8 @@ foreach ($row in $summary | Where-Object status -eq 'failed') {
             Assert-True ($history.Count -eq $iterations + 1) `
                 ("residual history length mismatch $key $kind")
             $summaryFinal = Number $finalValue "$key $kind final residual"
+            Assert-True ($summaryFinal -ge 0.0) `
+                ("negative final residual $key $kind")
             $historyFinal = Number $history[-1].relative_residual `
                 "$key $kind history final residual"
             $finalTolerance = 64.0 * 2.2204460492503131e-16 *
@@ -325,12 +531,44 @@ foreach ($row in @($surfaceFits) + @($dofs)) {
     Assert-True ($summaryByKey.ContainsKey((Key $row))) `
         ("orphan diagnostic " + (Key $row))
 }
+foreach ($point in $edgePoints) {
+    $key = (Key $point) + '|' + $point.connection_id + '|' + $point.cell_id
+    foreach ($field in @('point_x','point_y','point_z','tangent_x','tangent_y',
+            'tangent_z','mapped_tangent_dot','frame_determinant')) {
+        [void](Number $point.$field "$key $field")
+    }
+    $mismatch = Number $point.position_mismatch "$key position_mismatch"
+    $frameError = Number $point.frame_orthogonality_error `
+        "$key frame_orthogonality_error"
+    Assert-True ($mismatch -ge 0.0) ("negative position mismatch $key")
+    Assert-True ($frameError -ge 0.0) ("negative frame error $key")
+}
+foreach ($fit in $edgeFits) {
+    $key = (Key $fit) + '|' + $fit.connection_id + '|' + $fit.cell_id
+    foreach ($field in @('value_radius_over_h','normal_radius_over_h')) {
+        $radius = Number $fit.$field "$key $field"
+        Assert-True ($radius -ge 0.0) ("negative edge fit radius $key $field")
+    }
+    $sigmaMax = Number $fit.sigma_max "$key sigma_max"
+    $sigmaMin = Number $fit.sigma_min "$key sigma_min"
+    $condition = Number $fit.condition "$key condition"
+    Assert-True ($sigmaMax -gt 0.0 -and $sigmaMin -ge 0.0 -and
+        $condition -ge 1.0) ("invalid edge fit SVD domain $key")
+}
+$successfulKeys = @($summary | Where-Object status -eq 'ok' |
+    ForEach-Object { Key $_ })
+$surfaceDomainAudit = [NeumannEvidenceDomainAudit]::AuditSurfaceFits(
+    (Join-Path $OutputDirectory 'surface_fit_diagnostics.csv'),
+    [string[]]$successfulKeys)
+$dofDomainAggregates = [NeumannEvidenceDomainAudit]::AuditDofs(
+    (Join-Path $OutputDirectory 'dof_diagnostics.csv'),
+    [string[]]$successfulKeys)
 foreach ($row in $summary | Where-Object status -eq 'failed') {
     $key = Key $row
-    $surfaceIds = @($surfaceFits | Where-Object { (Key $_) -eq $key } |
+    $surfaceIds = @(Indexed-Rows $surfaceFitsByKey $key |
         ForEach-Object { Integer $_.center_dof "$key center_dof" } |
         Sort-Object)
-    $dofIds = @($dofs | Where-Object { (Key $_) -eq $key } |
+    $dofIds = @(Indexed-Rows $dofsByKey $key |
         ForEach-Object { Integer $_.dof_id "$key dof_id" } | Sort-Object)
     for ($index = 0; $index -lt $surfaceIds.Count; ++$index) {
         Assert-True ($surfaceIds[$index] -eq $index) `
@@ -359,13 +597,17 @@ foreach ($row in $summary | Where-Object {
     $expectedValueMaps = Integer $row.value_map_count "$key value_map_count"
     $expectedNormalMaps = Integer $row.normal_map_count "$key normal_map_count"
     $expectedEdgeMaps = Integer $row.edge_map_count "$key edge_map_count"
-    Assert-True (@($surfaceFits | Where-Object { (Key $_) -eq $key }).Count `
+    $keySurfaceFits = @(Indexed-Rows $surfaceFitsByKey $key)
+    $keyDofs = @(Indexed-Rows $dofsByKey $key)
+    $keyEdgePoints = @(Indexed-Rows $edgePointsByKey $key)
+    $keyEdgeFits = @(Indexed-Rows $edgeFitsByKey $key)
+    Assert-True ($keySurfaceFits.Count `
         -eq $expectedSurfaceMaps) ("surface map count mismatch $key")
-    Assert-True (@($dofs | Where-Object { (Key $_) -eq $key }).Count `
+    Assert-True ($keyDofs.Count `
         -eq $expectedDofs) ("DOF diagnostic count mismatch $key")
-    $surfaceIds = @($surfaceFits | Where-Object { (Key $_) -eq $key } |
+    $surfaceIds = @($keySurfaceFits |
         ForEach-Object { Integer $_.center_dof "$key center_dof" } | Sort-Object)
-    $dofIds = @($dofs | Where-Object { (Key $_) -eq $key } |
+    $dofIds = @($keyDofs |
         ForEach-Object { Integer $_.dof_id "$key dof_id" } | Sort-Object)
     for ($index = 0; $index -lt $surfaceIds.Count; ++$index) {
         Assert-True ($surfaceIds[$index] -eq $index) `
@@ -378,10 +620,19 @@ foreach ($row in $summary | Where-Object {
     Assert-True ($expectedValueMaps -eq $expectedSurfaceMaps -and
         $expectedNormalMaps -eq $expectedSurfaceMaps) `
         ("value/normal map count mismatch $key")
+    Assert-True ($ownerByKey[$key].available -eq '1') `
+        ("successful owner is unavailable $key")
+    foreach ($field in @('value_radius_max_over_h','normal_radius_max_over_h',
+            'edge_radius_max_over_h')) {
+        $radius = Number $row.$field "$key $field"
+        Assert-True ($radius -ge 0.0) ("negative summary radius $key $field")
+    }
+    Assert-True ((Number $row.condition_max "$key condition_max") -ge 1.0) `
+        ("invalid summary condition $key")
     if ($row.route -eq 'edge_reconstructed_value') {
-        Assert-True (@($edgePoints | Where-Object { (Key $_) -eq $key }).Count `
+        Assert-True ($keyEdgePoints.Count `
             -eq $expectedEdgeMaps) ("shared edge point count mismatch $key")
-        Assert-True (@($edgeFits | Where-Object { (Key $_) -eq $key }).Count `
+        Assert-True ($keyEdgeFits.Count `
             -eq $expectedEdgeMaps) ("shared edge fit count mismatch $key")
         Assert-True ($expectedEdgeMaps -gt 0) `
             ("successful shared route has no edge maps $key")
@@ -389,6 +640,60 @@ foreach ($row in $summary | Where-Object {
         Assert-True ($expectedEdgeMaps -eq 0) `
             ("control route reports edge maps $key")
     }
+}
+
+$rawBinsByKey = @{}
+foreach ($aggregate in $dofDomainAggregates) {
+    if (-not $rawBinsByKey.ContainsKey($aggregate.Key)) {
+        $rawBinsByKey[$aggregate.Key] = @{}
+    }
+    $rawBinsByKey[$aggregate.Key][$aggregate.Bin] = [pscustomobject]@{
+        count=$aggregate.Count; weight_sum=$aggregate.WeightSum;
+        density_linf=$aggregate.DensityLinf;
+        density_square=$aggregate.DensitySquare;
+        defect_linf=$aggregate.DefectLinf;
+        defect_square=$aggregate.DefectSquare }
+}
+$binAggregationChecks = New-Object System.Collections.Generic.List[object]
+foreach ($row in $summary | Where-Object status -eq 'ok') {
+    $key = Key $row
+    $totalCount = 0
+    foreach ($bin in Indexed-Rows $binsByKey $key) {
+        $count = Integer $bin.count "$key $($bin.distance_bin) count"
+        $weight = Number $bin.weight_sum "$key $($bin.distance_bin) weight"
+        $densityLinf = Number $bin.density_linf "$key $($bin.distance_bin) density Linf"
+        $densityRms = Number $bin.density_weighted_rms `
+            "$key $($bin.distance_bin) density RMS"
+        $defectLinf = Number $bin.defect_linf "$key $($bin.distance_bin) defect Linf"
+        $defectRms = Number $bin.defect_weighted_rms `
+            "$key $($bin.distance_bin) defect RMS"
+        $empty = Integer $bin.empty "$key $($bin.distance_bin) empty"
+        Assert-True ($count -ge 0 -and $weight -ge 0.0 -and
+            $densityLinf -ge 0.0 -and $densityRms -ge 0.0 -and
+            $defectLinf -ge 0.0 -and $defectRms -ge 0.0) `
+            ("invalid successful bin norm domain $key|$($bin.distance_bin)")
+        Assert-True (($empty -eq 1 -and $count -eq 0 -and $weight -eq 0.0) -or
+            ($empty -eq 0 -and $count -gt 0 -and $weight -gt 0.0)) `
+            ("bin empty/count/weight mismatch $key|$($bin.distance_bin)")
+        $totalCount += $count
+        $raw = $rawBinsByKey[$key][$bin.distance_bin]
+        $rawDensityRms = if ($raw.weight_sum -gt 0.0) {
+            [Math]::Sqrt($raw.density_square / $raw.weight_sum) } else { 0.0 }
+        $rawDefectRms = if ($raw.weight_sum -gt 0.0) {
+            [Math]::Sqrt($raw.defect_square / $raw.weight_sum) } else { 0.0 }
+        $equal = $count -eq $raw.count -and
+            (Nearly-Equal $weight $raw.weight_sum) -and
+            (Nearly-Equal $densityLinf $raw.density_linf) -and
+            (Nearly-Equal $densityRms $rawDensityRms) -and
+            (Nearly-Equal $defectLinf $raw.defect_linf) -and
+            (Nearly-Equal $defectRms $rawDefectRms)
+        $binAggregationChecks.Add([ordered]@{ key=$key;
+            distance_bin=$bin.distance_bin; equal=$equal })
+    }
+    $binAggregationChecks.Add([ordered]@{ key=$key;
+        distance_bin='partition_total';
+        equal=($totalCount -eq (Integer $row.surface_dof_count `
+            "$key surface_dof_count")) })
 }
 
 $orderMetrics = @('density_linf','density_l2','interior_linf','interior_l2')
@@ -461,6 +766,11 @@ function Record-Predicate(
     }
 }
 
+foreach ($check in $binAggregationChecks) {
+    Record-Predicate $check.equal `
+        ("raw_bin_aggregation:$($check.key):$($check.distance_bin)")
+}
+
 foreach ($row in $summary) {
     $key = Key $row
     if ($row.status -ne 'ok') {
@@ -477,6 +787,7 @@ foreach ($row in $summary) {
         ("common_iteration_cap:$key")
     $physicalFinal = Number $row.physical_final_residual "$key physical residual"
     $commonFinal = Number $row.common_final_residual "$key common residual"
+    $owner = $ownerByKey[$key]
     $runtimeQueries = Integer $row.runtime_geometry_queries "$key runtime queries"
     $runtimeSvd = Integer $row.runtime_svd_factorizations "$key runtime SVD"
     Record-Predicate ($physicalFinal -lt 2.0e-10) ("physical_final_residual:$key")
@@ -485,6 +796,38 @@ foreach ($row in $summary) {
     Record-Predicate ($runtimeSvd -eq 0) ("runtime_svd_factorizations:$key")
     Record-Predicate ($row.cauchy_fingerprint_before -eq
         $row.cauchy_fingerprint_after) ("cauchy_fingerprint:$key")
+    Record-Predicate ($owner.available -eq '1') ("owner_available:$key")
+    Record-Predicate ((Integer $owner.owner_query_count "$key owner queries") -gt 0) `
+        ("owner_queries:$key")
+    Record-Predicate ((Integer $row.cauchy_geometry_queries "$key cauchy queries") -gt 0 -and
+        (Integer $row.cauchy_svd_factorizations "$key cauchy SVD") -gt 0) `
+        ("cauchy_preprocess_work:$key")
+    Record-Predicate ($row.cauchy_geometry_queries -eq $owner.cauchy_geometry_queries -and
+        $row.cauchy_svd_factorizations -eq $owner.cauchy_svd_factorizations -and
+        $row.runtime_geometry_queries -eq $owner.runtime_geometry_queries -and
+        $row.runtime_svd_factorizations -eq $owner.runtime_svd_factorizations) `
+        ("summary_owner_counters:$key")
+    Record-Predicate ($row.cauchy_fingerprint_before -eq
+            $owner.cauchy_fingerprint_before -and
+        $row.cauchy_fingerprint_after -eq $owner.cauchy_fingerprint_after -and
+        $row.owner_fingerprint_before -eq $owner.owner_fingerprint_before -and
+        $row.owner_fingerprint_after -eq $owner.owner_fingerprint_after) `
+        ("summary_owner_fingerprints:$key")
+    Record-Predicate ($owner.cauchy_fingerprint_before -eq
+            $owner.cauchy_fingerprint_after -and
+        $owner.owner_fingerprint_before -eq $owner.owner_fingerprint_after -and
+        $owner.owner_output_digest_before -eq $owner.owner_output_digest_after) `
+        ("owner_before_after:$key")
+    Record-Predicate ($row.reference_equal -eq '1' -and $row.label_equal -eq '1' -and
+        $row.neighborhood_equal -eq '1' -and $row.common_rhs_hash_equal -eq '1' -and
+        $owner.reference_equal -eq '1' -and $owner.label_equal -eq '1' -and
+        $owner.neighborhood_equal -eq '1' -and
+        $owner.common_rhs_hash_equal -eq '1') ("owner_equal_flags:$key")
+    Record-Predicate ($row.reference_equal -eq $owner.reference_equal -and
+        $row.label_equal -eq $owner.label_equal -and
+        $row.neighborhood_equal -eq $owner.neighborhood_equal -and
+        $row.common_rhs_hash_equal -eq $owner.common_rhs_hash_equal) `
+        ("summary_owner_equal_flags:$key")
 }
 
 $referenceAudits = New-Object System.Collections.Generic.List[object]
@@ -492,11 +835,11 @@ foreach ($caseId in $caseIds) {
     foreach ($level in $ExpectedLevels) {
         $g1Key = "$caseId|$level|g1_value_g1_normal"
         $g1Summary = $summaryByKey[$g1Key]
-        $g1Owner = @($owners | Where-Object { (Key $_) -eq $g1Key })[0]
+        $g1Owner = $ownerByKey[$g1Key]
         foreach ($route in $routes) {
             $key = "$caseId|$level|$route"
             $candidate = $summaryByKey[$key]
-            $candidateOwner = @($owners | Where-Object { (Key $_) -eq $key })[0]
+            $candidateOwner = $ownerByKey[$key]
             $equal = $g1Summary.status -eq 'ok' -and $candidate.status -eq 'ok' -and
                 $candidateOwner.owner_query_count -eq $g1Owner.owner_query_count -and
                 $candidateOwner.owner_fingerprint_before -eq $g1Owner.owner_fingerprint_before -and
@@ -514,33 +857,36 @@ foreach ($caseId in $caseIds) {
 }
 
 foreach ($point in $edgePoints) {
+    if ($summaryByKey[(Key $point)].status -ne 'ok') { continue }
     $key = (Key $point) + '|' + $point.connection_id + '|' + $point.cell_id
     $mismatch = Number $point.position_mismatch "$key mismatch"
     $tangent = Number $point.mapped_tangent_dot "$key tangent"
     $frameError = Number $point.frame_orthogonality_error "$key frame"
     $determinant = Number $point.frame_determinant "$key determinant"
-    Record-Predicate ($mismatch -le 1.0e-11) ("edge_position_mismatch:$key")
-    Record-Predicate ($tangent -ge 0.9999999999) ("edge_tangent:$key")
-    Record-Predicate ($frameError -le 1.0e-10) ("edge_frame_orthogonality:$key")
+    Record-Predicate ($mismatch -ge 0.0 -and $mismatch -le 1.0e-11) `
+        ("edge_position_mismatch:$key")
+    Record-Predicate ($tangent -ge 0.9999999999 -and
+        $tangent -le 1.0 + 64.0 * 2.2204460492503131e-16) `
+        ("edge_tangent:$key")
+    Record-Predicate ($frameError -ge 0.0 -and $frameError -le 1.0e-10) `
+        ("edge_frame_orthogonality:$key")
     Record-Predicate ($determinant -gt 0.0) ("edge_frame_determinant:$key")
 }
 foreach ($fit in $edgeFits) {
+    if ($summaryByKey[(Key $fit)].status -ne 'ok') { continue }
     $key = (Key $fit) + '|' + $fit.connection_id + '|' + $fit.cell_id
     Record-Predicate ((Integer $fit.value_sector_0_count "$key value0") -eq 24 -and
         (Integer $fit.value_sector_1_count "$key value1") -eq 24 -and
         (Integer $fit.normal_sector_0_count "$key normal0") -eq 14 -and
         (Integer $fit.normal_sector_1_count "$key normal1") -eq 14) `
         ("edge_fit_counts:$key")
-    Record-Predicate ((Number $fit.sigma_min "$key sigma_min") -gt 0.0) `
+    $sigmaMax = Number $fit.sigma_max "$key sigma_max"
+    $sigmaMin = Number $fit.sigma_min "$key sigma_min"
+    Record-Predicate ($sigmaMin -gt 3.0e-12 * $sigmaMax) `
         ("edge_fit_rank:$key")
 }
-foreach ($fit in $surfaceFits) {
-    $key = (Key $fit) + '|' + $fit.center_dof
-    Record-Predicate ((Integer $fit.ordinary_value_count "$key values") -eq 48 -and
-        (Integer $fit.normal_count "$key normals") -eq 28) `
-        ("surface_fit_counts:$key")
-    Record-Predicate ((Number $fit.sigma_min "$key sigma_min") -gt 0.0) `
-        ("surface_fit_rank:$key")
+foreach ($failure in $surfaceDomainAudit.MandatoryFailures) {
+    Record-Predicate $false $failure
 }
 
 $iterationMetrics = New-Object System.Collections.Generic.List[object]
@@ -616,8 +962,8 @@ foreach ($orderRow in $orders) {
 $nearEdge = New-Object System.Collections.Generic.List[object]
 foreach ($row in $summary | Where-Object status -eq 'ok') {
     $key = Key $row
-    $near = @($bins | Where-Object {
-        (Key $_) -eq $key -and $_.distance_bin -in @('lt_h','h_to_2h') })
+    $near = @(Indexed-Rows $binsByKey $key | Where-Object {
+        $_.distance_bin -in @('lt_h','h_to_2h') })
     $weight = 0.0
     $square = 0.0
     $linf = 0.0
@@ -811,7 +1157,7 @@ foreach ($route in $routes) {
     $pass = $true
     foreach ($row in $summary | Where-Object route -eq $route) {
         $key = Key $row
-        $owner = @($owners | Where-Object { (Key $_) -eq $key })[0]
+        $owner = $ownerByKey[$key]
         $reference = @($referenceAudits | Where-Object {
             $_.case_id -eq $row.case_id -and $_.N -eq [int]$row.N -and
             $_.route -eq $route })[0]
@@ -902,6 +1248,7 @@ $decision = [ordered]@{
     n128_ratios = @($ratios | ForEach-Object { $_ })
     edge_error_trends = @($edgeTrends | ForEach-Object { $_ })
     raw_g1_reference_audits = @($referenceAudits | ForEach-Object { $_ })
+    raw_bin_aggregation_checks = @($binAggregationChecks | ForEach-Object { $_ })
     route_gate_pass = $routeGatePass
     primary_iteration_pass = $primaryIterationPass
     primary_W_no_worse = $primaryWNoWorse
