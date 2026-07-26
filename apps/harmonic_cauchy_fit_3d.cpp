@@ -1191,6 +1191,7 @@ SurfaceCauchyMap3D select_surface_map_inputs(
     std::optional<LegacySurfaceCauchyPolicy3D> legacy_policy)
 {
     SurfaceCauchyMap3D result;
+    result.neighborhood_fingerprint = neighborhoods.fingerprint;
     const auto& neighborhood =
         neighborhoods.centers[static_cast<std::size_t>(center)];
     result.nearest_edge_distance_over_h =
@@ -1468,6 +1469,7 @@ std::uint64_t hash_edge_map(std::uint64_t hash,
 std::uint64_t hash_surface_map(std::uint64_t hash,
                                const SurfaceCauchyMap3D& map)
 {
+    hash = append_hash(hash, map.neighborhood_fingerprint);
     hash = hash_int_vector(hash, map.value_ids);
     hash = hash_int_vector(hash, map.normal_ids);
     hash = hash_int_vector(hash, map.edge_point_ids);

@@ -136,6 +136,7 @@ struct EdgeValueMap3D {
 };
 
 struct SurfaceCauchyMap3D {
+    std::uint64_t neighborhood_fingerprint = 0;
     std::vector<int> value_ids;
     std::vector<int> normal_ids;
     std::vector<int> edge_point_ids;

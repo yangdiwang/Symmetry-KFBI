@@ -456,6 +456,13 @@ void test_second_level_routes_reproduce_cubic_and_share_edge_values()
                     && g1_map.nearest_edge_distance_over_h
                            == edge_map.nearest_edge_distance_over_h,
                 "route-independent cached edge distance is copied verbatim");
+        require(g1_map.neighborhood_fingerprint == neighborhoods.fingerprint
+                    && direct_map.neighborhood_fingerprint
+                           == neighborhoods.fingerprint
+                    && edge_map.neighborhood_fingerprint
+                           == neighborhoods.fingerprint,
+                "every route copies the shared neighborhood fingerprint "
+                "verbatim");
     }
 
     const int left = cloud.patches[0].dof_index(0, 3);
@@ -513,6 +520,11 @@ void test_sparse_apply_is_linear_and_preserves_immutable_audit()
     constexpr double a = 0.37;
     constexpr double b = -1.2;
     const auto audit_before = fit.audit();
+    std::vector<std::uint64_t> neighborhood_fingerprints_before;
+    neighborhood_fingerprints_before.reserve(fit.surface_maps().size());
+    for (const auto& map : fit.surface_maps())
+        neighborhood_fingerprints_before.push_back(
+            map.neighborhood_fingerprint);
     const auto fx = fit.apply(x_mu, x_eta);
     const auto fy = fit.apply(y_mu, y_eta);
     const auto fxy = fit.apply(a * x_mu + b * y_mu,
@@ -532,6 +544,11 @@ void test_sparse_apply_is_linear_and_preserves_immutable_audit()
                        == audit_before.svd_factorization_count
                 && fit.audit().fingerprint == audit_before.fingerprint,
             "repeated apply leaves the preprocessing audit bitwise unchanged");
+    for (std::size_t q = 0; q < fit.surface_maps().size(); ++q) {
+        require(fit.surface_maps()[q].neighborhood_fingerprint
+                    == neighborhood_fingerprints_before[q],
+                "apply preserves every copied neighborhood fingerprint");
+    }
     for (const auto* applied : {&fx, &fy, &fxy}) {
         require(applied->edge_values.size()
                     == static_cast<int>(fit.edge_maps().size()),
