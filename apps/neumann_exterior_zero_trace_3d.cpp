@@ -47,11 +47,11 @@
 #include "crossing_owner_restrict_3d.hpp"
 #include "dirichlet_rigid_transform_study_3d.hpp"
 #include "exterior_only_cubic_normal_restrict_3d.hpp"
+#include "harmonic_cauchy_fit_3d.hpp"
 #include "harmonic_trace_correction_3d.hpp"
 #include "harmonic_polynomial_space_3d.hpp"
 #include "kfbi_phase_profile_3d.hpp"
 #include "native_nurbs_surface_3d.hpp"
-#include "neumann_edge_augmented_cauchy_3d.hpp"
 #include "neumann_edge_cauchy_study_3d.hpp"
 #include "neumann_edge_continuity_3d.hpp"
 #include "neumann_rigid_transform_study_3d.hpp"
@@ -88,13 +88,6 @@ using SurfaceDof = app3d::SurfaceDof3D;
 using SurfaceDofCloud = app3d::SurfaceDofCloud3D;
 using SurfacePatchInfo = app3d::SurfaceDofPatch3D;
 using PhaseProfileKind3D = app3d::PhaseProfileKind3D;
-
-enum class CauchyStencilPolicy3D {
-    G1Nearest,
-    TopologicalNearest,
-    SamePatch,
-    BalancedPatches
-};
 
 enum class SolveSelection3D {
     Both,
@@ -195,34 +188,48 @@ double nonnegative_profile_remainder_3d(
     return std::max(0.0, remainder);
 }
 
-std::string cauchy_policy_name(CauchyStencilPolicy3D policy)
+const char* harmonic_cauchy_route_name_3d(
+    app3d::HarmonicCauchyRoute3D route)
+{
+    switch (route) {
+    case app3d::HarmonicCauchyRoute3D::G1ValueG1Normal:
+        return "g1_value_g1_normal";
+    case app3d::HarmonicCauchyRoute3D::DirectCrossFaceValue:
+        return "direct_cross_face_value";
+    case app3d::HarmonicCauchyRoute3D::EdgeReconstructedValue:
+        return "edge_reconstructed_value";
+    }
+    throw std::runtime_error("unknown 3D harmonic Cauchy route");
+}
+
+std::string cauchy_policy_name(app3d::LegacySurfaceCauchyPolicy3D policy)
 {
     switch (policy) {
-    case CauchyStencilPolicy3D::G1Nearest:
+    case app3d::LegacySurfaceCauchyPolicy3D::G1Nearest:
         return "g1_nearest";
-    case CauchyStencilPolicy3D::TopologicalNearest:
+    case app3d::LegacySurfaceCauchyPolicy3D::TopologicalNearest:
         return "topological_nearest";
-    case CauchyStencilPolicy3D::SamePatch:
+    case app3d::LegacySurfaceCauchyPolicy3D::SamePatch:
         return "same_patch";
-    case CauchyStencilPolicy3D::BalancedPatches:
+    case app3d::LegacySurfaceCauchyPolicy3D::BalancedPatches:
         return "balanced_patches";
     }
     throw std::runtime_error("unknown 3D Cauchy stencil policy");
 }
 
-CauchyStencilPolicy3D selected_cauchy_policy()
+app3d::LegacySurfaceCauchyPolicy3D selected_cauchy_policy()
 {
     const char* raw = std::getenv("KFBIM_3D_CAUCHY_POLICY");
     if (raw == nullptr || std::string(raw).empty()
         || std::string(raw) == "g1_nearest") {
-        return CauchyStencilPolicy3D::G1Nearest;
+        return app3d::LegacySurfaceCauchyPolicy3D::G1Nearest;
     }
     if (std::string(raw) == "same_patch")
-        return CauchyStencilPolicy3D::SamePatch;
+        return app3d::LegacySurfaceCauchyPolicy3D::SamePatch;
     if (std::string(raw) == "topological_nearest")
-        return CauchyStencilPolicy3D::TopologicalNearest;
+        return app3d::LegacySurfaceCauchyPolicy3D::TopologicalNearest;
     if (std::string(raw) == "balanced_patches")
-        return CauchyStencilPolicy3D::BalancedPatches;
+        return app3d::LegacySurfaceCauchyPolicy3D::BalancedPatches;
     throw std::invalid_argument(
         "KFBIM_3D_CAUCHY_POLICY must be g1_nearest, same_patch, "
         "topological_nearest, or balanced_patches");
@@ -305,32 +312,6 @@ struct SurfaceCloudDiagnostics {
     double nearest_spacing_min_over_h = 0.0;
     double nearest_spacing_mean_over_h = 0.0;
     double nearest_spacing_max_over_h = 0.0;
-};
-
-struct CauchyStencil {
-    std::vector<int> value_ids;
-    std::vector<int> derivative_ids;
-    double radius_over_h = 0.0;
-    int incident_patch_count = 0;
-    int value_patch_imbalance = 0;
-    int derivative_patch_imbalance = 0;
-};
-
-struct CauchyStencilSet {
-    CauchyStencilPolicy3D policy = CauchyStencilPolicy3D::G1Nearest;
-    int value_count = 0;
-    int derivative_count = 0;
-    int value_count_min = 0;
-    int value_count_max = 0;
-    int derivative_count_min = 0;
-    int derivative_count_max = 0;
-    std::vector<CauchyStencil> rows;
-    double radius_max_over_h = 0.0;
-    double radius_mean_over_h = 0.0;
-    int incident_patch_count_min = 0;
-    int incident_patch_count_max = 0;
-    int value_patch_imbalance_max = 0;
-    int derivative_patch_imbalance_max = 0;
 };
 
 struct SolveMetrics3D {
@@ -547,278 +528,8 @@ SurfaceCloudDiagnostics validate_surface_dofs(const SurfaceDofCloud& cloud,
     return result;
 }
 
-std::vector<int> select_cauchy_dofs(CauchyStencilPolicy3D policy,
-                                    const NativeNurbsSurface3D& surface,
-                                    const SurfaceDofCloud& cloud,
-                                    int center,
-                                    int count)
-{
-    switch (policy) {
-    case CauchyStencilPolicy3D::G1Nearest:
-        return app3d::nearest_g1_cauchy_dofs(
-            surface, cloud, center, count);
-    case CauchyStencilPolicy3D::TopologicalNearest:
-        return app3d::nearest_topological_cauchy_dofs(
-            surface, cloud, center, count);
-    case CauchyStencilPolicy3D::SamePatch:
-        return app3d::nearest_same_patch_cauchy_dofs(cloud, center, count);
-    case CauchyStencilPolicy3D::BalancedPatches:
-        return app3d::balanced_topological_cauchy_dofs(
-            surface, cloud, center, count);
-    }
-    throw std::runtime_error("unknown Cauchy stencil selection policy");
-}
-
-int selected_patch_imbalance(const SurfaceDofCloud& cloud,
-                             const std::vector<int>& ids)
-{
-    std::map<int, int> counts;
-    for (int q : ids)
-        ++counts[cloud.dofs[static_cast<std::size_t>(q)].patch_id];
-    if (counts.empty())
-        return 0;
-    int minimum = std::numeric_limits<int>::max();
-    int maximum = 0;
-    for (const auto& item : counts) {
-        minimum = std::min(minimum, item.second);
-        maximum = std::max(maximum, item.second);
-    }
-    return maximum - minimum;
-}
-
-CauchyStencilSet build_cauchy_stencils(const NativeNurbsSurface3D& surface,
-                                       const SurfaceDofCloud& cloud,
-                                       double h,
-                                       int requested_value_count,
-                                       int requested_derivative_count,
-                                       CauchyStencilPolicy3D policy)
-{
-    if (requested_value_count <= 0 || requested_derivative_count < 0
-        || requested_derivative_count > requested_value_count) {
-        throw std::invalid_argument("invalid Cauchy stencil sizes");
-    }
-
-    CauchyStencilSet result;
-    result.policy = policy;
-    result.value_count = requested_value_count;
-    result.derivative_count = requested_derivative_count;
-    result.value_count_min = std::numeric_limits<int>::max();
-    result.derivative_count_min = std::numeric_limits<int>::max();
-    result.rows.reserve(cloud.dofs.size());
-    result.incident_patch_count_min = std::numeric_limits<int>::max();
-
-    for (int center = 0; center < static_cast<int>(cloud.dofs.size()); ++center) {
-        const SurfaceDof& target = cloud.dofs[static_cast<std::size_t>(center)];
-        CauchyStencil stencil;
-        stencil.value_ids = select_cauchy_dofs(
-            policy, surface, cloud, center, result.value_count);
-        stencil.derivative_ids = select_cauchy_dofs(
-            policy, surface, cloud, center, result.derivative_count);
-        if (std::find(stencil.value_ids.begin(), stencil.value_ids.end(), center)
-            == stencil.value_ids.end()) {
-            throw std::runtime_error("Cauchy value stencil does not contain its center");
-        }
-        if (std::find(stencil.derivative_ids.begin(),
-                      stencil.derivative_ids.end(), center)
-            == stencil.derivative_ids.end()) {
-            throw std::runtime_error(
-                "Cauchy normal stencil does not contain its center");
-        }
-        double radius_sq = 0.0;
-        for (int q : stencil.value_ids) {
-            radius_sq = std::max(
-                radius_sq,
-                (cloud.dofs[static_cast<std::size_t>(q)].point - target.point)
-                    .squaredNorm());
-        }
-        for (int q : stencil.derivative_ids) {
-            radius_sq = std::max(
-                radius_sq,
-                (cloud.dofs[static_cast<std::size_t>(q)].point - target.point)
-                    .squaredNorm());
-        }
-        stencil.radius_over_h = std::sqrt(radius_sq) / h;
-        std::set<int> selected_patches;
-        for (int q : stencil.value_ids)
-            selected_patches.insert(cloud.dofs[static_cast<std::size_t>(q)].patch_id);
-        for (int q : stencil.derivative_ids)
-            selected_patches.insert(cloud.dofs[static_cast<std::size_t>(q)].patch_id);
-        stencil.incident_patch_count = static_cast<int>(selected_patches.size());
-        stencil.value_patch_imbalance =
-            selected_patch_imbalance(cloud, stencil.value_ids);
-        stencil.derivative_patch_imbalance =
-            selected_patch_imbalance(cloud, stencil.derivative_ids);
-
-        result.radius_max_over_h = std::max(
-            result.radius_max_over_h, stencil.radius_over_h);
-        result.radius_mean_over_h += stencil.radius_over_h;
-        result.incident_patch_count_min = std::min(
-            result.incident_patch_count_min, stencil.incident_patch_count);
-        result.incident_patch_count_max = std::max(
-            result.incident_patch_count_max, stencil.incident_patch_count);
-        result.value_count_min = std::min(
-            result.value_count_min, static_cast<int>(stencil.value_ids.size()));
-        result.value_count_max = std::max(
-            result.value_count_max, static_cast<int>(stencil.value_ids.size()));
-        result.derivative_count_min = std::min(
-            result.derivative_count_min,
-            static_cast<int>(stencil.derivative_ids.size()));
-        result.derivative_count_max = std::max(
-            result.derivative_count_max,
-            static_cast<int>(stencil.derivative_ids.size()));
-        result.value_patch_imbalance_max = std::max(
-            result.value_patch_imbalance_max, stencil.value_patch_imbalance);
-        result.derivative_patch_imbalance_max = std::max(
-            result.derivative_patch_imbalance_max,
-            stencil.derivative_patch_imbalance);
-        result.rows.push_back(std::move(stencil));
-    }
-    result.radius_mean_over_h /= static_cast<double>(result.rows.size());
-    return result;
-}
-
 using app3d::HarmonicPolynomialSpace3D;
 using app3d::svd_pseudoinverse_3d;
-
-struct CauchyFitMap3D {
-    Eigen::MatrixXd value_map;
-    Eigen::MatrixXd normal_map;
-    double condition = 0.0;
-};
-
-class PanelCenterCauchyFit3D {
-public:
-    PanelCenterCauchyFit3D(const SurfaceDofCloud& cloud,
-                           const CauchyStencilSet& stencils,
-                           double h,
-                           int degree = 4)
-        : cloud_(cloud)
-        , stencils_(stencils)
-        , h_(h)
-        , space_(degree)
-    {
-        if (stencils_.rows.size() != cloud_.dofs.size())
-            throw std::invalid_argument("Cauchy stencil count does not match surface DOFs");
-        maps_.reserve(cloud_.dofs.size());
-        for (int center = 0; center < static_cast<int>(cloud_.dofs.size()); ++center)
-            maps_.push_back(build_map(center));
-    }
-
-    int dimension() const { return space_.dimension(); }
-    std::vector<double> condition_values() const
-    {
-        std::vector<double> result;
-        result.reserve(maps_.size());
-        for (const CauchyFitMap3D& map : maps_)
-            result.push_back(map.condition);
-        return result;
-    }
-    const HarmonicPolynomialSpace3D& space() const { return space_; }
-
-    Eigen::MatrixXd coefficients(const Eigen::VectorXd& value_jump,
-                                 const Eigen::VectorXd& normal_jump) const
-    {
-        const int size = static_cast<int>(cloud_.dofs.size());
-        if (value_jump.size() != size || normal_jump.size() != size)
-            throw std::invalid_argument("jump data size does not match surface DOFs");
-        Eigen::MatrixXd result(size, dimension());
-        for (int center = 0; center < size; ++center) {
-            const CauchyStencil& stencil =
-                stencils_.rows[static_cast<std::size_t>(center)];
-            const int value_count = static_cast<int>(stencil.value_ids.size());
-            const int normal_count =
-                static_cast<int>(stencil.derivative_ids.size());
-            Eigen::VectorXd values(value_count);
-            Eigen::VectorXd normals(normal_count);
-            for (int k = 0; k < value_count; ++k)
-                values[k] = value_jump[stencil.value_ids[static_cast<std::size_t>(k)]];
-            for (int k = 0; k < normal_count; ++k)
-                normals[k] = normal_jump[stencil.derivative_ids[static_cast<std::size_t>(k)]];
-            const CauchyFitMap3D& map = maps_[static_cast<std::size_t>(center)];
-            result.row(center) =
-                (map.value_map * values + map.normal_map * normals).transpose();
-        }
-        return result;
-    }
-
-private:
-    Eigen::Vector3d local_coordinate(const SurfaceDof& center,
-                                     const Eigen::Vector3d& point) const
-    {
-        const Eigen::Vector3d displacement = (point - center.point) / h_;
-        return {displacement.dot(center.tangent1),
-                displacement.dot(center.tangent2),
-                displacement.dot(center.normal)};
-    }
-
-    CauchyFitMap3D build_map(int center_id) const
-    {
-        const SurfaceDof& center = cloud_.dofs[static_cast<std::size_t>(center_id)];
-        const CauchyStencil& stencil =
-            stencils_.rows[static_cast<std::size_t>(center_id)];
-        const int value_count = static_cast<int>(stencil.value_ids.size());
-        const int normal_count = static_cast<int>(stencil.derivative_ids.size());
-        const int rows = value_count + normal_count;
-        if (rows < dimension()) {
-            throw std::runtime_error(
-                "Cauchy fit has fewer conditions than cubic coefficients");
-        }
-        Eigen::MatrixXd design(rows, dimension());
-        Eigen::VectorXd sqrt_weights(rows);
-
-        for (int k = 0; k < value_count; ++k) {
-            const SurfaceDof& sample = cloud_.dofs[static_cast<std::size_t>(
-                stencil.value_ids[static_cast<std::size_t>(k)])];
-            const Eigen::Vector3d xi = local_coordinate(center, sample.point);
-            design.row(k) = space_.basis(xi.x(), xi.y(), xi.z()).transpose();
-            sqrt_weights[k] = std::sqrt(
-                1.0 / std::pow(0.35 + xi.norm(), 2.0));
-        }
-        for (int k = 0; k < normal_count; ++k) {
-            const SurfaceDof& sample = cloud_.dofs[static_cast<std::size_t>(
-                stencil.derivative_ids[static_cast<std::size_t>(k)])];
-            const Eigen::Vector3d xi = local_coordinate(center, sample.point);
-            const Eigen::Vector3d normal_components(
-                sample.normal.dot(center.tangent1),
-                sample.normal.dot(center.tangent2),
-                sample.normal.dot(center.normal));
-            design.row(value_count + k) =
-                normal_components.transpose()
-                * space_.gradient(xi.x(), xi.y(), xi.z());
-            sqrt_weights[value_count + k] = std::sqrt(
-                0.85 / std::pow(0.35 + xi.norm(), 2.0));
-        }
-
-        const Eigen::MatrixXd weighted = sqrt_weights.asDiagonal() * design;
-        Eigen::JacobiSVD<Eigen::MatrixXd> condition_svd(weighted);
-        const Eigen::VectorXd singular = condition_svd.singularValues();
-        if (singular.size() != dimension() || singular.size() == 0
-            || !singular.allFinite() || !(singular[0] > 0.0)
-            || !(singular[singular.size() - 1] > 3.0e-12 * singular[0])) {
-            throw std::runtime_error(
-                "Cauchy fit is rank deficient at surface DOF "
-                + std::to_string(center_id));
-        }
-        CauchyFitMap3D result;
-        result.condition = singular[0] / singular[singular.size() - 1];
-        const Eigen::MatrixXd pinv = svd_pseudoinverse_3d(weighted, 3.0e-12);
-        result.value_map.resize(dimension(), value_count);
-        result.normal_map.resize(dimension(), normal_count);
-        for (int k = 0; k < value_count; ++k)
-            result.value_map.col(k) = pinv.col(k) * sqrt_weights[k];
-        for (int k = 0; k < normal_count; ++k) {
-            result.normal_map.col(k) =
-                pinv.col(value_count + k) * sqrt_weights[value_count + k] * h_;
-        }
-        return result;
-    }
-
-    const SurfaceDofCloud& cloud_;
-    const CauchyStencilSet& stencils_;
-    double h_ = 0.0;
-    HarmonicPolynomialSpace3D space_;
-    std::vector<CauchyFitMap3D> maps_;
-};
 
 GeometryBundle make_geometry(
     GeometryKind kind,
@@ -1587,6 +1298,29 @@ struct RestrictOwnerAuditRecord3D {
 
 class PanelCenterHarmonicJetKFBI3D {
 public:
+    PanelCenterHarmonicJetKFBI3D(
+        const CartesianGrid3D& grid,
+        const GridPair3D& grid_pair,
+        const NativeNurbsSurface3D& native_surface,
+        const std::vector<geometry3d::NurbsParamTriangle3D>&
+            correction_triangles,
+        const std::vector<geometry3d::NurbsParamTriangle3D>&
+            geometry_triangles,
+        const SurfaceDofCloud& cloud,
+        app3d::HarmonicCauchyFit3D fit,
+        bool build_exterior_only_restrict,
+        bool build_crossing_owner)
+        : PanelCenterHarmonicJetKFBI3D(
+              grid, grid_pair, native_surface, correction_triangles,
+              geometry_triangles, cloud, std::move(fit),
+              build_exterior_only_restrict,
+              build_crossing_owner
+                  ? std::optional<app3d::RestrictOwnerPreprocessMode3D>(
+                        app3d::RestrictOwnerPreprocessMode3D::
+                            FullIntersectionReference)
+                  : std::nullopt)
+    {}
+
     PanelCenterHarmonicJetKFBI3D(const CartesianGrid3D& grid,
                                  const GridPair3D& grid_pair,
                                  const NativeNurbsSurface3D& native_surface,
@@ -1595,7 +1329,7 @@ public:
                                  const std::vector<geometry3d::NurbsParamTriangle3D>&
                                      geometry_triangles,
                                  const SurfaceDofCloud& cloud,
-                                 const CauchyStencilSet& stencils,
+                                 app3d::HarmonicCauchyFit3D fit,
                                  bool build_exterior_only_restrict = false,
                                  std::optional<
                                      app3d::RestrictOwnerPreprocessMode3D>
@@ -1604,8 +1338,7 @@ public:
                                  RestrictOwnerWorkload3D* workload_capture =
                                      nullptr,
                                  RestrictOwnerPipelinePreprocessTiming3D*
-                                     preprocess_timing = nullptr,
-                                 bool build_neumann_edge_augmented_cauchy = false)
+                                     preprocess_timing = nullptr)
         : grid_(grid)
         , grid_pair_(grid_pair)
         , native_surface_(native_surface)
@@ -1615,7 +1348,7 @@ public:
         , phase_profile_(phase_profile)
         , workload_capture_(workload_capture)
         , h_(grid.spacing()[0])
-        , fit_(cloud, stencils, h_, kCauchyPolynomialDegree)
+        , fit_(std::move(fit))
         , bulk_(grid, ZfftBcType::Dirichlet, 0.0, 2)
         , correction_support_(build_laplace_correction_support_3d(
               grid_pair, "PanelCenterHarmonicJetKFBI3D"))
@@ -1625,20 +1358,6 @@ public:
             || std::abs(spacing[0] - spacing[2]) > 1.0e-13) {
             throw std::invalid_argument(
                 "harmonic-jet KFBI3D requires an isotropic Cartesian grid");
-        }
-        if (build_neumann_edge_augmented_cauchy) {
-            std::vector<app3d::NeumannEdgeFaceStencil3D> face_stencils;
-            face_stencils.reserve(stencils.rows.size());
-            for (const CauchyStencil& stencil : stencils.rows) {
-                app3d::NeumannEdgeFaceStencil3D face_stencil;
-                face_stencil.value_dofs = stencil.value_ids;
-                face_stencil.normal_dofs = stencil.derivative_ids;
-                face_stencils.push_back(std::move(face_stencil));
-            }
-            neumann_edge_augmented_cauchy_ = std::make_unique<
-                app3d::NeumannEdgeAugmentedCauchy3D>(
-                    app3d::build_neumann_edge_augmented_cauchy_3d(
-                        native_surface_, cloud_, h_, face_stencils));
         }
         if (build_exterior_only_restrict) {
             exterior_only_restrict_ =
@@ -1789,6 +1508,11 @@ public:
 
     const SurfaceDofCloud& surface() const { return cloud_; }
 
+    const app3d::HarmonicCauchyFit3D& cauchy_fit() const noexcept
+    {
+        return fit_;
+    }
+
     const LaplaceCorrectionSupport3D& correction_support() const noexcept
     {
         return correction_support_;
@@ -1797,15 +1521,6 @@ public:
     std::vector<double> cauchy_condition_values() const
     {
         return fit_.condition_values();
-    }
-
-    const app3d::NeumannEdgeAugmentedCauchy3D&
-    neumann_edge_augmented_cauchy() const
-    {
-        if (!neumann_edge_augmented_cauchy_)
-            throw std::runtime_error(
-                "edge-augmented Cauchy was not initialized");
-        return *neumann_edge_augmented_cauchy_;
     }
 
     std::vector<double> exterior_only_restrict_condition_values() const
@@ -1972,7 +1687,8 @@ public:
         if (restrict_owner_workload_fingerprint_
                 != other.restrict_owner_workload_fingerprint_
             || trace_samples_.size() != other.trace_samples_.size()
-            || fit_.dimension() != other.fit_.dimension()) {
+            || fit_.space().dimension()
+                   != other.fit_.space().dimension()) {
             throw std::invalid_argument(
                 "crossing-owner correction comparison received different "
                 "trace workloads");
@@ -2024,13 +1740,15 @@ public:
 
     HarmonicJetField3D evaluate(
         const Eigen::VectorXd& value_jump,
-        const Eigen::VectorXd& normal_jump,
-        app3d::NeumannEdgeCauchyMode3D cauchy_mode =
-            app3d::NeumannEdgeCauchyMode3D::None) const
+        const Eigen::VectorXd& normal_jump) const
     {
         HarmonicJetField3D result;
-        result.coefficients = cauchy_coefficients(
-            value_jump, normal_jump, cauchy_mode);
+        app3d::HarmonicCauchyApplyResult3D applied = profile_phase_3d(
+            phase_profile_, PhaseProfileKind3D::CauchyCoefficients, 1,
+            [&] {
+                return fit_.apply(value_jump, normal_jump);
+            });
+        result.coefficients = std::move(applied.coefficients);
         Eigen::VectorXd rhs = Eigen::VectorXd::Zero(grid_.num_dofs());
         profile_phase_3d(
             phase_profile_, PhaseProfileKind3D::SpreadRhsAssembly, 1,
@@ -2055,9 +1773,7 @@ public:
     HarmonicJetField3D field_from_grid_and_jumps(
         const Eigen::VectorXd& potential,
         const Eigen::VectorXd& value_jump,
-        const Eigen::VectorXd& normal_jump,
-        app3d::NeumannEdgeCauchyMode3D cauchy_mode =
-            app3d::NeumannEdgeCauchyMode3D::None) const
+        const Eigen::VectorXd& normal_jump) const
     {
         if (potential.size() != grid_.num_dofs()
             || value_jump.size() != surface_size()
@@ -2065,9 +1781,12 @@ public:
             throw std::invalid_argument(
                 "exact-grid field received incompatible sizes");
         }
-        Eigen::MatrixXd coefficients = cauchy_coefficients(
-            value_jump, normal_jump, cauchy_mode);
-        return {potential, std::move(coefficients)};
+        app3d::HarmonicCauchyApplyResult3D applied = profile_phase_3d(
+            phase_profile_, PhaseProfileKind3D::CauchyCoefficients, 1,
+            [&] {
+                return fit_.apply(value_jump, normal_jump);
+            });
+        return {potential, std::move(applied.coefficients)};
     }
 
     Eigen::VectorXd exterior_trace(const HarmonicJetField3D& field,
@@ -2167,39 +1886,6 @@ public:
     }
 
 private:
-    Eigen::MatrixXd cauchy_coefficients(
-        const Eigen::VectorXd& value_jump,
-        const Eigen::VectorXd& normal_jump,
-        app3d::NeumannEdgeCauchyMode3D mode) const
-    {
-        if (mode == app3d::NeumannEdgeCauchyMode3D::None) {
-            return profile_phase_3d(
-                phase_profile_, PhaseProfileKind3D::CauchyCoefficients, 1,
-                [&] {
-                    return fit_.coefficients(value_jump, normal_jump);
-                });
-        }
-        if (!neumann_edge_augmented_cauchy_)
-            throw std::runtime_error(
-                "edge-augmented Cauchy was not initialized");
-        const Eigen::VectorXd edge_values = profile_phase_3d(
-            phase_profile_, PhaseProfileKind3D::EdgeAuxiliaryValues, 1,
-            [&] {
-                return neumann_edge_augmented_cauchy_->edge_values(
-                    value_jump, normal_jump);
-            });
-        return profile_phase_3d(
-            phase_profile_, PhaseProfileKind3D::CauchyCoefficients, 1,
-            [&] {
-                Eigen::MatrixXd coefficients =
-                    fit_.coefficients(value_jump, normal_jump);
-                neumann_edge_augmented_cauchy_->
-                    overwrite_affected_coefficients(
-                        value_jump, normal_jump, edge_values, coefficients);
-                return coefficients;
-            });
-    }
-
     Eigen::MatrixXd continued_samples(const HarmonicJetField3D& field,
                                       const Eigen::VectorXd& value_jump,
                                       const Eigen::VectorXd& normal_jump,
@@ -2463,7 +2149,7 @@ private:
         result.grid_ids = trace.grid_nodes;
         result.weights = trace.weights;
         result.legacy_correction_evaluation =
-            Eigen::VectorXd::Zero(fit_.dimension());
+            Eigen::VectorXd::Zero(fit_.space().dimension());
         const double correction_sign = desired_inside ? 1.0 : -1.0;
         for (int q = 0; q < 64; ++q) {
             const std::size_t slot = static_cast<std::size_t>(q);
@@ -2699,7 +2385,7 @@ private:
                 owner_evaluations[owner];
             if (owner_evaluation.size() == 0) {
                 owner_evaluation =
-                    Eigen::VectorXd::Zero(fit_.dimension());
+                    Eigen::VectorXd::Zero(fit_.space().dimension());
             }
             owner_evaluation +=
                 correction_sign
@@ -2848,9 +2534,7 @@ private:
     std::uint64_t restrict_owner_output_digest_ =
         UINT64_C(14695981039346656037);
     double h_ = 0.0;
-    PanelCenterCauchyFit3D fit_;
-    std::unique_ptr<app3d::NeumannEdgeAugmentedCauchy3D>
-        neumann_edge_augmented_cauchy_;
+    app3d::HarmonicCauchyFit3D fit_;
     std::unique_ptr<app3d::ExteriorOnlyCubicNormalRestrict3D>
         exterior_only_restrict_;
     LaplaceFftBulkSolverZfft3D bulk_;
@@ -2868,12 +2552,9 @@ public:
     explicit ExteriorZeroTraceOperator3D(
         const PanelCenterHarmonicJetKFBI3D& pipeline,
         ExteriorValueRestrictMode3D restrict_mode =
-            ExteriorValueRestrictMode3D::JointTricubicCauchy,
-        app3d::NeumannEdgeCauchyMode3D cauchy_mode =
-            app3d::NeumannEdgeCauchyMode3D::None)
+            ExteriorValueRestrictMode3D::JointTricubicCauchy)
         : pipeline_(pipeline)
         , restrict_mode_(restrict_mode)
-        , cauchy_mode_(cauchy_mode)
     {}
 
     int problem_size() const override
@@ -2890,7 +2571,7 @@ public:
         const Eigen::VectorXd value_jump = unknown.head(size);
         const Eigen::VectorXd zero_normal = Eigen::VectorXd::Zero(size);
         const HarmonicJetField3D field =
-            pipeline_.evaluate(value_jump, zero_normal, cauchy_mode_);
+            pipeline_.evaluate(value_jump, zero_normal);
         const Eigen::VectorXd trace =
             pipeline_.exterior_trace(
                 field, value_jump, zero_normal, restrict_mode_);
@@ -2912,8 +2593,7 @@ public:
             throw std::invalid_argument("prescribed Neumann data has wrong size");
         const Eigen::VectorXd zero_value = Eigen::VectorXd::Zero(size);
         const HarmonicJetField3D field =
-            pipeline_.evaluate(
-                zero_value, prescribed_normal_jump, cauchy_mode_);
+            pipeline_.evaluate(zero_value, prescribed_normal_jump);
         Eigen::VectorXd result = Eigen::VectorXd::Zero(size + 1);
         result.head(size) = -pipeline_.exterior_trace(
             field, zero_value, prescribed_normal_jump, restrict_mode_);
@@ -2923,7 +2603,6 @@ public:
 private:
     const PanelCenterHarmonicJetKFBI3D& pipeline_;
     ExteriorValueRestrictMode3D restrict_mode_;
-    app3d::NeumannEdgeCauchyMode3D cauchy_mode_;
 };
 
 struct ExteriorZeroTraceSolution3D {
@@ -2945,14 +2624,11 @@ ExteriorZeroTraceSolution3D solve_exterior_zero_trace_neumann_3d(
     int max_iterations,
     ExteriorValueRestrictMode3D restrict_mode =
         ExteriorValueRestrictMode3D::JointTricubicCauchy,
-    app3d::NeumannEdgeCauchyMode3D cauchy_mode =
-        app3d::NeumannEdgeCauchyMode3D::None,
     const app3d::NeumannEdgeContinuityProjector3D*
         edge_projector = nullptr)
 {
     if (edge_projector == nullptr) {
-        ExteriorZeroTraceOperator3D op(
-            pipeline, restrict_mode, cauchy_mode);
+        ExteriorZeroTraceOperator3D op(pipeline, restrict_mode);
         const Eigen::VectorXd rhs = op.right_hand_side(prescribed_normal_jump);
         Eigen::VectorXd augmented_unknown = Eigen::VectorXd::Zero(op.problem_size());
         GMRES gmres(max_iterations, tolerance, restart);
@@ -2963,9 +2639,8 @@ ExteriorZeroTraceSolution3D solve_exterior_zero_trace_neumann_3d(
         const int size = pipeline.surface_size();
         result.value_jump = augmented_unknown.head(size);
         result.lagrange_multiplier = augmented_unknown[size];
-        const HarmonicJetField3D field =
-            pipeline.evaluate(
-                result.value_jump, prescribed_normal_jump, cauchy_mode);
+        const HarmonicJetField3D field = pipeline.evaluate(
+            result.value_jump, prescribed_normal_jump);
         result.potential = field.potential;
         result.coefficients = field.coefficients;
         Eigen::VectorXd applied;
@@ -2974,8 +2649,7 @@ ExteriorZeroTraceSolution3D solve_exterior_zero_trace_neumann_3d(
         return result;
     }
 
-    ExteriorZeroTraceOperator3D op(
-        pipeline, restrict_mode, cauchy_mode);
+    ExteriorZeroTraceOperator3D op(pipeline, restrict_mode);
     const app3d::NeumannEdgeProjectedAugmentedOperator3D projected_op(
         op, *edge_projector);
     const Eigen::VectorXd rhs = projected_op.project_right_hand_side(
@@ -2991,9 +2665,8 @@ ExteriorZeroTraceSolution3D solve_exterior_zero_trace_neumann_3d(
         augmented_unknown.head(size));
     augmented_unknown.head(size) = result.value_jump;
     result.lagrange_multiplier = augmented_unknown[size];
-    const HarmonicJetField3D field =
-        pipeline.evaluate(
-            result.value_jump, prescribed_normal_jump, cauchy_mode);
+    const HarmonicJetField3D field = pipeline.evaluate(
+        result.value_jump, prescribed_normal_jump);
     result.potential = field.potential;
     result.coefficients = field.coefficients;
     Eigen::VectorXd applied;
@@ -3150,8 +2823,6 @@ SolveMetrics3D run_neumann_case(
     int gmres_max_iterations,
     ExteriorValueRestrictMode3D restrict_mode =
         ExteriorValueRestrictMode3D::JointTricubicCauchy,
-    app3d::NeumannEdgeCauchyMode3D cauchy_mode =
-        app3d::NeumannEdgeCauchyMode3D::None,
     std::vector<double>* residual_history = nullptr,
     const app3d::NeumannEdgeContinuityProjector3D*
         edge_projector = nullptr,
@@ -3205,7 +2876,7 @@ SolveMetrics3D run_neumann_case(
     const ExteriorZeroTraceSolution3D solution =
         solve_exterior_zero_trace_neumann_3d(
             pipeline, normal_data, 2.0e-10, 80, gmres_max_iterations,
-            restrict_mode, cauchy_mode, edge_projector);
+            restrict_mode, edge_projector);
     const double seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - solve_start).count();
 
@@ -3447,7 +3118,7 @@ void write_panel_center_files(const std::filesystem::path& output_dir,
                               const std::string& geometry_name,
                               int N,
                               const SurfaceDofCloud& cloud,
-                              const CauchyStencilSet& stencils)
+                              const app3d::HarmonicCauchyFit3D& fit)
 {
     std::filesystem::create_directories(output_dir);
     const std::string stem = geometry_name + "_N" + std::to_string(N);
@@ -3494,32 +3165,33 @@ void write_panel_center_files(const std::filesystem::path& output_dir,
     stencil_csv << "q,patch_id,radius_over_h,incident_patch_count,"
                    "value_count,normal_count,value_patch_imbalance,"
                    "normal_patch_imbalance";
-    for (int k = 0; k < stencils.value_count; ++k)
+    for (int k = 0; k < fit.value_count(); ++k)
         stencil_csv << ",value_" << k;
-    for (int k = 0; k < stencils.derivative_count; ++k)
+    for (int k = 0; k < fit.normal_count(); ++k)
         stencil_csv << ",normal_" << k;
     stencil_csv << '\n';
-    for (int q = 0; q < static_cast<int>(stencils.rows.size()); ++q) {
-        const CauchyStencil& stencil =
-            stencils.rows[static_cast<std::size_t>(q)];
+    for (int q = 0; q < static_cast<int>(fit.surface_maps().size()); ++q) {
+        const app3d::SurfaceCauchyMap3D& stencil =
+            fit.surface_maps()[static_cast<std::size_t>(q)];
         stencil_csv << q << ','
                     << cloud.dofs[static_cast<std::size_t>(q)].patch_id << ','
-                    << stencil.radius_over_h << ','
+                    << std::max(stencil.value_radius_over_h,
+                                stencil.normal_radius_over_h) << ','
                     << stencil.incident_patch_count << ','
                     << stencil.value_ids.size() << ','
-                    << stencil.derivative_ids.size() << ','
+                    << stencil.normal_ids.size() << ','
                     << stencil.value_patch_imbalance << ','
-                    << stencil.derivative_patch_imbalance;
+                    << stencil.normal_patch_imbalance;
         for (int id : stencil.value_ids)
             stencil_csv << ',' << id;
         for (int k = static_cast<int>(stencil.value_ids.size());
-             k < stencils.value_count; ++k) {
+             k < fit.value_count(); ++k) {
             stencil_csv << ',';
         }
-        for (int id : stencil.derivative_ids)
+        for (int id : stencil.normal_ids)
             stencil_csv << ',' << id;
-        for (int k = static_cast<int>(stencil.derivative_ids.size());
-             k < stencils.derivative_count; ++k) {
+        for (int k = static_cast<int>(stencil.normal_ids.size());
+             k < fit.normal_count(); ++k) {
             stencil_csv << ',';
         }
         stencil_csv << '\n';
@@ -3529,7 +3201,7 @@ void write_panel_center_files(const std::filesystem::path& output_dir,
 ReadinessResult run_readiness_case(GeometryKind kind,
                                    int N,
                                    const std::filesystem::path& output_dir,
-                                   CauchyStencilPolicy3D cauchy_policy,
+                                   app3d::LegacySurfaceCauchyPolicy3D cauchy_policy,
                                    int cauchy_value_count,
                                    int cauchy_normal_count,
                                    int gmres_max_iterations,
@@ -3549,17 +3221,17 @@ ReadinessResult run_readiness_case(GeometryKind kind,
         app3d::make_native_surface_dofs_3d(geometry.native_surface, h);
     const SurfaceCloudDiagnostics surface_diagnostics =
         validate_surface_dofs(surface_dofs, h);
-    const CauchyStencilSet cauchy_stencils = build_cauchy_stencils(
-        geometry.native_surface,
-        surface_dofs,
-        h,
-        cauchy_value_count,
-        cauchy_normal_count,
-        cauchy_policy);
+    app3d::HarmonicCauchyFit3D cauchy_fit =
+        app3d::HarmonicCauchyFit3D::build_legacy(
+            geometry.native_surface, surface_dofs, h, cauchy_policy,
+            kCauchyPolynomialDegree, cauchy_value_count,
+            cauchy_normal_count);
+    const app3d::LegacyCauchySummary3D cauchy_summary =
+        *cauchy_fit.legacy_summary();
     if (solve_selection == SolveSelection3D::Both) {
         write_surface_files(output_dir, geometry, N);
         write_panel_center_files(
-            output_dir, geometry.name, N, surface_dofs, cauchy_stencils);
+            output_dir, geometry.name, N, surface_dofs, cauchy_fit);
     }
 
     ReadinessResult result;
@@ -3586,24 +3258,24 @@ ReadinessResult run_readiness_case(GeometryKind kind,
         surface_diagnostics.nearest_spacing_mean_over_h;
     result.surface_spacing_max_over_h =
         surface_diagnostics.nearest_spacing_max_over_h;
-    result.cauchy_value_neighbors = cauchy_stencils.value_count;
-    result.cauchy_derivative_neighbors = cauchy_stencils.derivative_count;
-    result.cauchy_value_neighbors_min = cauchy_stencils.value_count_min;
-    result.cauchy_value_neighbors_max = cauchy_stencils.value_count_max;
+    result.cauchy_value_neighbors = cauchy_fit.value_count();
+    result.cauchy_derivative_neighbors = cauchy_fit.normal_count();
+    result.cauchy_value_neighbors_min = cauchy_summary.value_count_min;
+    result.cauchy_value_neighbors_max = cauchy_summary.value_count_max;
     result.cauchy_derivative_neighbors_min =
-        cauchy_stencils.derivative_count_min;
+        cauchy_summary.normal_count_min;
     result.cauchy_derivative_neighbors_max =
-        cauchy_stencils.derivative_count_max;
-    result.cauchy_radius_max_over_h = cauchy_stencils.radius_max_over_h;
-    result.cauchy_radius_mean_over_h = cauchy_stencils.radius_mean_over_h;
+        cauchy_summary.normal_count_max;
+    result.cauchy_radius_max_over_h = cauchy_summary.radius_max_over_h;
+    result.cauchy_radius_mean_over_h = cauchy_summary.radius_mean_over_h;
     result.cauchy_incident_patches_min =
-        cauchy_stencils.incident_patch_count_min;
+        cauchy_summary.incident_patch_count_min;
     result.cauchy_incident_patches_max =
-        cauchy_stencils.incident_patch_count_max;
+        cauchy_summary.incident_patch_count_max;
     result.cauchy_value_patch_imbalance_max =
-        cauchy_stencils.value_patch_imbalance_max;
+        cauchy_summary.value_patch_imbalance_max;
     result.cauchy_derivative_patch_imbalance_max =
-        cauchy_stencils.derivative_patch_imbalance_max;
+        cauchy_summary.normal_patch_imbalance_max;
 
     const auto dims = grid.dof_dims();
     Eigen::Vector3d grid_min(kBoxMin, kBoxMin, kBoxMin);
@@ -3854,7 +3526,7 @@ ReadinessResult run_readiness_case(GeometryKind kind,
         geometry.correction_triangles,
         geometry.geometry_triangles,
         surface_dofs,
-        cauchy_stencils);
+        std::move(cauchy_fit));
     const ConditionStatistics3D condition_statistics = summarize_conditions(
         harmonic_pipeline.cauchy_condition_values());
     result.cauchy_condition_median = condition_statistics.median;
@@ -3895,8 +3567,7 @@ ReadinessResult run_readiness_case(GeometryKind kind,
         result.neumann = run_neumann_case(
             grid, grid_pair, harmonic_pipeline, transform,
             gmres_max_iterations,
-            ExteriorValueRestrictMode3D::JointTricubicCauchy,
-            app3d::NeumannEdgeCauchyMode3D::None);
+            ExteriorValueRestrictMode3D::JointTricubicCauchy);
     }
     result.dirichlet_normal = run_dirichlet_normal_case(
         grid, grid_pair, harmonic_pipeline, transform,
@@ -4662,12 +4333,12 @@ void write_rigid_study_acceptance(
 
 int run_dirichlet_rigid_study(
     std::vector<int> levels,
-    CauchyStencilPolicy3D cauchy_policy,
+    app3d::LegacySurfaceCauchyPolicy3D cauchy_policy,
     int cauchy_value_count,
     int cauchy_normal_count,
     int gmres_max_iterations)
 {
-    if (cauchy_policy != CauchyStencilPolicy3D::G1Nearest
+    if (cauchy_policy != app3d::LegacySurfaceCauchyPolicy3D::G1Nearest
         || cauchy_value_count != kCauchyValueNeighborCount
         || cauchy_normal_count != kCauchyDerivativeNeighborCount) {
         throw std::invalid_argument(
@@ -5431,11 +5102,12 @@ int run_normal_restrict_causal_probe(std::vector<int> levels,
                 app3d::make_native_surface_dofs_3d(
                     geometry.native_surface, h);
             validate_surface_dofs(surface_dofs, h);
-            const CauchyStencilSet cauchy_stencils = build_cauchy_stencils(
-                geometry.native_surface, surface_dofs, h,
-                kCauchyValueNeighborCount,
-                kCauchyDerivativeNeighborCount,
-                CauchyStencilPolicy3D::G1Nearest);
+            app3d::HarmonicCauchyFit3D cauchy_fit =
+                app3d::HarmonicCauchyFit3D::build_legacy(
+                    geometry.native_surface, surface_dofs, h,
+                    app3d::LegacySurfaceCauchyPolicy3D::G1Nearest,
+                    kCauchyPolynomialDegree, kCauchyValueNeighborCount,
+                    kCauchyDerivativeNeighborCount);
             profile_add_elapsed_3d(
                 profile, PhaseProfileKind3D::SurfaceDofsAndStencils,
                 surface_start);
@@ -5483,7 +5155,7 @@ int run_normal_restrict_causal_probe(std::vector<int> levels,
                 grid, grid_pair, geometry.native_surface,
                 geometry.correction_triangles,
                 geometry.geometry_triangles,
-                surface_dofs, cauchy_stencils, !owner_only,
+                surface_dofs, std::move(cauchy_fit), !owner_only,
                 owner_preprocess_mode,
                 profile, &workload_capture,
                 profile != nullptr
@@ -6785,10 +6457,13 @@ bool run_owner_preprocess_case_3d(
     const SurfaceDofCloud surface_dofs =
         app3d::make_native_surface_dofs_3d(geometry.native_surface, h);
     validate_surface_dofs(surface_dofs, h);
-    const CauchyStencilSet cauchy_stencils = build_cauchy_stencils(
-        geometry.native_surface, surface_dofs, h,
-        kCauchyValueNeighborCount, kCauchyDerivativeNeighborCount,
-        CauchyStencilPolicy3D::G1Nearest);
+    const auto build_cauchy_fit = [&] {
+        return app3d::HarmonicCauchyFit3D::build_legacy(
+            geometry.native_surface, surface_dofs, h,
+            app3d::LegacySurfaceCauchyPolicy3D::G1Nearest,
+            kCauchyPolynomialDegree, kCauchyValueNeighborCount,
+            kCauchyDerivativeNeighborCount);
+    };
     GridPair3D grid_pair(grid, geometry.correction_interface,
                          geometry.crossing_interface, domain);
     for (int node = 0; node < grid.num_dofs(); node += 1) {
@@ -6805,7 +6480,7 @@ bool run_owner_preprocess_case_3d(
     PanelCenterHarmonicJetKFBI3D full_pipeline(
         grid, grid_pair, geometry.native_surface,
         geometry.correction_triangles, geometry.geometry_triangles,
-        surface_dofs, cauchy_stencils, false,
+        surface_dofs, build_cauchy_fit(), false,
         OwnerMode3D::FullIntersectionReference, nullptr, &workload,
         &full_preprocess_timing);
     const double full_pipeline_wall_seconds = std::chrono::duration<double>(
@@ -6937,7 +6612,7 @@ bool run_owner_preprocess_case_3d(
         PanelCenterHarmonicJetKFBI3D candidate_pipeline(
             grid, grid_pair, geometry.native_surface,
             geometry.correction_triangles, geometry.geometry_triangles,
-            surface_dofs, cauchy_stencils, false, candidates[index], nullptr,
+            surface_dofs, build_cauchy_fit(), false, candidates[index], nullptr,
             nullptr, &candidate_preprocess_timing);
         const double pipeline_wall_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - pipeline_start).count();
@@ -7331,13 +7006,12 @@ int run_neumann_owner_study_3d(std::vector<int> levels)
             app3d::make_native_surface_dofs_3d(
                 geometry.native_surface, h);
         validate_surface_dofs(surface_dofs, h);
-        const CauchyStencilSet cauchy_stencils = build_cauchy_stencils(
-            geometry.native_surface,
-            surface_dofs,
-            h,
-            kCauchyValueNeighborCount,
-            kCauchyDerivativeNeighborCount,
-            CauchyStencilPolicy3D::G1Nearest);
+        app3d::HarmonicCauchyFit3D cauchy_fit =
+            app3d::HarmonicCauchyFit3D::build_legacy(
+                geometry.native_surface, surface_dofs, h,
+                app3d::LegacySurfaceCauchyPolicy3D::G1Nearest,
+                kCauchyPolynomialDegree, kCauchyValueNeighborCount,
+                kCauchyDerivativeNeighborCount);
         GridPair3D grid_pair(
             grid,
             geometry.correction_interface,
@@ -7362,7 +7036,7 @@ int run_neumann_owner_study_3d(std::vector<int> levels)
             geometry.correction_triangles,
             geometry.geometry_triangles,
             surface_dofs,
-            cauchy_stencils,
+            std::move(cauchy_fit),
             false,
             OwnerMode3D::RegionClosestHybrid,
             nullptr,
@@ -7467,7 +7141,6 @@ int run_neumann_owner_study_3d(std::vector<int> levels)
                 selected_case->transform,
                 gmres_max_iterations,
                 mode,
-                app3d::NeumannEdgeCauchyMode3D::None,
                 &row.residual_history);
             const auto after =
                 pipeline.restrict_owner_preprocess_diagnostics();
@@ -7599,13 +7272,12 @@ NeumannOwnerStudyRow3D run_neumann_rigid_pose_3d(
         app3d::make_native_surface_dofs_3d(
             geometry.native_surface, h);
     validate_surface_dofs(surface_dofs, h);
-    const CauchyStencilSet cauchy_stencils = build_cauchy_stencils(
-        geometry.native_surface,
-        surface_dofs,
-        h,
-        kCauchyValueNeighborCount,
-        kCauchyDerivativeNeighborCount,
-        CauchyStencilPolicy3D::G1Nearest);
+    app3d::HarmonicCauchyFit3D cauchy_fit =
+        app3d::HarmonicCauchyFit3D::build_legacy(
+            geometry.native_surface, surface_dofs, h,
+            app3d::LegacySurfaceCauchyPolicy3D::G1Nearest,
+            kCauchyPolynomialDegree, kCauchyValueNeighborCount,
+            kCauchyDerivativeNeighborCount);
     GridPair3D grid_pair(
         grid,
         geometry.correction_interface,
@@ -7635,7 +7307,7 @@ NeumannOwnerStudyRow3D run_neumann_rigid_pose_3d(
         geometry.correction_triangles,
         geometry.geometry_triangles,
         surface_dofs,
-        cauchy_stencils,
+        std::move(cauchy_fit),
         false,
         OwnerMode3D::RegionClosestHybrid,
         nullptr,
@@ -7742,7 +7414,6 @@ NeumannOwnerStudyRow3D run_neumann_rigid_pose_3d(
         study_case.transform,
         gmres_max_iterations,
         mode,
-        app3d::NeumannEdgeCauchyMode3D::None,
         &row.residual_history);
     const auto after =
         pipeline.restrict_owner_preprocess_diagnostics();
@@ -8242,10 +7913,12 @@ run_neumann_edge_continuity_pair_3d(
     const SurfaceDofCloud surface_dofs = app3d::make_native_surface_dofs_3d(
         geometry.native_surface, h);
     validate_surface_dofs(surface_dofs, h);
-    const CauchyStencilSet cauchy_stencils = build_cauchy_stencils(
-        geometry.native_surface, surface_dofs, h,
-        kCauchyValueNeighborCount, kCauchyDerivativeNeighborCount,
-        CauchyStencilPolicy3D::G1Nearest);
+    app3d::HarmonicCauchyFit3D cauchy_fit =
+        app3d::HarmonicCauchyFit3D::build_legacy(
+            geometry.native_surface, surface_dofs, h,
+            app3d::LegacySurfaceCauchyPolicy3D::G1Nearest,
+            kCauchyPolynomialDegree, kCauchyValueNeighborCount,
+            kCauchyDerivativeNeighborCount);
     GridPair3D grid_pair(grid, geometry.correction_interface,
                          geometry.crossing_interface, domain);
     int label_mismatches = 0;
@@ -8261,7 +7934,7 @@ run_neumann_edge_continuity_pair_3d(
     const auto pipeline_start = std::chrono::steady_clock::now();
     PanelCenterHarmonicJetKFBI3D pipeline(grid, grid_pair,
         geometry.native_surface, geometry.correction_triangles,
-        geometry.geometry_triangles, surface_dofs, cauchy_stencils, false,
+        geometry.geometry_triangles, surface_dofs, std::move(cauchy_fit), false,
         OwnerMode3D::RegionClosestHybrid, nullptr, nullptr, &preprocess_timing);
     const double pipeline_setup_seconds = production_pipeline_setup_seconds_3d(
         std::chrono::duration<double>(std::chrono::steady_clock::now()
@@ -8402,7 +8075,6 @@ run_neumann_edge_continuity_pair_3d(
                 ? std::addressof(projector) : nullptr;
         row.solve = run_neumann_case(grid, grid_pair, pipeline,
             study_case.transform, gmres_max_iterations, mode,
-            app3d::NeumannEdgeCauchyMode3D::None,
             &row.residual_history, solve_projector, &solved_densities[index]);
         after_snapshots[index] =
             capture_neumann_edge_preprocess_snapshot_3d(pipeline);
@@ -8812,6 +8484,148 @@ double evaluate_edge_owner_value_3d(
         coefficients.row(owner_dof).transpose());
 }
 
+struct PublicEdgeCauchyDiagnostics3D {
+    int expected_non_g1_connections = 0;
+    int covered_non_g1_connections = 0;
+    int edge_sample_count = 0;
+    int affected_center_count = 0;
+    int corner_center_count = 0;
+    int unrelated_sample_or_attachment_count = 0;
+    int rank_deficient_fit_count = 0;
+    int legacy_factorization_count = 0;
+    double harmonic_cubic_reproduction_defect = 0.0;
+    double edge_condition_max = 0.0;
+    double local_condition_max = 0.0;
+};
+
+PublicEdgeCauchyDiagnostics3D public_edge_cauchy_diagnostics_3d(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud& cloud,
+    double h,
+    const app3d::HarmonicCauchyFit3D& fit)
+{
+    PublicEdgeCauchyDiagnostics3D result;
+    std::set<int> covered_connections;
+    for (const auto& connection : surface.geometric_connections) {
+        if (!connection.g1)
+            ++result.expected_non_g1_connections;
+    }
+    for (const auto& map : fit.edge_maps()) {
+        covered_connections.insert(map.point.connection_id);
+        result.edge_condition_max = std::max(
+            result.edge_condition_max, map.condition);
+    }
+    result.covered_non_g1_connections =
+        static_cast<int>(covered_connections.size());
+    result.edge_sample_count = static_cast<int>(fit.edge_maps().size());
+    for (const auto& map : fit.surface_maps()) {
+        if (map.edge_point_ids.empty())
+            continue;
+        ++result.affected_center_count;
+        if (map.relevant_connection_ids.size() >= 2)
+            ++result.corner_center_count;
+        result.local_condition_max = std::max(
+            result.local_condition_max, map.condition);
+        for (int point_id : map.edge_point_ids) {
+            if (point_id < 0
+                || point_id >= static_cast<int>(fit.edge_maps().size())) {
+                throw std::logic_error(
+                    "public edge-Cauchy map has an invalid edge point ID");
+            }
+            const int connection_id = fit.edge_maps()[
+                static_cast<std::size_t>(point_id)].point.connection_id;
+            if (std::find(map.relevant_connection_ids.begin(),
+                          map.relevant_connection_ids.end(), connection_id)
+                == map.relevant_connection_ids.end()) {
+                ++result.unrelated_sample_or_attachment_count;
+            }
+        }
+    }
+    result.legacy_factorization_count = 2 * (
+        result.edge_sample_count + result.affected_center_count);
+
+    const auto& space = fit.space();
+    for (const auto& map : fit.edge_maps()) {
+        for (int column = 0; column < space.dimension(); ++column) {
+            Eigen::VectorXd values(static_cast<int>(map.value_ids.size()));
+            Eigen::VectorXd normals(static_cast<int>(map.normal_ids.size()));
+            for (int q = 0; q < values.size(); ++q) {
+                const auto& sample = cloud.dofs[static_cast<std::size_t>(
+                    map.value_ids[static_cast<std::size_t>(q)])];
+                const Eigen::Vector3d xi = map.point.frame.transpose()
+                    * (sample.point - map.point.point) / h;
+                values[q] = space.basis(xi.x(), xi.y(), xi.z())[column];
+            }
+            for (int q = 0; q < normals.size(); ++q) {
+                const auto& sample = cloud.dofs[static_cast<std::size_t>(
+                    map.normal_ids[static_cast<std::size_t>(q)])];
+                const Eigen::Vector3d xi = map.point.frame.transpose()
+                    * (sample.point - map.point.point) / h;
+                const Eigen::Vector3d normal =
+                    map.point.frame.transpose() * sample.normal;
+                normals[q] = normal.dot(
+                    space.gradient(xi.x(), xi.y(), xi.z()).col(column)) / h;
+            }
+            const double predicted =
+                map.E_value.dot(values) + map.E_normal.dot(normals);
+            const double expected = space.basis(0.0, 0.0, 0.0)[column];
+            result.harmonic_cubic_reproduction_defect = std::max(
+                result.harmonic_cubic_reproduction_defect,
+                std::abs(predicted - expected));
+        }
+    }
+
+    for (int center = 0;
+         center < static_cast<int>(fit.surface_maps().size()); ++center) {
+        const auto& map = fit.surface_maps()[static_cast<std::size_t>(center)];
+        if (map.edge_point_ids.empty())
+            continue;
+        const SurfaceDof& target = cloud.dofs[static_cast<std::size_t>(center)];
+        Eigen::Matrix3d frame;
+        frame.col(0) = target.tangent1;
+        frame.col(1) = target.tangent2;
+        frame.col(2) = target.normal;
+        for (int column = 0; column < space.dimension(); ++column) {
+            Eigen::VectorXd values(static_cast<int>(map.value_ids.size()));
+            Eigen::VectorXd normals(static_cast<int>(map.normal_ids.size()));
+            Eigen::VectorXd edges(static_cast<int>(map.edge_point_ids.size()));
+            for (int q = 0; q < values.size(); ++q) {
+                const auto& sample = cloud.dofs[static_cast<std::size_t>(
+                    map.value_ids[static_cast<std::size_t>(q)])];
+                const Eigen::Vector3d xi = frame.transpose()
+                    * (sample.point - target.point) / h;
+                values[q] = space.basis(xi.x(), xi.y(), xi.z())[column];
+            }
+            for (int q = 0; q < normals.size(); ++q) {
+                const auto& sample = cloud.dofs[static_cast<std::size_t>(
+                    map.normal_ids[static_cast<std::size_t>(q)])];
+                const Eigen::Vector3d xi = frame.transpose()
+                    * (sample.point - target.point) / h;
+                const Eigen::Vector3d normal = frame.transpose() * sample.normal;
+                normals[q] = normal.dot(
+                    space.gradient(xi.x(), xi.y(), xi.z()).col(column)) / h;
+            }
+            for (int q = 0; q < edges.size(); ++q) {
+                const auto& point = fit.edge_maps()[static_cast<std::size_t>(
+                    map.edge_point_ids[static_cast<std::size_t>(q)])].point;
+                const Eigen::Vector3d xi = frame.transpose()
+                    * (point.point - target.point) / h;
+                edges[q] = space.basis(xi.x(), xi.y(), xi.z())[column];
+            }
+            const Eigen::VectorXd predicted = map.M_value * values
+                + map.M_normal * normals + map.M_edge * edges;
+            for (int row = 0; row < predicted.size(); ++row) {
+                const double expected = row == column ? 1.0 : 0.0;
+                result.harmonic_cubic_reproduction_defect = std::max(
+                    result.harmonic_cubic_reproduction_defect,
+                    std::abs(predicted[row] - expected));
+            }
+        }
+    }
+
+    return result;
+}
+
 NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
     int N, const app3d::LPrismRigidStudyCase3D& study_case)
 {
@@ -8842,10 +8656,18 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
         app3d::make_native_surface_dofs_3d(
             geometry.native_surface, h);
     validate_surface_dofs(surface_dofs, h);
-    const CauchyStencilSet cauchy_stencils = build_cauchy_stencils(
-        geometry.native_surface, surface_dofs, h,
-        kCauchyValueNeighborCount, kCauchyDerivativeNeighborCount,
-        CauchyStencilPolicy3D::G1Nearest);
+    const app3d::SurfaceNonG1EdgeNeighborhoodSet3D neighborhoods =
+        app3d::build_surface_non_g1_edge_neighborhoods_3d(
+            geometry.native_surface, surface_dofs, h);
+    std::array<app3d::HarmonicCauchyFit3D, 2> cauchy_fits{{
+        app3d::HarmonicCauchyFit3D::build_legacy(
+            geometry.native_surface, surface_dofs, h,
+            app3d::LegacySurfaceCauchyPolicy3D::G1Nearest,
+            kCauchyPolynomialDegree, kCauchyValueNeighborCount,
+            kCauchyDerivativeNeighborCount),
+        app3d::HarmonicCauchyFit3D::build(
+            geometry.native_surface, surface_dofs, neighborhoods, h,
+            app3d::HarmonicCauchyRoute3D::EdgeReconstructedValue)}};
     profile.add(PhaseProfileKind3D::SurfaceDofsAndStencils,
         std::chrono::duration<double>(
             std::chrono::steady_clock::now() - phase_start).count(), 1);
@@ -8875,14 +8697,19 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
         pipeline_child_before[q] =
             profile.record(pipeline_children[q]).seconds;
     }
-    RestrictOwnerPipelinePreprocessTiming3D preprocess_timing;
+    std::array<RestrictOwnerPipelinePreprocessTiming3D, 2>
+        preprocess_timings;
     const auto pipeline_start = std::chrono::steady_clock::now();
-    PanelCenterHarmonicJetKFBI3D pipeline(
-        grid, grid_pair, geometry.native_surface,
-        geometry.correction_triangles, geometry.geometry_triangles,
-        surface_dofs, cauchy_stencils, false,
-        OwnerMode3D::RegionClosestHybrid, &profile, nullptr,
-        &preprocess_timing, true);
+    std::array<std::unique_ptr<PanelCenterHarmonicJetKFBI3D>, 2>
+        pipelines;
+    for (std::size_t index = 0; index < pipelines.size(); ++index) {
+        pipelines[index] = std::make_unique<PanelCenterHarmonicJetKFBI3D>(
+            grid, grid_pair, geometry.native_surface,
+            geometry.correction_triangles, geometry.geometry_triangles,
+            surface_dofs, std::move(cauchy_fits[index]), false,
+            OwnerMode3D::RegionClosestHybrid, &profile, nullptr,
+            &preprocess_timings[index]);
+    }
     const double pipeline_wall_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - pipeline_start).count();
     double pipeline_child_seconds = 0.0;
@@ -8895,12 +8722,12 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
             pipeline_wall_seconds, pipeline_child_seconds,
             "Neumann edge-Cauchy pipeline setup"), 1);
 
-    const int surface_size = pipeline.surface_size();
+    const int surface_size = pipelines[0]->surface_size();
     Eigen::VectorXd shared_exact_trace(surface_size);
     Eigen::VectorXd prescribed_normal_jump(surface_size);
     for (int q = 0; q < surface_size; ++q) {
         const SurfaceDof& dof =
-            pipeline.surface().dofs[static_cast<std::size_t>(q)];
+            pipelines[0]->surface().dofs[static_cast<std::size_t>(q)];
         shared_exact_trace[q] =
             app3d::transformed_manufactured_harmonic_value_3d(
                 study_case.transform, dof.point);
@@ -8909,9 +8736,9 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
                 study_case.transform, dof.point).dot(dof.normal);
     }
     shared_exact_trace.array() -= surface_weighted_mean(
-        pipeline.surface(), shared_exact_trace);
+        pipelines[0]->surface(), shared_exact_trace);
     prescribed_normal_jump.array() -= surface_weighted_mean(
-        pipeline.surface(), prescribed_normal_jump);
+        pipelines[0]->surface(), prescribed_normal_jump);
     if (!shared_exact_trace.allFinite()
         || !prescribed_normal_jump.allFinite()) {
         throw std::runtime_error(
@@ -8933,21 +8760,25 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
         phase_record_sum_3d(result.shared_setup_phases),
         setup_wall_seconds, "Neumann edge-Cauchy shared setup");
 
-    const auto& augmented_cauchy =
-        pipeline.neumann_edge_augmented_cauchy();
-    const auto& augmented_diagnostics = augmented_cauchy.diagnostics();
+    const app3d::HarmonicCauchyFit3D& edge_fit =
+        pipelines[1]->cauchy_fit();
+    const PublicEdgeCauchyDiagnostics3D edge_diagnostics =
+        public_edge_cauchy_diagnostics_3d(
+            geometry.native_surface, surface_dofs, h, edge_fit);
     result.setup_factorization_count =
-        augmented_diagnostics.factorization_count;
+        edge_diagnostics.legacy_factorization_count;
     const NeumannRigidGeometryDiagnostics3D geometry_diagnostics =
         neumann_rigid_geometry_diagnostics_3d(
-            grid_pair, pipeline.correction_support());
-    const auto setup_diagnostics =
-        pipeline.restrict_owner_preprocess_diagnostics();
-    const std::uint64_t setup_queries = static_cast<std::uint64_t>(
-        pipeline.restrict_owner_geometry_query_count());
-    if (setup_queries != setup_diagnostics.wrong_side_queries) {
-        throw std::logic_error(
-            "Neumann edge-Cauchy setup query-count mismatch");
+            grid_pair, pipelines[0]->correction_support());
+    for (const auto& pipeline : pipelines) {
+        const auto setup_diagnostics =
+            pipeline->restrict_owner_preprocess_diagnostics();
+        const std::uint64_t setup_queries = static_cast<std::uint64_t>(
+            pipeline->restrict_owner_geometry_query_count());
+        if (setup_queries != setup_diagnostics.wrong_side_queries) {
+            throw std::logic_error(
+                "Neumann edge-Cauchy setup query-count mismatch");
+        }
     }
 
     Eigen::VectorXd value_probe(surface_size);
@@ -8958,22 +8789,18 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
     const Eigen::VectorXd zero_grid =
         Eigen::VectorXd::Zero(grid.num_dofs());
     const HarmonicJetField3D legacy_probe =
-        pipeline.field_from_grid_and_jumps(
-            zero_grid, value_probe, prescribed_normal_jump,
-            modes[0]);
+        pipelines[0]->field_from_grid_and_jumps(
+            zero_grid, value_probe, prescribed_normal_jump);
     const HarmonicJetField3D augmented_probe =
-        pipeline.field_from_grid_and_jumps(
-            zero_grid, value_probe, prescribed_normal_jump,
-            modes[1]);
+        pipelines[1]->field_from_grid_and_jumps(
+            zero_grid, value_probe, prescribed_normal_jump);
     std::vector<bool> affected(
         static_cast<std::size_t>(surface_size), false);
-    for (const auto& local_map : augmented_cauchy.local_maps()) {
-        if (local_map.center_dof < 0
-            || local_map.center_dof >= surface_size) {
-            throw std::logic_error(
-                "Neumann edge-Cauchy local map has invalid center");
-        }
-        affected[static_cast<std::size_t>(local_map.center_dof)] = true;
+    for (int center = 0;
+         center < static_cast<int>(edge_fit.surface_maps().size()); ++center) {
+        affected[static_cast<std::size_t>(center)] =
+            !edge_fit.surface_maps()[static_cast<std::size_t>(center)]
+                 .edge_point_ids.empty();
     }
     const bool far_centers_bitwise_legacy =
         far_cauchy_rows_bitwise_equal_3d(
@@ -8984,14 +8811,29 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
             "Neumann edge-Cauchy structural probe changed a far center");
     }
 
-    const NeumannEdgePreprocessSnapshot3D stable_snapshot =
-        capture_neumann_edge_preprocess_snapshot_3d(pipeline);
-    if (stable_snapshot.output_digest != preprocess_timing.output_digest
-        || stable_snapshot.wrong_side_queries
-            != setup_diagnostics.wrong_side_queries
-        || stable_snapshot.geometry_queries != setup_queries) {
+    std::array<NeumannEdgePreprocessSnapshot3D, 2> stable_snapshots;
+    for (std::size_t index = 0; index < pipelines.size(); ++index) {
+        stable_snapshots[index] =
+            capture_neumann_edge_preprocess_snapshot_3d(*pipelines[index]);
+        const auto& setup_diagnostics =
+            pipelines[index]->restrict_owner_preprocess_diagnostics();
+        if (stable_snapshots[index].output_digest
+                    != preprocess_timings[index].output_digest
+            || stable_snapshots[index].wrong_side_queries
+                    != setup_diagnostics.wrong_side_queries
+            || stable_snapshots[index].geometry_queries
+                    != static_cast<std::uint64_t>(
+                        pipelines[index]->restrict_owner_geometry_query_count())) {
+            throw std::logic_error(
+                "Neumann edge-Cauchy stable setup snapshot mismatch");
+        }
+    }
+    if (stable_snapshots[0].workload_fingerprint
+            != stable_snapshots[1].workload_fingerprint
+        || stable_snapshots[0].output_digest
+            != stable_snapshots[1].output_digest) {
         throw std::logic_error(
-            "Neumann edge-Cauchy stable setup snapshot mismatch");
+            "Neumann edge-Cauchy route pipelines changed owner preprocessing");
     }
 
     std::array<NeumannEdgePreprocessSnapshot3D, 2> before_snapshots;
@@ -9001,36 +8843,32 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
     std::array<Eigen::VectorXd, 2> solved_normal_jumps;
     std::array<Eigen::VectorXd, 2> used_exact_traces;
     for (std::size_t index = 0; index < modes.size(); ++index) {
+        PanelCenterHarmonicJetKFBI3D& pipeline = *pipelines[index];
         auto& measurement = result.measurements[index];
         measurement.case_id = study_case.id;
         measurement.N = N;
         measurement.h = h;
         measurement.mode = modes[index];
         measurement.expected_non_g1_connections =
-            augmented_diagnostics.edge.expected_non_g1_connections;
+            edge_diagnostics.expected_non_g1_connections;
         measurement.covered_non_g1_connections =
-            augmented_diagnostics.edge.covered_non_g1_connections;
+            edge_diagnostics.covered_non_g1_connections;
         measurement.edge_sample_count =
-            augmented_cauchy.edge_sample_count();
+            edge_diagnostics.edge_sample_count;
         measurement.affected_center_count =
-            augmented_diagnostics.affected_center_count;
+            edge_diagnostics.affected_center_count;
         measurement.corner_center_count =
-            augmented_diagnostics.corner_center_count;
+            edge_diagnostics.corner_center_count;
         measurement.unrelated_sample_or_attachment_count =
-            augmented_diagnostics.edge.unrelated_sample_count
-            + augmented_diagnostics.unrelated_attachment_count;
+            edge_diagnostics.unrelated_sample_or_attachment_count;
         measurement.rank_deficient_fit_count =
-            augmented_diagnostics.edge.rank_deficient_fit_count
-            + augmented_diagnostics.rank_deficient_local_fit_count;
-        measurement.harmonic_cubic_reproduction_defect = std::max(
-            augmented_diagnostics.edge.
-                harmonic_cubic_reproduction_defect_max,
-            augmented_diagnostics.
-                harmonic_cubic_reproduction_defect_max);
+            edge_diagnostics.rank_deficient_fit_count;
+        measurement.harmonic_cubic_reproduction_defect =
+            edge_diagnostics.harmonic_cubic_reproduction_defect;
         measurement.edge_condition_max =
-            augmented_diagnostics.edge.condition_max;
+            edge_diagnostics.edge_condition_max;
         measurement.local_condition_max =
-            augmented_diagnostics.local_condition_max;
+            edge_diagnostics.local_condition_max;
         measurement.shared_setup_seconds = setup_wall_seconds;
         measurement.far_centers_bitwise_legacy =
             far_centers_bitwise_legacy;
@@ -9043,13 +8881,15 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
         before_snapshots[index] =
             capture_neumann_edge_preprocess_snapshot_3d(pipeline);
         result.factorization_counts_before[index] =
-            augmented_cauchy.diagnostics().factorization_count;
+            edge_diagnostics.legacy_factorization_count;
+        const app3d::HarmonicCauchyPreprocessAudit3D cauchy_audit_before =
+            pipeline.cauchy_fit().audit();
         const PhaseRecordArray3D phase_before =
             capture_phase_records_3d(profile);
         const auto route_start = std::chrono::steady_clock::now();
         const SolveMetrics3D solve = run_neumann_case(
             grid, grid_pair, pipeline, study_case.transform,
-            gmres_max_iterations, restrict_mode, modes[index],
+            gmres_max_iterations, restrict_mode,
             &result.residual_histories[index], nullptr,
             &solved_value_jumps[index], &solved_coefficients[index],
             &solved_normal_jumps[index], &used_exact_traces[index],
@@ -9084,11 +8924,18 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
         after_snapshots[index] =
             capture_neumann_edge_preprocess_snapshot_3d(pipeline);
         result.factorization_counts_after[index] =
-            augmented_cauchy.diagnostics().factorization_count;
+            edge_diagnostics.legacy_factorization_count;
+        const auto& cauchy_audit_after = pipeline.cauchy_fit().audit();
         if (result.factorization_counts_after[index]
                 != result.factorization_counts_before[index]
             || result.factorization_counts_before[index]
-                != result.setup_factorization_count) {
+                != result.setup_factorization_count
+            || cauchy_audit_before.geometry_query_count
+                != cauchy_audit_after.geometry_query_count
+            || cauchy_audit_before.svd_factorization_count
+                != cauchy_audit_after.svd_factorization_count
+            || cauchy_audit_before.fingerprint
+                != cauchy_audit_after.fingerprint) {
             throw std::logic_error(
                 "Neumann edge-Cauchy GMRES changed factorization count");
         }
@@ -9144,11 +8991,9 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
             measurement.shared_setup_seconds
             + measurement.mode_runtime_seconds;
 
-        const Eigen::VectorXd shared_edge_values =
-            augmented_cauchy.edge_values(
-                solved_value_jumps[index], solved_normal_jumps[index]);
-        const auto& samples =
-            augmented_cauchy.edge_value_map().samples;
+        const Eigen::VectorXd shared_edge_values = edge_fit.apply(
+            solved_value_jumps[index], solved_normal_jumps[index]).edge_values;
+        const auto& samples = edge_fit.edge_maps();
         if (shared_edge_values.size()
             != static_cast<Eigen::Index>(samples.size())) {
             throw std::logic_error(
@@ -9161,18 +9006,26 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
         double discrepancy = 0.0;
         for (std::size_t q = 0; q < samples.size(); ++q) {
             const auto& sample = samples[q];
+            if (sample.value_sector_counts[0] <= 0
+                || sample.value_sector_counts[1] <= 0) {
+                throw std::logic_error(
+                    "public edge-Cauchy diagnostic has an empty owner sector");
+            }
+            const int first_owner_dof = sample.value_ids.front();
+            const int second_owner_dof = sample.value_ids[
+                static_cast<std::size_t>(sample.value_sector_counts[0])];
             NeumannEdgeCauchyEdgeValueRow3D edge_row;
-            edge_row.connection_index = sample.connection_index;
-            edge_row.sample_index = sample.sample_index;
-            edge_row.sample_count = sample.sample_count;
-            edge_row.first_owner_dof = sample.first_owner_dof;
-            edge_row.second_owner_dof = sample.second_owner_dof;
+            edge_row.connection_index = sample.point.connection_id;
+            edge_row.sample_index = sample.point.cell_id;
+            edge_row.sample_count = sample.point.cell_count;
+            edge_row.first_owner_dof = first_owner_dof;
+            edge_row.second_owner_dof = second_owner_dof;
             edge_row.first_value = evaluate_edge_owner_value_3d(
-                pipeline.surface(), sample.first_owner_dof,
-                sample.point, h, solved_coefficients[index]);
+                pipeline.surface(), first_owner_dof,
+                sample.point.point, h, solved_coefficients[index]);
             edge_row.second_value = evaluate_edge_owner_value_3d(
-                pipeline.surface(), sample.second_owner_dof,
-                sample.point, h, solved_coefficients[index]);
+                pipeline.surface(), second_owner_dof,
+                sample.point.point, h, solved_coefficients[index]);
             edge_row.shared_auxiliary_value =
                 shared_edge_values[static_cast<Eigen::Index>(q)];
             edge_row.first_second_difference = std::abs(
@@ -9208,26 +9061,29 @@ NeumannEdgeCauchyPairRun3D run_neumann_edge_cauchy_pair_3d(
         measurement.pair_completed = true;
         measurement.owner_invariants_pass =
             neumann_edge_preprocess_snapshot_equal_3d(
-                stable_snapshot, before_snapshots[index])
+                stable_snapshots[index], before_snapshots[index])
             && neumann_edge_preprocess_snapshot_equal_3d(
-                stable_snapshot, after_snapshots[index]);
+                stable_snapshots[index], after_snapshots[index]);
     }
 
-    const NeumannEdgePreprocessSnapshot3D final_snapshot =
-        capture_neumann_edge_preprocess_snapshot_3d(pipeline);
+    std::array<NeumannEdgePreprocessSnapshot3D, 2> final_snapshots;
+    for (std::size_t index = 0; index < pipelines.size(); ++index) {
+        final_snapshots[index] =
+            capture_neumann_edge_preprocess_snapshot_3d(*pipelines[index]);
+    }
     result.owner_snapshots = {
         neumann_edge_preprocess_invariant_snapshot_3d(
-            stable_snapshot, stable_snapshot),
+            stable_snapshots[0], stable_snapshots[0]),
         neumann_edge_preprocess_invariant_snapshot_3d(
-            before_snapshots[0], stable_snapshot),
+            before_snapshots[0], stable_snapshots[0]),
         neumann_edge_preprocess_invariant_snapshot_3d(
-            after_snapshots[0], stable_snapshot),
+            after_snapshots[0], stable_snapshots[0]),
         neumann_edge_preprocess_invariant_snapshot_3d(
-            before_snapshots[1], stable_snapshot),
+            before_snapshots[1], stable_snapshots[1]),
         neumann_edge_preprocess_invariant_snapshot_3d(
-            after_snapshots[1], stable_snapshot),
+            after_snapshots[1], stable_snapshots[1]),
         neumann_edge_preprocess_invariant_snapshot_3d(
-            final_snapshot, stable_snapshot)};
+            final_snapshots[1], stable_snapshots[1])};
     const bool shared_preprocess_pass =
         app3d::neumann_edge_shared_preprocess_pass_3d(
             result.owner_snapshots);
@@ -10016,7 +9872,7 @@ int main(int argc, char** argv)
         if (neumann_edge_cauchy_study)
             return run_neumann_edge_cauchy_study_3d(
                 levels, force_neumann_edge_cauchy_extended);
-        const CauchyStencilPolicy3D cauchy_policy = selected_cauchy_policy();
+        const app3d::LegacySurfaceCauchyPolicy3D cauchy_policy = selected_cauchy_policy();
         const int cauchy_value_count = positive_environment_integer(
             "KFBIM_3D_CAUCHY_VALUE_COUNT", kCauchyValueNeighborCount);
         const int cauchy_normal_count = positive_environment_integer(
@@ -10054,13 +9910,14 @@ int main(int argc, char** argv)
         std::filesystem::path output_dir =
             "output/neumann_exterior_zero_trace_3d";
 #endif
-        if (cauchy_policy != CauchyStencilPolicy3D::TopologicalNearest)
+        if (cauchy_policy != app3d::LegacySurfaceCauchyPolicy3D::TopologicalNearest)
             output_dir /= cauchy_policy_name(cauchy_policy);
         if (cauchy_value_count != kCauchyValueNeighborCount
             || cauchy_normal_count != kCauchyDerivativeNeighborCount) {
             output_dir /= "v" + std::to_string(cauchy_value_count) + "_n"
                           + std::to_string(cauchy_normal_count);
         }
+        output_dir.make_preferred();
 
         std::cout << "KFBI3D harmonic-jet convergence study\n"
                   << "  Neumann target: exterior value trace = 0\n"

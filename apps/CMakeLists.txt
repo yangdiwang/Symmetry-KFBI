@@ -117,6 +117,10 @@ if(KFBIM_BUILD_3D)
     add_executable(neumann_exterior_zero_trace_3d
         neumann_exterior_zero_trace_3d.cpp
     )
+
+    add_executable(neumann_exterior_zero_trace_3d_route_test
+        neumann_exterior_zero_trace_3d_route_test.cpp
+    )
 endif()
 
 target_link_libraries(shape_opt_transmission_2d PRIVATE
@@ -223,11 +227,21 @@ if(KFBIM_BUILD_3D)
         kfbim_phase_profile_3d
         Threads::Threads
     )
+    target_link_libraries(neumann_exterior_zero_trace_3d_route_test PRIVATE
+        kfbim_3d_app_geometry
+        kfbim_core
+        kfbim_phase_profile_3d
+        Threads::Threads
+    )
     if(WIN32)
         target_link_libraries(neumann_exterior_zero_trace_3d PRIVATE Psapi)
+        target_link_libraries(
+            neumann_exterior_zero_trace_3d_route_test PRIVATE Psapi)
     endif()
     if(MSVC)
         target_compile_options(neumann_exterior_zero_trace_3d PRIVATE /bigobj)
+        target_compile_options(
+            neumann_exterior_zero_trace_3d_route_test PRIVATE /bigobj)
     endif()
 endif()
 
@@ -296,4 +310,9 @@ if(KFBIM_BUILD_3D)
     target_compile_features(nurbs_geometry_preprocess_benchmark_3d_test PRIVATE cxx_std_17)
     target_compile_features(nurbs_geometry_preprocess_benchmark_3d PRIVATE cxx_std_17)
     target_compile_features(neumann_exterior_zero_trace_3d PRIVATE cxx_std_17)
+    target_compile_definitions(neumann_exterior_zero_trace_3d_route_test PRIVATE
+        KFBIM_APP_OUTPUT_DIR="${PROJECT_SOURCE_DIR}/output"
+    )
+    target_compile_features(
+        neumann_exterior_zero_trace_3d_route_test PRIVATE cxx_std_17)
 endif()
