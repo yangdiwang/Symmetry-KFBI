@@ -1,14 +1,23 @@
 #include <apps/harmonic_cauchy_fit_3d.hpp>
 
+#include <Eigen/SVD>
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <map>
+#include <set>
 #include <sstream>
 #include <utility>
 
 namespace kfbim::app3d {
 
 namespace {
+
+HarmonicCauchyError3D shared_edge_failure(
+    int connection_id,
+    const std::array<std::vector<int>, 2>& sectors,
+    const std::string& message);
 
 struct EdgeGeometry3D {
     Eigen::Vector2d uv = Eigen::Vector2d::Zero();
@@ -20,7 +29,9 @@ struct EdgeGeometry3D {
 EdgeGeometry3D edge_geometry(
     const geometry3d::NurbsSurfacePatch3D& patch,
     geometry3d::NurbsPatchEdge3D edge,
-    double parameter)
+    double parameter,
+    int connection_id,
+    const std::array<std::vector<int>, 2>& sectors)
 {
     double u = patch.domain_start_u();
     double v = patch.domain_start_v();
@@ -44,19 +55,26 @@ EdgeGeometry3D edge_geometry(
         patch.evaluate_with_derivatives(u, v);
     const bool varying_v = edge == geometry3d::NurbsPatchEdge3D::UMin
                         || edge == geometry3d::NurbsPatchEdge3D::UMax;
+    const Eigen::Vector3d tangent =
+        varying_v ? derivatives.dv : derivatives.du;
+    const double tangent_norm = tangent.norm();
+    if (!tangent.allFinite() || !std::isfinite(tangent_norm)
+        || tangent_norm <= 1.0e-14) {
+        throw shared_edge_failure(
+            connection_id, sectors,
+            "native patch edge has a zero or non-finite tangent");
+    }
     Eigen::Vector3d normal = derivatives.du.cross(derivatives.dv);
     const double normal_norm = normal.norm();
     if (!std::isfinite(normal_norm) || normal_norm <= 1.0e-14) {
-        HarmonicCauchyFailure3D diagnostic;
-        diagnostic.stage = "shared_edge_geometry";
-        diagnostic.entity_kind = "patch_edge";
-        diagnostic.message = "native patch edge has a degenerate normal";
-        throw HarmonicCauchyError3D(std::move(diagnostic));
+        throw shared_edge_failure(
+            connection_id, sectors,
+            "native patch edge has a degenerate normal");
     }
     normal /= normal_norm;
     return {{u, v},
             derivatives.point,
-            varying_v ? derivatives.dv : derivatives.du,
+            tangent,
             normal};
 }
 
@@ -177,6 +195,21 @@ SharedEdgePointSet3D make_shared_edge_points_3d(
                 connection.first.begin,
                 connection.first.end,
                 edge_length_parameter_samples);
+        if (!std::isfinite(interval_length)) {
+            const double midpoint = 0.5
+                * (connection.first.begin + connection.first.end);
+            (void)edge_geometry(
+                first_patch, connection.first.edge, midpoint,
+                connection_id, sectors);
+            throw shared_edge_failure(
+                connection_id, sectors,
+                "connection native edge length is non-finite");
+        }
+        if (interval_length <= 0.0) {
+            throw shared_edge_failure(
+                connection_id, sectors,
+                "connection native edge length is non-positive");
+        }
         const int cell_count = std::max(
             1, static_cast<int>(std::ceil(interval_length / h)));
         auto& connection_ids = result.point_ids_by_connection[
@@ -194,9 +227,11 @@ SharedEdgePointSet3D make_shared_edge_points_3d(
                 + second_fraction
                     * (connection.second.end - connection.second.begin);
             const EdgeGeometry3D first = edge_geometry(
-                first_patch, connection.first.edge, first_parameter);
+                first_patch, connection.first.edge, first_parameter,
+                connection_id, sectors);
             const EdgeGeometry3D second = edge_geometry(
-                second_patch, connection.second.edge, second_parameter);
+                second_patch, connection.second.edge, second_parameter,
+                connection_id, sectors);
             const double mismatch = (first.point - second.point).norm();
             result.max_position_mismatch =
                 std::max(result.max_position_mismatch, mismatch);
@@ -590,6 +625,24 @@ select_direct_cross_face_value_dofs_3d(
         }
         const auto& connection = surface.geometric_connections[
             static_cast<std::size_t>(connection_id)];
+        const std::vector<int> first_sector =
+            smooth_patch_component(surface, connection.first.patch);
+        const std::vector<int> second_sector =
+            smooth_patch_component(surface, connection.second.patch);
+        const bool first_is_center = same_sector(first_sector, center_sector);
+        const bool second_is_center = same_sector(second_sector, center_sector);
+        if (first_is_center == second_is_center) {
+            HarmonicCauchyFailure3D diagnostic;
+            diagnostic.stage = "direct_selector_topology";
+            diagnostic.entity_kind = "surface_dof";
+            diagnostic.entity_id = center_dof;
+            diagnostic.connection_id = connection_id;
+            diagnostic.incident_sectors = {
+                center_sector, first_sector, second_sector};
+            diagnostic.message =
+                "cached relevant connection is not incident to exactly one center sector";
+            throw HarmonicCauchyError3D(std::move(diagnostic));
+        }
         for (int patch : {connection.first.patch, connection.second.patch}) {
             std::vector<int> sector = smooth_patch_component(surface, patch);
             if (!same_sector(sector, center_sector))
@@ -626,10 +679,15 @@ select_direct_cross_face_value_dofs_3d(
                 .squaredNorm(),
             q});
     }
-    const auto candidate_less = [](const Candidate& first,
-                                   const Candidate& second) {
-        return first.first != second.first
-            ? first.first < second.first : first.second < second.second;
+    const double distance_quantum = 1.0e-12 * h * h;
+    const auto candidate_less = [distance_quantum](const Candidate& first,
+                                                    const Candidate& second) {
+        const long long first_key = static_cast<long long>(
+            std::llround(first.first / distance_quantum));
+        const long long second_key = static_cast<long long>(
+            std::llround(second.first / distance_quantum));
+        return first_key != second_key
+            ? first_key < second_key : first.second < second.second;
     };
     for (auto& sector_candidates : candidates)
         std::sort(sector_candidates.begin(), sector_candidates.end(),
@@ -774,10 +832,15 @@ select_surface_edge_points_3d(
     const Eigen::Vector3d& center_point =
         cloud.dofs[static_cast<std::size_t>(center_dof)].point;
     using Candidate = std::pair<double, int>;
-    const auto candidate_less = [](const Candidate& first,
-                                   const Candidate& second) {
-        return first.first != second.first
-            ? first.first < second.first : first.second < second.second;
+    const double distance_quantum = 1.0e-12 * h * h;
+    const auto candidate_less = [distance_quantum](const Candidate& first,
+                                                    const Candidate& second) {
+        const long long first_key = static_cast<long long>(
+            std::llround(first.first / distance_quantum));
+        const long long second_key = static_cast<long long>(
+            std::llround(second.first / distance_quantum));
+        return first_key != second_key
+            ? first_key < second_key : first.second < second.second;
     };
     std::vector<Candidate> selected;
     for (int connection_id : neighborhood.relevant_connection_ids) {
@@ -826,6 +889,857 @@ select_surface_edge_points_3d(
     for (const Candidate& candidate : selected)
         result.edge_point_ids.push_back(candidate.second);
     return result;
+}
+
+namespace {
+
+bool sector_contains_patch(const std::vector<int>& sector, int patch)
+{
+    return std::binary_search(sector.begin(), sector.end(), patch);
+}
+
+std::vector<int> nearest_sector_dofs(
+    const SurfaceDofCloud3D& cloud,
+    const Eigen::Vector3d& center,
+    const std::vector<int>& sector,
+    int count,
+    double h)
+{
+    using Candidate = std::pair<long long, int>;
+    std::vector<Candidate> candidates;
+    const double quantum = 1.0e-12 * h * h;
+    for (int q = 0; q < static_cast<int>(cloud.dofs.size()); ++q) {
+        const auto& dof = cloud.dofs[static_cast<std::size_t>(q)];
+        if (!sector_contains_patch(sector, dof.patch_id))
+            continue;
+        const double distance_sq = (dof.point - center).squaredNorm();
+        candidates.push_back({
+            static_cast<long long>(std::llround(distance_sq / quantum)), q});
+    }
+    std::sort(candidates.begin(), candidates.end());
+    std::vector<int> result;
+    const int take = std::min(count, static_cast<int>(candidates.size()));
+    result.reserve(static_cast<std::size_t>(take));
+    for (int q = 0; q < take; ++q)
+        result.push_back(candidates[static_cast<std::size_t>(q)].second);
+    return result;
+}
+
+double sample_radius_over_h(const SurfaceDofCloud3D& cloud,
+                            const Eigen::Vector3d& center,
+                            const std::vector<int>& ids,
+                            double h)
+{
+    double radius_sq = 0.0;
+    for (int id : ids) {
+        radius_sq = std::max(
+            radius_sq,
+            (cloud.dofs[static_cast<std::size_t>(id)].point - center)
+                .squaredNorm());
+    }
+    return std::sqrt(radius_sq) / h;
+}
+
+int patch_imbalance(const SurfaceDofCloud3D& cloud,
+                    const std::vector<int>& ids)
+{
+    std::map<int, int> counts;
+    for (int id : ids)
+        ++counts[cloud.dofs[static_cast<std::size_t>(id)].patch_id];
+    if (counts.empty())
+        return 0;
+    int minimum = std::numeric_limits<int>::max();
+    int maximum = 0;
+    for (const auto& item : counts) {
+        minimum = std::min(minimum, item.second);
+        maximum = std::max(maximum, item.second);
+    }
+    return maximum - minimum;
+}
+
+int incident_patch_count(const SurfaceDofCloud3D& cloud,
+                         const std::vector<int>& value_ids,
+                         const std::vector<int>& normal_ids)
+{
+    std::set<int> patches;
+    for (int id : value_ids)
+        patches.insert(cloud.dofs[static_cast<std::size_t>(id)].patch_id);
+    for (int id : normal_ids)
+        patches.insert(cloud.dofs[static_cast<std::size_t>(id)].patch_id);
+    return static_cast<int>(patches.size());
+}
+
+Eigen::VectorXd gather(const Eigen::VectorXd& source,
+                       const std::vector<int>& ids)
+{
+    Eigen::VectorXd result(static_cast<int>(ids.size()));
+    for (int q = 0; q < result.size(); ++q)
+        result[q] = source[ids[static_cast<std::size_t>(q)]];
+    return result;
+}
+
+struct DesignInverse3D {
+    Eigen::MatrixXd pinv;
+    double sigma_max = 0.0;
+    double sigma_min = 0.0;
+    double condition = 0.0;
+};
+
+DesignInverse3D factor_design(
+    const Eigen::MatrixXd& weighted,
+    int dimension,
+    double relative_cutoff,
+    HarmonicCauchyFailure3D diagnostic,
+    std::size_t& svd_count)
+{
+    ++svd_count;
+    Eigen::JacobiSVD<Eigen::MatrixXd> svd(
+        weighted, Eigen::ComputeThinU | Eigen::ComputeThinV);
+    const Eigen::VectorXd singular = svd.singularValues();
+    if (singular.size() > 0) {
+        diagnostic.sigma_max = singular[0];
+        diagnostic.sigma_min = singular[singular.size() - 1];
+        if (diagnostic.sigma_min > 0.0)
+            diagnostic.condition = diagnostic.sigma_max / diagnostic.sigma_min;
+        else if (diagnostic.sigma_max > 0.0)
+            diagnostic.condition = std::numeric_limits<double>::infinity();
+    }
+    if (singular.size() != dimension || !singular.allFinite()
+        || !(diagnostic.sigma_max > 0.0)
+        || !(diagnostic.sigma_min
+             > relative_cutoff * diagnostic.sigma_max)) {
+        std::ostringstream message;
+        message << diagnostic.stage << " rank failure entity="
+                << diagnostic.entity_id << " sigma_max="
+                << diagnostic.sigma_max << " sigma_min="
+                << diagnostic.sigma_min << " condition="
+                << diagnostic.condition;
+        diagnostic.message = message.str();
+        throw HarmonicCauchyError3D(std::move(diagnostic));
+    }
+    Eigen::VectorXd inverse = singular.cwiseInverse();
+    DesignInverse3D result;
+    result.pinv = svd.matrixV() * inverse.asDiagonal()
+                * svd.matrixU().transpose();
+    result.sigma_max = diagnostic.sigma_max;
+    result.sigma_min = diagnostic.sigma_min;
+    result.condition = diagnostic.condition;
+    return result;
+}
+
+HarmonicCauchyError3D edge_sample_failure(
+    const SharedEdgePoint3D& point,
+    const std::array<int, 2>& value_counts,
+    const std::array<int, 2>& normal_counts,
+    int required_value,
+    int required_normal,
+    double value_radius,
+    double normal_radius)
+{
+    HarmonicCauchyFailure3D diagnostic;
+    diagnostic.stage = "edge_sector_selection";
+    diagnostic.entity_kind = "edge_point";
+    diagnostic.entity_id = point.id;
+    diagnostic.connection_id = point.connection_id;
+    diagnostic.incident_sectors = {
+        point.sector_patch_ids[0], point.sector_patch_ids[1]};
+    diagnostic.actual_value_counts = {
+        value_counts[0], value_counts[1]};
+    diagnostic.actual_normal_counts = {
+        normal_counts[0], normal_counts[1]};
+    diagnostic.required_value_count = required_value;
+    diagnostic.required_normal_count = required_normal;
+    diagnostic.value_radius_over_h = value_radius;
+    diagnostic.normal_radius_over_h = normal_radius;
+    std::ostringstream message;
+    message << "edge point " << point.id << " connection "
+            << point.connection_id << " sectors";
+    for (const auto& sector : point.sector_patch_ids) {
+        message << " [";
+        for (int patch : sector)
+            message << patch << ',';
+        message << ']';
+    }
+    message << " requires/actual value " << required_value << '/'
+            << value_counts[0] << ',' << value_counts[1]
+            << " normal " << required_normal << '/'
+            << normal_counts[0] << ',' << normal_counts[1]
+            << " radii " << value_radius << '/' << normal_radius;
+    diagnostic.message = message.str();
+    return HarmonicCauchyError3D(std::move(diagnostic));
+}
+
+EdgeValueMap3D build_edge_value_map(
+    const SharedEdgePoint3D& point,
+    const SurfaceDofCloud3D& cloud,
+    const HarmonicPolynomialSpace3D& space,
+    double h,
+    double relative_cutoff,
+    std::size_t& svd_count)
+{
+    constexpr int value_per_sector = 24;
+    constexpr int normal_per_sector = 14;
+    EdgeValueMap3D result;
+    result.point = point;
+    result.sector_patch_ids = point.sector_patch_ids;
+    for (int sector = 0; sector < 2; ++sector) {
+        const std::vector<int> values = nearest_sector_dofs(
+            cloud, point.point,
+            point.sector_patch_ids[static_cast<std::size_t>(sector)],
+            value_per_sector, h);
+        const std::vector<int> normals = nearest_sector_dofs(
+            cloud, point.point,
+            point.sector_patch_ids[static_cast<std::size_t>(sector)],
+            normal_per_sector, h);
+        result.value_sector_counts[static_cast<std::size_t>(sector)] =
+            static_cast<int>(values.size());
+        result.normal_sector_counts[static_cast<std::size_t>(sector)] =
+            static_cast<int>(normals.size());
+        result.value_ids.insert(
+            result.value_ids.end(), values.begin(), values.end());
+        result.normal_ids.insert(
+            result.normal_ids.end(), normals.begin(), normals.end());
+    }
+    result.value_radius_over_h = sample_radius_over_h(
+        cloud, point.point, result.value_ids, h);
+    result.normal_radius_over_h = sample_radius_over_h(
+        cloud, point.point, result.normal_ids, h);
+    if (result.value_sector_counts
+            != std::array<int, 2>{{value_per_sector, value_per_sector}}
+        || result.normal_sector_counts
+            != std::array<int, 2>{{normal_per_sector, normal_per_sector}}) {
+        throw edge_sample_failure(
+            point, result.value_sector_counts, result.normal_sector_counts,
+            value_per_sector, normal_per_sector,
+            result.value_radius_over_h, result.normal_radius_over_h);
+    }
+
+    const int value_count = static_cast<int>(result.value_ids.size());
+    const int normal_count = static_cast<int>(result.normal_ids.size());
+    Eigen::MatrixXd design(value_count + normal_count, space.dimension());
+    Eigen::VectorXd sqrt_weights(value_count + normal_count);
+    for (int k = 0; k < value_count; ++k) {
+        const auto& sample = cloud.dofs[static_cast<std::size_t>(
+            result.value_ids[static_cast<std::size_t>(k)])];
+        const Eigen::Vector3d xi =
+            point.frame.transpose() * (sample.point - point.point) / h;
+        design.row(k) =
+            space.basis(xi.x(), xi.y(), xi.z()).transpose();
+        sqrt_weights[k] = 1.0 / (0.35 + xi.norm());
+    }
+    for (int k = 0; k < normal_count; ++k) {
+        const auto& sample = cloud.dofs[static_cast<std::size_t>(
+            result.normal_ids[static_cast<std::size_t>(k)])];
+        const Eigen::Vector3d xi =
+            point.frame.transpose() * (sample.point - point.point) / h;
+        const Eigen::Vector3d normal_components =
+            point.frame.transpose() * sample.normal;
+        design.row(value_count + k) = normal_components.transpose()
+            * space.gradient(xi.x(), xi.y(), xi.z());
+        sqrt_weights[value_count + k] =
+            std::sqrt(0.85) / (0.35 + xi.norm());
+    }
+    HarmonicCauchyFailure3D diagnostic;
+    diagnostic.stage = "edge_map_factorization";
+    diagnostic.entity_kind = "edge_point";
+    diagnostic.entity_id = point.id;
+    diagnostic.connection_id = point.connection_id;
+    diagnostic.incident_sectors = {
+        point.sector_patch_ids[0], point.sector_patch_ids[1]};
+    diagnostic.actual_value_counts = {
+        result.value_sector_counts[0], result.value_sector_counts[1]};
+    diagnostic.actual_normal_counts = {
+        result.normal_sector_counts[0], result.normal_sector_counts[1]};
+    diagnostic.required_value_count = value_per_sector;
+    diagnostic.required_normal_count = normal_per_sector;
+    diagnostic.value_radius_over_h = result.value_radius_over_h;
+    diagnostic.normal_radius_over_h = result.normal_radius_over_h;
+    const DesignInverse3D inverse = factor_design(
+        sqrt_weights.asDiagonal() * design, space.dimension(),
+        relative_cutoff, std::move(diagnostic), svd_count);
+    result.sigma_max = inverse.sigma_max;
+    result.sigma_min = inverse.sigma_min;
+    result.condition = inverse.condition;
+    result.E_value.resize(value_count);
+    result.E_normal.resize(normal_count);
+    const Eigen::VectorXd origin = space.basis(0.0, 0.0, 0.0);
+    for (int k = 0; k < value_count; ++k) {
+        result.E_value[k] =
+            origin.dot(inverse.pinv.col(k)) * sqrt_weights[k];
+    }
+    for (int k = 0; k < normal_count; ++k) {
+        result.E_normal[k] = origin.dot(inverse.pinv.col(value_count + k))
+                           * sqrt_weights[value_count + k] * h;
+    }
+    return result;
+}
+
+SurfaceCauchyMap3D select_surface_map_inputs(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud3D& cloud,
+    const SharedEdgePointSet3D* edge_points,
+    const SurfaceNonG1EdgeNeighborhoodSet3D& neighborhoods,
+    int center,
+    double h,
+    HarmonicCauchyRoute3D route,
+    int value_count,
+    int normal_count,
+    std::optional<LegacySurfaceCauchyPolicy3D> legacy_policy)
+{
+    SurfaceCauchyMap3D result;
+    const auto& neighborhood =
+        neighborhoods.centers[static_cast<std::size_t>(center)];
+    result.nearest_edge_distance_over_h =
+        neighborhood.nearest_distance_over_h;
+    result.relevant_connection_ids = neighborhood.relevant_connection_ids;
+    const int center_patch =
+        cloud.dofs[static_cast<std::size_t>(center)].patch_id;
+    const std::vector<int> center_sector =
+        smooth_patch_component(surface, center_patch);
+    const auto legacy_ids = [&](int count) {
+        switch (*legacy_policy) {
+        case LegacySurfaceCauchyPolicy3D::G1Nearest:
+            return nearest_g1_cauchy_dofs(surface, cloud, center, count);
+        case LegacySurfaceCauchyPolicy3D::TopologicalNearest:
+            return nearest_topological_cauchy_dofs(
+                surface, cloud, center, count);
+        case LegacySurfaceCauchyPolicy3D::SamePatch:
+            return nearest_same_patch_cauchy_dofs(cloud, center, count);
+        case LegacySurfaceCauchyPolicy3D::BalancedPatches:
+            return balanced_topological_cauchy_dofs(
+                surface, cloud, center, count);
+        }
+        throw std::logic_error("unknown legacy Cauchy policy");
+    };
+    if (legacy_policy) {
+        result.value_ids = legacy_ids(value_count);
+        result.value_sector_patch_ids = {center_sector};
+        result.value_sector_counts = {
+            static_cast<int>(result.value_ids.size())};
+    } else if (route == HarmonicCauchyRoute3D::DirectCrossFaceValue) {
+        const DirectCrossFaceSelection3D direct =
+            select_direct_cross_face_value_dofs_3d(
+                surface, cloud, neighborhoods, center, value_count, h);
+        result.value_ids = direct.dof_ids;
+        result.value_sector_patch_ids = direct.sector_patch_ids;
+        result.value_sector_counts = direct.sector_sample_counts;
+    } else {
+        result.value_ids = nearest_sector_dofs(
+            cloud, cloud.dofs[static_cast<std::size_t>(center)].point,
+            center_sector, value_count, h);
+        result.value_sector_patch_ids = {center_sector};
+        result.value_sector_counts = {
+            static_cast<int>(result.value_ids.size())};
+    }
+    result.normal_ids = legacy_policy
+        ? legacy_ids(normal_count)
+        : nearest_sector_dofs(
+              cloud, cloud.dofs[static_cast<std::size_t>(center)].point,
+              center_sector, normal_count, h);
+    result.normal_sector_patch_ids = {center_sector};
+    result.normal_sector_counts = {
+        static_cast<int>(result.normal_ids.size())};
+    if (static_cast<int>(result.value_ids.size()) != value_count
+        || static_cast<int>(result.normal_ids.size()) != normal_count) {
+        HarmonicCauchyFailure3D diagnostic;
+        diagnostic.stage = "surface_sector_selection";
+        diagnostic.entity_kind = "surface_dof";
+        diagnostic.entity_id = center;
+        diagnostic.incident_sectors = result.value_sector_patch_ids;
+        diagnostic.actual_value_counts = result.value_sector_counts;
+        diagnostic.actual_normal_counts = result.normal_sector_counts;
+        diagnostic.required_value_count = value_count;
+        diagnostic.required_normal_count = normal_count;
+        diagnostic.message =
+            "surface Cauchy sectors cannot fill the requested sample counts";
+        throw HarmonicCauchyError3D(std::move(diagnostic));
+    }
+    if (!legacy_policy
+        && route == HarmonicCauchyRoute3D::EdgeReconstructedValue) {
+        if (edge_points == nullptr)
+            throw std::logic_error("edge route requires shared edge points");
+        const SurfaceEdgePointSelection3D edge =
+            select_surface_edge_points_3d(
+                surface, cloud, *edge_points, neighborhoods, center, h);
+        result.edge_point_ids = edge.edge_point_ids;
+    }
+    const Eigen::Vector3d& center_point =
+        cloud.dofs[static_cast<std::size_t>(center)].point;
+    result.value_radius_over_h = sample_radius_over_h(
+        cloud, center_point, result.value_ids, h);
+    result.normal_radius_over_h = sample_radius_over_h(
+        cloud, center_point, result.normal_ids, h);
+    result.incident_patch_count = incident_patch_count(
+        cloud, result.value_ids, result.normal_ids);
+    result.value_patch_imbalance = patch_imbalance(cloud, result.value_ids);
+    result.normal_patch_imbalance = patch_imbalance(cloud, result.normal_ids);
+    return result;
+}
+
+SurfaceCauchyMap3D build_surface_map(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud3D& cloud,
+    const SharedEdgePointSet3D* edge_points,
+    const SurfaceNonG1EdgeNeighborhoodSet3D& neighborhoods,
+    const HarmonicPolynomialSpace3D& space,
+    int center,
+    double h,
+    HarmonicCauchyRoute3D route,
+    int value_count,
+    int normal_count,
+    double relative_cutoff,
+    std::size_t& svd_count,
+    std::optional<LegacySurfaceCauchyPolicy3D> legacy_policy = std::nullopt)
+{
+    SurfaceCauchyMap3D result = select_surface_map_inputs(
+        surface, cloud, edge_points, neighborhoods, center, h, route,
+        value_count, normal_count, legacy_policy);
+    const auto& target = cloud.dofs[static_cast<std::size_t>(center)];
+    Eigen::Matrix3d frame;
+    frame.col(0) = target.tangent1;
+    frame.col(1) = target.tangent2;
+    frame.col(2) = target.normal;
+    const int edge_count = static_cast<int>(result.edge_point_ids.size());
+    const int rows = value_count + normal_count + edge_count;
+    Eigen::MatrixXd design(rows, space.dimension());
+    Eigen::VectorXd sqrt_weights(rows);
+    for (int k = 0; k < value_count; ++k) {
+        const auto& sample = cloud.dofs[static_cast<std::size_t>(
+            result.value_ids[static_cast<std::size_t>(k)])];
+        const Eigen::Vector3d xi =
+            frame.transpose() * (sample.point - target.point) / h;
+        design.row(k) =
+            space.basis(xi.x(), xi.y(), xi.z()).transpose();
+        sqrt_weights[k] = 1.0 / (0.35 + xi.norm());
+    }
+    for (int k = 0; k < normal_count; ++k) {
+        const auto& sample = cloud.dofs[static_cast<std::size_t>(
+            result.normal_ids[static_cast<std::size_t>(k)])];
+        const Eigen::Vector3d xi =
+            frame.transpose() * (sample.point - target.point) / h;
+        const Eigen::Vector3d normal_components =
+            frame.transpose() * sample.normal;
+        design.row(value_count + k) = normal_components.transpose()
+            * space.gradient(xi.x(), xi.y(), xi.z());
+        sqrt_weights[value_count + k] =
+            std::sqrt(0.85) / (0.35 + xi.norm());
+    }
+    double edge_radius_sq = 0.0;
+    for (int k = 0; k < edge_count; ++k) {
+        const int point_id =
+            result.edge_point_ids[static_cast<std::size_t>(k)];
+        if (edge_points == nullptr || point_id < 0
+            || point_id >= static_cast<int>(edge_points->points.size())) {
+            HarmonicCauchyFailure3D diagnostic;
+            diagnostic.stage = "surface_edge_rows";
+            diagnostic.entity_kind = "surface_dof";
+            diagnostic.entity_id = center;
+            diagnostic.actual_edge_count = edge_count;
+            diagnostic.message = "surface map references an invalid edge point";
+            throw HarmonicCauchyError3D(std::move(diagnostic));
+        }
+        const Eigen::Vector3d displacement =
+            edge_points->points[static_cast<std::size_t>(point_id)].point
+            - target.point;
+        const Eigen::Vector3d xi = frame.transpose() * displacement / h;
+        design.row(value_count + normal_count + k) =
+            space.basis(xi.x(), xi.y(), xi.z()).transpose();
+        sqrt_weights[value_count + normal_count + k] =
+            1.0 / (0.35 + xi.norm());
+        edge_radius_sq = std::max(edge_radius_sq, displacement.squaredNorm());
+    }
+    result.edge_radius_over_h = std::sqrt(edge_radius_sq) / h;
+
+    HarmonicCauchyFailure3D diagnostic;
+    diagnostic.stage = "surface_map_factorization";
+    diagnostic.entity_kind = "surface_dof";
+    diagnostic.entity_id = center;
+    diagnostic.connection_id = result.relevant_connection_ids.empty()
+        ? -1 : result.relevant_connection_ids.front();
+    diagnostic.incident_sectors = result.value_sector_patch_ids;
+    diagnostic.actual_value_counts = result.value_sector_counts;
+    diagnostic.actual_normal_counts = result.normal_sector_counts;
+    diagnostic.required_value_count = value_count;
+    diagnostic.required_normal_count = normal_count;
+    diagnostic.actual_edge_count = edge_count;
+    diagnostic.value_radius_over_h = result.value_radius_over_h;
+    diagnostic.normal_radius_over_h = result.normal_radius_over_h;
+    diagnostic.edge_radius_over_h = result.edge_radius_over_h;
+    const DesignInverse3D inverse = factor_design(
+        sqrt_weights.asDiagonal() * design, space.dimension(),
+        relative_cutoff, std::move(diagnostic), svd_count);
+    result.sigma_max = inverse.sigma_max;
+    result.sigma_min = inverse.sigma_min;
+    result.condition = inverse.condition;
+    result.M_value.resize(space.dimension(), value_count);
+    result.M_normal.resize(space.dimension(), normal_count);
+    result.M_edge.resize(space.dimension(), edge_count);
+    for (int k = 0; k < value_count; ++k)
+        result.M_value.col(k) = inverse.pinv.col(k) * sqrt_weights[k];
+    for (int k = 0; k < normal_count; ++k) {
+        result.M_normal.col(k) = inverse.pinv.col(value_count + k)
+            * sqrt_weights[value_count + k] * h;
+    }
+    for (int k = 0; k < edge_count; ++k) {
+        result.M_edge.col(k) = inverse.pinv.col(
+            value_count + normal_count + k)
+            * sqrt_weights[value_count + normal_count + k];
+    }
+    return result;
+}
+
+std::uint64_t hash_int_vector(std::uint64_t hash,
+                              const std::vector<int>& values)
+{
+    hash = append_hash(hash, values.size());
+    for (int value : values)
+        hash = append_hash(hash, value);
+    return hash;
+}
+
+std::uint64_t hash_sector_vector(
+    std::uint64_t hash,
+    const std::vector<std::vector<int>>& sectors)
+{
+    hash = append_hash(hash, sectors.size());
+    for (const auto& sector : sectors)
+        hash = hash_int_vector(hash, sector);
+    return hash;
+}
+
+template <class Derived>
+std::uint64_t hash_eigen(std::uint64_t hash,
+                         const Eigen::MatrixBase<Derived>& matrix)
+{
+    const Eigen::Index rows = matrix.rows();
+    const Eigen::Index cols = matrix.cols();
+    hash = append_hash(hash, rows);
+    hash = append_hash(hash, cols);
+    for (Eigen::Index row = 0; row < rows; ++row) {
+        for (Eigen::Index col = 0; col < cols; ++col)
+            hash = append_hash(hash, matrix(row, col));
+    }
+    return hash;
+}
+
+std::uint64_t hash_edge_map(std::uint64_t hash,
+                            const EdgeValueMap3D& map)
+{
+    const SharedEdgePoint3D& point = map.point;
+    hash = append_hash(hash, point.id);
+    hash = append_hash(hash, point.connection_id);
+    hash = append_hash(hash, point.cell_id);
+    hash = append_hash(hash, point.cell_count);
+    hash = append_hash(hash, point.fraction);
+    hash = append_hash(hash, point.quadrature_weight);
+    hash = append_hash(hash, point.native_parameters[0]);
+    hash = append_hash(hash, point.native_parameters[1]);
+    hash = hash_eigen(hash, point.native_uv[0]);
+    hash = hash_eigen(hash, point.native_uv[1]);
+    hash = hash_eigen(hash, point.point);
+    hash = hash_eigen(hash, point.tangent);
+    hash = hash_eigen(hash, point.frame);
+    hash = hash_int_vector(hash, map.sector_patch_ids[0]);
+    hash = hash_int_vector(hash, map.sector_patch_ids[1]);
+    hash = append_hash(hash, map.value_sector_counts[0]);
+    hash = append_hash(hash, map.value_sector_counts[1]);
+    hash = append_hash(hash, map.normal_sector_counts[0]);
+    hash = append_hash(hash, map.normal_sector_counts[1]);
+    hash = hash_int_vector(hash, map.value_ids);
+    hash = hash_int_vector(hash, map.normal_ids);
+    hash = hash_eigen(hash, map.E_value);
+    hash = hash_eigen(hash, map.E_normal);
+    hash = append_hash(hash, map.value_radius_over_h);
+    hash = append_hash(hash, map.normal_radius_over_h);
+    hash = append_hash(hash, map.sigma_max);
+    hash = append_hash(hash, map.sigma_min);
+    hash = append_hash(hash, map.condition);
+    return hash;
+}
+
+std::uint64_t hash_surface_map(std::uint64_t hash,
+                               const SurfaceCauchyMap3D& map)
+{
+    hash = hash_int_vector(hash, map.value_ids);
+    hash = hash_int_vector(hash, map.normal_ids);
+    hash = hash_int_vector(hash, map.edge_point_ids);
+    hash = hash_sector_vector(hash, map.value_sector_patch_ids);
+    hash = hash_int_vector(hash, map.value_sector_counts);
+    hash = hash_sector_vector(hash, map.normal_sector_patch_ids);
+    hash = hash_int_vector(hash, map.normal_sector_counts);
+    hash = hash_int_vector(hash, map.relevant_connection_ids);
+    hash = append_hash(hash, map.incident_patch_count);
+    hash = append_hash(hash, map.value_patch_imbalance);
+    hash = append_hash(hash, map.normal_patch_imbalance);
+    hash = hash_eigen(hash, map.M_value);
+    hash = hash_eigen(hash, map.M_normal);
+    hash = hash_eigen(hash, map.M_edge);
+    hash = append_hash(hash, map.value_radius_over_h);
+    hash = append_hash(hash, map.normal_radius_over_h);
+    hash = append_hash(hash, map.edge_radius_over_h);
+    hash = append_hash(hash, map.nearest_edge_distance_over_h);
+    hash = append_hash(hash, map.sigma_max);
+    hash = append_hash(hash, map.sigma_min);
+    hash = append_hash(hash, map.condition);
+    return hash;
+}
+
+} // namespace
+
+HarmonicCauchyFit3D::HarmonicCauchyFit3D(int degree)
+    : space_(degree)
+{}
+
+HarmonicCauchyFit3D HarmonicCauchyFit3D::build(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud3D& cloud,
+    const SurfaceNonG1EdgeNeighborhoodSet3D& neighborhoods,
+    double h,
+    HarmonicCauchyRoute3D route,
+    int degree,
+    int value_count,
+    int normal_count,
+    double relative_svd_cutoff)
+{
+    validate_surface_cloud(surface, cloud, h);
+    if (degree < 1 || value_count <= 0 || normal_count < 0
+        || normal_count > value_count || !std::isfinite(relative_svd_cutoff)
+        || relative_svd_cutoff <= 0.0) {
+        throw std::invalid_argument("invalid harmonic Cauchy fit parameters");
+    }
+    if (degree != 3 || value_count != 48 || normal_count != 28) {
+        throw std::invalid_argument(
+            "native harmonic Cauchy routes require cubic 48/28 maps");
+    }
+    if (neighborhoods.centers.size() != cloud.dofs.size()) {
+        throw std::invalid_argument(
+            "harmonic Cauchy fit requires complete cached neighborhoods");
+    }
+    for (int q = 0; q < static_cast<int>(cloud.dofs.size()); ++q) {
+        if (neighborhoods.centers[static_cast<std::size_t>(q)].center_dof != q) {
+            throw std::invalid_argument(
+                "harmonic Cauchy neighborhood center IDs are inconsistent");
+        }
+    }
+    HarmonicCauchyFit3D result(degree);
+    result.value_count_ = value_count;
+    result.normal_count_ = normal_count;
+    result.cloud_size_ = static_cast<int>(cloud.dofs.size());
+    result.route_ = route;
+    result.audit_.geometry_query_count = neighborhoods.geometry_query_count;
+    result.audit_.svd_factorization_count = degree >= 2 ? 1U : 0U;
+    std::optional<SharedEdgePointSet3D> points;
+    if (route == HarmonicCauchyRoute3D::EdgeReconstructedValue) {
+        points = make_shared_edge_points_3d(surface, h);
+        for (const auto& point : points->points) {
+            result.edge_maps_.push_back(build_edge_value_map(
+                point, cloud, result.space_, h, relative_svd_cutoff,
+                result.audit_.svd_factorization_count));
+        }
+        result.audit_.geometry_query_count += 2 * points->points.size();
+        result.audit_.geometry_query_count += static_cast<std::size_t>(
+            std::count_if(
+                surface.geometric_connections.begin(),
+                surface.geometric_connections.end(),
+                [](const geometry3d::NurbsPatchEdgeConnection3D& connection) {
+                    return !connection.g1;
+                }));
+    }
+    result.surface_maps_.reserve(cloud.dofs.size());
+    for (int center = 0; center < result.cloud_size_; ++center) {
+        result.surface_maps_.push_back(build_surface_map(
+            surface, cloud, points ? &*points : nullptr, neighborhoods,
+            result.space_, center, h, route, value_count, normal_count,
+            relative_svd_cutoff,
+            result.audit_.svd_factorization_count));
+    }
+    constexpr std::uint64_t offset = 1469598103934665603ULL;
+    std::uint64_t fingerprint = offset;
+    fingerprint = append_hash(fingerprint, route);
+    fingerprint = append_hash(fingerprint, degree);
+    fingerprint = append_hash(fingerprint, value_count);
+    fingerprint = append_hash(fingerprint, normal_count);
+    fingerprint = append_hash(
+        fingerprint, result.audit_.geometry_query_count);
+    fingerprint = append_hash(
+        fingerprint, result.audit_.svd_factorization_count);
+    for (const auto& map : result.edge_maps_)
+        fingerprint = hash_edge_map(fingerprint, map);
+    for (const auto& map : result.surface_maps_)
+        fingerprint = hash_surface_map(fingerprint, map);
+    result.audit_.fingerprint = fingerprint;
+    return result;
+}
+
+HarmonicCauchyFit3D HarmonicCauchyFit3D::build_legacy(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud3D& cloud,
+    double h,
+    LegacySurfaceCauchyPolicy3D policy,
+    int degree,
+    int value_count,
+    int normal_count,
+    double relative_svd_cutoff)
+{
+    validate_surface_cloud(surface, cloud, h);
+    if (degree < 1 || value_count <= 0 || normal_count < 0
+        || normal_count > value_count || !std::isfinite(relative_svd_cutoff)
+        || relative_svd_cutoff <= 0.0) {
+        throw std::invalid_argument("invalid legacy harmonic Cauchy parameters");
+    }
+    SurfaceNonG1EdgeNeighborhoodSet3D neighborhoods;
+    neighborhoods.centers.resize(cloud.dofs.size());
+    for (int q = 0; q < static_cast<int>(cloud.dofs.size()); ++q)
+        neighborhoods.centers[static_cast<std::size_t>(q)].center_dof = q;
+
+    HarmonicCauchyFit3D result(degree);
+    result.value_count_ = value_count;
+    result.normal_count_ = normal_count;
+    result.cloud_size_ = static_cast<int>(cloud.dofs.size());
+    result.route_ = HarmonicCauchyRoute3D::G1ValueG1Normal;
+    result.legacy_policy_ = policy;
+    result.audit_.svd_factorization_count = degree >= 2 ? 1U : 0U;
+    LegacyCauchySummary3D summary;
+    summary.policy = policy;
+    summary.degree = degree;
+    summary.value_count = value_count;
+    summary.normal_count = normal_count;
+    summary.value_count_min = std::numeric_limits<int>::max();
+    summary.normal_count_min = std::numeric_limits<int>::max();
+    summary.incident_patch_count_min = std::numeric_limits<int>::max();
+    result.surface_maps_.reserve(cloud.dofs.size());
+    for (int center = 0; center < result.cloud_size_; ++center) {
+        SurfaceCauchyMap3D map = build_surface_map(
+            surface, cloud, nullptr, neighborhoods, result.space_, center, h,
+            result.route_, value_count, normal_count, relative_svd_cutoff,
+            result.audit_.svd_factorization_count, policy);
+        const int actual_values = static_cast<int>(map.value_ids.size());
+        const int actual_normals = static_cast<int>(map.normal_ids.size());
+        summary.value_count_min =
+            std::min(summary.value_count_min, actual_values);
+        summary.value_count_max =
+            std::max(summary.value_count_max, actual_values);
+        summary.normal_count_min =
+            std::min(summary.normal_count_min, actual_normals);
+        summary.normal_count_max =
+            std::max(summary.normal_count_max, actual_normals);
+        const double radius =
+            std::max(map.value_radius_over_h, map.normal_radius_over_h);
+        summary.radius_max_over_h =
+            std::max(summary.radius_max_over_h, radius);
+        summary.radius_mean_over_h += radius;
+        summary.incident_patch_count_min = std::min(
+            summary.incident_patch_count_min, map.incident_patch_count);
+        summary.incident_patch_count_max = std::max(
+            summary.incident_patch_count_max, map.incident_patch_count);
+        summary.value_patch_imbalance_max = std::max(
+            summary.value_patch_imbalance_max, map.value_patch_imbalance);
+        summary.normal_patch_imbalance_max = std::max(
+            summary.normal_patch_imbalance_max, map.normal_patch_imbalance);
+        result.surface_maps_.push_back(std::move(map));
+    }
+    if (!result.surface_maps_.empty()) {
+        summary.radius_mean_over_h /=
+            static_cast<double>(result.surface_maps_.size());
+    }
+    result.legacy_summary_ = summary;
+    constexpr std::uint64_t offset = 1469598103934665603ULL;
+    std::uint64_t fingerprint = offset;
+    fingerprint = append_hash(fingerprint, policy);
+    fingerprint = append_hash(fingerprint, degree);
+    fingerprint = append_hash(fingerprint, value_count);
+    fingerprint = append_hash(fingerprint, normal_count);
+    fingerprint = append_hash(
+        fingerprint, result.audit_.geometry_query_count);
+    fingerprint = append_hash(
+        fingerprint, result.audit_.svd_factorization_count);
+    for (const auto& map : result.surface_maps_)
+        fingerprint = hash_surface_map(fingerprint, map);
+    result.audit_.fingerprint = fingerprint;
+    return result;
+}
+
+HarmonicCauchyApplyResult3D HarmonicCauchyFit3D::apply(
+    const Eigen::VectorXd& value_jump,
+    const Eigen::VectorXd& normal_jump) const
+{
+    if (value_jump.size() != cloud_size_ || normal_jump.size() != cloud_size_)
+        throw std::invalid_argument("jump data size does not match surface DOFs");
+    HarmonicCauchyApplyResult3D result;
+    result.fingerprint_before = audit_.fingerprint;
+    result.edge_values.resize(static_cast<int>(edge_maps_.size()));
+    for (int e = 0; e < result.edge_values.size(); ++e) {
+        const auto& map = edge_maps_[static_cast<std::size_t>(e)];
+        result.edge_values[e] =
+            map.E_value.dot(gather(value_jump, map.value_ids))
+            + map.E_normal.dot(gather(normal_jump, map.normal_ids));
+    }
+    result.coefficients = Eigen::MatrixXd::Zero(
+        static_cast<int>(surface_maps_.size()), space_.dimension());
+    for (int center = 0;
+         center < static_cast<int>(surface_maps_.size()); ++center) {
+        const auto& map = surface_maps_[static_cast<std::size_t>(center)];
+        const Eigen::VectorXd values = gather(value_jump, map.value_ids);
+        const Eigen::VectorXd normals = gather(normal_jump, map.normal_ids);
+        Eigen::VectorXd coefficients;
+        if (map.edge_point_ids.empty()) {
+            coefficients = map.M_value * values + map.M_normal * normals;
+        } else {
+            coefficients = map.M_value * values + map.M_normal * normals
+                + map.M_edge * gather(result.edge_values, map.edge_point_ids);
+        }
+        result.coefficients.row(center) = coefficients.transpose();
+    }
+    result.fingerprint_after = audit_.fingerprint;
+    return result;
+}
+
+const HarmonicPolynomialSpace3D& HarmonicCauchyFit3D::space() const noexcept
+{
+    return space_;
+}
+
+int HarmonicCauchyFit3D::degree() const noexcept { return space_.degree(); }
+int HarmonicCauchyFit3D::value_count() const noexcept { return value_count_; }
+int HarmonicCauchyFit3D::normal_count() const noexcept { return normal_count_; }
+
+std::optional<LegacySurfaceCauchyPolicy3D>
+HarmonicCauchyFit3D::legacy_policy() const noexcept
+{
+    return legacy_policy_;
+}
+
+std::optional<LegacyCauchySummary3D>
+HarmonicCauchyFit3D::legacy_summary() const
+{
+    return legacy_summary_;
+}
+
+std::vector<double> HarmonicCauchyFit3D::condition_values() const
+{
+    std::vector<double> result;
+    result.reserve(surface_maps_.size());
+    for (const auto& map : surface_maps_)
+        result.push_back(map.condition);
+    return result;
+}
+
+const std::vector<EdgeValueMap3D>&
+HarmonicCauchyFit3D::edge_maps() const noexcept
+{
+    return edge_maps_;
+}
+
+const std::vector<SurfaceCauchyMap3D>&
+HarmonicCauchyFit3D::surface_maps() const noexcept
+{
+    return surface_maps_;
+}
+
+const HarmonicCauchyPreprocessAudit3D&
+HarmonicCauchyFit3D::audit() const noexcept
+{
+    return audit_;
 }
 
 } // namespace kfbim::app3d
