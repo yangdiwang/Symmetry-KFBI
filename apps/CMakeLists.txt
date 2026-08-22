@@ -66,6 +66,17 @@ add_executable(dirichlet_harmonic_jet_python_compatible_2d
     neumann_harmonic_jet_python_compatible_2d.cpp
 )
 
+option(KFBIM_BUILD_EXPERIMENTAL_3D
+    "Build supplementary remote 3D algorithms, studies, and benchmarks" OFF)
+option(KFBIM_BUILD_REMOTE_SOLVER_ROUTE_TEST
+    "Build the legacy remote solver route test (requires an API adapter)" OFF)
+
+if(KFBIM_BUILD_REMOTE_SOLVER_ROUTE_TEST AND NOT KFBIM_BUILD_EXPERIMENTAL_3D)
+    message(FATAL_ERROR
+        "KFBIM_BUILD_REMOTE_SOLVER_ROUTE_TEST requires "
+        "KFBIM_BUILD_EXPERIMENTAL_3D=ON")
+endif()
+
 if(KFBIM_BUILD_3D)
     add_library(kfbim_3d_app_geometry STATIC
         crossing_owner_restrict_3d.cpp
@@ -90,6 +101,26 @@ if(KFBIM_BUILD_3D)
         topology_reachable_target_projection_3d.cpp
         topology_trace_projector_3d.cpp
     )
+
+    if(KFBIM_BUILD_EXPERIMENTAL_3D)
+        find_package(Threads REQUIRED)
+
+        # Supplementary A/B routes stay outside the baseline library so an
+        # ordinary build retains the reference algorithm and dependencies.
+        add_library(kfbim_3d_experimental_algorithms STATIC
+            harmonic_trace_correction_3d.cpp
+            harmonic_cauchy_fit_3d.cpp
+            restrict_owner_geometry_preprocessor_3d.cpp
+            neumann_edge_continuity_3d.cpp
+            neumann_rigid_transform_study_3d.cpp
+            neumann_edge_augmented_cauchy_3d.cpp
+            neumann_edge_cauchy_study_3d.cpp
+        )
+
+        add_library(kfbim_phase_profile_3d STATIC
+            kfbi_phase_profile_3d.cpp
+        )
+    endif()
 
     add_executable(native_nurbs_surface_3d_test
         native_nurbs_surface_3d_test.cpp
@@ -194,6 +225,50 @@ if(KFBIM_BUILD_3D)
         crossing_cauchy_plan_3d.cpp
     )
 
+    if(KFBIM_BUILD_EXPERIMENTAL_3D)
+    add_executable(harmonic_cauchy_fit_3d_test
+        harmonic_cauchy_fit_3d_test.cpp
+    )
+
+    add_executable(neumann_edge_continuity_3d_test
+        neumann_edge_continuity_3d_test.cpp
+    )
+
+    add_executable(neumann_edge_augmented_cauchy_3d_test
+        neumann_edge_augmented_cauchy_3d_test.cpp
+    )
+
+    add_executable(neumann_edge_cauchy_study_3d_test
+        neumann_edge_cauchy_study_3d_test.cpp
+    )
+
+    add_executable(neumann_rigid_transform_study_3d_test
+        neumann_rigid_transform_study_3d_test.cpp
+    )
+
+    add_executable(restrict_owner_geometry_preprocessor_3d_test
+        restrict_owner_geometry_preprocessor_3d_test.cpp
+    )
+
+    add_executable(harmonic_trace_correction_3d_test
+        harmonic_trace_correction_3d_test.cpp
+    )
+
+    add_executable(kfbim_phase_profile_3d_test
+        kfbi_phase_profile_3d_test.cpp
+    )
+
+    add_executable(nurbs_geometry_preprocess_benchmark_3d_test
+        nurbs_geometry_preprocess_benchmark_3d.cpp
+        nurbs_geometry_preprocess_benchmark_3d_test.cpp
+    )
+
+    add_executable(nurbs_geometry_preprocess_benchmark_3d
+        nurbs_geometry_preprocess_benchmark_3d.cpp
+    )
+
+    endif()
+
     add_executable(neumann_exterior_zero_trace_3d
         neumann_exterior_zero_trace_3d.cpp
         crossing_cauchy_plan_3d.cpp
@@ -221,6 +296,13 @@ if(KFBIM_BUILD_3D)
         mean_free_trace_mass_coordinates_3d.cpp
         reduced_trace_projection_3d.cpp
     )
+
+    if(KFBIM_BUILD_EXPERIMENTAL_3D
+       AND KFBIM_BUILD_REMOTE_SOLVER_ROUTE_TEST)
+        add_executable(neumann_exterior_zero_trace_3d_route_test
+            neumann_exterior_zero_trace_3d_route_test.cpp
+        )
+    endif()
 endif()
 
 target_link_libraries(shape_opt_transmission_2d PRIVATE
@@ -306,6 +388,18 @@ if(KFBIM_BUILD_3D)
         kfbim_core
     )
 
+    if(KFBIM_BUILD_EXPERIMENTAL_3D)
+        target_link_libraries(kfbim_3d_experimental_algorithms PUBLIC
+            kfbim_3d_app_geometry
+        )
+        target_link_libraries(kfbim_phase_profile_3d PUBLIC
+            Threads::Threads
+        )
+        if(WIN32)
+            target_link_libraries(kfbim_phase_profile_3d PUBLIC Psapi)
+        endif()
+    endif()
+
     target_link_libraries(native_nurbs_surface_3d_test PRIVATE
         kfbim_3d_app_geometry
     )
@@ -334,6 +428,26 @@ if(KFBIM_BUILD_3D)
         kfbim_3d_app_geometry
     )
 
+    if(KFBIM_BUILD_EXPERIMENTAL_3D)
+    target_link_libraries(harmonic_cauchy_fit_3d_test PRIVATE
+        kfbim_3d_experimental_algorithms
+    )
+    target_compile_features(harmonic_cauchy_fit_3d_test PRIVATE cxx_std_17)
+
+    target_link_libraries(neumann_edge_continuity_3d_test PRIVATE
+        kfbim_3d_experimental_algorithms
+    )
+
+    target_link_libraries(neumann_edge_augmented_cauchy_3d_test PRIVATE
+        kfbim_3d_experimental_algorithms
+    )
+
+    target_link_libraries(neumann_edge_cauchy_study_3d_test PRIVATE
+        kfbim_3d_experimental_algorithms
+    )
+
+    endif()
+
     target_link_libraries(native_nurbs_surface_transform_3d_test PRIVATE
         kfbim_3d_app_geometry
     )
@@ -341,6 +455,12 @@ if(KFBIM_BUILD_3D)
     target_link_libraries(dirichlet_rigid_transform_study_3d_test PRIVATE
         kfbim_3d_app_geometry
     )
+
+    if(KFBIM_BUILD_EXPERIMENTAL_3D)
+        target_link_libraries(neumann_rigid_transform_study_3d_test PRIVATE
+            kfbim_3d_experimental_algorithms
+        )
+    endif()
 
     target_link_libraries(harmonic_polynomial_space_3d_test PRIVATE
         kfbim_3d_app_geometry
@@ -408,6 +528,29 @@ if(KFBIM_BUILD_3D)
         kfbim_3d_app_geometry
     )
 
+    if(KFBIM_BUILD_EXPERIMENTAL_3D)
+    target_link_libraries(restrict_owner_geometry_preprocessor_3d_test PRIVATE
+        kfbim_3d_experimental_algorithms
+    )
+
+    target_link_libraries(harmonic_trace_correction_3d_test PRIVATE
+        kfbim_3d_experimental_algorithms
+    )
+
+    target_link_libraries(kfbim_phase_profile_3d_test PRIVATE
+        kfbim_phase_profile_3d
+    )
+
+    target_link_libraries(nurbs_geometry_preprocess_benchmark_3d_test PRIVATE
+        kfbim_3d_app_geometry
+    )
+
+    target_link_libraries(nurbs_geometry_preprocess_benchmark_3d PRIVATE
+        kfbim_3d_app_geometry
+    )
+
+    endif()
+
     target_link_libraries(neumann_exterior_zero_trace_3d PRIVATE
         kfbim_3d_app_geometry
         kfbim_core
@@ -431,6 +574,21 @@ if(KFBIM_BUILD_3D)
     target_link_libraries(kfbi_general_cap_exterior_trace_3d PRIVATE
         kfbim_core
     )
+
+    if(KFBIM_BUILD_EXPERIMENTAL_3D
+       AND KFBIM_BUILD_REMOTE_SOLVER_ROUTE_TEST)
+        target_link_libraries(neumann_exterior_zero_trace_3d_route_test PRIVATE
+            kfbim_3d_experimental_algorithms
+            kfbim_3d_app_geometry
+            kfbim_core
+            kfbim_phase_profile_3d
+            Threads::Threads
+        )
+        if(MSVC)
+            target_compile_options(
+                neumann_exterior_zero_trace_3d_route_test PRIVATE /bigobj)
+        endif()
+    endif()
 endif()
 
 target_compile_definitions(shape_opt_transmission_2d PRIVATE
@@ -471,6 +629,13 @@ target_compile_definitions(dirichlet_harmonic_jet_python_compatible_2d PRIVATE
 )
 
 if(KFBIM_BUILD_3D)
+    if(KFBIM_BUILD_EXPERIMENTAL_3D)
+        target_compile_definitions(
+            nurbs_geometry_preprocess_benchmark_3d PRIVATE
+            KFBIM_NURBS_GEOMETRY_PREPROCESS_BENCHMARK_3D_MAIN=1
+        )
+    endif()
+
     target_compile_definitions(neumann_exterior_zero_trace_3d PRIVATE
         KFBIM_APP_OUTPUT_DIR="${PROJECT_SOURCE_DIR}/output"
     )
@@ -550,4 +715,35 @@ if(KFBIM_BUILD_3D)
         kfbi_topology_affine_exterior_trace_3d PRIVATE cxx_std_17)
     target_compile_features(
         kfbi_general_cap_exterior_trace_3d PRIVATE cxx_std_17)
+
+    if(KFBIM_BUILD_EXPERIMENTAL_3D)
+        target_compile_features(
+            kfbim_3d_experimental_algorithms PUBLIC cxx_std_17)
+        target_compile_features(kfbim_phase_profile_3d PUBLIC cxx_std_17)
+        target_compile_features(harmonic_cauchy_fit_3d_test PRIVATE cxx_std_17)
+        target_compile_features(neumann_edge_continuity_3d_test PRIVATE cxx_std_17)
+        target_compile_features(
+            neumann_edge_augmented_cauchy_3d_test PRIVATE cxx_std_17)
+        target_compile_features(neumann_edge_cauchy_study_3d_test PRIVATE cxx_std_17)
+        target_compile_features(
+            neumann_rigid_transform_study_3d_test PRIVATE cxx_std_17)
+        target_compile_features(kfbim_phase_profile_3d_test PRIVATE cxx_std_17)
+        target_compile_features(
+            restrict_owner_geometry_preprocessor_3d_test PRIVATE cxx_std_17)
+        target_compile_features(harmonic_trace_correction_3d_test PRIVATE cxx_std_17)
+        target_compile_features(
+            nurbs_geometry_preprocess_benchmark_3d_test PRIVATE cxx_std_17)
+        target_compile_features(
+            nurbs_geometry_preprocess_benchmark_3d PRIVATE cxx_std_17)
+    endif()
+
+    if(KFBIM_BUILD_EXPERIMENTAL_3D
+       AND KFBIM_BUILD_REMOTE_SOLVER_ROUTE_TEST)
+        target_compile_definitions(
+            neumann_exterior_zero_trace_3d_route_test PRIVATE
+            KFBIM_APP_OUTPUT_DIR="${PROJECT_SOURCE_DIR}/output"
+        )
+        target_compile_features(
+            neumann_exterior_zero_trace_3d_route_test PRIVATE cxx_std_17)
+    endif()
 endif()

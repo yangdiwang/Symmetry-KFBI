@@ -311,12 +311,14 @@ double edge_length(const NurbsSurfacePatch3D& patch,
 
     double integral = 0.0;
     for (int i = 0; i < num_samples; ++i) {
-        const double t = static_cast<double>(i) / static_cast<double>(num_samples - 1);
+        const double t = static_cast<double>(i)
+                       / static_cast<double>(num_samples - 1);
         const double parameter = lerp(a, b, t);
         const auto uv = edge_uv(patch, edge, parameter);
         const NurbsSurfaceDerivatives3D d =
             patch.evaluate_with_derivatives(uv.first, uv.second);
-        const double weight = (i == 0 || i == num_samples - 1) ? 0.5 : 1.0;
+        const double weight =
+            (i == 0 || i == num_samples - 1) ? 0.5 : 1.0;
         integral += weight * tangent_speed(d, edge);
     }
     return integral * span / static_cast<double>(num_samples - 1);
@@ -699,6 +701,486 @@ kfbim::Interface3D build_interface_from_triangles(
 }
 
 } // namespace
+
+namespace {
+
+struct NativeEdgeSample3D {
+    Eigen::Vector3d point = Eigen::Vector3d::Zero();
+    Eigen::Vector3d tangent = Eigen::Vector3d::Zero();
+};
+
+bool native_edge_varies_v(NurbsPatchEdge3D edge)
+{
+    return edge == NurbsPatchEdge3D::UMin
+        || edge == NurbsPatchEdge3D::UMax;
+}
+
+std::pair<double, double> native_edge_domain(
+    const NurbsSurfacePatch3D& patch,
+    NurbsPatchEdge3D edge)
+{
+    if (native_edge_varies_v(edge))
+        return {patch.domain_start_v(), patch.domain_end_v()};
+    return {patch.domain_start_u(), patch.domain_end_u()};
+}
+
+const kfbim::geometry::NurbsBasis1D& native_edge_varying_basis(
+    const NurbsSurfacePatch3D& patch,
+    NurbsPatchEdge3D edge)
+{
+    return native_edge_varies_v(edge) ? patch.basis_v() : patch.basis_u();
+}
+
+NativeEdgeSample3D sample_native_edge(const NurbsSurfacePatch3D& patch,
+                                      NurbsPatchEdge3D edge,
+                                      double parameter)
+{
+    double u = patch.domain_start_u();
+    double v = patch.domain_start_v();
+    switch (edge) {
+    case NurbsPatchEdge3D::UMin:
+        v = parameter;
+        break;
+    case NurbsPatchEdge3D::UMax:
+        u = patch.domain_end_u();
+        v = parameter;
+        break;
+    case NurbsPatchEdge3D::VMin:
+        u = parameter;
+        break;
+    case NurbsPatchEdge3D::VMax:
+        u = parameter;
+        v = patch.domain_end_v();
+        break;
+    }
+    const NurbsSurfaceDerivatives3D derivatives =
+        patch.evaluate_with_derivatives(u, v);
+    return {derivatives.point,
+            native_edge_varies_v(edge) ? derivatives.dv : derivatives.du};
+}
+
+void validate_native_edge_interval(const NurbsSurfacePatch3D& patch,
+                                   NurbsPatchEdge3D edge,
+                                   double begin,
+                                   double end)
+{
+    if (!std::isfinite(begin) || !std::isfinite(end) || begin >= end) {
+        throw std::invalid_argument(
+            "NURBS patch edge interval must be finite and increasing");
+    }
+    const auto domain = native_edge_domain(patch, edge);
+    const double scale = std::max({1.0, std::abs(domain.first),
+                                  std::abs(domain.second)});
+    const double tolerance = 64.0 * std::numeric_limits<double>::epsilon()
+                           * scale;
+    if (begin < domain.first - tolerance || end > domain.second + tolerance) {
+        throw std::out_of_range(
+            "NURBS patch edge interval lies outside the native domain");
+    }
+}
+
+struct BrentIntervalResult3D {
+    bool converged = false;
+    double parameter = 0.0;
+    double bracket_begin = 0.0;
+    double bracket_end = 0.0;
+    int iterations = 0;
+};
+
+template <class Function, class Curve>
+BrentIntervalResult3D safeguarded_brent_root(
+    Function function,
+    Curve curve,
+    double left,
+    double right,
+    double parameter_tolerance,
+    double physical_tolerance)
+{
+    double a = left;
+    double b = right;
+    double fa = function(a);
+    double fb = function(b);
+    if (!std::isfinite(fa) || !std::isfinite(fb) || fa > 0.0 || fb < 0.0)
+        return {};
+    if (fa == 0.0)
+        return {true, a, a, a, 0};
+    if (fb == 0.0)
+        return {true, b, b, b, 0};
+    if (std::abs(fa) < std::abs(fb)) {
+        std::swap(a, b);
+        std::swap(fa, fb);
+    }
+    double c = a;
+    double fc = fa;
+    double d = c;
+    bool used_bisection = true;
+    for (int iteration = 1; iteration <= 64; ++iteration) {
+        const double low = std::min(a, b);
+        const double high = std::max(a, b);
+        if (high - low <= parameter_tolerance
+            || (curve(high).point - curve(low).point).norm()
+                   <= physical_tolerance) {
+            return {true, b, low, high, iteration - 1};
+        }
+
+        double s = 0.0;
+        if (fa != fc && fb != fc) {
+            s = a * fb * fc / ((fa - fb) * (fa - fc))
+              + b * fa * fc / ((fb - fa) * (fb - fc))
+              + c * fa * fb / ((fc - fa) * (fc - fb));
+        } else {
+            s = b - fb * (b - a) / (fb - fa);
+        }
+        const double guarded = 0.25 * (3.0 * a + b);
+        const bool outside_guard =
+            s <= std::min(guarded, b) || s >= std::max(guarded, b);
+        const bool insufficient_bisection_progress = used_bisection
+            && std::abs(s - b) >= 0.5 * std::abs(b - c);
+        const bool insufficient_interpolation_progress = !used_bisection
+            && std::abs(s - b) >= 0.5 * std::abs(c - d);
+        const bool collapsed_bisection = used_bisection
+            && std::abs(b - c) < parameter_tolerance;
+        const bool collapsed_interpolation = !used_bisection
+            && std::abs(c - d) < parameter_tolerance;
+        const bool repeated_best_endpoint =
+            std::abs(s - b) <= parameter_tolerance;
+        if (!std::isfinite(s) || outside_guard
+            || insufficient_bisection_progress
+            || insufficient_interpolation_progress
+            || collapsed_bisection || collapsed_interpolation
+            || repeated_best_endpoint) {
+            s = 0.5 * (a + b);
+            used_bisection = true;
+        } else {
+            used_bisection = false;
+        }
+
+        const double fs = function(s);
+        if (!std::isfinite(fs))
+            return {};
+        d = c;
+        c = b;
+        fc = fb;
+        if ((fa < 0.0 && fs > 0.0) || (fa > 0.0 && fs < 0.0)) {
+            b = s;
+            fb = fs;
+        } else {
+            a = s;
+            fa = fs;
+        }
+        if (fs == 0.0)
+            return {true, s, s, s, iteration};
+        if (std::abs(fa) < std::abs(fb)) {
+            std::swap(a, b);
+            std::swap(fa, fb);
+        }
+    }
+    return {false, b, std::min(a, b), std::max(a, b), 64};
+}
+
+template <class Function, class Curve>
+BrentIntervalResult3D bounded_brent_minimum(
+    Function function,
+    Curve curve,
+    double left,
+    double seed,
+    double right,
+    double parameter_tolerance,
+    double physical_tolerance)
+{
+    constexpr double golden = 0.3819660112501051;
+    double a = left;
+    double b = right;
+    double x = seed;
+    double w = x;
+    double v = x;
+    double fx = function(x);
+    double fw = fx;
+    double fv = fx;
+    double e = 0.0;
+    double d = 0.0;
+    if (!std::isfinite(fx))
+        return {};
+
+    for (int iteration = 1; iteration <= 64; ++iteration) {
+        if (b - a <= parameter_tolerance
+            || (curve(b).point - curve(a).point).norm()
+                   <= physical_tolerance) {
+            return {true, x, a, b, iteration - 1};
+        }
+        const double midpoint = 0.5 * (a + b);
+        double p = 0.0;
+        double q = 0.0;
+        double r = 0.0;
+        bool parabolic = false;
+        if (std::abs(e) > parameter_tolerance) {
+            r = (x - w) * (fx - fv);
+            q = (x - v) * (fx - fw);
+            p = (x - v) * q - (x - w) * r;
+            q = 2.0 * (q - r);
+            if (q > 0.0)
+                p = -p;
+            q = std::abs(q);
+            const double previous_e = e;
+            e = d;
+            if (q > 0.0 && std::abs(p) < std::abs(0.5 * q * previous_e)
+                && p > q * (a - x) && p < q * (b - x)) {
+                d = p / q;
+                parabolic = std::abs(d) >= 0.05 * (b - a);
+            }
+        }
+        if (!parabolic) {
+            e = x < midpoint ? b - x : a - x;
+            d = golden * e;
+        }
+        const double minimum_step = parameter_tolerance;
+        const double u = std::clamp(
+            x + (std::abs(d) >= minimum_step
+                     ? d
+                     : std::copysign(minimum_step, d == 0.0 ? midpoint - x : d)),
+            a,
+            b);
+        if (u == x)
+            return {true, x, a, b, iteration};
+        const double fu = function(u);
+        if (!std::isfinite(fu))
+            return {};
+        if (fu <= fx) {
+            if (u < x)
+                b = x;
+            else
+                a = x;
+            v = w;
+            fv = fw;
+            w = x;
+            fw = fx;
+            x = u;
+            fx = fu;
+        } else {
+            if (u < x)
+                a = u;
+            else
+                b = u;
+            if (fu <= fw || w == x) {
+                v = w;
+                fv = fw;
+                w = u;
+                fw = fu;
+            } else if (fu <= fv || v == x || v == w) {
+                v = u;
+                fv = fu;
+            }
+        }
+    }
+    return {false, x, a, b, 64};
+}
+
+} // namespace
+
+double estimate_nurbs_patch_edge_interval_length_3d(
+    const NurbsSurfacePatch3D& patch,
+    NurbsPatchEdge3D edge,
+    double begin,
+    double end,
+    int parameter_sample_count)
+{
+    validate_native_edge_interval(patch, edge, begin, end);
+    if (parameter_sample_count < 2) {
+        throw std::invalid_argument(
+            "NURBS edge length requires at least two parameter samples");
+    }
+    const double delta =
+        (end - begin) / static_cast<double>(parameter_sample_count - 1);
+    double sum = 0.5 * sample_native_edge(patch, edge, begin).tangent.norm()
+               + 0.5 * sample_native_edge(patch, edge, end).tangent.norm();
+    for (int q = 1; q < parameter_sample_count - 1; ++q) {
+        sum += sample_native_edge(
+            patch, edge, begin + static_cast<double>(q) * delta).tangent.norm();
+    }
+    return delta * sum;
+}
+
+NurbsPatchEdgeClosestPoint3D
+closest_point_to_nurbs_patch_edge_interval_3d(
+    const NurbsSurfacePatch3D& patch,
+    NurbsPatchEdge3D edge,
+    double begin,
+    double end,
+    const Eigen::Vector3d& query,
+    double model_diameter)
+{
+    validate_native_edge_interval(patch, edge, begin, end);
+    if (!query.allFinite())
+        throw std::invalid_argument("NURBS edge query must be finite");
+    if (!std::isfinite(model_diameter) || model_diameter <= 0.0) {
+        throw std::invalid_argument(
+            "NURBS edge query requires a positive model diameter");
+    }
+    const double parameter_tolerance =
+        64.0 * std::numeric_limits<double>::epsilon()
+        * std::max({1.0, std::abs(begin), std::abs(end)});
+    const double physical_tolerance =
+        std::max(1.0e-12 * model_diameter, 1.0e-14);
+    const auto curve = [&](double parameter) {
+        return sample_native_edge(patch, edge, parameter);
+    };
+    const auto objective = [&](double parameter) {
+        return (curve(parameter).point - query).squaredNorm();
+    };
+    const auto stationary = [&](double parameter) {
+        const NativeEdgeSample3D sample = curve(parameter);
+        return (sample.point - query).dot(sample.tangent);
+    };
+
+    std::vector<double> split_parameters{begin};
+    for (double knot : native_edge_varying_basis(patch, edge).knots()) {
+        if (knot > begin && knot < end)
+            split_parameters.push_back(knot);
+    }
+    split_parameters.push_back(end);
+    std::sort(split_parameters.begin(), split_parameters.end());
+    split_parameters.erase(
+        std::unique(split_parameters.begin(), split_parameters.end()),
+        split_parameters.end());
+
+    struct Candidate {
+        double parameter = 0.0;
+        Eigen::Vector3d point = Eigen::Vector3d::Zero();
+        double distance = std::numeric_limits<double>::infinity();
+        double error_bound = std::numeric_limits<double>::infinity();
+        int refinement_level = 0;
+        int fallback_priority = 0;
+    };
+    std::vector<Candidate> candidates;
+    const auto append_candidate = [&](double parameter,
+                                      double error_bound,
+                                      int refinement_level,
+                                      int fallback_priority) {
+        const Eigen::Vector3d point = curve(parameter).point;
+        const double distance = (point - query).norm();
+        for (Candidate& existing : candidates) {
+            if (std::abs(existing.parameter - parameter)
+                <= parameter_tolerance) {
+                if (distance < existing.distance) {
+                    existing = {parameter, point, distance, error_bound,
+                                refinement_level, fallback_priority};
+                }
+                return;
+            }
+        }
+        candidates.push_back(
+            {parameter, point, distance, error_bound, refinement_level,
+             fallback_priority});
+    };
+    append_candidate(begin, 0.0, 0, 2);
+    append_candidate(end, 0.0, 0, 2);
+
+    int knot_span_count = 0;
+    int maximum_refinement = 0;
+    constexpr int samples_per_span = 17;
+    for (std::size_t span = 1; span < split_parameters.size(); ++span) {
+        const double span_begin = split_parameters[span - 1];
+        const double span_end = split_parameters[span];
+        if (span_end <= span_begin + parameter_tolerance)
+            continue;
+        ++knot_span_count;
+        std::array<double, samples_per_span> parameters{};
+        std::array<double, samples_per_span> objectives{};
+        std::array<double, samples_per_span> stationaries{};
+        for (int sample = 0; sample < samples_per_span; ++sample) {
+            const double fraction = static_cast<double>(sample)
+                                  / static_cast<double>(samples_per_span - 1);
+            parameters[static_cast<std::size_t>(sample)] =
+                span_begin + fraction * (span_end - span_begin);
+            objectives[static_cast<std::size_t>(sample)] = objective(
+                parameters[static_cast<std::size_t>(sample)]);
+            stationaries[static_cast<std::size_t>(sample)] = stationary(
+                parameters[static_cast<std::size_t>(sample)]);
+        }
+        for (int sample = 0; sample < samples_per_span - 1; ++sample) {
+            if (stationaries[static_cast<std::size_t>(sample)] <= 0.0
+                && stationaries[static_cast<std::size_t>(sample + 1)] >= 0.0) {
+                const BrentIntervalResult3D root = safeguarded_brent_root(
+                    stationary,
+                    curve,
+                    parameters[static_cast<std::size_t>(sample)],
+                    parameters[static_cast<std::size_t>(sample + 1)],
+                    parameter_tolerance,
+                    physical_tolerance);
+                maximum_refinement = std::max(maximum_refinement, root.iterations);
+                if (!root.converged) {
+                    NurbsPatchEdgeClosestPoint3D failure;
+                    failure.parameter = root.parameter;
+                    failure.point = curve(root.parameter).point;
+                    failure.distance = (failure.point - query).norm();
+                    failure.distance_error_bound =
+                        (curve(root.bracket_end).point
+                            - curve(root.bracket_begin).point).norm();
+                    failure.knot_span_count = knot_span_count;
+                    failure.refinement_level = maximum_refinement;
+                    return failure;
+                }
+                append_candidate(root.parameter, physical_tolerance,
+                                 root.iterations, 0);
+            }
+        }
+        for (int sample = 1; sample < samples_per_span - 1; ++sample) {
+            const double previous = objectives[static_cast<std::size_t>(sample - 1)];
+            const double current = objectives[static_cast<std::size_t>(sample)];
+            const double next = objectives[static_cast<std::size_t>(sample + 1)];
+            if (current <= previous && current <= next
+                && (current < previous || current < next)) {
+                const BrentIntervalResult3D minimum = bounded_brent_minimum(
+                    objective,
+                    curve,
+                    parameters[static_cast<std::size_t>(sample - 1)],
+                    parameters[static_cast<std::size_t>(sample)],
+                    parameters[static_cast<std::size_t>(sample + 1)],
+                    parameter_tolerance,
+                    physical_tolerance);
+                maximum_refinement =
+                    std::max(maximum_refinement, minimum.iterations);
+                if (!minimum.converged) {
+                    NurbsPatchEdgeClosestPoint3D failure;
+                    failure.parameter = minimum.parameter;
+                    failure.point = curve(minimum.parameter).point;
+                    failure.distance = (failure.point - query).norm();
+                    failure.distance_error_bound =
+                        (curve(minimum.bracket_end).point
+                            - curve(minimum.bracket_begin).point).norm();
+                    failure.knot_span_count = knot_span_count;
+                    failure.refinement_level = maximum_refinement;
+                    return failure;
+                }
+                append_candidate(minimum.parameter, physical_tolerance,
+                                 minimum.iterations, 1);
+            }
+        }
+    }
+
+    if (knot_span_count == 0 || candidates.empty())
+        return {};
+    const Candidate* best = &candidates.front();
+    for (const Candidate& candidate : candidates) {
+        if (candidate.distance < best->distance - physical_tolerance
+            || (std::abs(candidate.distance - best->distance)
+                    <= physical_tolerance
+                && (candidate.fallback_priority < best->fallback_priority
+                    || (candidate.fallback_priority == best->fallback_priority
+                        && candidate.parameter < best->parameter)))) {
+            best = &candidate;
+        }
+    }
+    NurbsPatchEdgeClosestPoint3D result;
+    result.converged = true;
+    result.parameter = best->parameter;
+    result.point = best->point;
+    result.distance = best->distance;
+    result.distance_error_bound = best->error_bound;
+    result.knot_span_count = knot_span_count;
+    result.refinement_level = maximum_refinement;
+    return result;
+}
 
 NurbsPatchEdgeOffsets3D compute_nurbs_patch_edge_offsets_3d(
     const NurbsSurfacePatch3D& patch,

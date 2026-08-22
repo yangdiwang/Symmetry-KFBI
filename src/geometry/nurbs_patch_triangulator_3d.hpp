@@ -6,10 +6,39 @@
 
 #include <Eigen/Dense>
 
+#include <src/geometry/nurbs_surface_model_3d.hpp>
+
 #include <array>
+#include <limits>
 #include <vector>
 
 namespace kfbim::geometry3d {
+
+struct NurbsPatchEdgeClosestPoint3D {
+    bool converged = false;
+    double parameter = 0.0;
+    Eigen::Vector3d point = Eigen::Vector3d::Zero();
+    double distance = std::numeric_limits<double>::infinity();
+    double distance_error_bound = std::numeric_limits<double>::infinity();
+    int knot_span_count = 0;
+    int refinement_level = 0;
+};
+
+[[nodiscard]] double estimate_nurbs_patch_edge_interval_length_3d(
+    const NurbsSurfacePatch3D& patch,
+    NurbsPatchEdge3D edge,
+    double begin,
+    double end,
+    int parameter_sample_count = 64);
+
+[[nodiscard]] NurbsPatchEdgeClosestPoint3D
+closest_point_to_nurbs_patch_edge_interval_3d(
+    const NurbsSurfacePatch3D& patch,
+    NurbsPatchEdge3D edge,
+    double begin,
+    double end,
+    const Eigen::Vector3d& query,
+    double model_diameter);
 
 struct NurbsPatchEdgeOffset3D {
     double knot_offset = 0.0;

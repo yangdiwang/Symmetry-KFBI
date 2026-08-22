@@ -3,6 +3,7 @@
 #include "nurbs_bezier_extraction_3d.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
@@ -15,6 +16,14 @@
 
 namespace kfbim::geometry3d {
 namespace {
+
+using PreprocessClock3D = std::chrono::steady_clock;
+
+double elapsed_seconds(PreprocessClock3D::time_point begin,
+                       PreprocessClock3D::time_point end)
+{
+    return std::chrono::duration<double>(end - begin).count();
+}
 
 constexpr std::uint64_t kNodeMask =
     (std::uint64_t{1} << 62) - std::uint64_t{1};
@@ -200,6 +209,15 @@ void accumulate_intersection_diagnostics(
         total.candidate_elements, increment.candidate_elements,
         "NURBS intersection candidate diagnostic overflow");
     checked_accumulate_int(
+        total.bvh_candidate_elements, increment.bvh_candidate_elements,
+        "NURBS BVH-candidate diagnostic overflow");
+    checked_accumulate_int(
+        total.mapped_candidate_elements, increment.mapped_candidate_elements,
+        "NURBS mapped-candidate diagnostic overflow");
+    total.maximum_candidate_elements_per_edge = std::max(
+        total.maximum_candidate_elements_per_edge,
+        increment.maximum_candidate_elements_per_edge);
+    checked_accumulate_int(
         total.triangle_seed_hits, increment.triangle_seed_hits,
         "NURBS triangle-seed diagnostic overflow");
     checked_accumulate_int(
@@ -215,6 +233,44 @@ void accumulate_intersection_diagnostics(
     checked_accumulate_int(
         total.newton_iterations, increment.newton_iterations,
         "NURBS Newton-iteration diagnostic overflow");
+    checked_accumulate_int(
+        total.early_unique_certificate_attempts,
+        increment.early_unique_certificate_attempts,
+        "NURBS early unique-root certificate diagnostic overflow");
+    checked_accumulate_int(
+        total.early_unique_certificate_successes,
+        increment.early_unique_certificate_successes,
+        "NURBS early unique-root certificate success diagnostic overflow");
+    checked_accumulate_int(
+        total.planar_analytic_hits, increment.planar_analytic_hits,
+        "NURBS planar analytic-hit diagnostic overflow");
+    checked_accumulate_int(
+        total.planar_analytic_misses, increment.planar_analytic_misses,
+        "NURBS planar analytic-miss diagnostic overflow");
+    checked_accumulate_int(
+        total.planar_analytic_fallbacks,
+        increment.planar_analytic_fallbacks,
+        "NURBS planar analytic-fallback diagnostic overflow");
+    checked_accumulate_int(
+        total.closest_point_prefilter_attempts,
+        increment.closest_point_prefilter_attempts,
+        "NURBS closest-point prefilter-attempt diagnostic overflow");
+    checked_accumulate_int(
+        total.closest_point_prefilter_certified_hits,
+        increment.closest_point_prefilter_certified_hits,
+        "NURBS closest-point prefilter-hit diagnostic overflow");
+    checked_accumulate_int(
+        total.closest_point_prefilter_certified_misses,
+        increment.closest_point_prefilter_certified_misses,
+        "NURBS closest-point prefilter-miss diagnostic overflow");
+    checked_accumulate_int(
+        total.closest_point_prefilter_fallbacks,
+        increment.closest_point_prefilter_fallbacks,
+        "NURBS closest-point prefilter-fallback diagnostic overflow");
+    checked_accumulate_int(
+        total.certified_fallback_elements,
+        increment.certified_fallback_elements,
+        "NURBS certified-fallback diagnostic overflow");
     checked_accumulate_int(
         total.same_patch_deduplications,
         increment.same_patch_deduplications,
@@ -782,6 +838,8 @@ struct NurbsCartesianDomain3D::Impl {
         , grid_origin(grid.origin())
         , grid_spacing(grid.spacing())
     {
+        const PreprocessClock3D::time_point construction_begin =
+            PreprocessClock3D::now();
         patch_g1_components = build_patch_g1_components(model);
         if (grid.layout() != DofLayout3D::Node) {
             throw std::invalid_argument(
@@ -793,6 +851,11 @@ struct NurbsCartesianDomain3D::Impl {
                 throw std::invalid_argument(
                     "NurbsCartesianDomain3D requires positive finite Cartesian spacing");
             }
+        }
+        if (std::isnan(options.maximum_element_extent_cap)
+            || options.maximum_element_extent_cap <= 0.0) {
+            throw std::invalid_argument(
+                "NURBS maximum element extent cap must be positive");
         }
         const auto cells = grid.num_cells();
         for (int axis = 0; axis < 3; ++axis) {
@@ -846,7 +909,9 @@ struct NurbsCartesianDomain3D::Impl {
 
         const double maximum_spacing =
             *std::max_element(spacing.begin(), spacing.end());
-        const double maximum_leaf_extent = 2.0 * maximum_spacing;
+        const double maximum_leaf_extent = std::min(
+            2.0 * maximum_spacing,
+            options.maximum_element_extent_cap);
         if (!std::isfinite(maximum_leaf_extent)) {
             throw std::overflow_error(
                 "NURBS acceleration leaf extent must be finite");
@@ -854,14 +919,27 @@ struct NurbsCartesianDomain3D::Impl {
 
         NurbsSurfaceIntersectorOptions3D intersector_options;
         intersector_options.use_triangle_seeds = options.use_triangle_seeds;
+        intersector_options.use_early_unique_root_certificate =
+            options.strategy
+            != NurbsCartesianPreprocessStrategy3D::CertifiedBaseline;
+        intersector_options.use_affine_planar_fast_path =
+            options.strategy
+            == NurbsCartesianPreprocessStrategy3D::Hybrid;
+        intersector_options.use_closest_point_prefilter =
+            options.strategy
+            == NurbsCartesianPreprocessStrategy3D::Hybrid;
         intersector_options.maximum_element_extent = maximum_leaf_extent;
         intersector_options.local_max_subdivision_depth = 4;
         // The Cartesian event catalog stores physical events, not per-patch
         // roots.  Declared non-G1 owners therefore have to be merged upstream
         // into one crossing with an owners list.
         intersector_options.preserve_non_g1_root_owners = false;
+        const PreprocessClock3D::time_point intersector_begin =
+            PreprocessClock3D::now();
         NurbsSurfaceIntersector3D intersector(
             std::move(model), intersector_options);
+        diagnostics.intersector_build_seconds = elapsed_seconds(
+            intersector_begin, PreprocessClock3D::now());
         bounds = intersector.bounds();
         tolerance = intersector.geometry_tolerance();
         if (!std::isfinite(tolerance) || tolerance < 0.0) {
@@ -926,8 +1004,9 @@ struct NurbsCartesianDomain3D::Impl {
         interface_edges[2].assign(
             z_barrier_size, std::uint8_t{0});
 
-        const std::vector<RationalBezierElement3D> leaves =
-            intersector.acceleration_leaves(maximum_leaf_extent);
+        const PreprocessClock3D::time_point candidate_begin =
+            PreprocessClock3D::now();
+        const auto& leaves = intersector.query_elements();
         if (leaves.size() != intersector.query_element_count()) {
             throw std::logic_error(
                 "NURBS acceleration leaves differ from BVH query elements");
@@ -939,8 +1018,20 @@ struct NurbsCartesianDomain3D::Impl {
 
         const auto origin = grid.origin();
         std::vector<std::uint64_t> candidate_keys;
-        for (const RationalBezierElement3D& leaf : leaves) {
-            const NurbsAabb3D leaf_bounds = leaf.bounds();
+        std::vector<std::pair<std::uint64_t, std::size_t>>
+            candidate_incidences;
+        const bool use_mapped_candidates =
+            options.strategy
+            != NurbsCartesianPreprocessStrategy3D::CertifiedBaseline;
+        const auto record_candidate =
+            [&](std::uint64_t key, std::size_t element_id) {
+                if (use_mapped_candidates)
+                    candidate_incidences.emplace_back(key, element_id);
+                else
+                    candidate_keys.push_back(key);
+            };
+        for (const NurbsQueryElementDescriptor3D& leaf : leaves) {
+            const NurbsAabb3D& leaf_bounds = leaf.bounds;
             for (int axis = 0; axis < 3; ++axis) {
                 const double h = spacing[static_cast<std::size_t>(axis)];
                 const ClosedIntInterval start_range =
@@ -983,10 +1074,11 @@ struct NurbsCartesianDomain3D::Impl {
                              j <= transverse_max[1]; ++j) {
                             for (int i = start_range.lower;
                                  i <= start_range.upper; ++i) {
-                                candidate_keys.push_back(
+                                record_candidate(
                                     edge_key(
                                         axis,
-                                        structured_node_index(i, j, k)));
+                                        structured_node_index(i, j, k)),
+                                    leaf.id);
                             }
                         }
                     }
@@ -997,10 +1089,11 @@ struct NurbsCartesianDomain3D::Impl {
                              j <= start_range.upper; ++j) {
                             for (int i = transverse_min[0];
                                  i <= transverse_max[0]; ++i) {
-                                candidate_keys.push_back(
+                                record_candidate(
                                     edge_key(
                                         axis,
-                                        structured_node_index(i, j, k)));
+                                        structured_node_index(i, j, k)),
+                                    leaf.id);
                             }
                         }
                     }
@@ -1011,21 +1104,42 @@ struct NurbsCartesianDomain3D::Impl {
                              j <= transverse_max[1]; ++j) {
                             for (int i = transverse_min[0];
                                  i <= transverse_max[0]; ++i) {
-                                candidate_keys.push_back(
+                                record_candidate(
                                     edge_key(
                                         axis,
-                                        structured_node_index(i, j, k)));
+                                        structured_node_index(i, j, k)),
+                                    leaf.id);
                             }
                         }
                     }
                 }
             }
         }
-        std::sort(candidate_keys.begin(), candidate_keys.end());
-        candidate_keys.erase(
-            std::unique(candidate_keys.begin(), candidate_keys.end()),
-            candidate_keys.end());
+        if (use_mapped_candidates) {
+            std::sort(
+                candidate_incidences.begin(), candidate_incidences.end());
+            candidate_incidences.erase(
+                std::unique(
+                    candidate_incidences.begin(), candidate_incidences.end()),
+                candidate_incidences.end());
+            diagnostics.candidate_element_incidence_count =
+                candidate_incidences.size();
+            candidate_keys.reserve(candidate_incidences.size());
+            for (const auto& incidence : candidate_incidences) {
+                if (candidate_keys.empty()
+                    || candidate_keys.back() != incidence.first) {
+                    candidate_keys.push_back(incidence.first);
+                }
+            }
+        } else {
+            std::sort(candidate_keys.begin(), candidate_keys.end());
+            candidate_keys.erase(
+                std::unique(candidate_keys.begin(), candidate_keys.end()),
+                candidate_keys.end());
+        }
         diagnostics.candidate_grid_edge_count = candidate_keys.size();
+        diagnostics.candidate_enumeration_seconds = elapsed_seconds(
+            candidate_begin, PreprocessClock3D::now());
 
         std::unique_ptr<NurbsSurfaceIntersector3D> retry_intersector;
         std::unique_ptr<NurbsSurfaceIntersector3D> final_retry_intersector;
@@ -1099,15 +1213,47 @@ struct NurbsCartesianDomain3D::Impl {
             return containing;
         };
 
-        const auto targeted_retry = [&](const NurbsCartesianEdgeQuery3D& query) {
-            NurbsCartesianEdgeIntersections3D result =
-                deep_intersector().intersect_cartesian_edge(query);
-            if (grid_edge_root_set_requires_targeted_retry_3d(result))
+        const auto targeted_retry = [&]
+            (const NurbsCartesianEdgeQuery3D& query,
+             const std::vector<std::size_t>& candidate_ids) {
+            NurbsCartesianEdgeIntersections3D result;
+            if (use_mapped_candidates) {
+                result = intersector.intersect_cartesian_edge(
+                    query, candidate_ids,
+                    NurbsCartesianEdgeQueryOptions3D{
+                        6,
+                        NurbsCartesianEdgeQueryRoute3D::
+                            OptimizedCertified});
+            } else {
+                result = deep_intersector().intersect_cartesian_edge(query);
+            }
+            // The mapped/optimized retry is only a first certified attempt.
+            // If any part of the complete root set remains ambiguous, fall
+            // back to the deeper full-BVH route rather than accepting a
+            // unique/first-root approximation.
+            if (grid_edge_root_set_requires_targeted_retry_3d(result)) {
                 result = final_intersector().intersect_cartesian_edge(query);
+            }
             return result;
         };
 
+        std::size_t incidence_cursor = 0;
         for (const std::uint64_t key : candidate_keys) {
+            std::vector<std::size_t> candidate_ids;
+            if (use_mapped_candidates) {
+                if (incidence_cursor >= candidate_incidences.size()
+                    || candidate_incidences[incidence_cursor].first != key) {
+                    throw std::logic_error(
+                        "NURBS candidate incidence grouping is inconsistent");
+                }
+                while (incidence_cursor < candidate_incidences.size()
+                       && candidate_incidences[incidence_cursor].first
+                              == key) {
+                    candidate_ids.push_back(
+                        candidate_incidences[incidence_cursor].second);
+                    ++incidence_cursor;
+                }
+            }
             const std::uint64_t axis_bits = key >> 62;
             if (axis_bits > 2)
                 throw std::overflow_error("invalid Cartesian edge key axis");
@@ -1133,8 +1279,16 @@ struct NurbsCartesianDomain3D::Impl {
             const Eigen::Vector3d end = as_vector(grid.coord(end_node));
             const NurbsCartesianEdgeQuery3D query{
                 axis, ijk[0], ijk[1], ijk[2], start, end};
+            const PreprocessClock3D::time_point intersection_begin =
+                PreprocessClock3D::now();
             NurbsCartesianEdgeIntersections3D edge_result =
-                intersector.intersect_cartesian_edge(query);
+                use_mapped_candidates
+                ? intersector.intersect_cartesian_edge(query, candidate_ids)
+                : intersector.intersect_cartesian_edge(query);
+            diagnostics.edge_intersection_seconds += elapsed_seconds(
+                intersection_begin, PreprocessClock3D::now());
+            PreprocessClock3D::time_point materialization_begin =
+                PreprocessClock3D::now();
             accumulate_intersection_diagnostics(
                 diagnostics.intersections, edge_result.diagnostics);
             std::vector<int> toggled_components;
@@ -1175,7 +1329,14 @@ struct NurbsCartesianDomain3D::Impl {
                     diagnostics.targeted_retry_count,
                     std::size_t{1},
                     "NURBS targeted-retry diagnostic overflow");
-                edge_result = targeted_retry(query);
+                diagnostics.edge_materialization_seconds += elapsed_seconds(
+                    materialization_begin, PreprocessClock3D::now());
+                const PreprocessClock3D::time_point retry_begin =
+                    PreprocessClock3D::now();
+                edge_result = targeted_retry(query, candidate_ids);
+                diagnostics.edge_intersection_seconds += elapsed_seconds(
+                    retry_begin, PreprocessClock3D::now());
+                materialization_begin = PreprocessClock3D::now();
                 used_targeted_retry = true;
                 accumulate_intersection_diagnostics(
                     diagnostics.targeted_retry_intersections,
@@ -1357,10 +1518,29 @@ struct NurbsCartesianDomain3D::Impl {
                     barrier_count, std::size_t{1},
                     "NURBS barrier diagnostic count overflow");
             }
+            diagnostics.edge_materialization_seconds += elapsed_seconds(
+                materialization_begin, PreprocessClock3D::now());
         }
 
+        if (use_mapped_candidates
+            && incidence_cursor != candidate_incidences.size()) {
+            throw std::logic_error(
+                "NURBS candidate incidences were not fully consumed");
+        }
+        const PreprocessClock3D::time_point flood_begin =
+            PreprocessClock3D::now();
         flood_and_label(grid, intersector);
+        diagnostics.flood_labeling_seconds = std::max(
+            0.0,
+            elapsed_seconds(flood_begin, PreprocessClock3D::now())
+                - diagnostics.representative_classification_seconds);
+        const PreprocessClock3D::time_point verification_begin =
+            PreprocessClock3D::now();
         verify_barriers();
+        diagnostics.invariant_verification_seconds = elapsed_seconds(
+            verification_begin, PreprocessClock3D::now());
+        diagnostics.total_construction_seconds = elapsed_seconds(
+            construction_begin, PreprocessClock3D::now());
     }
 
     bool is_compatible_grid(const CartesianGrid3D& grid) const noexcept
@@ -1558,9 +1738,14 @@ struct NurbsCartesianDomain3D::Impl {
                     "Cartesian representative-query diagnostic count overflow");
                 const Eigen::Vector3d representative_point = as_vector(
                     grid.coord(representatives[component]));
+                const PreprocessClock3D::time_point classification_begin =
+                    PreprocessClock3D::now();
                 const std::vector<int> containing =
                     intersector.containing_components(
                         representative_point);
+                diagnostics.representative_classification_seconds +=
+                    elapsed_seconds(
+                        classification_begin, PreprocessClock3D::now());
                 if (containing.empty()) {
                     component_labels[component] = 0;
                 } else if (containing.size() == 1) {
