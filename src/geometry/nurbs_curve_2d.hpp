@@ -53,6 +53,10 @@ public:
 
     [[nodiscard]] Vector evaluate(double t) const { return curve_.evaluate(t); }
     [[nodiscard]] Vector derivative(double t) const { return curve_.derivative(t); }
+    [[nodiscard]] Vector second_derivative(double t) const
+    {
+        return curve_.second_derivative(t);
+    }
     [[nodiscard]] Vector tangent(double t) const { return curve_.tangent(t); }
 
     [[nodiscard]] double rational_basis_value(int i, double t) const
@@ -72,6 +76,10 @@ public:
 
     Eigen::Vector2d eval(double t) const override { return evaluate(t); }
     Eigen::Vector2d deriv(double t) const override { return derivative(t); }
+    Eigen::Vector2d second_deriv(double t) const override
+    {
+        return second_derivative(t);
+    }
     double t_min() const override { return domain_start(); }
     double t_max() const override { return domain_end(); }
 

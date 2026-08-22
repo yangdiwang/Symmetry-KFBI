@@ -3,6 +3,7 @@
 #include "rational_bezier_element_3d.hpp"
 
 #include <Eigen/Dense>
+#include <array>
 #include <stdexcept>
 
 #include <vector>
@@ -48,6 +49,12 @@ struct NurbsElementIntersectionDiagnostics3D {
     int roots_recovered_by_supplied_seed = 0;
     int maximum_supplied_seed_count = 0;
     int high_degree_control_hull_fallbacks = 0;
+    // Outward-rounded conservative longitudinal intervals (physical distance
+    // from segment start) of terminal boxes whose root content could not be
+    // certified.
+    // These let callers prove that an unresolved box lies beyond the part of
+    // a segment relevant to a nearest-root query.
+    std::vector<std::array<double, 2>> unresolved_longitudinal_intervals;
 };
 
 struct NurbsElementIntersectionResult3D {

@@ -15,7 +15,8 @@ void validate_cloud(const NativeNurbsSurface3D& surface,
 {
     if (surface.patches.empty()
         || surface.patches.size() != cloud.patches.size()
-        || surface.smooth_neighbors.size() != surface.patches.size()) {
+        || (!surface.smooth_neighbors.empty()
+            && surface.smooth_neighbors.size() != surface.patches.size())) {
         throw std::invalid_argument(
             "crossing-owner selection has incompatible surface DOF cloud");
     }

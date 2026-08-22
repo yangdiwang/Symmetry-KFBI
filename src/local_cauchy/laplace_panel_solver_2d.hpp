@@ -465,18 +465,16 @@ build_panel_center_cauchy_geometry_cache_2d(const Interface2D& iface,
     cache.points.resize(static_cast<std::size_t>(Nc));
 
     for (int p = 0; p < Np; ++p) {
-        const int g0 = iface.point_index(p, 0);
-        const int g1 = iface.point_index(p, 1);
-        const int g2 = iface.point_index(p, 2);
+        const Eigen::Vector2d left =
+            geometry2d::panel_point(iface, p, -1.0);
+        const Eigen::Vector2d middle =
+            geometry2d::panel_point(iface, p, 0.0);
+        const Eigen::Vector2d right =
+            geometry2d::panel_point(iface, p, 1.0);
         const double panel_pts[3][2] = {
-            {iface.points()(g0, 0), iface.points()(g0, 1)},
-            {iface.points()(g1, 0), iface.points()(g1, 1)},
-            {iface.points()(g2, 0), iface.points()(g2, 1)}
-        };
-        const double panel_nml[3][2] = {
-            {iface.panel_normal(p, 0)[0], iface.panel_normal(p, 0)[1]},
-            {iface.panel_normal(p, 1)[0], iface.panel_normal(p, 1)[1]},
-            {iface.panel_normal(p, 2)[0], iface.panel_normal(p, 2)[1]}
+            {left[0], left[1]},
+            {middle[0], middle[1]},
+            {right[0], right[1]}
         };
         const double panel_length = detail::panel_chord_length_2d(panel_pts);
 
@@ -496,12 +494,18 @@ build_panel_center_cauchy_geometry_cache_2d(const Interface2D& iface,
             cache.panel_index[ci] = p;
             cache.local_s[ci] = t;
 
-            double center[2];
-            detail::interpolate_vector_3_at_nodes(
-                detail::kPanelP2S, panel_pts, t, center);
-            double center_normal[2];
-            detail::panel_normal_2d_at_nodes(
-                detail::kPanelP2S, panel_pts, panel_nml, t, center_normal);
+            const Eigen::Vector2d center_point =
+                geometry2d::panel_point(iface, p, t);
+            const Eigen::Vector2d center_normal_vector =
+                geometry2d::panel_normal(iface, p, t);
+            double center[2] = {
+                center_point[0],
+                center_point[1]
+            };
+            double center_normal[2] = {
+                center_normal_vector[0],
+                center_normal_vector[1]
+            };
             cache.centers(ci, 0) = center[0];
             cache.centers(ci, 1) = center[1];
             cache.normals(ci, 0) = center_normal[0];
@@ -514,22 +518,12 @@ build_panel_center_cauchy_geometry_cache_2d(const Interface2D& iface,
                     detail::kPanelP2S, s_values[j], weights);
                 for (int k = 0; k < 3; ++k)
                     point.interpolation_weights[j][k] = weights[k];
-                detail::interpolate_vector_3_at_nodes(
-                    detail::kPanelP2S,
-                    panel_pts,
-                    s_values[j],
-                    bdry1[j]);
                 point.collocation_points[j] =
-                    Eigen::Vector2d(bdry1[j][0], bdry1[j][1]);
-                double nml[2];
-                detail::panel_normal_2d_at_nodes(
-                    detail::kPanelP2S,
-                    panel_pts,
-                    panel_nml,
-                    s_values[j],
-                    nml);
+                    geometry2d::panel_point(iface, p, s_values[j]);
+                bdry1[j][0] = point.collocation_points[j][0];
+                bdry1[j][1] = point.collocation_points[j][1];
                 point.collocation_normals[j] =
-                    Eigen::Vector2d(nml[0], nml[1]);
+                    geometry2d::panel_normal(iface, p, s_values[j]);
             }
 
             double bdry2[2][2] = {
@@ -969,29 +963,46 @@ inline PanelCenterCauchyResult2D laplace_panel_quadratic_center_cauchy_2d(
             const double s_minus = t - detail::kCollocationDelta;
             const double s_plus  = t + detail::kCollocationDelta;
 
-            double center[2];
-            detail::interpolate_vector_3_at_nodes(detail::kPanelP2S, panel_pts, t, center);
-
-            double center_normal[2];
-            detail::panel_normal_2d_at_nodes(detail::kPanelP2S,
-                                             panel_pts, panel_nml, t, center_normal);
+            const Eigen::Vector2d center_point =
+                geometry2d::panel_point(iface, p, t);
+            const Eigen::Vector2d center_normal_vector =
+                geometry2d::panel_normal(iface, p, t);
+            double center[2] = {
+                center_point[0],
+                center_point[1]
+            };
+            double center_normal[2] = {
+                center_normal_vector[0],
+                center_normal_vector[1]
+            };
 
             double bdry1[3][2];
-            detail::interpolate_vector_3_at_nodes(detail::kPanelP2S, panel_pts, s_minus, bdry1[0]);
-            detail::interpolate_vector_3_at_nodes(detail::kPanelP2S, panel_pts, t,       bdry1[1]);
-            detail::interpolate_vector_3_at_nodes(detail::kPanelP2S, panel_pts, s_plus,  bdry1[2]);
+            const Eigen::Vector2d bdry1_point[3] = {
+                geometry2d::panel_point(iface, p, s_minus),
+                center_point,
+                geometry2d::panel_point(iface, p, s_plus)
+            };
+            for (int j = 0; j < 3; ++j) {
+                bdry1[j][0] = bdry1_point[j][0];
+                bdry1[j][1] = bdry1_point[j][1];
+            }
 
             double bdry2[2][2];
-            detail::interpolate_vector_3_at_nodes(detail::kPanelP2S, panel_pts, s_minus, bdry2[0]);
-            detail::interpolate_vector_3_at_nodes(detail::kPanelP2S, panel_pts, s_plus,  bdry2[1]);
+            bdry2[0][0] = bdry1[0][0];
+            bdry2[0][1] = bdry1[0][1];
+            bdry2[1][0] = bdry1[2][0];
+            bdry2[1][1] = bdry1[2][1];
             double bdry2_nml[2][2];
-            detail::panel_normal_2d_at_nodes(detail::kPanelP2S,
-                                             panel_pts, panel_nml, s_minus, bdry2_nml[0]);
-            detail::panel_normal_2d_at_nodes(detail::kPanelP2S,
-                                             panel_pts, panel_nml, s_plus,  bdry2_nml[1]);
+            const Eigen::Vector2d normal_minus =
+                geometry2d::panel_normal(iface, p, s_minus);
+            const Eigen::Vector2d normal_plus =
+                geometry2d::panel_normal(iface, p, s_plus);
+            bdry2_nml[0][0] = normal_minus[0];
+            bdry2_nml[0][1] = normal_minus[1];
+            bdry2_nml[1][0] = normal_plus[0];
+            bdry2_nml[1][1] = normal_plus[1];
 
-            double bulk[2];
-            detail::interpolate_vector_3_at_nodes(detail::kPanelP2S, panel_pts, t, bulk);
+            double bulk[2] = {center[0], center[1]};
             if (profile_detail) {
                 center_geom_sec += detail::cauchy_elapsed_seconds_2d(
                     center_geom_start, std::chrono::steady_clock::now());

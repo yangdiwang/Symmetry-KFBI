@@ -1,5 +1,9 @@
 # 3D L-prism Neumann Cauchy-policy comparison
 
+> This comparison uses the current production default `g1_nearest`, which
+> never crosses non-G1 topological edges. `topological_nearest` remains
+> available explicitly for cross-edge diagnostics.
+
 ## Configuration
 
 - Levels: `N=32,64,128`; no `N=256` run.
@@ -8,9 +12,9 @@
 - GMRES tolerance: `2e-10`.
 - Default maximum GMRES iterations: 80 for both formulations.
 
-The default stencil policy is `g1_nearest`: it may traverse
-`smooth_neighbors` but never a non-G1 topological edge. `same_patch` and
-`topological_nearest` remain explicit diagnostics.
+For this recorded comparison, the default stencil policy was `g1_nearest`:
+it may traverse `smooth_neighbors` but never a non-G1 topological edge.
+`same_patch` and `topological_nearest` were explicit diagnostics.
 
 ## Neumann internal maximum error
 
@@ -42,9 +46,12 @@ case, samples on adjacent faces still come from one smooth Cartesian
 harmonic field, so the cross-edge stencil is more compact and symmetric.
 Its maximum radius is about `4.18h`, worst condition number about `15`, and
 the GMRES counts fall to `28,24,31`. This is a useful Neumann diagnostic,
-but not a safe global default: the Dirichlet-normal formulation took
-`54` steps at `N=32`, hit the new 80-step cap at `N=64`, and was deliberately
-stopped at 40 steps in the isolated `N=128` diagnostic.
+and is now the Neumann-focused production default. The same application
+policy also reaches the Dirichlet-normal formulation: that solve took `54`
+steps at `N=32`, hit the new 80-step cap at `N=64`, and was deliberately
+stopped at 40 steps in the isolated `N=128` diagnostic. Fine-grid
+Dirichlet-normal studies should therefore select `g1_nearest` explicitly or
+set a separate iteration budget.
 
 ## Runtime guard
 

@@ -1,19 +1,20 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
+#include <map>
+#include <stdexcept>
 #include <vector>
 
 #include "../geometry/corner_patch_2d.hpp"
 #include "../geometry/grid_pair_2d.hpp"
 #include "../geometry/grid_pair_3d.hpp"
+#include "../geometry/nurbs_cartesian_domain_3d.hpp"
 #include "../grid/structured_grid_ops.hpp"
+#include "laplace_correction_op.hpp"
+#include "laplace_grid_edge_event_correction_3d.hpp"
 
 namespace kfbim {
-
-enum class LaplaceCrossingKind {
-    InterfaceJump,
-    CornerPatchBoundary
-};
 
 enum class LaplaceJumpCorrectionSource2D {
     RawInterface,
@@ -26,17 +27,16 @@ enum class PatchInterfaceJumpMode2D {
     SingularRemovedJump
 };
 
-struct LaplaceCrossingCorrectionOp {
-    LaplaceCrossingKind kind = LaplaceCrossingKind::InterfaceJump;
-    int rhs_node = -1;
-    int correction_node = -1;
-    int neighbor_slot = -1;
-    int side_delta = 0;
-    int patch = -1;
-    double stencil_weight = 0.0;
-    int rhs_patch = -1;
-    int correction_patch = -1;
-};
+inline P2CrossingOwner3D laplace_crossing_owner_3d(
+    const GridPair3D& grid_pair,
+    const LaplaceCrossingCorrectionOp& op)
+{
+    return has_grid_edge_event_3d(op)
+        ? grid_pair.p2_crossing_owner_for_grid_edge_event(
+              op.grid_edge_event)
+        : grid_pair.p2_crossing_owner_between(
+              op.rhs_node, op.correction_node);
+}
 
 inline LaplaceJumpCorrectionSource2D laplace_crossing_source_2d(
     const LaplaceCrossingCorrectionOp& op)
@@ -58,10 +58,16 @@ struct LaplaceCorrectionSupport2D {
 
 struct LaplaceCorrectionSupport3D {
     std::vector<LaplaceCrossingCorrectionOp> crossing_ops;
+    // Event-aware native NURBS catalog.  crossing_ops contains two directed
+    // entries for every retained physical event; the legacy label-change scan
+    // is used only when no native Cartesian domain is attached.
+    std::vector<geometry3d::GridEdgeEvent3D>
+        certified_grid_edge_events;
     std::vector<std::array<int, 10>> restrict_stencils;
     std::vector<int> correction_nodes;
     std::vector<int> projection_nodes;
     int restrict_sample_visits = 0;
+    std::size_t certified_label_preserving_event_count = 0;
 };
 
 namespace laplace_correction_support_detail {
@@ -197,7 +203,38 @@ inline LaplaceCorrectionSupport3D build_laplace_correction_support_3d(
     std::vector<char> needs_c(n_grid, 0);
 
     LaplaceCorrectionSupport3D support;
-    for (int n = 0; n < n_grid; ++n) {
+    if (const geometry3d::NurbsCartesianDomain3D* domain =
+            grid_pair.nurbs_cartesian_domain()) {
+        if (domain->diagnostics().uncertified_grid_edge_count != 0) {
+            throw std::runtime_error(
+                "native multi-event correction requires every candidate grid edge to have a certified complete root set");
+        }
+        for (const geometry3d::GridEdgeEvent3D& event :
+             domain->grid_edge_event_catalog()) {
+            const int first = event.id.first_node;
+            const int second = event.id.second_node;
+            const std::vector<LaplaceCrossingCorrectionOp> event_ops =
+                native_grid_edge_event_correction_ops_3d(grid, event);
+            if (event_ops.empty())
+                continue;
+
+            support.certified_grid_edge_events.push_back(event);
+            const int first_side =
+                laplace_correction_support_detail::side_from_label(
+                    grid_pair.domain_label(first));
+            const int second_side =
+                laplace_correction_support_detail::side_from_label(
+                    grid_pair.domain_label(second));
+            if (first_side == second_side)
+                ++support.certified_label_preserving_event_count;
+
+            support.crossing_ops.insert(
+                support.crossing_ops.end(),
+                event_ops.begin(), event_ops.end());
+            needs_c[first] = 1;
+            needs_c[second] = 1;
+        }
+    } else for (int n = 0; n < n_grid; ++n) {
         if (structured_grid::is_boundary_node(grid, n))
             continue;
 
@@ -217,14 +254,16 @@ inline LaplaceCorrectionSupport3D build_laplace_correction_support_3d(
                 continue;
 
             needs_c[nb] = 1;
-            support.crossing_ops.push_back(
-                {LaplaceCrossingKind::InterfaceJump,
-                 n,
-                 nb,
-                 slot,
-                 side_n - side_nb,
-                 -1,
-                 structured_grid::stencil_weight_for_neighbor(grid, slot)});
+            LaplaceCrossingCorrectionOp op;
+            op.kind = LaplaceCrossingKind::InterfaceJump;
+            op.rhs_node = n;
+            op.correction_node = nb;
+            op.neighbor_slot = slot;
+            op.side_delta = side_n - side_nb;
+            op.patch = -1;
+            op.stencil_weight =
+                structured_grid::stencil_weight_for_neighbor(grid, slot);
+            support.crossing_ops.push_back(op);
         }
     }
 

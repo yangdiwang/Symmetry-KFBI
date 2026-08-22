@@ -62,6 +62,7 @@ struct AlignedInteriorErrors {
 };
 
 struct CircleMetrics {
+    std::string restrict_method;
     int n = 0;
     int panels = 0;
     int interface_points = 0;
@@ -100,6 +101,19 @@ struct CircleMetrics {
     double normal_error_inf = 0.0;
     BulkErrors solved_bulk;
     AlignedInteriorErrors new_aligned_bulk;
+    int restrict_wrong_side_nodes = 0;
+    int restrict_corrected_nodes = 0;
+    int exact_crossing_owners = 0;
+    int gap_fallback_owners = 0;
+    int endpoint_fallback_owners = 0;
+    int center_cauchy_jump_samples = 0;
+    int trace_points_without_incident_center = 0;
+    int six_point_cross_stencils = 0;
+    int diagonal_zero_crossing_rejections = 0;
+    int diagonal_multiple_crossing_rejections = 0;
+    int expanded_same_side_center_stencils = 0;
+    double max_same_side_center_distance_over_h = 0.0;
+    double max_six_point_weight_l1 = 0.0;
 
     int legacy_iterations = 0;
     bool legacy_converged = false;
@@ -148,6 +162,90 @@ double environment_double(const char* name, double fallback)
 {
     const char* value = std::getenv(name);
     return value == nullptr ? fallback : std::stod(value);
+}
+
+LaplaceNeumannExteriorRestrictMethod2D selected_restrict_method()
+{
+    const char* raw = std::getenv("KFBIM_CIRCLE_RESTRICT");
+    if (raw == nullptr || std::string(raw).empty()
+        || std::string(raw) == "six_point_quadratic"
+        || std::string(raw) == "legacy") {
+        return LaplaceNeumannExteriorRestrictMethod2D::SixPointQuadratic;
+    }
+    if (std::string(raw) == "joint_bicubic_cubic_crossing_owner"
+        || std::string(raw) == "crossing_owner") {
+        return LaplaceNeumannExteriorRestrictMethod2D::
+            JointBicubicCubicCrossingOwner;
+    }
+    if (std::string(raw)
+            == "joint_biquadratic_quadratic_center_cauchy_jump"
+        || std::string(raw) == "center_cauchy_jump") {
+        return LaplaceNeumannExteriorRestrictMethod2D::
+            JointBiquadraticQuadraticCenterCauchyJump;
+    }
+    if (std::string(raw)
+            == "joint_six_point_quadratic_center_cauchy_jump"
+        || std::string(raw) == "six_point_cross_stencil") {
+        return LaplaceNeumannExteriorRestrictMethod2D::
+            JointSixPointQuadraticCenterCauchyJump;
+    }
+    throw std::invalid_argument(
+        "KFBIM_CIRCLE_RESTRICT must be six_point_quadratic (or legacy), "
+        "joint_bicubic_cubic_crossing_owner (or crossing_owner), "
+        "joint_biquadratic_quadratic_center_cauchy_jump "
+        "(or center_cauchy_jump), or "
+        "joint_six_point_quadratic_center_cauchy_jump "
+        "(or six_point_cross_stencil)");
+}
+
+const char* restrict_method_name(
+    LaplaceNeumannExteriorRestrictMethod2D method)
+{
+    switch (method) {
+    case LaplaceNeumannExteriorRestrictMethod2D::SixPointQuadratic:
+        return "six_point_quadratic";
+    case LaplaceNeumannExteriorRestrictMethod2D::
+             JointBiquadraticQuadraticCrossingOwner:
+        return "joint_biquadratic_quadratic_crossing_owner";
+    case LaplaceNeumannExteriorRestrictMethod2D::
+             JointBiquadraticQuadraticCenterCauchyJump:
+        return "joint_biquadratic_quadratic_center_cauchy_jump";
+    case LaplaceNeumannExteriorRestrictMethod2D::
+             JointSixPointQuadraticCenterCauchyJump:
+        return "joint_six_point_quadratic_center_cauchy_jump";
+    case LaplaceNeumannExteriorRestrictMethod2D::
+             JointBiquadraticQuadraticVirtualSideFlip:
+        return "joint_biquadratic_quadratic_virtual_side_flip";
+    case LaplaceNeumannExteriorRestrictMethod2D::
+             JointBicubicCubicCrossingOwner:
+        return "joint_bicubic_cubic_crossing_owner";
+    }
+    throw std::runtime_error("unknown smooth-circle restrict method");
+}
+
+const char* restrict_output_tag(
+    LaplaceNeumannExteriorRestrictMethod2D method)
+{
+    switch (method) {
+    case LaplaceNeumannExteriorRestrictMethod2D::SixPointQuadratic:
+        return "six_point_quadratic";
+    case LaplaceNeumannExteriorRestrictMethod2D::
+             JointBiquadraticQuadraticCrossingOwner:
+        return "p2_crossing_owner_joint_quadratic";
+    case LaplaceNeumannExteriorRestrictMethod2D::
+             JointBiquadraticQuadraticCenterCauchyJump:
+        return "p2_joint_quadratic_center_cauchy_jump";
+    case LaplaceNeumannExteriorRestrictMethod2D::
+             JointSixPointQuadraticCenterCauchyJump:
+        return "p2_joint_six_point_quadratic_center_cauchy_jump";
+    case LaplaceNeumannExteriorRestrictMethod2D::
+             JointBiquadraticQuadraticVirtualSideFlip:
+        return "p2_joint_quadratic_virtual_side_flip";
+    case LaplaceNeumannExteriorRestrictMethod2D::
+             JointBicubicCubicCrossingOwner:
+        return "p2_crossing_owner_joint_cubic";
+    }
+    throw std::runtime_error("unknown smooth-circle restrict output tag");
 }
 
 BulkErrors measure_bulk_errors(
@@ -222,7 +320,12 @@ AlignedInteriorErrors measure_aligned_interior_errors(
     return errors;
 }
 
-CircleMetrics run_level(int n, int max_iter, double tolerance, int restart)
+CircleMetrics run_level(
+    int n,
+    int max_iter,
+    double tolerance,
+    int restart,
+    LaplaceNeumannExteriorRestrictMethod2D restrict_method)
 {
     if (n < 16)
         throw std::invalid_argument("circle grid size must be at least 16");
@@ -236,7 +339,14 @@ CircleMetrics run_level(int n, int max_iter, double tolerance, int restart)
     const Interface2D iface =
         CurveResampler2D::discretize_quadratic_lagrange(
             circle, h, 2.4);
-    LaplaceNeumannExteriorTrace2D solver(grid, iface);
+    LaplaceNeumannExteriorTraceOptions2D options;
+    options.restrict_method = restrict_method;
+    if (restrict_method
+        != LaplaceNeumannExteriorRestrictMethod2D::SixPointQuadratic) {
+        options.correction_method =
+            LaplaceCorrectionMethod2D::CrossingOwner;
+    }
+    LaplaceNeumannExteriorTrace2D solver(grid, iface, options);
     LaplaceBvpOptions2D legacy_options;
     legacy_options.panel_method =
         LaplaceBvpPanelMethod2D::QuadraticPanelCenter;
@@ -358,6 +468,7 @@ CircleMetrics run_level(int n, int max_iter, double tolerance, int restart)
         / solver.active_weights().sum());
 
     CircleMetrics metrics;
+    metrics.restrict_method = restrict_method_name(restrict_method);
     metrics.n = n;
     metrics.panels = iface.num_panels();
     metrics.interface_points = nq;
@@ -416,6 +527,62 @@ CircleMetrics run_level(int n, int max_iter, double tolerance, int restart)
         grid, solver.grid_pair(), result.u_bulk, exact_f_mean);
     metrics.new_aligned_bulk = measure_aligned_interior_errors(
         grid, solver.grid_pair(), result.u_bulk, exact_f_mean);
+    if (const auto* diagnostics =
+            solver.joint_polynomial_restrict_diagnostics()) {
+        metrics.restrict_wrong_side_nodes =
+            diagnostics->wrong_side_nodes;
+        metrics.restrict_corrected_nodes =
+            diagnostics->corrected_nodes;
+        metrics.exact_crossing_owners =
+            diagnostics->exact_crossing_owners;
+        metrics.gap_fallback_owners =
+            diagnostics->gap_fallback_owners;
+        metrics.endpoint_fallback_owners =
+            diagnostics->endpoint_fallback_owners;
+        metrics.center_cauchy_jump_samples =
+            diagnostics->center_cauchy_jump_samples;
+        metrics.trace_points_without_incident_center =
+            diagnostics->trace_points_without_incident_center;
+        metrics.six_point_cross_stencils =
+            diagnostics->six_point_cross_stencils;
+        metrics.diagonal_zero_crossing_rejections =
+            diagnostics->diagonal_zero_crossing_rejections;
+        metrics.diagonal_multiple_crossing_rejections =
+            diagnostics->diagonal_multiple_crossing_rejections;
+        metrics.expanded_same_side_center_stencils =
+            diagnostics->expanded_same_side_center_stencils;
+        metrics.max_same_side_center_distance_over_h =
+            diagnostics->max_same_side_center_distance_over_h;
+        metrics.max_six_point_weight_l1 =
+            diagnostics->max_six_point_weight_l1;
+
+        const bool uses_center_cauchy_jump =
+            restrict_method
+                == LaplaceNeumannExteriorRestrictMethod2D::
+                       JointBiquadraticQuadraticCenterCauchyJump
+            || restrict_method
+                == LaplaceNeumannExteriorRestrictMethod2D::
+                       JointSixPointQuadraticCenterCauchyJump;
+        if (uses_center_cauchy_jump) {
+            const int expected_samples = 6 * nq;
+            if (metrics.center_cauchy_jump_samples
+                    != expected_samples
+                || metrics.trace_points_without_incident_center != 0) {
+                throw std::runtime_error(
+                    "center-Cauchy jump restrict did not bind every smooth "
+                    "circle trace point to an incident panel center");
+            }
+            if (restrict_method
+                    == LaplaceNeumannExteriorRestrictMethod2D::
+                           JointSixPointQuadraticCenterCauchyJump
+                && metrics.six_point_cross_stencils
+                       != expected_samples) {
+                throw std::runtime_error(
+                    "six-point quadratic restrict did not build one cross "
+                    "stencil for every smooth-circle trace sample");
+            }
+        }
+    }
     metrics.legacy_iterations = legacy_result.iterations;
     metrics.legacy_converged = legacy_result.converged;
     metrics.legacy_solve_sec = legacy_solve_sec;
@@ -444,7 +611,8 @@ void print_metrics(const CircleMetrics& m)
 {
     std::cout << "N=" << m.n << " h=" << m.h
               << " panels=" << m.panels
-              << " Nq=" << m.interface_points << '\n';
+              << " Nq=" << m.interface_points
+              << " restrict=" << m.restrict_method << '\n';
     std::cout << "  RHS: removed_mean=" << m.raw_g_mean
               << " compatible_mean=" << m.compatible_g_mean
               << " |b|inf=" << m.rhs_inf
@@ -506,6 +674,27 @@ void print_metrics(const CircleMetrics& m)
               << m.legacy_raw_normal_residual_mean << '/'
               << m.legacy_weighted_normal_residual_mean
               << " time=" << m.legacy_solve_sec << "s\n";
+    if (m.restrict_method != "six_point_quadratic") {
+        std::cout << "  joint restrict: wrong/corrected="
+                  << m.restrict_wrong_side_nodes << '/'
+                  << m.restrict_corrected_nodes
+                  << " owner exact/gap/endpoint="
+                  << m.exact_crossing_owners << '/'
+                  << m.gap_fallback_owners << '/'
+                  << m.endpoint_fallback_owners
+                  << " center-jump/no-center="
+                  << m.center_cauchy_jump_samples << '/'
+                  << m.trace_points_without_incident_center << '\n'
+                  << "    six-stencils=" << m.six_point_cross_stencils
+                  << " diagonal reject zero/multi="
+                  << m.diagonal_zero_crossing_rejections << '/'
+                  << m.diagonal_multiple_crossing_rejections
+                  << " expanded=" << m.expanded_same_side_center_stencils
+                  << " max-center-d/h="
+                  << m.max_same_side_center_distance_over_h
+                  << " max-weight-L1=" << m.max_six_point_weight_l1
+                  << '\n';
+    }
 }
 
 double observed_order(double coarse, double fine)
@@ -561,7 +750,8 @@ void write_csv(const std::filesystem::path& path,
     std::ofstream out(path);
     if (!out)
         throw std::runtime_error("cannot open result CSV: " + path.string());
-    out << "N,h,panels,Nq,iterations,augmented_converged,physical_converged,"
+    out << "restrict_method,N,h,panels,Nq,iterations,"
+           "augmented_converged,physical_converged,"
            "rhs_build_sec,solve_sec,new_total_sec,raw_g_mean,"
            "compatible_g_mean,exact_f_mean,rhs_inf,"
            "rhs_route_mismatch,a_one_inside_inf,a_one_direct_inf,"
@@ -575,7 +765,17 @@ void write_csv(const std::filesystem::path& path,
            "independent_closure_inf,trace_error_inf,trace_error_wrms,"
            "normal_error_inf,solved_bulk_in_inf,solved_bulk_in_rms,"
            "solved_bulk_out_inf,new_aligned_shift,new_aligned_inf,"
-           "new_aligned_rms,legacy_iterations,legacy_converged,"
+           "new_aligned_rms,restrict_wrong_side_nodes,"
+           "restrict_corrected_nodes,exact_crossing_owners,"
+           "gap_fallback_owners,endpoint_fallback_owners,"
+           "center_cauchy_jump_samples,"
+           "trace_points_without_incident_center,"
+           "six_point_cross_stencils,"
+           "diagonal_zero_crossing_rejections,"
+           "diagonal_multiple_crossing_rejections,"
+           "expanded_same_side_center_stencils,"
+           "max_same_side_center_distance_over_h,max_six_point_weight_l1,"
+           "legacy_iterations,legacy_converged,"
            "legacy_solve_sec,legacy_final_rel,legacy_density_mean,"
            "legacy_raw_normal_residual_inf,"
            "legacy_projected_normal_residual_inf,"
@@ -584,7 +784,8 @@ void write_csv(const std::filesystem::path& path,
            "legacy_aligned_inf,legacy_aligned_rms\n";
     out << std::setprecision(17);
     for (const CircleMetrics& m : rows) {
-        out << m.n << ',' << m.h << ',' << m.panels << ','
+        out << m.restrict_method << ','
+            << m.n << ',' << m.h << ',' << m.panels << ','
             << m.interface_points << ',' << m.iterations << ','
             << (m.augmented_converged ? 1 : 0) << ','
             << (m.physical_converged ? 1 : 0) << ','
@@ -617,6 +818,19 @@ void write_csv(const std::filesystem::path& path,
             << m.new_aligned_bulk.shift << ','
             << m.new_aligned_bulk.inf << ','
             << m.new_aligned_bulk.rms << ','
+            << m.restrict_wrong_side_nodes << ','
+            << m.restrict_corrected_nodes << ','
+            << m.exact_crossing_owners << ','
+            << m.gap_fallback_owners << ','
+            << m.endpoint_fallback_owners << ','
+            << m.center_cauchy_jump_samples << ','
+            << m.trace_points_without_incident_center << ','
+            << m.six_point_cross_stencils << ','
+            << m.diagonal_zero_crossing_rejections << ','
+            << m.diagonal_multiple_crossing_rejections << ','
+            << m.expanded_same_side_center_stencils << ','
+            << m.max_same_side_center_distance_over_h << ','
+            << m.max_six_point_weight_l1 << ','
             << m.legacy_iterations << ','
             << (m.legacy_converged ? 1 : 0) << ','
             << m.legacy_solve_sec << ','
@@ -650,14 +864,19 @@ int main(int argc, char** argv)
             "KFBIM_CIRCLE_EXT_TRACE_RESTART", 40);
         const double tolerance = environment_double(
             "KFBIM_CIRCLE_EXT_TRACE_TOL", 1.0e-9);
+        const LaplaceNeumannExteriorRestrictMethod2D restrict_method =
+            selected_restrict_method();
         std::cout << "KFBI2D smooth-circle Neumann new-vs-legacy comparison\n"
                   << "tol=" << tolerance << " max_iter=" << max_iter
-                  << " restart=" << restart << '\n';
+                  << " restart=" << restart
+                  << " restrict=" << restrict_method_name(restrict_method)
+                  << '\n';
 
         std::vector<CircleMetrics> results;
         for (int n : levels) {
             CircleMetrics metrics =
-                run_level(n, max_iter, tolerance, restart);
+                run_level(
+                    n, max_iter, tolerance, restart, restrict_method);
             print_metrics(metrics);
             results.push_back(metrics);
         }
@@ -669,7 +888,15 @@ int main(int argc, char** argv)
         const std::filesystem::path output_dir = "output";
 #endif
         const std::filesystem::path csv_path =
-            output_dir / "neumann_circle_new_vs_legacy_2d.csv";
+            restrict_method
+                    == LaplaceNeumannExteriorRestrictMethod2D::
+                           SixPointQuadratic
+                ? output_dir / "neumann_circle_new_vs_legacy_2d.csv"
+                : output_dir
+                    / ("neumann_circle_new_vs_legacy_2d_"
+                       + std::string(
+                           restrict_output_tag(restrict_method))
+                       + ".csv");
         write_csv(csv_path, results);
         std::cout << "CSV: " << csv_path.string() << '\n';
         return 0;

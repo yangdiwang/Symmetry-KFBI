@@ -8,6 +8,49 @@
 
 namespace kfbim {
 
+enum class P2CrossingOwnerStatus2D {
+    ExactIntersection,
+    GapFallback,
+    EndpointNearestCenter
+};
+
+struct P2CrossingOwner2D {
+    int center_index = -1;
+    int panel_index = -1;
+    double local_s = 0.0;
+    double edge_parameter = 0.5;
+    Eigen::Vector2d crossing_point = Eigen::Vector2d::Zero();
+    Eigen::Vector2d crossing_normal = Eigen::Vector2d::Zero();
+    double crossing_residual = 0.0;
+    // Number of distinct intersections with represented P2 panels along the
+    // requested segment. Duplicate reports of the same physical hit from two
+    // incident panels count once. Gap and nearest-center fallbacks report 0.
+    int exact_intersection_count = 0;
+    // Number of distinct represented-panel intersections that cross the
+    // segment transversely.  Tangential contacts are retained in
+    // exact_intersection_count for diagnostics, but do not flip the domain
+    // side and therefore are excluded here.
+    int transverse_intersection_count = 0;
+    // Distinguish an actual hit on a represented corner-gap segment from the
+    // last-resort center nearest to the whole query segment.  Both retain the
+    // legacy GapFallback status, but grid-edge restrict stencils accept only
+    // the former as geometrically identified crossing information.
+    bool explicit_gap_intersection = false;
+    P2CrossingOwnerStatus2D status =
+        P2CrossingOwnerStatus2D::EndpointNearestCenter;
+
+    int domain_side_crossing_count() const noexcept
+    {
+        return transverse_intersection_count
+             + (explicit_gap_intersection ? 1 : 0);
+    }
+
+    bool flips_domain_side() const noexcept
+    {
+        return (domain_side_crossing_count() & 1) != 0;
+    }
+};
+
 class GridPair2D {
 public:
     GridPair2D(const CartesianGrid2D& grid, const Interface2D& interface);
@@ -24,6 +67,11 @@ public:
     // bulk node index → nearest active P2 expansion center. Available only for
     // QuadraticLagrange 3-point panels.
     int nearest_p2_expansion_center(int bulk_node_idx) const;
+    P2CrossingOwner2D p2_crossing_owner_between(
+        Eigen::Vector2d segment_start,
+        Eigen::Vector2d segment_end) const;
+    P2CrossingOwner2D p2_crossing_owner_between(int bulk_node_a,
+                                                int bulk_node_b) const;
     int nearest_p2_expansion_center_between(int bulk_node_a,
                                             int bulk_node_b) const;
 

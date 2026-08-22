@@ -1,6 +1,9 @@
 #pragma once
 
+#include "../geometry/panel_geometry_2d.hpp"
+
 #include <Eigen/Dense>
+#include <memory>
 #include <vector>
 
 namespace kfbim {
@@ -90,7 +93,8 @@ public:
                 Eigen::VectorXd  weights,
                 int              points_per_panel,
                 Eigen::VectorXi  panel_components,
-                PanelNodeLayout2D panel_node_layout = PanelNodeLayout2D::LegacyGaussLegendre);
+                PanelNodeLayout2D panel_node_layout = PanelNodeLayout2D::LegacyGaussLegendre,
+                std::shared_ptr<const IPanelGeometry2D> panel_geometry = nullptr);
 
     // Explicit-connectivity constructor. panel_point_indices is Np x k and
     // maps each panel-local point to a row in points/normals/weights.
@@ -100,7 +104,8 @@ public:
                 int              points_per_panel,
                 Eigen::MatrixXi  panel_point_indices,
                 Eigen::VectorXi  panel_components,
-                PanelNodeLayout2D panel_node_layout = PanelNodeLayout2D::LegacyGaussLegendre);
+                PanelNodeLayout2D panel_node_layout = PanelNodeLayout2D::LegacyGaussLegendre,
+                std::shared_ptr<const IPanelGeometry2D> panel_geometry = nullptr);
 
     // Explicit panel-side geometry and corner metadata constructor.
     // panel_side_geometry stores per-panel-side limiting tangent/normal data;
@@ -116,7 +121,8 @@ public:
                 std::vector<int> corner_index_by_point,
                 std::vector<CornerData2D> corners,
                 PanelNodeLayout2D panel_node_layout = PanelNodeLayout2D::LegacyGaussLegendre,
-                std::vector<CornerPatch2D> corner_patches = {});
+                std::vector<CornerPatch2D> corner_patches = {},
+                std::shared_ptr<const IPanelGeometry2D> panel_geometry = nullptr);
 
     int num_points()       const { return static_cast<int>(points_.rows()); }
     int points_per_panel() const { return points_per_panel_; }
@@ -159,6 +165,11 @@ public:
     const std::vector<int>& corner_index_by_point() const { return corner_index_by_point_; }
     const std::vector<CornerData2D>& corners() const { return corners_; }
     const std::vector<CornerPatch2D>& corner_patches() const { return corner_patches_; }
+    bool has_panel_geometry() const { return static_cast<bool>(panel_geometry_); }
+    const IPanelGeometry2D& panel_geometry() const { return *panel_geometry_; }
+    const std::shared_ptr<const IPanelGeometry2D>& panel_geometry_ptr() const {
+        return panel_geometry_;
+    }
     PanelNodeLayout2D       panel_node_layout() const { return panel_node_layout_; }
 
 private:
@@ -183,6 +194,7 @@ private:
     std::vector<int> corner_index_by_point_;
     std::vector<CornerData2D> corners_;
     std::vector<CornerPatch2D> corner_patches_;
+    std::shared_ptr<const IPanelGeometry2D> panel_geometry_;
     PanelNodeLayout2D panel_node_layout_;
 };
 

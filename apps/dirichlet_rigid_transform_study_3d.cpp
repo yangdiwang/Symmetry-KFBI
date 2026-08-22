@@ -96,6 +96,31 @@ Eigen::Vector3d manufactured_harmonic_gradient_3d(const Eigen::Vector3d& point)
             -0.28 * exponential * cos_y * std::sin(0.28 * point.z())};
 }
 
+Eigen::Matrix3d manufactured_harmonic_hessian_3d(
+    const Eigen::Vector3d& point)
+{
+    constexpr double ax = 0.35;
+    constexpr double by = 0.21;
+    constexpr double cz = 0.28;
+    const double exponential = std::exp(ax * point.x());
+    const double cos_y = std::cos(by * point.y());
+    const double sin_y = std::sin(by * point.y());
+    const double cos_z = std::cos(cz * point.z());
+    const double sin_z = std::sin(cz * point.z());
+    const double value = exponential * cos_y * cos_z;
+    Eigen::Matrix3d result;
+    result(0, 0) = ax * ax * value;
+    result(1, 1) = -by * by * value;
+    result(2, 2) = -cz * cz * value;
+    result(0, 1) = result(1, 0) =
+        -ax * by * exponential * sin_y * cos_z;
+    result(0, 2) = result(2, 0) =
+        -ax * cz * exponential * cos_y * sin_z;
+    result(1, 2) = result(2, 1) =
+        by * cz * exponential * sin_y * sin_z;
+    return result;
+}
+
 double transformed_manufactured_harmonic_value_3d(
     const RigidTransform3D& transform,
     const Eigen::Vector3d& point)
@@ -109,6 +134,16 @@ Eigen::Vector3d transformed_manufactured_harmonic_gradient_3d(
 {
     const Eigen::Vector3d source = transform.inverse_point(point);
     return transform.forward_vector(manufactured_harmonic_gradient_3d(source));
+}
+
+Eigen::Matrix3d transformed_manufactured_harmonic_hessian_3d(
+    const RigidTransform3D& transform,
+    const Eigen::Vector3d& point)
+{
+    const Eigen::Vector3d source = transform.inverse_point(point);
+    const Eigen::Matrix3d& rotation = transform.rotation();
+    return rotation * manufactured_harmonic_hessian_3d(source)
+         * rotation.transpose();
 }
 
 } // namespace kfbim::app3d

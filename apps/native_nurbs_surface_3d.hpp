@@ -16,7 +16,8 @@ namespace kfbim::app3d {
 enum class GeometryKind3D {
     Torus,
     HollowCylinder,
-    LPrism
+    LPrism,
+    UPrism
 };
 
 using PatchEdge3D = geometry3d::NurbsPatchEdge3D;
@@ -104,6 +105,15 @@ struct SurfaceDofCloud3D {
     const SurfaceDofCloud3D& cloud,
     int center_dof,
     int count);
+
+// Return every patch joined to `patch` by a physical G1 connection.  The
+// canonical source is geometric_connections, whose edge intervals can
+// represent a long edge joined to several short edges.  The legacy
+// one-neighbor-per-edge table is retained as a fallback for older synthetic
+// surfaces which do not carry geometric connection records.
+[[nodiscard]] std::vector<int> smooth_patch_neighbors_3d(
+    const NativeNurbsSurface3D& surface,
+    int patch);
 
 [[nodiscard]] std::vector<int> balanced_topological_cauchy_dofs(
     const NativeNurbsSurface3D& surface,

@@ -30,10 +30,15 @@ make_l_prism_dirichlet_rigid_study_cases_3d();
 double manufactured_harmonic_value_3d(const Eigen::Vector3d& point);
 Eigen::Vector3d manufactured_harmonic_gradient_3d(
     const Eigen::Vector3d& point);
+Eigen::Matrix3d manufactured_harmonic_hessian_3d(
+    const Eigen::Vector3d& point);
 double transformed_manufactured_harmonic_value_3d(
     const RigidTransform3D& transform,
     const Eigen::Vector3d& point);
 Eigen::Vector3d transformed_manufactured_harmonic_gradient_3d(
+    const RigidTransform3D& transform,
+    const Eigen::Vector3d& point);
+Eigen::Matrix3d transformed_manufactured_harmonic_hessian_3d(
     const RigidTransform3D& transform,
     const Eigen::Vector3d& point);
 

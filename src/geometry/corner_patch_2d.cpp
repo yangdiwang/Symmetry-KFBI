@@ -312,7 +312,8 @@ Interface2D with_corner_patches_2d(const Interface2D& iface,
                        iface.corner_index_by_point(),
                        iface.corners(),
                        iface.panel_node_layout(),
-                       std::move(patches));
+                       std::move(patches),
+                       iface.panel_geometry_ptr());
 }
 
 Interface2D apply_corner_patch_config_2d(const Interface2D& iface,

@@ -268,6 +268,129 @@ public:
         return 0.0;
     }
 
+    // Second derivatives of the nonzero basis functions, in the same local
+    // order as active_basis_indices().  This is Algorithm A2.3 from the
+    // NURBS Book specialized to derivative order two.  Keeping the analytic
+    // derivative here is important for curvature: finite differences across
+    // a repeated knot would mix the two one-sided geometric limits.
+    [[nodiscard]] std::vector<double> evaluate_nonzero_second_derivatives(
+        double u) const
+    {
+        const double parameter = checked_parameter(u);
+        const int span = find_span(parameter);
+        const int p = degree_;
+        std::vector<double> result(
+            static_cast<std::size_t>(p + 1), 0.0);
+        if (p < 2)
+            return result;
+
+        std::vector<std::vector<double>> ndu(
+            static_cast<std::size_t>(p + 1),
+            std::vector<double>(static_cast<std::size_t>(p + 1), 0.0));
+        std::vector<double> left(static_cast<std::size_t>(p + 1), 0.0);
+        std::vector<double> right(static_cast<std::size_t>(p + 1), 0.0);
+        ndu[0][0] = 1.0;
+        for (int j = 1; j <= p; ++j) {
+            left[static_cast<std::size_t>(j)] =
+                parameter - knots_[static_cast<std::size_t>(span + 1 - j)];
+            right[static_cast<std::size_t>(j)] =
+                knots_[static_cast<std::size_t>(span + j)] - parameter;
+            double saved = 0.0;
+            for (int r = 0; r < j; ++r) {
+                ndu[static_cast<std::size_t>(j)][static_cast<std::size_t>(r)] =
+                    right[static_cast<std::size_t>(r + 1)]
+                  + left[static_cast<std::size_t>(j - r)];
+                const double temporary = divide_or_zero(
+                    ndu[static_cast<std::size_t>(r)]
+                       [static_cast<std::size_t>(j - 1)],
+                    ndu[static_cast<std::size_t>(j)]
+                       [static_cast<std::size_t>(r)]);
+                ndu[static_cast<std::size_t>(r)][static_cast<std::size_t>(j)] =
+                    saved + right[static_cast<std::size_t>(r + 1)] * temporary;
+                saved = left[static_cast<std::size_t>(j - r)] * temporary;
+            }
+            ndu[static_cast<std::size_t>(j)][static_cast<std::size_t>(j)] =
+                saved;
+        }
+
+        std::vector<std::vector<double>> work(
+            2, std::vector<double>(static_cast<std::size_t>(p + 1), 0.0));
+        for (int r = 0; r <= p; ++r) {
+            int previous = 0;
+            int current = 1;
+            work[0][0] = 1.0;
+            double derivative = 0.0;
+            for (int order = 1; order <= 2; ++order) {
+                std::fill(work[static_cast<std::size_t>(current)].begin(),
+                          work[static_cast<std::size_t>(current)].end(),
+                          0.0);
+                derivative = 0.0;
+                const int shifted = r - order;
+                const int reduced = p - order;
+                if (r >= order) {
+                    work[static_cast<std::size_t>(current)][0] =
+                        divide_or_zero(
+                            work[static_cast<std::size_t>(previous)][0],
+                            ndu[static_cast<std::size_t>(reduced + 1)]
+                               [static_cast<std::size_t>(shifted)]);
+                    derivative =
+                        work[static_cast<std::size_t>(current)][0]
+                      * ndu[static_cast<std::size_t>(shifted)]
+                           [static_cast<std::size_t>(reduced)];
+                }
+                const int first = shifted >= -1 ? 1 : -shifted;
+                const int last = r - 1 <= reduced
+                    ? order - 1 : p - r;
+                for (int j = first; j <= last; ++j) {
+                    work[static_cast<std::size_t>(current)]
+                        [static_cast<std::size_t>(j)] = divide_or_zero(
+                            work[static_cast<std::size_t>(previous)]
+                                [static_cast<std::size_t>(j)]
+                          - work[static_cast<std::size_t>(previous)]
+                                [static_cast<std::size_t>(j - 1)],
+                            ndu[static_cast<std::size_t>(reduced + 1)]
+                               [static_cast<std::size_t>(shifted + j)]);
+                    derivative +=
+                        work[static_cast<std::size_t>(current)]
+                            [static_cast<std::size_t>(j)]
+                      * ndu[static_cast<std::size_t>(shifted + j)]
+                           [static_cast<std::size_t>(reduced)];
+                }
+                if (r <= reduced) {
+                    work[static_cast<std::size_t>(current)]
+                        [static_cast<std::size_t>(order)] = divide_or_zero(
+                            -work[static_cast<std::size_t>(previous)]
+                                 [static_cast<std::size_t>(order - 1)],
+                            ndu[static_cast<std::size_t>(reduced + 1)]
+                               [static_cast<std::size_t>(r)]);
+                    derivative +=
+                        work[static_cast<std::size_t>(current)]
+                            [static_cast<std::size_t>(order)]
+                      * ndu[static_cast<std::size_t>(r)]
+                           [static_cast<std::size_t>(reduced)];
+                }
+                std::swap(previous, current);
+            }
+            result[static_cast<std::size_t>(r)] =
+                static_cast<double>(p * (p - 1)) * derivative;
+        }
+        return result;
+    }
+
+    [[nodiscard]] double basis_second_derivative(int i, double u) const
+    {
+        if (i < 0 || i >= num_basis_functions())
+            throw std::invalid_argument("basis index is out of range");
+
+        const auto indices = active_basis_indices(u);
+        const auto derivatives = evaluate_nonzero_second_derivatives(u);
+        for (std::size_t local = 0; local < indices.size(); ++local) {
+            if (indices[local] == i)
+                return derivatives[local];
+        }
+        return 0.0;
+    }
+
 private:
     int degree_;
     std::vector<double> knots_;

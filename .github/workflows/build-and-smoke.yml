@@ -40,11 +40,34 @@ jobs:
           KFBIM_PYJET_RESTRICT_MODE: compare
         run: |
           ./build/apps/neumann_exterior_trace_circle_2d 24
+          KFBIM_CIRCLE_RESTRICT=six_point_cross_stencil \
+            ./build/apps/neumann_exterior_trace_circle_2d 24
           ./build/apps/neumann_exterior_trace_lshape_2d 24
+          KFBIM_LSHAPE_RESTRICT=center_cauchy_jump \
+            ./build/apps/neumann_exterior_trace_lshape_2d 24
+          KFBIM_LSHAPE_RESTRICT=six_point_cross_stencil \
+            ./build/apps/neumann_exterior_trace_lshape_2d 24
           ./build/apps/neumann_harmonic_jet_case_2d ellipse 24
+          KFBIM_HJET_RESTRICT=six_point_cross_stencil \
+            ./build/apps/neumann_harmonic_jet_case_2d ellipse 24
+          KFBIM_HJET_RESTRICT=six_point_cross_stencil \
+          KFBIM_HJET_SPREAD=cubic_harmonic \
+            ./build/apps/neumann_harmonic_jet_case_2d ellipse 24
+          ./build/apps/laplace_smooth_boundary_iteration_2d both ellipse 24
+          ./build/apps/laplace_nsc_et_bvp_2d_test
           ./build/apps/neumann_harmonic_jet_python_compatible_2d ellipse 24
+          ./build/apps/geometric_feature_trace_fit_3d_test
+          ./build/apps/grid_edge_event_3d_test
+          ./build/apps/restrict_crossing_selector_3d_test
+          ./build/apps/restrict_crossing_feature_side_classifier_3d_test
+          ./build/apps/restrict_crossing_path_state_3d_test
+          ./build/apps/direct_coefficient_cauchy_3d_test
+          ./build/apps/topology_trace_projector_3d_test
+          ./build/apps/topology_density_constraints_3d_test
           three_d_output="$(
             env -u KFBIM_3D_CAUCHY_POLICY \
+              -u KFBIM_3D_DIRICHLET_JUMP_SPACE \
+              -u KFBIM_3D_DIRICHLET_FEATURE_COUPLING \
               ./build/apps/neumann_exterior_zero_trace_3d l_prism
           )"
           printf '%s\n' "$three_d_output"
@@ -63,9 +86,17 @@ jobs:
           printf '%s\n' "$three_d_output" | grep -Fq \
             'cauchy_policy=g1_nearest'
           printf '%s\n' "$three_d_output" | grep -Fq \
+            'neumann_compatibility=operator_flux'
+          printf '%s\n' "$three_d_output" | grep -Fq \
+            'dirichlet_jump_space=legacy_sample_fit'
+          printf '%s\n' "$three_d_output" | grep -Fq \
+            'dirichlet_feature_coupling=broken_sheets'
+          printf '%s\n' "$three_d_output" | grep -Fq \
             'cauchy_degree=3 restrict_grid_degree=3 restrict_normal_degree=3'
           printf '%s\n' "$three_d_output" | grep -Fq \
             'cauchy_counts=48/28'
+          printf '%s\n' "$three_d_output" | grep -Fq \
+            'value_trace_fit=geometric_feature'
           printf '%s\n' "$three_d_output" | grep -Fq \
             'gmres_max_iterations=80'
           printf '%s\n' "$three_d_output" | grep -Fq \
@@ -84,11 +115,11 @@ jobs:
           printf '%s\n' "$capped_output" | grep -Fq \
             'final_relative_residual='
           printf '%s\n' "$capped_output" | grep -Fq \
-            '[neumann] converged/iterations=0/1'
+            '[neumann] augmented/physical/iterations=0/0/1'
           printf '%s\n' "$capped_output" | grep -Fq \
-            '[dirichlet-normal] converged/iterations=0/1'
+            '[dirichlet-normal] augmented/physical/iterations=0/0/1'
           test "$(printf '%s\n' "$capped_output" | grep -c '^\[ready\]')" -eq 1
-          summary_dir=output/neumann_exterior_zero_trace_3d/g1_nearest
+          summary_dir=output/neumann_exterior_zero_trace_3d
           for summary_csv in \
               geometry_readiness.csv \
               neumann_results.csv \
@@ -120,9 +151,31 @@ jobs:
           printf '%s\n' "$three_d_override_output" | grep -Fq \
             'cauchy_policy=topological_nearest'
           printf '%s\n' "$three_d_override_output" | grep -Fq \
-            '[neumann] converged/iterations=1/'
+            '[neumann] augmented/physical/iterations=1/1/'
           printf '%s\n' "$three_d_override_output" | grep -Fq \
-            '[dirichlet-normal] converged/iterations=1/'
+            '[dirichlet-normal] augmented/physical/iterations=1/1/'
+          quartic_output="$(
+            ./build/apps/neumann_exterior_zero_trace_3d_all_quartic \
+              l_prism 16
+          )"
+          printf '%s\n' "$quartic_output" | grep -Fq \
+            'approximation_scheme=all_quartic'
+          printf '%s\n' "$quartic_output" | grep -Fq \
+            'cauchy_degree=4 restrict_grid_degree=4 restrict_normal_degree=4'
+          printf '%s\n' "$quartic_output" | grep -Fq \
+            '[neumann] augmented/physical/iterations=1/1/'
+          quartic_summary_dir=output/neumann_exterior_zero_trace_3d/all_quartic
+          grep -Fq ',all_quartic,4,4,4,operator_flux,' \
+            "$quartic_summary_dir/neumann_results.csv"
+          if invalid_output="$(
+            KFBIM_3D_NEUMANN_COMPATIBILITY=invalid \
+              ./build/apps/neumann_exterior_zero_trace_3d l_prism 16 2>&1
+          )"; then
+            echo 'invalid 3D Neumann compatibility mode unexpectedly succeeded'
+            exit 1
+          fi
+          printf '%s\n' "$invalid_output" | grep -Fq \
+            'KFBIM_3D_NEUMANN_COMPATIBILITY must be operator_flux or trace_border_legacy'
           for invalid_counts in '0 6' '-1 6' 'abc 6' '10 12'; do
             read -r value_count normal_count <<< "$invalid_counts"
             if invalid_output="$(

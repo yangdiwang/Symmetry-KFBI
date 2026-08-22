@@ -32,6 +32,55 @@ double relative_norm(const Eigen::VectorXd& residual,
         : residual.norm();
 }
 
+LaplaceP2JointPolynomialRestrictOptions2D
+joint_restrict_options(
+    const LaplaceNeumannExteriorTraceOptions2D& options,
+    LaplaceNeumannExteriorRestrictMethod2D method)
+{
+    switch (method) {
+    case LaplaceNeumannExteriorRestrictMethod2D::
+             JointBiquadraticQuadraticCrossingOwner:
+        return options.joint_quadratic_restrict;
+    case LaplaceNeumannExteriorRestrictMethod2D::
+             JointBiquadraticQuadraticCenterCauchyJump:
+        return options.joint_quadratic_center_cauchy_jump_restrict;
+    case LaplaceNeumannExteriorRestrictMethod2D::
+             JointSixPointQuadraticInterfaceJump:
+        return options
+            .joint_six_point_quadratic_interface_jump_restrict;
+    case LaplaceNeumannExteriorRestrictMethod2D::
+             JointSixPointQuadraticGridEdgeInterfaceJump:
+        return options
+            .joint_six_point_quadratic_grid_edge_interface_jump_restrict;
+    case LaplaceNeumannExteriorRestrictMethod2D::
+             JointSixPointQuadraticGridEdgeSharedSidePolynomialInterfaceJump:
+        return options
+            .joint_six_point_quadratic_grid_edge_shared_side_polynomial_interface_jump_restrict;
+    case LaplaceNeumannExteriorRestrictMethod2D::
+             JointSixPointQuadraticCenterCauchyJump:
+        return options
+            .joint_six_point_quadratic_center_cauchy_jump_restrict;
+    case LaplaceNeumannExteriorRestrictMethod2D::
+             JointBiquadraticQuadraticVirtualSideFlip:
+        return options.joint_quadratic_virtual_side_flip_restrict;
+    case LaplaceNeumannExteriorRestrictMethod2D::
+             UnifiedSpatialNormalP2CrossingOwner:
+        return options
+            .unified_spatial_normal_p2_crossing_owner_restrict;
+    case LaplaceNeumannExteriorRestrictMethod2D::
+             UnifiedSpatialNormalP2DofCauchyExterior:
+        return options
+            .unified_spatial_normal_p2_dof_cauchy_exterior_restrict;
+    case LaplaceNeumannExteriorRestrictMethod2D::
+             JointBicubicCubicCrossingOwner:
+        return options.joint_cubic_restrict;
+    case LaplaceNeumannExteriorRestrictMethod2D::SixPointQuadratic:
+        break;
+    }
+    throw std::invalid_argument(
+        "LaplaceNeumannExteriorTrace2D six-point restrict has no joint options");
+}
+
 class BorderedExteriorTraceOperator2D final : public IKFBIOperator {
 public:
     BorderedExteriorTraceOperator2D(
@@ -80,9 +129,23 @@ LaplaceNeumannExteriorTrace2D::LaplaceNeumannExteriorTrace2D(
               options.correction_method,
               options.restrict_stencil_radius,
               {},
-              {})
+              {},
+              options.spread_mode,
+              options.cubic_harmonic_spread,
+              LaplaceCrossingTraceStencil2D::PhiP3PsiP2,
+              options.crossing_jet_scheme)
     , bulk_solver_(grid, ZfftBcType::Dirichlet, 0.0)
     , restrict_op_(grid_pair_, options.restrict_stencil_radius)
+    , restrict_method_(options.restrict_method)
+    , joint_polynomial_restrict_op_(
+          restrict_method_
+                  != LaplaceNeumannExteriorRestrictMethod2D::
+                         SixPointQuadratic
+              ? std::make_unique<
+                    LaplaceP2CrossingOwnerJointPolynomialRestrict2D>(
+                    grid_pair_,
+                    joint_restrict_options(options, restrict_method_))
+              : nullptr)
     , active_interface_points_(
           std::move(options.active_interface_points))
     , border_column_(std::move(options.border_column))
@@ -104,6 +167,14 @@ LaplaceNeumannExteriorTrace2D::LaplaceNeumannExteriorTrace2D(
     if (!iface.corner_patches().empty()) {
         throw std::invalid_argument(
             "LaplaceNeumannExteriorTrace2D does not accept corner patches or singular corrections");
+    }
+    if (restrict_method_
+            != LaplaceNeumannExteriorRestrictMethod2D::
+                   SixPointQuadratic
+        && options.correction_method
+               != LaplaceCorrectionMethod2D::CrossingOwner) {
+        throw std::invalid_argument(
+            "LaplaceNeumannExteriorTrace2D joint polynomial restrict requires crossing-owner spread correction");
     }
 
     const int n_iface = iface.num_points();
@@ -143,6 +214,33 @@ LaplaceNeumannExteriorTrace2D::LaplaceNeumannExteriorTrace2D(
             if (iface_to_active_[static_cast<std::size_t>(q)] < 0) {
                 throw std::invalid_argument(
                     "LaplaceNeumannExteriorTrace2D every panel point must be active");
+            }
+        }
+    }
+    if (restrict_method_
+            == LaplaceNeumannExteriorRestrictMethod2D::
+                   JointBiquadraticQuadraticCenterCauchyJump
+        || restrict_method_
+               == LaplaceNeumannExteriorRestrictMethod2D::
+                      JointSixPointQuadraticCenterCauchyJump
+        || restrict_method_
+               == LaplaceNeumannExteriorRestrictMethod2D::
+                      UnifiedSpatialNormalP2CrossingOwner
+        || restrict_method_
+               == LaplaceNeumannExteriorRestrictMethod2D::
+                      UnifiedSpatialNormalP2DofCauchyExterior) {
+        for (int q : active_interface_points_) {
+            if (!referenced[static_cast<std::size_t>(q)]) {
+                throw std::invalid_argument(
+                    "LaplaceNeumannExteriorTrace2D center-Cauchy jump "
+                    "restrict requires every active point to belong to a P2 "
+                    "panel");
+            }
+            if (iface.is_corner_point(q)) {
+                throw std::invalid_argument(
+                    "LaplaceNeumannExteriorTrace2D center-Cauchy jump "
+                    "restrict requires smooth active points; a physical "
+                    "corner needs branch-local trace DOFs");
             }
         }
     }
@@ -219,6 +317,7 @@ LaplaceNeumannExteriorTrace2D::JumpFieldResult2D
 LaplaceNeumannExteriorTrace2D::evaluate_jump(
     const Eigen::VectorXd& value_jump,
     const Eigen::VectorXd& normal_jump,
+    LaplaceCrossingTraceStencil2D trace_stencil,
     bool recover_exterior_virtual) const
 {
     const int n_active = problem_size();
@@ -237,16 +336,27 @@ LaplaceNeumannExteriorTrace2D::evaluate_jump(
         zero_rhs_derivs_);
 
     Eigen::VectorXd rhs = zero_bulk_rhs_;
-    const LaplaceSpreadResult2D spread_result = spread_.apply(jumps, rhs);
+    const LaplaceSpreadResult2D spread_result =
+        spread_.apply_with_crossing_trace_stencil(
+            jumps, rhs, trace_stencil);
 
     Eigen::VectorXd u_bulk;
     bulk_solver_.solve(-rhs, u_bulk);
+    const bool joint_polynomial =
+        restrict_method_
+            != LaplaceNeumannExteriorRestrictMethod2D::
+                   SixPointQuadratic;
     const std::vector<LocalPoly2D> interior_polys =
-        restrict_op_.apply_interior_virtual(u_bulk, spread_result);
+        joint_polynomial
+            ? joint_polynomial_restrict_op_->apply_interior_virtual(
+                  u_bulk, spread_result)
+            : restrict_op_.apply_interior_virtual(u_bulk, spread_result);
     std::vector<LocalPoly2D> exterior_polys;
     if (recover_exterior_virtual) {
-        exterior_polys =
-            restrict_op_.apply_exterior_virtual(u_bulk, spread_result);
+        exterior_polys = joint_polynomial
+            ? joint_polynomial_restrict_op_->apply_exterior_virtual(
+                  u_bulk, spread_result)
+            : restrict_op_.apply_exterior_virtual(u_bulk, spread_result);
     }
 
     JumpFieldResult2D result;
@@ -296,7 +406,10 @@ void LaplaceNeumannExteriorTrace2D::apply(
         kContext, "operator input", x.size(), n_active);
 
     const JumpFieldResult2D value_field = evaluate_jump(
-        x, Eigen::VectorXd::Zero(n_active), true);
+        x,
+        Eigen::VectorXd::Zero(n_active),
+        LaplaceCrossingTraceStencil2D::PhiP3,
+        true);
 
     // Match the Python harmonic-jet iteration literally:
     //
@@ -335,7 +448,10 @@ LaplaceNeumannExteriorTrace2D::build_rhs(
         neumann_data
         - compatibility_mean * Eigen::VectorXd::Ones(n_active);
     const JumpFieldResult2D fixed_field = evaluate_jump(
-        Eigen::VectorXd::Zero(n_active), compatible_neumann, true);
+        Eigen::VectorXd::Zero(n_active),
+        compatible_neumann,
+        LaplaceCrossingTraceStencil2D::PsiP2,
+        true);
 
     LaplaceNeumannExteriorTraceRhs2D result;
     result.compatible_neumann_data = compatible_neumann;
@@ -365,7 +481,10 @@ LaplaceNeumannExteriorTrace2D::evaluate_cauchy(
     const Eigen::VectorXd& normal_jump) const
 {
     const JumpFieldResult2D field = evaluate_jump(
-        value_jump, normal_jump, true);
+        value_jump,
+        normal_jump,
+        LaplaceCrossingTraceStencil2D::PhiP3PsiP2,
+        true);
 
     LaplaceExteriorTraceField2D result;
     result.u_bulk = field.u_bulk;
@@ -441,9 +560,15 @@ LaplaceNeumannExteriorTrace2D::solve(
     const Eigen::VectorXd f = bordered_solution.head(n_active);
     const double lambda = bordered_solution[n_active];
     const JumpFieldResult2D value_field = evaluate_jump(
-        f, Eigen::VectorXd::Zero(n_active), true);
+        f,
+        Eigen::VectorXd::Zero(n_active),
+        LaplaceCrossingTraceStencil2D::PhiP3,
+        true);
     const JumpFieldResult2D combined_field = evaluate_jump(
-        f, compatible_neumann, true);
+        f,
+        compatible_neumann,
+        LaplaceCrossingTraceStencil2D::PhiP3PsiP2,
+        true);
 
     const Eigen::VectorXd& af = value_field.trace_exterior_virtual;
     const Eigen::VectorXd physical_residual = b - af;

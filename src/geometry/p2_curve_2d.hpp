@@ -49,6 +49,9 @@ inline Eigen::Vector2d panel_point(const Interface2D& iface,
                                    int                panel,
                                    double             s)
 {
+    if (iface.has_panel_geometry())
+        return iface.panel_geometry().point(panel, s);
+
     double N[3];
     p2_shape(s, N);
     Eigen::Vector2d pt = Eigen::Vector2d::Zero();
@@ -61,6 +64,9 @@ inline Eigen::Vector2d panel_tangent(const Interface2D& iface,
                                      int                panel,
                                      double             s)
 {
+    if (iface.has_panel_geometry())
+        return iface.panel_geometry().tangent(panel, s);
+
     double dN[3];
     p2_shape_deriv(s, dN);
     Eigen::Vector2d tangent = Eigen::Vector2d::Zero();
@@ -73,6 +79,9 @@ inline Eigen::Vector2d panel_second_derivative(const Interface2D& iface,
                                                int                panel,
                                                double             s)
 {
+    if (iface.has_panel_geometry())
+        return iface.panel_geometry().second_derivative(panel, s);
+
     double ddN[3];
     p2_shape_second_deriv(s, ddN);
     Eigen::Vector2d second = Eigen::Vector2d::Zero();
@@ -85,6 +94,9 @@ inline Eigen::Vector2d panel_normal(const Interface2D& iface,
                                     int                panel,
                                     double             s)
 {
+    if (iface.has_panel_geometry())
+        return iface.panel_geometry().normal(panel, s);
+
     const Eigen::Vector2d tangent = panel_tangent(iface, panel, s);
     const double tlen = tangent.norm();
 

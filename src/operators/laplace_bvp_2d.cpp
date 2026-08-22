@@ -23,6 +23,20 @@ using operators_detail::project_mean_zero;
 using operators_detail::require_vector_size;
 using operators_detail::signed_rhs_derivs;
 
+LaplaceCrossingTraceStencil2D laplace_crossing_trace_stencil_for_bvp_2d(
+    LaplaceBvpType2D type)
+{
+    switch (type) {
+    case LaplaceBvpType2D::InteriorDirichlet:
+    case LaplaceBvpType2D::ExteriorDirichlet:
+        return LaplaceCrossingTraceStencil2D::PhiP3;
+    case LaplaceBvpType2D::InteriorNeumann:
+    case LaplaceBvpType2D::ExteriorNeumann:
+        return LaplaceCrossingTraceStencil2D::PsiP2;
+    }
+    throw std::invalid_argument("unsupported Laplace BVP type");
+}
+
 namespace {
 
 bool is_neumann_type(LaplaceBvpType2D type)
@@ -140,7 +154,9 @@ std::unique_ptr<ILaplaceSpread2D> make_laplace_spread_2d(
     LaplaceCorrectionMethod2D correction_method,
     int                     restrict_stencil_radius,
     CornerPatchSolverOptions2D corner_patch_solver,
-    SdCornerLiftingOptions2D sd_corner_lifting)
+    SdCornerLiftingOptions2D sd_corner_lifting,
+    LaplaceCrossingTraceStencil2D crossing_trace_stencil,
+    LaplaceCrossingJetScheme2D crossing_jet_scheme)
 {
     switch (method) {
     case LaplaceBvpPanelMethod2D::QuadraticPanelCenter:
@@ -150,7 +166,11 @@ std::unique_ptr<ILaplaceSpread2D> make_laplace_spread_2d(
             correction_method,
             restrict_stencil_radius,
             std::move(corner_patch_solver),
-            std::move(sd_corner_lifting));
+            std::move(sd_corner_lifting),
+            LaplaceP2PanelCenterSpreadMode2D::QuadraticCauchy,
+            LaplaceP2CubicHarmonicSpreadOptions2D{},
+            crossing_trace_stencil,
+            crossing_jet_scheme);
     }
     throw std::invalid_argument("unsupported Laplace BVP panel method");
 }
@@ -209,14 +229,40 @@ CornerPatchConfig2D make_bvp_corner_patch_config(
 std::unique_ptr<ILaplaceRestrict2D> make_laplace_restrict_2d(
     LaplaceBvpPanelMethod2D method,
     const GridPair2D&       grid_pair,
-    int                     restrict_stencil_radius)
+    int                     restrict_stencil_radius,
+    LaplaceBvpRestrictMethod2D restrict_method,
+    LaplaceP2JointPolynomialRestrictOptions2D joint_options)
 {
     switch (method) {
     case LaplaceBvpPanelMethod2D::QuadraticPanelCenter:
-        return std::make_unique<LaplaceQuadraticPanelCenterRestrict2D>(
-            grid_pair, restrict_stencil_radius);
+        switch (restrict_method) {
+        case LaplaceBvpRestrictMethod2D::
+                 SixPointQuadraticCrossingOwner:
+            return std::make_unique<
+                LaplaceQuadraticPanelCenterRestrict2D>(
+                    grid_pair, restrict_stencil_radius);
+        case LaplaceBvpRestrictMethod2D::
+                 JointPolynomialCrossingOwner:
+            return std::make_unique<
+                LaplaceP2CrossingOwnerJointPolynomialRestrict2D>(
+                    grid_pair, std::move(joint_options));
+        case LaplaceBvpRestrictMethod2D::
+                 UnifiedSpatialNormalP2CrossingOwner:
+            return std::make_unique<
+                LaplaceP2CrossingOwnerJointPolynomialRestrict2D>(
+                    grid_pair,
+                    make_laplace_p2_unified_spatial_normal_restrict_options_2d());
+        case LaplaceBvpRestrictMethod2D::
+                 UnifiedSpatialNormalP2DofCauchyExterior:
+            return std::make_unique<
+                LaplaceP2CrossingOwnerJointPolynomialRestrict2D>(
+                    grid_pair,
+                    make_laplace_p2_dof_cauchy_exterior_restrict_options_2d());
+        }
+        break;
     }
-    throw std::invalid_argument("unsupported Laplace BVP panel method");
+    throw std::invalid_argument(
+        "unsupported Laplace BVP panel/restrict method combination");
 }
 
 double rhs_deriv_sign_for_type(LaplaceBvpType2D type)
@@ -245,6 +291,29 @@ std::vector<LaplaceJumpData2D> make_jumps(
         jumps[q].u_jump = neumann ? 0.0 : density[q];
         jumps[q].un_jump = neumann ? density[q] : 0.0;
         jumps[q].rhs_derivs = rhs_derivs[q];
+    }
+    return jumps;
+}
+
+std::vector<LaplaceJumpData2D> make_cauchy_jumps(
+    const Interface2D&                  iface,
+    const Eigen::VectorXd&              value_jump,
+    const Eigen::VectorXd&              normal_jump,
+    const std::vector<Eigen::VectorXd>& rhs_derivs)
+{
+    const int n_iface = iface.num_points();
+    if (value_jump.size() != n_iface || normal_jump.size() != n_iface
+        || static_cast<int>(rhs_derivs.size()) != n_iface) {
+        throw std::invalid_argument(
+            "LaplaceBvp2D Cauchy jump data must match the interface size");
+    }
+    std::vector<LaplaceJumpData2D> jumps(
+        static_cast<std::size_t>(n_iface));
+    for (int q = 0; q < n_iface; ++q) {
+        jumps[static_cast<std::size_t>(q)].u_jump = value_jump[q];
+        jumps[static_cast<std::size_t>(q)].un_jump = normal_jump[q];
+        jumps[static_cast<std::size_t>(q)].rhs_derivs =
+            rhs_derivs[static_cast<std::size_t>(q)];
     }
     return jumps;
 }
@@ -290,23 +359,63 @@ LaplaceBvp2D::LaplaceBvp2D(
                                      make_bvp_corner_patch_solver_options(
                                          type,
                                          options.corner_patch_solver),
-                                      make_bvp_sd_corner_lifting_options(
-                                          make_bvp_corner_patch_config(
-                                              type,
-                                              options.corner_patch,
-                                              options.corner_patch_solver),
-                                          options.sd_corner_lifting)))
+                                     make_bvp_sd_corner_lifting_options(
+                                         make_bvp_corner_patch_config(
+                                             type,
+                                             options.corner_patch,
+                                             options.corner_patch_solver),
+                                         options.sd_corner_lifting),
+                                     options.formulation
+                                             == LaplaceBvpFormulation2D::
+                                                    ExteriorTraceCauchy
+                                         ? LaplaceCrossingTraceStencil2D::
+                                               PhiP3PsiP2
+                                         : laplace_crossing_trace_stencil_for_bvp_2d(
+                                               type),
+                                     options.crossing_jet_scheme))
     , bulk_solver_(grid, ZfftBcType::Dirichlet, options.eta)
     , restrict_op_(make_laplace_restrict_2d(options.panel_method,
                                             grid_pair_,
-                                            options.restrict_stencil_radius))
+                                            options.restrict_stencil_radius,
+                                            options.restrict_method,
+                                            options.joint_restrict))
     , potentials_(*spread_, bulk_solver_, *restrict_op_)
     , type_(type)
+    , formulation_(options.formulation)
     , rhs_deriv_sign_(rhs_deriv_sign_for_type(type))
     , eta_(options.eta)
     , outer_dirichlet_values_(std::move(options.outer_dirichlet_values))
     , active_interface_points_(std::move(options.active_interface_points))
 {
+    if (options.restrict_method
+            != LaplaceBvpRestrictMethod2D::
+                   SixPointQuadraticCrossingOwner
+        && options.correction_method
+               != LaplaceCorrectionMethod2D::CrossingOwner) {
+        throw std::invalid_argument(
+            "LaplaceBvp2D joint crossing-owner restrict requires crossing-owner spread correction");
+    }
+    if (options.restrict_method
+            != LaplaceBvpRestrictMethod2D::
+                   SixPointQuadraticCrossingOwner
+        && (!effective_iface_->corners().empty()
+            || !effective_iface_->corner_patches().empty()
+            || options.sd_corner_lifting.enabled)) {
+        throw std::invalid_argument(
+            "LaplaceBvp2D joint crossing-owner restrict currently requires a smooth interface without corner lifting");
+    }
+    if (formulation_ == LaplaceBvpFormulation2D::ExteriorTraceCauchy) {
+        if (outer_dirichlet_values_.size() != 0) {
+            throw std::invalid_argument(
+                "LaplaceBvp2D exterior-trace formulation currently requires homogeneous outer-box Dirichlet data");
+        }
+        if (!effective_iface_->corners().empty()
+            || !effective_iface_->corner_patches().empty()
+            || options.sd_corner_lifting.enabled) {
+            throw std::invalid_argument(
+                "LaplaceBvp2D exterior-trace formulation currently supports smooth interfaces without corner lifting");
+        }
+    }
     if (outer_dirichlet_values_.size() != 0) {
         require_vector_size("LaplaceBvp2D",
                             "outer_dirichlet_values",
@@ -343,11 +452,58 @@ void LaplaceBvp2D::apply(const Eigen::VectorXd& x, Eigen::VectorXd& y) const
     const int n_active = problem_size();
     require_vector_size("LaplaceBvp2D", "operator input", x.size(), n_active);
 
+    if (formulation_ == LaplaceBvpFormulation2D::ExteriorTraceCauchy) {
+        apply_exterior_trace_unknown(x, y);
+        return;
+    }
+
     const Eigen::VectorXd zero_rhs =
         Eigen::VectorXd::Zero(grid_pair_.grid().num_dofs());
     const std::vector<Eigen::VectorXd> zero_derivs(
         n_iface, Eigen::VectorXd::Zero(1));
     apply_with_rhs(x, zero_rhs, zero_derivs, y);
+}
+
+void LaplaceBvp2D::apply_exterior_trace_unknown(
+    const Eigen::VectorXd& density,
+    Eigen::VectorXd&       y) const
+{
+    const Interface2D& iface = grid_pair_.interface();
+    const int n_iface = iface.num_points();
+    const int n_active = problem_size();
+    require_vector_size(
+        "LaplaceBvp2D", "exterior-trace density", density.size(), n_active);
+
+    const Eigen::VectorXd full_density = expand_active_density(density);
+    const Eigen::VectorXd zeros = Eigen::VectorXd::Zero(n_iface);
+    const std::vector<Eigen::VectorXd> zero_derivs(
+        static_cast<std::size_t>(n_iface), Eigen::VectorXd::Zero(1));
+    const Eigen::VectorXd zero_rhs =
+        Eigen::VectorXd::Zero(grid_pair_.grid().num_dofs());
+
+    const bool neumann = is_neumann_type(type_);
+    const Eigen::VectorXd& value_jump = neumann ? full_density : zeros;
+    const Eigen::VectorXd& normal_jump = neumann ? zeros : full_density;
+    const LaplaceCrossingTraceStencil2D trace_stencil = neumann
+        ? LaplaceCrossingTraceStencil2D::PhiP3
+        : LaplaceCrossingTraceStencil2D::PsiP2;
+    const auto result = potentials_.evaluate(
+        make_cauchy_jumps(
+            iface, value_jump, normal_jump, zero_derivs),
+        zero_rhs,
+        trace_stencil);
+
+    // s=+1 means the physical domain is the '+' (interior) side, so the
+    // ghost trace is the '-' trace.  For an exterior physical BVP s=-1 and
+    // the ghost trace is the '+' trace.  In both cases R_ghost = avg-s*jump/2.
+    const double physical_side = side_jump_sign(type_);
+    y.resize(n_active);
+    for (int a = 0; a < n_active; ++a) {
+        const int q = active_interface_points_[static_cast<std::size_t>(a)];
+        y[a] = neumann
+            ? result.u_avg[q] - 0.5 * physical_side * full_density[q]
+            : result.un_avg[q] - 0.5 * physical_side * full_density[q];
+    }
 }
 
 int LaplaceBvp2D::problem_size() const
@@ -448,6 +604,11 @@ LaplaceBvpSolveResult2D LaplaceBvp2D::solve(
     double tol,
     int restart) const
 {
+    if (formulation_ == LaplaceBvpFormulation2D::ExteriorTraceCauchy) {
+        return solve_exterior_trace(
+            boundary_data, f_bulk, rhs_derivs, max_iter, tol, restart);
+    }
+
     StageTimer2D timer;
     const bool profile = profile_solve_2d();
 
@@ -557,6 +718,129 @@ LaplaceBvpSolveResult2D LaplaceBvp2D::solve(
             std::move(residuals),
             iterations,
             gmres.converged()};
+}
+
+LaplaceBvpSolveResult2D LaplaceBvp2D::solve_exterior_trace(
+    const Eigen::VectorXd&              boundary_data,
+    const Eigen::VectorXd&              f_bulk,
+    const std::vector<Eigen::VectorXd>& rhs_derivs,
+    int max_iter,
+    double tol,
+    int restart) const
+{
+    const Interface2D& iface = grid_pair_.interface();
+    const int n_iface = iface.num_points();
+    const int n_active = problem_size();
+    require_vector_size(
+        "LaplaceBvp2D", "boundary_data", boundary_data.size(), n_active);
+    require_vector_size("LaplaceBvp2D",
+                        "f_bulk",
+                        f_bulk.size(),
+                        grid_pair_.grid().num_dofs());
+    if (!boundary_data.allFinite() || !f_bulk.allFinite()) {
+        throw std::invalid_argument(
+            "LaplaceBvp2D exterior-trace inputs must be finite");
+    }
+
+    const std::vector<Eigen::VectorXd> full_rhs_derivs =
+        expand_active_rhs_derivs(rhs_derivs);
+    const std::vector<Eigen::VectorXd> signed_derivs = signed_rhs_derivs(
+        "LaplaceBvp2D", full_rhs_derivs, n_iface, rhs_deriv_sign_);
+    const Eigen::VectorXd rhs =
+        apply_dirichlet_boundary_elimination(f_bulk);
+
+    const bool neumann = is_neumann_type(type_);
+    const double physical_side = side_jump_sign(type_);
+    // ExteriorTraceCauchy receives the prescribed Cauchy block in the
+    // repository's fixed jump convention already.  It is density data, not a
+    // physical-side trace that still needs orientation by physical_side.
+    const Eigen::VectorXd full_boundary_jump =
+        expand_active_density(boundary_data);
+    const Eigen::VectorXd zeros = Eigen::VectorXd::Zero(n_iface);
+    const Eigen::VectorXd& fixed_value_jump =
+        neumann ? zeros : full_boundary_jump;
+    const Eigen::VectorXd& fixed_normal_jump =
+        neumann ? full_boundary_jump : zeros;
+    const LaplaceCrossingTraceStencil2D fixed_stencil = neumann
+        ? LaplaceCrossingTraceStencil2D::PsiP2
+        : LaplaceCrossingTraceStencil2D::PhiP3;
+
+    // The prescribed jump block, volume forcing, and RHS jumps form one fixed
+    // field. Keeping it outside apply() makes the Krylov operator strictly
+    // linear.
+    const auto fixed_result = potentials_.evaluate(
+        make_cauchy_jumps(iface,
+                          fixed_value_jump,
+                          fixed_normal_jump,
+                          signed_derivs),
+        rhs,
+        fixed_stencil);
+    Eigen::VectorXd b(n_active);
+    for (int a = 0; a < n_active; ++a) {
+        const int q = active_interface_points_[static_cast<std::size_t>(a)];
+        const double fixed_ghost_trace = neumann
+            ? fixed_result.u_avg[q]
+                - 0.5 * physical_side * fixed_value_jump[q]
+            : fixed_result.un_avg[q]
+                - 0.5 * physical_side * fixed_normal_jump[q];
+        b[a] = -fixed_ghost_trace;
+    }
+
+    GMRES gmres(max_iter, tol, restart);
+    Eigen::VectorXd density = Eigen::VectorXd::Zero(n_active);
+    int iterations = 0;
+    if (uses_neumann_nullspace_projection(type_, eta_)) {
+        project_mean_zero(b);
+        MeanProjectedOperator projected_op(*this);
+        iterations = gmres.solve(projected_op, b, density);
+        project_mean_zero(density);
+    } else {
+        iterations = gmres.solve(*this, b, density);
+    }
+
+    const Eigen::VectorXd full_density = expand_active_density(density);
+    const Eigen::VectorXd& final_value_jump =
+        neumann ? full_density : full_boundary_jump;
+    const Eigen::VectorXd& final_normal_jump =
+        neumann ? full_boundary_jump : full_density;
+    auto full_result = potentials_.evaluate(
+        make_cauchy_jumps(iface,
+                          final_value_jump,
+                          final_normal_jump,
+                          signed_derivs),
+        rhs,
+        LaplaceCrossingTraceStencil2D::PhiP3PsiP2);
+    restore_dirichlet_boundary(full_result.u_bulk);
+    restore_dirichlet_boundary(full_result.u_physical);
+
+    Eigen::VectorXd trace(n_active);
+    Eigen::VectorXd normal_trace(n_active);
+    Eigen::VectorXd ghost_trace(n_active);
+    Eigen::VectorXd ghost_normal_trace(n_active);
+    for (int a = 0; a < n_active; ++a) {
+        const int q = active_interface_points_[static_cast<std::size_t>(a)];
+        trace[a] = full_result.u_avg[q]
+                 + 0.5 * physical_side * final_value_jump[q];
+        normal_trace[a] = full_result.un_avg[q]
+                        + 0.5 * physical_side * final_normal_jump[q];
+        ghost_trace[a] = full_result.u_avg[q]
+                       - 0.5 * physical_side * final_value_jump[q];
+        ghost_normal_trace[a] = full_result.un_avg[q]
+                              - 0.5 * physical_side
+                                    * final_normal_jump[q];
+    }
+
+    return {std::move(full_result.u_bulk),
+            std::move(full_result.u_physical),
+            std::move(density),
+            std::move(full_result.corner_patch_corrections),
+            gmres.residuals(),
+            iterations,
+            gmres.converged(),
+            std::move(trace),
+            std::move(normal_trace),
+            std::move(ghost_trace),
+            std::move(ghost_normal_trace)};
 }
 
 } // namespace kfbim

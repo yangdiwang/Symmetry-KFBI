@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <memory>
 #include <vector>
 #include <Eigen/Dense>
 #include "../local_cauchy/jump_data.hpp"
@@ -10,9 +11,14 @@
 #include "../geometry/grid_pair_2d.hpp"
 #include "../geometry/grid_pair_3d.hpp"
 #include "laplace_correction_support.hpp"
+#include "laplace_crossing_trace_stencil_2d.hpp"
 #include "laplace_sd_corner_lifting_2d.hpp"
 
 namespace kfbim {
+
+class LaplaceArcLengthBSplineCrossingJetPlan2D;
+struct LaplaceArcLengthBSplineTraceState2D;
+class LaplaceNurbsDensityTraceState2D;
 
 // ---------------------------------------------------------------------------
 // Spread (Layer 1): interface jump data → bulk RHS correction
@@ -29,6 +35,7 @@ namespace kfbim {
 
 enum class LaplaceCorrectionMethod {
     NearestExpansionCenter,
+    CrossingOwner,
     ProjectionPoint
 };
 
@@ -99,8 +106,35 @@ struct LaplaceCorrectionContext2D {
     LaplaceCorrectionMethod correction_method =
         LaplaceCorrectionMethod::NearestExpansionCenter;
 
-    // Existing center-polynomial correction data. In projection-point mode this
-    // may be empty because C(x) is evaluated directly from projected P2 data.
+    // BVP/layer-selected interface trace stencil for exact crossing-local
+    // reconstruction.  Dirichlet uses PhiP3, Neumann uses PsiP2, while
+    // transmission and generic combined potentials use PhiP3PsiP2.
+    LaplaceCrossingTraceStencil2D crossing_trace_stencil =
+        LaplaceCrossingTraceStencil2D::PhiP3PsiP2;
+
+    // Crossing-trace reconstruction selected by the BVP.  In ALS-CJ mode the
+    // immutable geometry/arclength/spline plan is shared by every GMRES
+    // application, while the fitted coefficient state is a snapshot of this
+    // application's jump density.  Restrict consumes the same pair so spread
+    // and restrict evaluate one identical continuous crossing trace.
+    LaplaceCrossingJetScheme2D crossing_jet_scheme =
+        LaplaceCrossingJetScheme2D::LocalArclengthLagrange;
+    std::shared_ptr<const LaplaceArcLengthBSplineCrossingJetPlan2D>
+        arc_length_bspline_crossing_jet_plan;
+    std::shared_ptr<const LaplaceArcLengthBSplineTraceState2D>
+        arc_length_bspline_trace_state;
+
+    // Direct reduced-coefficient state. When present, spread and restrict
+    // evaluate exactly this immutable state at every certified NURBS
+    // crossing; no nodal density fit is performed in the application.
+    std::shared_ptr<const LaplaceNurbsDensityTraceState2D>
+        direct_nurbs_density_trace_state;
+
+    // Existing center-polynomial correction data. CrossingOwner uses these for
+    // unresolved/corner fallback and center-based trace continuation; reliable
+    // crossings reconstruct their quadratic spatial polynomial directly from
+    // the retained P2 crossing and the jump vectors below. In projection-point
+    // mode this may be empty because C(x) is evaluated from projected P2 data.
     std::vector<LocalPoly2D> correction_polys;
 
     // Surface data needed by the projection-point evaluator. Vectors are sized
@@ -146,6 +180,25 @@ public:
     virtual LaplaceSpreadResult2D apply(
         const std::vector<LaplaceJumpData2D>& jumps,
         Eigen::VectorXd&                      rhs_correction) const = 0;
+
+    // Per-potential override used by exterior-trace BVP formulations.  Legacy
+    // spread implementations may ignore the reconstruction policy; the P2
+    // crossing-owner spread overrides it and binds the same policy into the
+    // result consumed by restrict.
+    virtual LaplaceSpreadResult2D apply_with_crossing_trace_stencil(
+        const std::vector<LaplaceJumpData2D>& jumps,
+        Eigen::VectorXd&                      rhs_correction,
+        LaplaceCrossingTraceStencil2D         trace_stencil) const
+    {
+        LaplaceSpreadResult2D result = apply(jumps, rhs_correction);
+        result.crossing_trace_stencil = trace_stencil;
+        return result;
+    }
+
+    virtual LaplaceCrossingTraceStencil2D crossing_trace_stencil() const
+    {
+        return LaplaceCrossingTraceStencil2D::PhiP3PsiP2;
+    }
 
     virtual const GridPair2D& grid_pair() const = 0;
 };

@@ -54,7 +54,8 @@ Interface2D::Interface2D(Eigen::MatrixX2d points,
                          Eigen::VectorXd  weights,
                          int              points_per_panel,
                          Eigen::VectorXi  panel_components,
-                         PanelNodeLayout2D panel_node_layout)
+                         PanelNodeLayout2D panel_node_layout,
+                         std::shared_ptr<const IPanelGeometry2D> panel_geometry)
     : points_(std::move(points))
     , normals_(std::move(normals))
     , weights_(std::move(weights))
@@ -62,6 +63,7 @@ Interface2D::Interface2D(Eigen::MatrixX2d points,
     , panel_point_indices_(make_panel_major_connectivity(static_cast<int>(points_.rows()),
                                                          points_per_panel))
     , panel_components_(std::move(panel_components))
+    , panel_geometry_(std::move(panel_geometry))
     , panel_node_layout_(panel_node_layout)
 {
     validate_topology();
@@ -76,13 +78,15 @@ Interface2D::Interface2D(Eigen::MatrixX2d points,
                          int              points_per_panel,
                          Eigen::MatrixXi  panel_point_indices,
                          Eigen::VectorXi  panel_components,
-                         PanelNodeLayout2D panel_node_layout)
+                         PanelNodeLayout2D panel_node_layout,
+                         std::shared_ptr<const IPanelGeometry2D> panel_geometry)
     : points_(std::move(points))
     , normals_(std::move(normals))
     , weights_(std::move(weights))
     , points_per_panel_(points_per_panel)
     , panel_point_indices_(std::move(panel_point_indices))
     , panel_components_(std::move(panel_components))
+    , panel_geometry_(std::move(panel_geometry))
     , panel_node_layout_(panel_node_layout)
 {
     validate_topology();
@@ -102,7 +106,8 @@ Interface2D::Interface2D(Eigen::MatrixX2d points,
                          std::vector<int> corner_index_by_point,
                          std::vector<CornerData2D> corners,
                          PanelNodeLayout2D panel_node_layout,
-                         std::vector<CornerPatch2D> corner_patches)
+                         std::vector<CornerPatch2D> corner_patches,
+                         std::shared_ptr<const IPanelGeometry2D> panel_geometry)
     : points_(std::move(points))
     , normals_(std::move(normals))
     , weights_(std::move(weights))
@@ -115,6 +120,7 @@ Interface2D::Interface2D(Eigen::MatrixX2d points,
     , corner_index_by_point_(std::move(corner_index_by_point))
     , corners_(std::move(corners))
     , corner_patches_(std::move(corner_patches))
+    , panel_geometry_(std::move(panel_geometry))
     , panel_node_layout_(panel_node_layout)
 {
     validate();
@@ -208,6 +214,11 @@ void Interface2D::validate() const
         throw std::invalid_argument("panel_tangents row count must equal num_panels * points_per_panel");
     if (panel_tangents_.cols() != 2)
         throw std::invalid_argument("panel_tangents must have exactly two columns");
+    if (panel_geometry_
+        && panel_geometry_->num_panels() != num_panels()) {
+        throw std::invalid_argument(
+            "panel geometry panel count must equal num_panels");
+    }
     if (point_kind_.size() != static_cast<std::size_t>(num_points()))
         throw std::invalid_argument("point_kind size must equal num_points");
     if (corner_index_by_point_.size() != static_cast<std::size_t>(num_points()))

@@ -8,6 +8,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 namespace kfbim::app3d {
@@ -18,6 +19,7 @@ constexpr double kPi = 3.141592653589793238462643383279502884;
 
 using geometry::NurbsBasis1D;
 using geometry3d::NurbsPatchEdgeConnection3D;
+using geometry3d::NurbsPatchEdgeInterval3D;
 using geometry3d::NurbsSurfacePatch3D;
 using geometry3d::full_patch_edge_interval;
 
@@ -29,6 +31,129 @@ struct RationalQuarterArc2D {
 int edge_index(PatchEdge3D edge)
 {
     return static_cast<int>(edge);
+}
+
+bool is_u_edge(PatchEdge3D edge)
+{
+    return edge == PatchEdge3D::UMin || edge == PatchEdge3D::UMax;
+}
+
+std::pair<double, double> edge_parameter_domain(
+    const NativeNurbsSurface3D& surface,
+    int patch,
+    PatchEdge3D edge)
+{
+    if (patch < 0 || patch >= static_cast<int>(surface.patches.size()))
+        throw std::out_of_range("smooth edge has an invalid patch");
+    const NurbsSurfacePatch3D& geometry =
+        surface.patches[static_cast<std::size_t>(patch)];
+    return is_u_edge(edge)
+        ? std::pair<double, double>{
+              geometry.domain_start_v(), geometry.domain_end_v()}
+        : std::pair<double, double>{
+              geometry.domain_start_u(), geometry.domain_end_u()};
+}
+
+bool interval_is_full_edge(const NativeNurbsSurface3D& surface,
+                           const NurbsPatchEdgeInterval3D& interval)
+{
+    const auto domain = edge_parameter_domain(
+        surface, interval.patch, interval.edge);
+    const double scale = std::max(1.0, domain.second - domain.first);
+    const double tolerance = 2.0e-12 * scale;
+    return std::abs(interval.begin - domain.first) <= tolerance
+        && std::abs(interval.end - domain.second) <= tolerance;
+}
+
+struct SmoothEdgeTransition3D {
+    int patch = -1;
+    PatchEdge3D edge = PatchEdge3D::UMin;
+    double source_begin = 0.0;
+    double source_end = 1.0;
+    double destination_begin = 0.0;
+    double destination_end = 1.0;
+    bool reversed = false;
+};
+
+std::vector<SmoothEdgeTransition3D> smooth_edge_transitions(
+    const NativeNurbsSurface3D& surface,
+    int source_patch,
+    PatchEdge3D source_edge)
+{
+    if (source_patch < 0
+        || source_patch >= static_cast<int>(surface.patches.size())) {
+        throw std::out_of_range("smooth edge transition has an invalid patch");
+    }
+    if (!surface.smooth_neighbors.empty()
+        && surface.smooth_neighbors.size() != surface.patches.size()) {
+        throw std::invalid_argument(
+            "legacy smooth-neighbor metadata has an invalid size");
+    }
+
+    std::vector<SmoothEdgeTransition3D> result;
+    for (const NurbsPatchEdgeConnection3D& connection :
+         surface.geometric_connections) {
+        if (!connection.g1)
+            continue;
+        const bool source_is_first =
+            connection.first.patch == source_patch
+            && connection.first.edge == source_edge;
+        const bool source_is_second =
+            connection.second.patch == source_patch
+            && connection.second.edge == source_edge;
+        if (!source_is_first && !source_is_second)
+            continue;
+        const NurbsPatchEdgeInterval3D& source = source_is_first
+            ? connection.first : connection.second;
+        const NurbsPatchEdgeInterval3D& destination = source_is_first
+            ? connection.second : connection.first;
+        if (!(source.end > source.begin)
+            || !(destination.end > destination.begin)) {
+            throw std::invalid_argument(
+                "smooth geometric connection has a degenerate interval");
+        }
+        result.push_back({destination.patch,
+                          destination.edge,
+                          source.begin,
+                          source.end,
+                          destination.begin,
+                          destination.end,
+                          connection.reversed});
+    }
+
+    // Old unit fixtures sometimes provide only the fixed-size neighbor
+    // table.  Use it only when no interval-aware connection exists on this
+    // edge, so a long edge may own several geometric children without being
+    // shadowed by a legacy slot.
+    if (result.empty() && !surface.smooth_neighbors.empty()) {
+        const auto& legacy = surface.smooth_neighbors[
+            static_cast<std::size_t>(source_patch)]
+            [static_cast<std::size_t>(edge_index(source_edge))];
+        if (legacy) {
+            const auto source_domain = edge_parameter_domain(
+                surface, source_patch, source_edge);
+            const auto destination_domain = edge_parameter_domain(
+                surface, legacy->patch, legacy->edge);
+            result.push_back({legacy->patch,
+                              legacy->edge,
+                              source_domain.first,
+                              source_domain.second,
+                              destination_domain.first,
+                              destination_domain.second,
+                              legacy->reversed});
+        }
+    }
+    std::sort(result.begin(), result.end(),
+              [](const SmoothEdgeTransition3D& a,
+                 const SmoothEdgeTransition3D& b) {
+                  return std::tie(a.source_begin, a.source_end, a.patch,
+                                  a.edge, a.destination_begin,
+                                  a.destination_end, a.reversed)
+                       < std::tie(b.source_begin, b.source_end, b.patch,
+                                  b.edge, b.destination_begin,
+                                  b.destination_end, b.reversed);
+              });
+    return result;
 }
 
 RationalQuarterArc2D quarter_arc(double angle0)
@@ -448,8 +573,164 @@ NativeNurbsSurface3D make_l_prism()
         const double py = x.y() + 0.07;
         const bool in_plan =
             (px > -0.60 && px < 0.60 && py > -0.60 && py < 0.0)
-         || (px > -0.60 && px < 0.0 && py > 0.0 && py < 0.60);
+         || (px > -0.60 && px < 0.0 && py >= 0.0 && py < 0.60);
         return in_plan && x.z() > -0.63 && x.z() < 0.67;
+    };
+    return surface;
+}
+
+NativeNurbsSurface3D make_u_prism()
+{
+    // Five congruent cells form a planar U: three cells on the bottom row
+    // and one additional cell above each outer column.  Keeping the caps
+    // split by cell exposes their true G1 topology while the eight vertical
+    // walls remain separate sheets across the physical C0 creases.
+    constexpr double sx = 0.07;
+    constexpr double sy = -0.07;
+    constexpr double z0 = -0.63;
+    constexpr double z1 = 0.67;
+    constexpr double cell_size = 0.36;
+    constexpr double x0 = sx - 1.5 * cell_size;
+    constexpr double x1 = sx - 0.5 * cell_size;
+    constexpr double x2 = sx + 0.5 * cell_size;
+    constexpr double x3 = sx + 1.5 * cell_size;
+    constexpr double y0 = sy - cell_size;
+    constexpr double y1 = sy;
+    constexpr double y2 = sy + cell_size;
+    const std::array<std::array<double, 4>, 5> cells{{
+        {{x0, x1, y0, y1}},
+        {{x1, x2, y0, y1}},
+        {{x2, x3, y0, y1}},
+        {{x0, x1, y1, y2}},
+        {{x2, x3, y1, y2}}}};
+
+    NativeNurbsSurface3D surface;
+    surface.name = "u_prism";
+    surface.description =
+        "eighteen native bilinear NURBS U-prism patches";
+    for (int cell = 0; cell < 5; ++cell) {
+        const auto& bounds = cells[static_cast<std::size_t>(cell)];
+        append_l_prism_bottom(surface,
+                              "bottom_cell_" + std::to_string(cell),
+                              bounds[0], bounds[1], bounds[2], bounds[3], z0);
+    }
+    for (int cell = 0; cell < 5; ++cell) {
+        const auto& bounds = cells[static_cast<std::size_t>(cell)];
+        append_l_prism_top(surface,
+                           "top_cell_" + std::to_string(cell),
+                           bounds[0], bounds[1], bounds[2], bounds[3], z1);
+    }
+
+    // Counter-clockwise boundary as viewed from +z.  This ordering and the
+    // (boundary,z) side parameterization give every wall its outward normal.
+    const std::array<Eigen::Vector2d, 8> boundary{{
+        {x0, y0}, {x3, y0}, {x3, y2}, {x2, y2},
+        {x2, y1}, {x1, y1}, {x1, y2}, {x0, y2}}};
+    for (int side = 0; side < 8; ++side) {
+        const Eigen::Vector2d a = boundary[static_cast<std::size_t>(side)];
+        const Eigen::Vector2d b =
+            boundary[static_cast<std::size_t>((side + 1) % 8)];
+        append_patch(surface,
+                     "side_" + std::to_string(side),
+                     NurbsSurfacePatch3D::make_bilinear_plane(
+                         {a.x(), a.y(), z0}, {b.x(), b.y(), z0},
+                         {a.x(), a.y(), z1}, {b.x(), b.y(), z1}));
+    }
+
+    // Smooth cell-to-cell cap joins.  Bottom caps use (u,v)=(y,x), whereas
+    // top caps use (u,v)=(x,y), following the orientation convention shared
+    // with the established L-prism geometry.
+    connect_smooth(surface, 0, PatchEdge3D::VMax,
+                   1, PatchEdge3D::VMin, false);
+    connect_smooth(surface, 1, PatchEdge3D::VMax,
+                   2, PatchEdge3D::VMin, false);
+    connect_smooth(surface, 0, PatchEdge3D::UMax,
+                   3, PatchEdge3D::UMin, false);
+    connect_smooth(surface, 2, PatchEdge3D::UMax,
+                   4, PatchEdge3D::UMin, false);
+    connect_smooth(surface, 5, PatchEdge3D::UMax,
+                   6, PatchEdge3D::UMin, false);
+    connect_smooth(surface, 6, PatchEdge3D::UMax,
+                   7, PatchEdge3D::UMin, false);
+    connect_smooth(surface, 5, PatchEdge3D::VMax,
+                   8, PatchEdge3D::VMin, false);
+    connect_smooth(surface, 7, PatchEdge3D::VMax,
+                   9, PatchEdge3D::VMin, false);
+
+    for (int side = 0; side < 8; ++side) {
+        const int side_patch = 10 + side;
+        connect_feature(surface,
+            side_patch, PatchEdge3D::UMax, 0.0, 1.0,
+            10 + (side + 1) % 8, PatchEdge3D::UMin, 0.0, 1.0, false);
+    }
+
+    // Bottom cap to wall connections.  Long outer sides are partitioned so
+    // every interval is covered exactly once without inventing cap patches.
+    for (int column = 0; column < 3; ++column) {
+        connect_feature(surface,
+            10, PatchEdge3D::VMin,
+            static_cast<double>(column) / 3.0,
+            static_cast<double>(column + 1) / 3.0,
+            column, PatchEdge3D::UMin, 0.0, 1.0, false);
+    }
+    connect_feature(surface, 11, PatchEdge3D::VMin, 0.0, 0.5,
+                    2, PatchEdge3D::VMax, 0.0, 1.0, false);
+    connect_feature(surface, 11, PatchEdge3D::VMin, 0.5, 1.0,
+                    4, PatchEdge3D::VMax, 0.0, 1.0, false);
+    connect_feature(surface, 12, PatchEdge3D::VMin, 0.0, 1.0,
+                    4, PatchEdge3D::UMax, 0.0, 1.0, true);
+    connect_feature(surface, 13, PatchEdge3D::VMin, 0.0, 1.0,
+                    4, PatchEdge3D::VMin, 0.0, 1.0, true);
+    connect_feature(surface, 14, PatchEdge3D::VMin, 0.0, 1.0,
+                    1, PatchEdge3D::UMax, 0.0, 1.0, true);
+    connect_feature(surface, 15, PatchEdge3D::VMin, 0.0, 1.0,
+                    3, PatchEdge3D::VMax, 0.0, 1.0, false);
+    connect_feature(surface, 16, PatchEdge3D::VMin, 0.0, 1.0,
+                    3, PatchEdge3D::UMax, 0.0, 1.0, true);
+    connect_feature(surface, 17, PatchEdge3D::VMin, 0.0, 0.5,
+                    3, PatchEdge3D::VMin, 0.0, 1.0, true);
+    connect_feature(surface, 17, PatchEdge3D::VMin, 0.5, 1.0,
+                    0, PatchEdge3D::VMin, 0.0, 1.0, true);
+
+    // Top cap to wall connections use the top-cap parameter orientation.
+    for (int column = 0; column < 3; ++column) {
+        connect_feature(surface,
+            10, PatchEdge3D::VMax,
+            static_cast<double>(column) / 3.0,
+            static_cast<double>(column + 1) / 3.0,
+            5 + column, PatchEdge3D::VMin, 0.0, 1.0, false);
+    }
+    connect_feature(surface, 11, PatchEdge3D::VMax, 0.0, 0.5,
+                    7, PatchEdge3D::UMax, 0.0, 1.0, false);
+    connect_feature(surface, 11, PatchEdge3D::VMax, 0.5, 1.0,
+                    9, PatchEdge3D::UMax, 0.0, 1.0, false);
+    connect_feature(surface, 12, PatchEdge3D::VMax, 0.0, 1.0,
+                    9, PatchEdge3D::VMax, 0.0, 1.0, true);
+    connect_feature(surface, 13, PatchEdge3D::VMax, 0.0, 1.0,
+                    9, PatchEdge3D::UMin, 0.0, 1.0, true);
+    connect_feature(surface, 14, PatchEdge3D::VMax, 0.0, 1.0,
+                    6, PatchEdge3D::VMax, 0.0, 1.0, true);
+    connect_feature(surface, 15, PatchEdge3D::VMax, 0.0, 1.0,
+                    8, PatchEdge3D::UMax, 0.0, 1.0, false);
+    connect_feature(surface, 16, PatchEdge3D::VMax, 0.0, 1.0,
+                    8, PatchEdge3D::VMax, 0.0, 1.0, true);
+    connect_feature(surface, 17, PatchEdge3D::VMax, 0.0, 0.5,
+                    8, PatchEdge3D::UMin, 0.0, 1.0, true);
+    connect_feature(surface, 17, PatchEdge3D::VMax, 0.5, 1.0,
+                    5, PatchEdge3D::UMin, 0.0, 1.0, true);
+
+    const double height = z1 - z0;
+    surface.expected_area = 2.0 * 5.0 * cell_size * cell_size
+                          + 12.0 * cell_size * height;
+    surface.exact_inside = [=](const Eigen::Vector3d& x) {
+        const bool in_bottom =
+            x.x() > x0 && x.x() < x3 && x.y() > y0 && x.y() < y1;
+        const bool in_left_arm =
+            x.x() > x0 && x.x() < x1 && x.y() >= y1 && x.y() < y2;
+        const bool in_right_arm =
+            x.x() > x2 && x.x() < x3 && x.y() >= y1 && x.y() < y2;
+        return (in_bottom || in_left_arm || in_right_arm)
+            && x.z() > z0 && x.z() < z1;
     };
     return surface;
 }
@@ -470,6 +751,8 @@ NativeNurbsSurface3D make_native_nurbs_surface_3d(GeometryKind3D kind)
         return make_hollow_cylinder();
     case GeometryKind3D::LPrism:
         return make_l_prism();
+    case GeometryKind3D::UPrism:
+        return make_u_prism();
     }
     throw std::invalid_argument("unknown native 3D geometry kind");
 }
@@ -534,6 +817,31 @@ std::pair<Eigen::Vector3d, Eigen::Vector3d> tangent_frame(
 
 } // namespace
 
+std::vector<int> smooth_patch_neighbors_3d(
+    const NativeNurbsSurface3D& surface,
+    int patch)
+{
+    if (patch < 0 || patch >= static_cast<int>(surface.patches.size()))
+        throw std::out_of_range("invalid patch for smooth-neighbor query");
+    std::vector<int> result;
+    for (int edge_value = 0; edge_value < 4; ++edge_value) {
+        const auto transitions = smooth_edge_transitions(
+            surface, patch, static_cast<PatchEdge3D>(edge_value));
+        for (const SmoothEdgeTransition3D& transition : transitions) {
+            if (transition.patch < 0
+                || transition.patch
+                       >= static_cast<int>(surface.patches.size())) {
+                throw std::runtime_error(
+                    "smooth topology contains an invalid neighboring patch");
+            }
+            result.push_back(transition.patch);
+        }
+    }
+    std::sort(result.begin(), result.end());
+    result.erase(std::unique(result.begin(), result.end()), result.end());
+    return result;
+}
+
 SurfaceDofCloud3D make_native_surface_dofs_3d(
     const NativeNurbsSurface3D& surface,
     double h)
@@ -542,7 +850,8 @@ SurfaceDofCloud3D make_native_surface_dofs_3d(
         throw std::invalid_argument("native surface DOFs require positive h");
     if (surface.patches.empty()
         || surface.patch_names.size() != surface.patches.size()
-        || surface.smooth_neighbors.size() != surface.patches.size()
+        || (!surface.smooth_neighbors.empty()
+            && surface.smooth_neighbors.size() != surface.patches.size())
         || surface.topological_patch_neighbors.size()
                != surface.patches.size()) {
         throw std::invalid_argument("native surface metadata is inconsistent");
@@ -572,19 +881,8 @@ SurfaceDofCloud3D make_native_surface_dofs_3d(
             2,
             static_cast<int>(std::ceil(
                 direction_length_v[static_cast<std::size_t>(patch_id)] / h)));
-        tensor_patch.smooth_patch_ids.push_back(patch_id);
-        for (const auto& neighbor_slot :
-             surface.smooth_neighbors[static_cast<std::size_t>(patch_id)]) {
-            if (neighbor_slot
-                && std::find(tensor_patch.smooth_patch_ids.begin(),
-                             tensor_patch.smooth_patch_ids.end(),
-                             neighbor_slot->patch)
-                       == tensor_patch.smooth_patch_ids.end()) {
-                tensor_patch.smooth_patch_ids.push_back(neighbor_slot->patch);
-            }
-        }
-        std::sort(tensor_patch.smooth_patch_ids.begin(),
-                  tensor_patch.smooth_patch_ids.end());
+        tensor_patch.smooth_patch_ids =
+            smooth_patch_component(surface, patch_id);
         cloud.patches.push_back(std::move(tensor_patch));
     }
 
@@ -596,35 +894,56 @@ SurfaceDofCloud3D make_native_surface_dofs_3d(
         bool changed = true;
         while (changed) {
             changed = false;
-            for (int patch_id = 0;
-                 patch_id < static_cast<int>(cloud.patches.size());
-                 ++patch_id) {
-                for (int edge_value = 0; edge_value < 4; ++edge_value) {
-                    const auto& connection = surface.smooth_neighbors[
-                        static_cast<std::size_t>(patch_id)]
-                        [static_cast<std::size_t>(edge_value)];
-                    if (!connection)
-                        continue;
-                    const PatchEdge3D edge =
-                        static_cast<PatchEdge3D>(edge_value);
-                    SurfaceDofPatch3D& source =
-                        cloud.patches[static_cast<std::size_t>(patch_id)];
-                    SurfaceDofPatch3D& destination = cloud.patches[
-                        static_cast<std::size_t>(connection->patch)];
-                    int& source_count =
-                        edge == PatchEdge3D::UMin || edge == PatchEdge3D::UMax
-                            ? source.nv : source.nu;
-                    int& destination_count =
-                        connection->edge == PatchEdge3D::UMin
-                                || connection->edge == PatchEdge3D::UMax
-                            ? destination.nv : destination.nu;
-                    const int shared_count =
-                        std::max(source_count, destination_count);
-                    if (source_count != shared_count
-                        || destination_count != shared_count) {
-                        source_count = shared_count;
-                        destination_count = shared_count;
-                        changed = true;
+            const auto harmonize = [&](int patch_a,
+                                       PatchEdge3D edge_a,
+                                       int patch_b,
+                                       PatchEdge3D edge_b) {
+                SurfaceDofPatch3D& a =
+                    cloud.patches[static_cast<std::size_t>(patch_a)];
+                SurfaceDofPatch3D& b =
+                    cloud.patches[static_cast<std::size_t>(patch_b)];
+                int& count_a = is_u_edge(edge_a) ? a.nv : a.nu;
+                int& count_b = is_u_edge(edge_b) ? b.nv : b.nu;
+                const int shared = std::max(count_a, count_b);
+                if (count_a != shared || count_b != shared) {
+                    count_a = shared;
+                    count_b = shared;
+                    changed = true;
+                }
+            };
+
+            // Only full/full joins require identical tensor row counts.
+            // At a smooth T, a long-edge interval and a short full edge have
+            // different total counts; interval-aware crossing below maps the
+            // physical sub-interval instead of inflating the short patch.
+            for (const NurbsPatchEdgeConnection3D& connection :
+                 surface.geometric_connections) {
+                if (connection.g1
+                    && interval_is_full_edge(surface, connection.first)
+                    && interval_is_full_edge(surface, connection.second)) {
+                    harmonize(connection.first.patch, connection.first.edge,
+                              connection.second.patch,
+                              connection.second.edge);
+                }
+            }
+
+            // Preserve old synthetic fixtures that carry only the legacy
+            // fixed-size table and no geometric connection list.
+            if (surface.geometric_connections.empty()
+                && !surface.smooth_neighbors.empty()) {
+                for (int patch_id = 0;
+                     patch_id < static_cast<int>(cloud.patches.size());
+                     ++patch_id) {
+                    for (int edge_value = 0; edge_value < 4; ++edge_value) {
+                        const auto& connection = surface.smooth_neighbors[
+                            static_cast<std::size_t>(patch_id)]
+                            [static_cast<std::size_t>(edge_value)];
+                        if (connection) {
+                            harmonize(
+                                patch_id,
+                                static_cast<PatchEdge3D>(edge_value),
+                                connection->patch, connection->edge);
+                        }
                     }
                 }
             }
@@ -745,19 +1064,75 @@ void reflect_across_feature_edge(PatchEdge3D edge,
     }
 }
 
-void cross_smooth_edge(const SurfaceDofCloud3D& cloud,
+std::optional<SmoothEdgeTransition3D> smooth_transition_for_lattice(
+    const NativeNurbsSurface3D& surface,
+    const SurfaceDofCloud3D& cloud,
+    PatchEdge3D source_edge,
+    const DofLatticeCoordinate3D& coordinate)
+{
+    const SurfaceDofPatch3D& source =
+        cloud.patches[static_cast<std::size_t>(coordinate.patch)];
+    const int source_along_index = along_index(source_edge, coordinate);
+    const int source_along_count = along_count(source_edge, source);
+    const auto source_domain = edge_parameter_domain(
+        surface, coordinate.patch, source_edge);
+    const double along =
+        (static_cast<double>(source_along_index) + 0.5)
+        / static_cast<double>(source_along_count);
+    const double source_parameter =
+        source_domain.first
+        + along * (source_domain.second - source_domain.first);
+
+    // A corner candidate can be half a lattice cell beyond the edge-domain
+    // endpoint because the 2x2 stencil crosses two patch edges in sequence.
+    // Clamp only the interval-selection probe; retain the extrapolated
+    // parameter below so the second edge crossing is not lost.
+    const double probe = std::clamp(
+        source_parameter, source_domain.first, source_domain.second);
+    const double scale = std::max(1.0, source_domain.second - source_domain.first);
+    const double tolerance = 2.0e-12 * scale;
+    const std::vector<SmoothEdgeTransition3D> transitions =
+        smooth_edge_transitions(surface, coordinate.patch, source_edge);
+    for (const SmoothEdgeTransition3D& transition : transitions) {
+        if (probe >= transition.source_begin - tolerance
+            && probe <= transition.source_end + tolerance) {
+            return transition;
+        }
+    }
+    return std::nullopt;
+}
+
+void cross_smooth_edge(const NativeNurbsSurface3D& surface,
+                       const SurfaceDofCloud3D& cloud,
                        PatchEdge3D source_edge,
-                       const SmoothPatchNeighbor3D& connection,
+                       const SmoothEdgeTransition3D& connection,
                        DofLatticeCoordinate3D& coordinate)
 {
     const SurfaceDofPatch3D& source =
         cloud.patches[static_cast<std::size_t>(coordinate.patch)];
     const int source_along_index = along_index(source_edge, coordinate);
     const int source_along_count = along_count(source_edge, source);
-    double along = (static_cast<double>(source_along_index) + 0.5)
-                 / static_cast<double>(source_along_count);
+    const auto source_domain = edge_parameter_domain(
+        surface, coordinate.patch, source_edge);
+    const double source_parameter =
+        source_domain.first
+        + (static_cast<double>(source_along_index) + 0.5)
+              / static_cast<double>(source_along_count)
+              * (source_domain.second - source_domain.first);
+    double interval_coordinate =
+        (source_parameter - connection.source_begin)
+        / (connection.source_end - connection.source_begin);
     if (connection.reversed)
-        along = 1.0 - along;
+        interval_coordinate = 1.0 - interval_coordinate;
+    const double destination_parameter =
+        connection.destination_begin
+        + interval_coordinate
+              * (connection.destination_end - connection.destination_begin);
+    const auto destination_domain = edge_parameter_domain(
+        surface, connection.patch, connection.edge);
+    const double destination_along =
+        (destination_parameter - destination_domain.first)
+        / (destination_domain.second - destination_domain.first);
 
     coordinate.patch = connection.patch;
     const SurfaceDofPatch3D& destination =
@@ -765,7 +1140,8 @@ void cross_smooth_edge(const SurfaceDofCloud3D& cloud,
     const int destination_along_count =
         along_count(connection.edge, destination);
     const int destination_along_index = static_cast<int>(
-        std::floor(along * static_cast<double>(destination_along_count)));
+        std::floor(destination_along
+                   * static_cast<double>(destination_along_count)));
     switch (connection.edge) {
     case PatchEdge3D::UMin:
         coordinate.i = 0;
@@ -803,11 +1179,10 @@ int resolve_lattice_candidate(const NativeNurbsSurface3D& surface,
         const SurfaceDofPatch3D& patch =
             cloud.patches[static_cast<std::size_t>(coordinate.patch)];
         const PatchEdge3D edge = first_crossed_edge(patch, coordinate);
-        const auto& connection =
-            surface.smooth_neighbors[static_cast<std::size_t>(coordinate.patch)]
-                                    [static_cast<std::size_t>(edge_index(edge))];
+        const std::optional<SmoothEdgeTransition3D> connection =
+            smooth_transition_for_lattice(surface, cloud, edge, coordinate);
         if (connection)
-            cross_smooth_edge(cloud, edge, *connection, coordinate);
+            cross_smooth_edge(surface, cloud, edge, *connection, coordinate);
         else
             reflect_across_feature_edge(edge, patch, coordinate);
     }
@@ -940,7 +1315,8 @@ std::array<int, 4> parameter_dof_candidates_2x2(
     if (patch_id < 0
         || patch_id >= static_cast<int>(surface.patches.size())
         || surface.patches.size() != cloud.patches.size()
-        || surface.smooth_neighbors.size() != surface.patches.size()) {
+        || (!surface.smooth_neighbors.empty()
+            && surface.smooth_neighbors.size() != surface.patches.size())) {
         throw std::invalid_argument("invalid native patch for 2x2 DOF lookup");
     }
     const geometry3d::NurbsSurfacePatch3D& patch =
@@ -1017,7 +1393,8 @@ std::vector<int> nearest_g1_cauchy_dofs(
     if (count <= 0)
         throw std::invalid_argument("Cauchy sample count must be positive");
     if (surface.patches.size() != cloud.patches.size()
-        || surface.smooth_neighbors.size() != surface.patches.size()) {
+        || (!surface.smooth_neighbors.empty()
+            && surface.smooth_neighbors.size() != surface.patches.size())) {
         throw std::invalid_argument(
             "G1 Cauchy selection requires complete smooth topology");
     }
@@ -1040,11 +1417,7 @@ std::vector<int> nearest_g1_cauchy_dofs(
            && !frontier.empty()) {
         std::vector<int> next;
         for (int patch : frontier) {
-            for (const auto& connection :
-                 surface.smooth_neighbors[static_cast<std::size_t>(patch)]) {
-                if (!connection)
-                    continue;
-                const int neighbor = connection->patch;
+            for (int neighbor : smooth_patch_neighbors_3d(surface, patch)) {
                 if (neighbor < 0
                     || neighbor >= static_cast<int>(surface.patches.size())) {
                     throw std::runtime_error(
@@ -1211,7 +1584,8 @@ std::vector<int> smooth_patch_component(const NativeNurbsSurface3D& surface,
                                         int patch)
 {
     if (patch < 0 || patch >= static_cast<int>(surface.patches.size())
-        || surface.smooth_neighbors.size() != surface.patches.size()) {
+        || (!surface.smooth_neighbors.empty()
+            && surface.smooth_neighbors.size() != surface.patches.size())) {
         throw std::invalid_argument("invalid patch for smooth component query");
     }
     std::vector<int> result;
@@ -1223,12 +1597,10 @@ std::vector<int> smooth_patch_component(const NativeNurbsSurface3D& surface,
         const int current = pending.front();
         pending.pop();
         result.push_back(current);
-        for (const auto& connection :
-             surface.smooth_neighbors[static_cast<std::size_t>(current)]) {
-            if (connection
-                && !visited[static_cast<std::size_t>(connection->patch)]) {
-                visited[static_cast<std::size_t>(connection->patch)] = true;
-                pending.push(connection->patch);
+        for (int neighbor : smooth_patch_neighbors_3d(surface, current)) {
+            if (!visited[static_cast<std::size_t>(neighbor)]) {
+                visited[static_cast<std::size_t>(neighbor)] = true;
+                pending.push(neighbor);
             }
         }
     }

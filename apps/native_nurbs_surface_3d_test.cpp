@@ -1,4 +1,6 @@
 #include "native_nurbs_surface_3d.hpp"
+#include "dirichlet_rigid_transform_study_3d.hpp"
+#include "native_nurbs_surface_transform_3d.hpp"
 
 #include "src/geometry/grid_pair_3d.hpp"
 #include "src/geometry/nurbs_bezier_extraction_3d.hpp"
@@ -178,6 +180,8 @@ void test_native_models()
             "outer and inner cylinder walls are not direct neighbors");
     const NativeNurbsSurface3D lprism =
         make_native_nurbs_surface_3d(GeometryKind3D::LPrism);
+    const NativeNurbsSurface3D uprism =
+        make_native_nurbs_surface_3d(GeometryKind3D::UPrism);
 
     require(torus.patches.size() == 16,
             "torus must have 4x4 native patches");
@@ -185,9 +189,12 @@ void test_native_models()
             "cylinder must have four quarters on each of four sheets");
     require(lprism.patches.size() == 12,
             "L-prism must retain its twelve native patches");
+    require(uprism.patches.size() == 18,
+            "U-prism must have ten cap cells and eight wall patches");
     check_patch_regular(torus);
     check_patch_regular(cylinder);
     check_patch_regular(lprism);
+    check_patch_regular(uprism);
 
     for (const auto& patch : torus.patches) {
         const double u = 0.5 * (patch.domain_start_u() + patch.domain_end_u());
@@ -224,6 +231,85 @@ void test_native_models()
                              + 8.0 * 0.60 * 1.30;
     require(std::abs(lprism.expected_area - lprism_area) < 1.0e-13,
             "L-prism exact area");
+    require(lprism.exact_inside({-0.23, -0.07, 0.0}),
+            "L-prism artificial cap-cell seam remains interior");
+    require(!lprism.exact_inside({0.37, -0.07, 0.0}),
+            "L-prism physical re-entrant boundary remains exterior");
+
+    const double uprism_area = 2.0 * 5.0 * 0.36 * 0.36
+                              + 12.0 * 0.36 * 1.30;
+    require(std::abs(uprism.expected_area - uprism_area) < 1.0e-13,
+            "U-prism exact area");
+}
+
+void test_u_prism_geometry()
+{
+    const NativeNurbsSurface3D surface =
+        make_native_nurbs_surface_3d(GeometryKind3D::UPrism);
+    require(surface.name == "u_prism", "U-prism canonical geometry name");
+
+    const auto model = surface.geometry_model();
+    const auto closed = model.validate_closed();
+    require(model.num_patches() == 18, "U-prism model patch count");
+    require(model.connections().size() == 40,
+            "U-prism interval-connection count");
+    require(closed.uncovered_interval_count == 0
+                && closed.multiply_covered_interval_count == 0
+                && closed.position_mismatch_count == 0
+                && closed.orientation_mismatch_count == 0
+                && closed.g1_normal_mismatch_count == 0,
+            "U-prism is a closed, consistently oriented interval topology");
+
+    Eigen::Vector3d lower = Eigen::Vector3d::Constant(
+        std::numeric_limits<double>::infinity());
+    Eigen::Vector3d upper = Eigen::Vector3d::Constant(
+        -std::numeric_limits<double>::infinity());
+    for (const auto& patch : surface.patches) {
+        for (const auto& row : patch.control_net()) {
+            for (const Eigen::Vector3d& point : row) {
+                lower = lower.cwiseMin(point);
+                upper = upper.cwiseMax(point);
+            }
+        }
+    }
+    const Eigen::Vector3d expected_lower(-0.47, -0.43, -0.63);
+    const Eigen::Vector3d expected_upper(0.61, 0.29, 0.67);
+    require((lower - expected_lower).lpNorm<Eigen::Infinity>() < 1.0e-13
+                && (upper - expected_upper).lpNorm<Eigen::Infinity>()
+                       < 1.0e-13,
+            "U-prism exact AABB");
+
+    require(surface.exact_inside({0.07, -0.25, 0.0}),
+            "U-prism bottom bar is interior");
+    require(surface.exact_inside({-0.29, 0.11, 0.0}),
+            "U-prism left arm is interior");
+    require(surface.exact_inside({0.43, 0.11, 0.0}),
+            "U-prism right arm is interior");
+    require(!surface.exact_inside({0.07, 0.11, 0.0}),
+            "U-prism central slot is exterior");
+    require(!surface.exact_inside({0.07, -0.25, 0.80}),
+            "U-prism point above the cap is exterior");
+
+    require(smooth_patch_component(surface, 0).size() == 5,
+            "U-prism bottom cap has one five-patch G1 component");
+    require(smooth_patch_component(surface, 5).size() == 5,
+            "U-prism top cap has one five-patch G1 component");
+    for (int side = 10; side < 18; ++side) {
+        require(smooth_patch_component(surface, side).size() == 1,
+                "each U-prism wall remains a separate C0 sheet");
+    }
+    const auto& long_bottom_neighbors =
+        surface.topological_patch_neighbors[10];
+    require(std::find(long_bottom_neighbors.begin(),
+                      long_bottom_neighbors.end(), 0)
+                != long_bottom_neighbors.end()
+                && std::find(long_bottom_neighbors.begin(),
+                             long_bottom_neighbors.end(), 1)
+                       != long_bottom_neighbors.end()
+                && std::find(long_bottom_neighbors.begin(),
+                             long_bottom_neighbors.end(), 2)
+                       != long_bottom_neighbors.end(),
+            "U-prism long bottom wall is connected to all three cap cells");
 }
 
 void test_native_surface_interval_topology()
@@ -243,7 +329,8 @@ void test_native_surface_interval_topology()
     for (const Expected expected : {
              Expected{GeometryKind3D::Torus, 16, 32},
              Expected{GeometryKind3D::HollowCylinder, 16, 32},
-             Expected{GeometryKind3D::LPrism, 12, 26}}) {
+             Expected{GeometryKind3D::LPrism, 12, 26},
+             Expected{GeometryKind3D::UPrism, 18, 40}}) {
         const NativeNurbsSurface3D surface =
             make_native_nurbs_surface_3d(expected.kind);
         const kfbim::geometry3d::NurbsSurfaceModel3D model =
@@ -1729,6 +1816,41 @@ void test_native_nurbs_surface_intersector()
     cylinder_grid_options.maximum_element_extent = 0.09375;
     const NurbsSurfaceIntersector3D cylinder_grid_intersector(
         cylinder.geometry_model(), cylinder_grid_options);
+
+    const auto rigid_cases =
+        kfbim::app3d::make_l_prism_dirichlet_rigid_study_cases_3d();
+    const auto rigid_case = std::find_if(
+        rigid_cases.begin(), rigid_cases.end(), [](const auto& item) {
+            return item.id == "rot_axis123_17deg_t_xyz_1";
+        });
+    require(rigid_case != rigid_cases.end(),
+            "production rigid-transform case is present");
+    const NativeNurbsSurface3D rigid_cylinder =
+        kfbim::app3d::transform_native_nurbs_surface_3d(
+            cylinder, rigid_case->transform);
+    auto rigid_cylinder_options = grid_scaled_options;
+    rigid_cylinder_options.maximum_element_extent = 2.0 * (3.0 / 128.0);
+    const NurbsSurfaceIntersector3D rigid_cylinder_intersector(
+        rigid_cylinder.geometry_model(), rigid_cylinder_options);
+    const auto rigid_cylinder_hit =
+        rigid_cylinder_intersector.intersect_cartesian_edge(
+            NurbsCartesianEdgeQuery3D{
+                0, 68, 36, 46,
+                {0.09375, -0.65625, -0.421875},
+                {0.1171875, -0.65625, -0.421875}});
+    require(rigid_cylinder_hit.crossings.size() == 1
+                && rigid_cylinder_hit.ambiguous_clusters.empty()
+                && rigid_cylinder_hit.root_count_known
+                && rigid_cylinder_hit.parity_known_from_roots
+                && rigid_cylinder_hit.confirmed_transverse_count == 1
+                && rigid_cylinder_hit.changes_component_membership
+                && !rigid_cylinder_hit.has_near_tangent_candidate
+                && rigid_cylinder_hit.diagnostics.unresolved_candidates == 0
+                && rigid_cylinder_hit.crossings.front().patch_index == 2
+                && rigid_cylinder_hit.crossings.front().residual
+                       <= rigid_cylinder_intersector.geometry_tolerance(),
+            "N=128 rotated cylinder duplicate seeds polish to one root");
+
     const auto cylinder_grid_miss =
         cylinder_grid_intersector.intersect_cartesian_edge(
             NurbsCartesianEdgeQuery3D{
@@ -2423,6 +2545,87 @@ void test_nurbs_cartesian_under_resolved_torus_uses_parity()
                 && domain.diagnostics().even_parity_interface_edge_count > 0,
             "under-resolved torus keeps even multi-crossing interface edges");
 }
+
+void test_translated_torus_point_classification_uses_deep_retry()
+{
+    constexpr int N = 32;
+    constexpr double h = 3.0 / static_cast<double>(N);
+    const kfbim::CartesianGrid3D grid(
+        {-1.5, -1.5, -1.5}, {h, h, h}, {N, N, N},
+        kfbim::DofLayout3D::Node);
+    const NativeNurbsSurface3D torus =
+        make_native_nurbs_surface_3d(GeometryKind3D::Torus);
+    const auto rigid_cases =
+        kfbim::app3d::make_l_prism_dirichlet_rigid_study_cases_3d();
+    const auto translated_case = std::find_if(
+        rigid_cases.begin(), rigid_cases.end(), [](const auto& item) {
+            return item.id == "tx_p0137";
+        });
+    require(translated_case != rigid_cases.end(),
+            "translated rigid-transform case is present");
+    const NativeNurbsSurface3D translated =
+        kfbim::app3d::transform_native_nurbs_surface_3d(
+            torus, translated_case->transform);
+
+    const kfbim::geometry3d::NurbsCartesianDomain3D domain(
+        grid, translated.geometry_model());
+    const int formerly_unresolved = grid.index(16, 8, 17);
+    const auto coordinate = grid.coord(formerly_unresolved);
+    const Eigen::Vector3d point(
+        coordinate[0], coordinate[1], coordinate[2]);
+    require((domain.label(formerly_unresolved) > 0)
+                == translated.exact_inside(point),
+            "translated torus classifies the former conservative ray point");
+}
+
+void test_rigid_torus_label_changing_edge_uses_final_retry()
+{
+    constexpr int N = 64;
+    constexpr double h = 3.0 / static_cast<double>(N);
+    const kfbim::CartesianGrid3D grid(
+        {-1.5, -1.5, -1.5}, {h, h, h}, {N, N, N},
+        kfbim::DofLayout3D::Node);
+    const NativeNurbsSurface3D torus =
+        make_native_nurbs_surface_3d(GeometryKind3D::Torus);
+    const auto rigid_cases =
+        kfbim::app3d::make_l_prism_dirichlet_rigid_study_cases_3d();
+    const auto rigid_case = std::find_if(
+        rigid_cases.begin(), rigid_cases.end(), [](const auto& item) {
+            return item.id == "rot_axis123_17deg_t_xyz_1";
+        });
+    require(rigid_case != rigid_cases.end(),
+            "strong rigid-transform case is present");
+    const NativeNurbsSurface3D transformed =
+        kfbim::app3d::transform_native_nurbs_surface_3d(
+            torus, rigid_case->transform);
+
+    const kfbim::geometry3d::NurbsCartesianDomain3D domain(
+        grid, transformed.geometry_model());
+    const int first = grid.index(37, 45, 33);
+    const int second = grid.index(38, 45, 33);
+    const auto classification =
+        domain.edge_classification_between(first, second);
+    require(classification.used_targeted_retry
+                && classification.correction_safe
+                && classification.root_count_known
+                && classification.parity_known_from_roots
+                && classification.confirmed_crossing_count == 1
+                && classification.ambiguous_cluster_count == 0
+                && domain.diagnostics()
+                       .targeted_retry_intersections
+                       .maximum_subdivision_depth_reached <= 10,
+            "rigid torus N=64 label-changing edge is resolved safely: "
+                + std::to_string(classification.used_targeted_retry) + "/"
+                + std::to_string(classification.correction_safe) + "/"
+                + std::to_string(classification.root_count_known) + "/"
+                + std::to_string(classification.parity_known_from_roots) + "/"
+                + std::to_string(classification.confirmed_crossing_count) + "/"
+                + std::to_string(classification.ambiguous_cluster_count) + "/"
+                + std::to_string(
+                    domain.diagnostics()
+                        .targeted_retry_intersections
+                        .maximum_subdivision_depth_reached));
+}
 void test_nurbs_cartesian_targeted_retry()
 {
     constexpr int N = 128;
@@ -2436,8 +2639,10 @@ void test_nurbs_cartesian_targeted_retry()
         grid, torus.geometry_model());
     const auto& diagnostics = domain.diagnostics();
     require(diagnostics.targeted_retry_count > 0
-                && diagnostics.ambiguous_label_changing_edge_count
+                && diagnostics.ambiguous_parity_edge_count
                        == diagnostics.targeted_retry_count
+                && diagnostics.ambiguous_label_changing_edge_count
+                       < diagnostics.targeted_retry_count
                 && diagnostics.targeted_retry_resolved_count
                        == diagnostics.targeted_retry_count
                 && diagnostics.targeted_retry_unsafe_count == 0
@@ -2446,11 +2651,12 @@ void test_nurbs_cartesian_targeted_retry()
                        .maximum_subdivision_depth_reached <= 4
                 && diagnostics.targeted_retry_intersections
                        .maximum_subdivision_depth_reached <= 6,
-            "N=128 torus resolves every ambiguous label-changing edge");
+            "N=128 torus resolves every ambiguous edge, including same-label edges");
 
     const auto dims = grid.dof_dims();
     std::size_t correction_safe_barriers = 0;
     std::size_t retried_edges = 0;
+    std::size_t retried_label_preserving_edges = 0;
     for (int k = 0; k < dims[2]; ++k) {
         for (int j = 0; j < dims[1]; ++j) {
             for (int i = 0; i < dims[0]; ++i) {
@@ -2467,8 +2673,11 @@ void test_nurbs_cartesian_targeted_retry()
                     if (info.used_targeted_retry) {
                         ++retried_edges;
                         require(info.root_count_known
-                                    && info.parity_known_from_roots,
-                                "targeted retry resolves root parity");
+                                    && info.parity_known_from_roots
+                                    && info.physical_events_certified,
+                                "targeted retry resolves the complete physical event sequence");
+                        if (!domain.has_barrier_between(node, neighbor))
+                            ++retried_label_preserving_edges;
                     }
                     if (!domain.has_barrier_between(node, neighbor))
                         continue;
@@ -2480,9 +2689,10 @@ void test_nurbs_cartesian_targeted_retry()
         }
     }
     require(retried_edges == diagnostics.targeted_retry_count
+                && retried_label_preserving_edges > 0
                 && correction_safe_barriers
                        == diagnostics.correction_safe_edge_count,
-            "retry and correction-safe diagnostics match edge records");
+            "retry includes label-preserving edges and diagnostics match records");
 }
 void test_nurbs_cartesian_input_contracts()
 {
@@ -3154,6 +3364,7 @@ int main()
 {
     try {
         test_native_models();
+        test_u_prism_geometry();
         test_native_surface_interval_topology();
         test_interval_topology_rejects_out_of_domain_endpoint();
         test_interval_topology_rejects_tiny_gap();
@@ -3181,6 +3392,8 @@ int main()
         test_direct_nurbs_point_classification();
         test_nurbs_cartesian_l_prism_labels();
         test_nurbs_cartesian_under_resolved_torus_uses_parity();
+        test_translated_torus_point_classification_uses_deep_retry();
+        test_rigid_torus_label_changing_edge_uses_final_retry();
         test_nurbs_cartesian_targeted_retry();
         test_nurbs_cartesian_input_contracts();
         test_nurbs_cartesian_multiple_components();

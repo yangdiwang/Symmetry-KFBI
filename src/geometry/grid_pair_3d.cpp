@@ -11,6 +11,7 @@
 #include <CGAL/Search_traits_adapter.h>
 #include <CGAL/Orthogonal_k_neighbor_search.h>
 #include <CGAL/property_map.h>
+#include <CGAL/version.h>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -20,8 +21,10 @@
 #include <array>
 #include <memory>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
+#include <variant>
 #include <boost/variant/get.hpp>
 
 namespace kfbim {
@@ -106,12 +109,107 @@ struct DistanceSample3D {
     int             component;
     int             panel = -1;
     Eigen::Vector3d barycentric = Eigen::Vector3d::Zero();
+    int             nurbs_patch = -1;
 };
 
 struct NearestResult3D {
     int    index = -1;
     double dist2 = std::numeric_limits<double>::infinity();
 };
+
+P2NativeEventOwnerCenterSelection3D
+select_p2_native_event_owner_center_3d(
+    const geometry3d::GridEdgeEvent3D& event,
+    const std::vector<int>& patch_g1_components,
+    const std::vector<P2NativeSheetCenterCandidate3D>& center_candidates,
+    double distance_tie_tolerance)
+{
+    if (!std::isfinite(distance_tie_tolerance)
+        || distance_tie_tolerance < 0.0) {
+        throw std::invalid_argument(
+            "native event owner-center tie tolerance must be finite and nonnegative");
+    }
+    if (!event.certified_transverse() || !event.point.allFinite()
+        || event.owners.empty()) {
+        throw std::invalid_argument(
+            "native event owner-center selection requires a certified owned event");
+    }
+    if (patch_g1_components.empty() || center_candidates.empty()) {
+        throw std::runtime_error(
+            "native event owner-center selection has no G1 sheet metadata");
+    }
+
+    P2NativeEventOwnerCenterSelection3D best;
+    double best_distance = std::numeric_limits<double>::infinity();
+    double best_transversality = -1.0;
+    int best_owner_patch = std::numeric_limits<int>::max();
+    double best_owner_u = std::numeric_limits<double>::infinity();
+    double best_owner_v = std::numeric_limits<double>::infinity();
+    int best_center_index = std::numeric_limits<int>::max();
+
+    for (int owner_index = 0;
+         owner_index < static_cast<int>(event.owners.size()); ++owner_index) {
+        const geometry3d::NurbsSurfaceRootOwner3D& owner =
+            event.owners[static_cast<std::size_t>(owner_index)];
+        if (owner.patch_index < 0
+            || owner.patch_index
+                   >= static_cast<int>(patch_g1_components.size())
+            || !owner.point.allFinite()
+            || !std::isfinite(owner.u) || !std::isfinite(owner.v)
+            || !std::isfinite(owner.transversality)) {
+            throw std::invalid_argument(
+                "native event owner-center selection received an invalid owner");
+        }
+        const int owner_sheet = patch_g1_components[
+            static_cast<std::size_t>(owner.patch_index)];
+        for (int candidate_index = 0;
+             candidate_index < static_cast<int>(center_candidates.size());
+             ++candidate_index) {
+            const P2NativeSheetCenterCandidate3D& center =
+                center_candidates[static_cast<std::size_t>(candidate_index)];
+            if (center.center_index < 0 || center.panel_index < 0
+                || center.nurbs_patch_index < 0
+                || center.nurbs_patch_index
+                       >= static_cast<int>(patch_g1_components.size())
+                || !center.point.allFinite()) {
+                throw std::invalid_argument(
+                    "native event owner-center selection received an invalid center");
+            }
+            if (patch_g1_components[static_cast<std::size_t>(
+                    center.nurbs_patch_index)] != owner_sheet) {
+                continue;
+            }
+            const double distance = (center.point - event.point).norm();
+            const bool closer = distance
+                < best_distance - distance_tie_tolerance;
+            const bool tied = std::abs(distance - best_distance)
+                <= distance_tie_tolerance;
+            const bool more_transverse = tied
+                && owner.transversality > best_transversality;
+            const bool same_transversality = tied
+                && owner.transversality == best_transversality;
+            const bool stable_owner = same_transversality
+                && std::tie(owner.patch_index, owner.u, owner.v,
+                            center.center_index)
+                     < std::tie(best_owner_patch, best_owner_u, best_owner_v,
+                                best_center_index);
+            if (!closer && !more_transverse && !stable_owner)
+                continue;
+            best = {owner_index, candidate_index};
+            best_distance = distance;
+            best_transversality = owner.transversality;
+            best_owner_patch = owner.patch_index;
+            best_owner_u = owner.u;
+            best_owner_v = owner.v;
+            best_center_index = center.center_index;
+        }
+    }
+    if (best.owner_index < 0) {
+        throw std::runtime_error(
+            "native grid-edge event has no P2 expansion center on any owner G1 sheet");
+    }
+    return best;
+}
 
 static std::vector<int> point_components_3d(const Interface3D& iface)
 {
@@ -162,7 +260,8 @@ static std::vector<DistanceSample3D> distance_samples_3d(const Interface3D& ifac
 }
 
 static std::vector<DistanceSample3D> p2_expansion_center_samples_3d(
-    const Interface3D& iface)
+    const Interface3D& iface,
+    const std::vector<int>& panel_nurbs_patches)
 {
     if (iface.points_per_panel() != 6
         || iface.panel_node_layout() != PanelNodeLayout3D::QuadraticLagrange) {
@@ -175,12 +274,15 @@ static std::vector<DistanceSample3D> p2_expansion_center_samples_3d(
     samples.reserve(center_bary.size()
                     * static_cast<std::size_t>(iface.num_panels()));
     for (int p = 0; p < iface.num_panels(); ++p) {
+        const int nurbs_patch = panel_nurbs_patches.empty()
+            ? -1 : panel_nurbs_patches[static_cast<std::size_t>(p)];
         for (const Eigen::Vector3d& bary : center_bary) {
             samples.push_back({geometry3d::panel_point(iface, p, bary),
                                geometry3d::panel_oriented_normal(iface, p, bary),
                                iface.panel_components()[p],
                                p,
-                               bary});
+                               bary,
+                               nurbs_patch});
         }
     }
     return samples;
@@ -603,6 +705,11 @@ static void verify_native_label_crossing_invariant(
 // ============================================================================
 // Pimpl
 // ============================================================================
+struct P2G1SheetCenterCloud3D {
+    std::vector<int> global_center_indices;
+    std::unique_ptr<NearestPointCloud3D> cloud;
+};
+
 struct GridPair3D::Impl {
     std::vector<int>    closest_bulk_node;
     std::vector<int>    closest_iface_pt;
@@ -612,6 +719,9 @@ struct GridPair3D::Impl {
     std::vector<DistanceSample3D> p2_center_samples;
     std::unique_ptr<PointSpatialHash3D> p2_center_hash;
     std::unique_ptr<NearestPointCloud3D> p2_center_cloud;
+    std::unordered_map<int, P2G1SheetCenterCloud3D>
+        p2_centers_by_g1_sheet;
+    bool has_native_panel_patch_metadata = false;
     std::vector<int> nearest_p2_center_for_node;
     std::vector<int> owner_p2_center_for_point;
     double p2_center_cache_radius = -1.0;
@@ -656,6 +766,17 @@ GridPair3D::GridPair3D(
     const Interface3D& iface,
     const Interface3D& crossing_geometry,
     std::shared_ptr<const geometry3d::NurbsCartesianDomain3D> nurbs_domain)
+    : GridPair3D(
+          grid, iface, crossing_geometry, std::move(nurbs_domain), {})
+{
+}
+
+GridPair3D::GridPair3D(
+    const CartesianGrid3D& grid,
+    const Interface3D& iface,
+    const Interface3D& crossing_geometry,
+    std::shared_ptr<const geometry3d::NurbsCartesianDomain3D> nurbs_domain,
+    std::vector<int> correction_panel_nurbs_patches)
     : grid_(grid)
     , interface_(iface)
     , crossing_geometry_(crossing_geometry)
@@ -665,6 +786,42 @@ GridPair3D::GridPair3D(
     if (nurbs_domain_ && !nurbs_domain_->is_compatible_grid(grid_)) {
         throw std::invalid_argument(
             "GridPair3D native NURBS domain grid does not match the supplied Cartesian grid");
+    }
+    if (!correction_panel_nurbs_patches.empty()) {
+        if (!nurbs_domain_) {
+            throw std::invalid_argument(
+                "GridPair3D panel-to-NURBS metadata requires a native domain");
+        }
+        if (correction_panel_nurbs_patches.size()
+            != static_cast<std::size_t>(iface.num_panels())) {
+            throw std::invalid_argument(
+                "GridPair3D panel-to-NURBS metadata does not match the correction panels");
+        }
+        const std::vector<int>& patch_g1_components =
+            nurbs_domain_->patch_g1_components();
+        std::unordered_map<int, int> g1_to_interface_group;
+        std::unordered_map<int, int> interface_group_to_g1;
+        for (int panel = 0; panel < iface.num_panels(); ++panel) {
+            const int patch = correction_panel_nurbs_patches[
+                static_cast<std::size_t>(panel)];
+            if (patch < 0
+                || patch >= static_cast<int>(patch_g1_components.size())) {
+                throw std::invalid_argument(
+                    "GridPair3D panel-to-NURBS metadata contains an invalid patch");
+            }
+            const int g1 = patch_g1_components[static_cast<std::size_t>(patch)];
+            const int interface_group = iface.panel_smooth_groups()[panel];
+            const auto first = g1_to_interface_group.emplace(
+                g1, interface_group);
+            const auto second = interface_group_to_g1.emplace(
+                interface_group, g1);
+            if ((!first.second && first.first->second != interface_group)
+                || (!second.second && second.first->second != g1)) {
+                throw std::invalid_argument(
+                    "GridPair3D panel smooth groups disagree with native G1 topology");
+            }
+        }
+        impl_->has_native_panel_patch_metadata = true;
     }
     const bool profile = profile_grid_pair_3d();
     const ProfileClock3D::time_point t_total_start = ProfileClock3D::now();
@@ -750,13 +907,38 @@ GridPair3D::GridPair3D(
             impl_->crossing_tree->accelerate_distance_queries();
         }
 
-        impl_->p2_center_samples = p2_expansion_center_samples_3d(iface);
+        impl_->p2_center_samples = p2_expansion_center_samples_3d(
+            iface, correction_panel_nurbs_patches);
         const std::vector<Eigen::Vector3d> p2_center_points =
             sample_points_for_hash(impl_->p2_center_samples);
         impl_->p2_center_hash = std::make_unique<PointSpatialHash3D>(
             p2_center_points, max_grid_spacing(grid));
         impl_->p2_center_cloud = std::make_unique<NearestPointCloud3D>(
             p2_center_points);
+        if (impl_->has_native_panel_patch_metadata) {
+            const std::vector<int>& patch_g1_components =
+                nurbs_domain_->patch_g1_components();
+            for (int center = 0;
+                 center < static_cast<int>(impl_->p2_center_samples.size());
+                 ++center) {
+                const int patch = impl_->p2_center_samples[
+                    static_cast<std::size_t>(center)].nurbs_patch;
+                const int g1 = patch_g1_components[
+                    static_cast<std::size_t>(patch)];
+                impl_->p2_centers_by_g1_sheet[g1].global_center_indices.
+                    push_back(center);
+            }
+            for (auto& entry : impl_->p2_centers_by_g1_sheet) {
+                std::vector<Eigen::Vector3d> points;
+                points.reserve(entry.second.global_center_indices.size());
+                for (int center : entry.second.global_center_indices) {
+                    points.push_back(impl_->p2_center_samples[
+                        static_cast<std::size_t>(center)].point);
+                }
+                entry.second.cloud =
+                    std::make_unique<NearestPointCloud3D>(points);
+            }
+        }
         impl_->nearest_p2_center_for_node.resize(N, -1);
         impl_->owner_p2_center_for_point.resize(Nq, -1);
         std::vector<double> owner_center_dist2(
@@ -1042,6 +1224,16 @@ P2CrossingOwner3D GridPair3D::p2_crossing_owner_between(int a, int b) const {
         const auto intersection =
             impl_->crossing_tree->any_intersection(segment);
         if (intersection) {
+#if CGAL_VERSION_MAJOR >= 6
+            if (const CPoint3* point =
+                    std::get_if<CPoint3>(&(intersection->first))) {
+                hit = to_eigen(*point);
+            } else if (const CSegment3* overlap =
+                           std::get_if<CSegment3>(&(intersection->first))) {
+                hit = 0.5 * (to_eigen(overlap->source())
+                           + to_eigen(overlap->target()));
+            }
+#else
             if (const CPoint3* point =
                     boost::get<CPoint3>(&(intersection->first))) {
                 hit = to_eigen(*point);
@@ -1050,6 +1242,7 @@ P2CrossingOwner3D GridPair3D::p2_crossing_owner_between(int a, int b) const {
                 hit = 0.5 * (to_eigen(overlap->source())
                            + to_eigen(overlap->target()));
             }
+#endif
             face = intersection->second;
             owner.status = P2CrossingOwnerStatus3D::ExactIntersection;
         } else {
@@ -1080,6 +1273,122 @@ P2CrossingOwner3D GridPair3D::p2_crossing_owner_between(int a, int b) const {
 
 }
 
+P2CrossingOwner3D GridPair3D::p2_crossing_owner_for_grid_edge_event(
+    const geometry3d::GridEdgeEventId3D& event_id) const
+{
+    if (!nurbs_domain_) {
+        throw std::runtime_error(
+            "event-specific crossing ownership requires a native NURBS domain");
+    }
+    if (impl_->p2_center_samples.empty()) {
+        throw std::runtime_error(
+            "event-specific crossing ownership requires P2 QuadraticLagrange panels");
+    }
+    if (event_id.first_node < 0
+        || event_id.first_node >= grid_.num_dofs()
+        || event_id.second_node < 0
+        || event_id.second_node >= grid_.num_dofs()
+        || event_id.first_node >= event_id.second_node
+        || event_id.ordinal < 0) {
+        throw std::out_of_range(
+            "invalid canonical native grid-edge event id");
+    }
+
+    const std::vector<geometry3d::GridEdgeEventView3D> views =
+        nurbs_domain_->grid_edge_events_between(
+            event_id.first_node, event_id.second_node);
+    const geometry3d::GridEdgeEvent3D* event = nullptr;
+    for (const geometry3d::GridEdgeEventView3D& view : views) {
+        if (view.id() == event_id) {
+            event = &view.canonical_event();
+            break;
+        }
+    }
+    if (event == nullptr) {
+        throw std::runtime_error(
+            "native grid-edge event id is absent from the domain catalog");
+    }
+    if (!event->certified_transverse()) {
+        throw std::runtime_error(
+            "event-specific crossing ownership rejects an uncertified event");
+    }
+    if (event->owners.empty()) {
+        throw std::logic_error(
+            "certified native grid-edge event has no NURBS owner");
+    }
+
+    if (!impl_->has_native_panel_patch_metadata) {
+        throw std::runtime_error(
+            "event-specific native ownership requires panel-to-NURBS patch metadata; refusing an uncertified mixed-sheet owner");
+    }
+    const std::vector<int>& patch_g1_components =
+        nurbs_domain_->patch_g1_components();
+    std::vector<P2NativeSheetCenterCandidate3D> candidates;
+    candidates.reserve(event->owners.size());
+    for (const geometry3d::NurbsSurfaceRootOwner3D& owner : event->owners) {
+        if (owner.patch_index < 0
+            || owner.patch_index
+                   >= static_cast<int>(patch_g1_components.size())) {
+            throw std::logic_error(
+                "native grid-edge event contains an invalid NURBS owner patch");
+        }
+        const int g1 = patch_g1_components[
+            static_cast<std::size_t>(owner.patch_index)];
+        const auto sheet = impl_->p2_centers_by_g1_sheet.find(g1);
+        if (sheet == impl_->p2_centers_by_g1_sheet.end()
+            || !sheet->second.cloud
+            || sheet->second.global_center_indices.empty()) {
+            continue;
+        }
+        const int local_center = sheet->second.cloud->nearest_stable(
+            event->point);
+        if (local_center < 0
+            || local_center >= static_cast<int>(
+                   sheet->second.global_center_indices.size())) {
+            throw std::logic_error(
+                "native G1 sheet center index is outside its lookup table");
+        }
+        const int center = sheet->second.global_center_indices[
+            static_cast<std::size_t>(local_center)];
+        const DistanceSample3D& sample = impl_->p2_center_samples[
+            static_cast<std::size_t>(center)];
+        candidates.push_back({
+            center, sample.panel, sample.nurbs_patch, sample.point});
+    }
+    const P2NativeEventOwnerCenterSelection3D selection =
+        select_p2_native_event_owner_center_3d(
+            *event, patch_g1_components, candidates,
+            std::max(nurbs_domain_->geometry_tolerance(), 1.0e-14));
+    const P2NativeSheetCenterCandidate3D& selected_center =
+        candidates[static_cast<std::size_t>(
+            selection.center_candidate_index)];
+    const int center_index = selected_center.center_index;
+    const DistanceSample3D& sample = impl_->p2_center_samples[
+        static_cast<std::size_t>(center_index)];
+    const geometry3d::NurbsSurfaceRootOwner3D& nurbs_owner =
+        event->owners[static_cast<std::size_t>(selection.owner_index)];
+    if (patch_g1_components[static_cast<std::size_t>(
+            nurbs_owner.patch_index)]
+        != patch_g1_components[static_cast<std::size_t>(
+            sample.nurbs_patch)]) {
+        throw std::logic_error(
+            "native event owner and P2 expansion center escaped their selected G1 sheet");
+    }
+    P2CrossingOwner3D owner;
+    owner.center_index = center_index;
+    owner.panel_index = sample.panel;
+    owner.edge_parameter = event->canonical_parameter;
+    owner.barycentric = sample.barycentric;
+    owner.nurbs_patch_index = nurbs_owner.patch_index;
+    owner.nurbs_parameter = {nurbs_owner.u, nurbs_owner.v};
+    owner.crossing_point = event->point;
+    owner.crossing_normal = nurbs_owner.normal;
+    owner.surface_component = event->component;
+    owner.crossing_residual = nurbs_owner.residual;
+    owner.status = P2CrossingOwnerStatus3D::ExactIntersection;
+    return owner;
+}
+
 int GridPair3D::nearest_p2_expansion_center_between(int a, int b) const {
     return p2_crossing_owner_between(a, b).center_index;
 }
@@ -1103,6 +1412,12 @@ int GridPair3D::domain_label(int n) const {
 bool GridPair3D::has_nurbs_domain() const noexcept
 {
     return static_cast<bool>(nurbs_domain_);
+}
+
+const geometry3d::NurbsCartesianDomain3D*
+GridPair3D::nurbs_cartesian_domain() const noexcept
+{
+    return nurbs_domain_.get();
 }
 
 const geometry3d::NurbsCartesianDomainDiagnostics3D&

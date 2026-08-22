@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -53,30 +54,11 @@ std::vector<P2CrossingOwner3D> build_crossing_owners_for_spread_3d(
     const LaplaceCorrectionSupport3D& support)
 {
     std::vector<P2CrossingOwner3D> owners(support.crossing_ops.size());
-    std::unordered_map<std::uint64_t, P2CrossingOwner3D>
-        owner_by_undirected_edge;
-    owner_by_undirected_edge.reserve(support.crossing_ops.size());
     for (std::size_t op_idx = 0; op_idx < support.crossing_ops.size();
          ++op_idx) {
         const LaplaceCrossingCorrectionOp& op =
             support.crossing_ops[op_idx];
-        const std::uint32_t lo = static_cast<std::uint32_t>(
-            std::min(op.rhs_node, op.correction_node));
-        const std::uint32_t hi = static_cast<std::uint32_t>(
-            std::max(op.rhs_node, op.correction_node));
-        const std::uint64_t key =
-            (static_cast<std::uint64_t>(lo) << 32)
-            | static_cast<std::uint64_t>(hi);
-        const auto found = owner_by_undirected_edge.find(key);
-        if (found != owner_by_undirected_edge.end()) {
-            owners[op_idx] = found->second;
-            continue;
-        }
-        const P2CrossingOwner3D owner =
-            grid_pair.p2_crossing_owner_between(
-            op.rhs_node, op.correction_node);
-        owner_by_undirected_edge.emplace(key, owner);
-        owners[op_idx] = owner;
+        owners[op_idx] = laplace_crossing_owner_3d(grid_pair, op);
     }
     return owners;
 }
@@ -85,9 +67,18 @@ Eigen::Vector3d crossing_point(const CartesianGrid3D& grid,
                                const LaplaceCrossingCorrectionOp& op,
                                const P2CrossingOwner3D& owner)
 {
+    if (owner.status == P2CrossingOwnerStatus3D::ExactIntersection
+        && owner.crossing_point.allFinite()) {
+        return owner.crossing_point;
+    }
     const Eigen::Vector3d a = node_coord(grid, op.rhs_node);
     const Eigen::Vector3d b = node_coord(grid, op.correction_node);
-    const double t = std::max(0.0, std::min(1.0, owner.edge_parameter));
+    double parameter = owner.edge_parameter;
+    if (has_grid_edge_event_3d(op)
+        && op.rhs_node == op.grid_edge_event.second_node) {
+        parameter = 1.0 - parameter;
+    }
+    const double t = std::max(0.0, std::min(1.0, parameter));
     return a + t * (b - a);
 }
 
@@ -113,6 +104,17 @@ LaplaceQuadraticPatchCenterSpread3D::LaplaceQuadraticPatchCenterSpread3D(
     if (projection_restrict_stencil_radius_ < 1)
         throw std::invalid_argument(
             "LaplaceQuadraticPatchCenterSpread3D projection restrict stencil radius must be positive");
+    if (correction_method_ == LaplaceCorrectionMethod3D::ProjectionPoint) {
+        std::set<std::pair<int, int>> seen_edges;
+        for (const geometry3d::GridEdgeEvent3D& event
+             : support_.certified_grid_edge_events) {
+            if (!seen_edges.emplace(
+                    event.id.first_node, event.id.second_node).second) {
+                throw std::runtime_error(
+                    "projection-point spread does not provide event-specific multi-root continuation");
+            }
+        }
+    }
     if (correction_method_ == LaplaceCorrectionMethod3D::ProjectionPoint) {
         projection_cache_ =
             project_p2_grid_nodes_to_interface_3d(grid_pair_, support_.projection_nodes);
@@ -205,8 +207,7 @@ LaplaceSpreadResult3D LaplaceQuadraticPatchCenterSpread3D::apply(
             const P2CrossingOwner3D owner =
                 op_idx < crossing_owners_.size()
                     ? crossing_owners_[op_idx]
-                    : grid_pair_.p2_crossing_owner_between(
-                          op.rhs_node, op.correction_node);
+                    : laplace_crossing_owner_3d(grid_pair_, op);
             if (owner.center_index < 0)
                 continue;
             const Eigen::Vector3d hit = crossing_point(grid, op, owner);

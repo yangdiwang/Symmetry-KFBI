@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -14,6 +15,20 @@
 
 namespace kfbim {
 
+enum class LaplaceNeumannExteriorRestrictMethod2D {
+    SixPointQuadratic,
+    JointBiquadraticQuadraticCrossingOwner,
+    JointBiquadraticQuadraticCenterCauchyJump,
+    JointSixPointQuadraticInterfaceJump,
+    JointSixPointQuadraticGridEdgeInterfaceJump,
+    JointSixPointQuadraticGridEdgeSharedSidePolynomialInterfaceJump,
+    JointSixPointQuadraticCenterCauchyJump,
+    JointBiquadraticQuadraticVirtualSideFlip,
+    UnifiedSpatialNormalP2CrossingOwner,
+    UnifiedSpatialNormalP2DofCauchyExterior,
+    JointBicubicCubicCrossingOwner
+};
+
 // Options for the harmonic interior Neumann formulation whose unknown is the
 // interior Dirichlet trace f and whose physical residual is the exterior
 // Dirichlet trace.  This first 2D implementation intentionally has no corner
@@ -22,6 +37,40 @@ struct LaplaceNeumannExteriorTraceOptions2D {
     int restrict_stencil_radius = 2;
     LaplaceCorrectionMethod2D correction_method =
         LaplaceCorrectionMethod2D::NearestExpansionCenter;
+    LaplaceP2PanelCenterSpreadMode2D spread_mode =
+        LaplaceP2PanelCenterSpreadMode2D::QuadraticCauchy;
+    LaplaceP2CubicHarmonicSpreadOptions2D cubic_harmonic_spread;
+    LaplaceCrossingJetScheme2D crossing_jet_scheme =
+        LaplaceCrossingJetScheme2D::ArcLengthBSplineCrossingJet;
+    LaplaceNeumannExteriorRestrictMethod2D restrict_method =
+        LaplaceNeumannExteriorRestrictMethod2D::SixPointQuadratic;
+    LaplaceP2JointCubicRestrictOptions2D joint_cubic_restrict;
+    LaplaceP2JointPolynomialRestrictOptions2D joint_quadratic_restrict =
+        make_laplace_p2_joint_quadratic_restrict_options_2d();
+    LaplaceP2JointPolynomialRestrictOptions2D
+        joint_quadratic_center_cauchy_jump_restrict =
+            make_laplace_p2_joint_quadratic_center_cauchy_jump_options_2d();
+    LaplaceP2JointPolynomialRestrictOptions2D
+        joint_six_point_quadratic_interface_jump_restrict =
+            make_laplace_p2_joint_quadratic_cross_stencil_interface_jump_options_2d();
+    LaplaceP2JointPolynomialRestrictOptions2D
+        joint_six_point_quadratic_grid_edge_interface_jump_restrict =
+            make_laplace_p2_joint_quadratic_grid_edge_cross_stencil_interface_jump_options_2d();
+    LaplaceP2JointPolynomialRestrictOptions2D
+        joint_six_point_quadratic_grid_edge_shared_side_polynomial_interface_jump_restrict =
+            make_laplace_p2_joint_quadratic_grid_edge_shared_side_polynomial_interface_jump_options_2d();
+    LaplaceP2JointPolynomialRestrictOptions2D
+        joint_six_point_quadratic_center_cauchy_jump_restrict =
+            make_laplace_p2_joint_quadratic_cross_stencil_center_cauchy_jump_options_2d();
+    LaplaceP2JointPolynomialRestrictOptions2D
+        joint_quadratic_virtual_side_flip_restrict =
+            make_laplace_p2_joint_quadratic_virtual_side_flip_options_2d();
+    LaplaceP2JointPolynomialRestrictOptions2D
+        unified_spatial_normal_p2_dof_cauchy_exterior_restrict =
+            make_laplace_p2_dof_cauchy_exterior_restrict_options_2d();
+    LaplaceP2JointPolynomialRestrictOptions2D
+        unified_spatial_normal_p2_crossing_owner_restrict =
+            make_laplace_p2_unified_spatial_normal_restrict_options_2d();
 
     // Empty means every interface point.  If a subset is supplied, every P2
     // panel point must be active and every inactive metadata point must have
@@ -149,6 +198,25 @@ public:
         return normalized_weights_;
     }
     const Eigen::VectorXd& border_column() const { return border_column_; }
+    LaplaceNeumannExteriorRestrictMethod2D restrict_method() const {
+        return restrict_method_;
+    }
+    LaplaceP2PanelCenterSpreadMode2D spread_mode() const {
+        return spread_.spread_mode();
+    }
+    double cubic_harmonic_spread_max_condition() const {
+        return spread_.cubic_harmonic_max_condition();
+    }
+    const LaplaceP2JointPolynomialRestrictDiagnostics2D*
+    joint_polynomial_restrict_diagnostics() const {
+        return joint_polynomial_restrict_op_
+            ? &joint_polynomial_restrict_op_->diagnostics()
+            : nullptr;
+    }
+    const LaplaceP2JointCubicRestrictDiagnostics2D*
+    joint_cubic_restrict_diagnostics() const {
+        return joint_polynomial_restrict_diagnostics();
+    }
 
 private:
     struct JumpFieldResult2D {
@@ -162,12 +230,16 @@ private:
     Eigen::VectorXd expand_active(const Eigen::VectorXd& values) const;
     JumpFieldResult2D evaluate_jump(const Eigen::VectorXd& value_jump,
                                     const Eigen::VectorXd& normal_jump,
+                                    LaplaceCrossingTraceStencil2D trace_stencil,
                                     bool recover_exterior_virtual = false) const;
 
     GridPair2D grid_pair_;
     LaplaceQuadraticPanelCenterSpread2D spread_;
     LaplaceFftBulkSolverZfft2D bulk_solver_;
     LaplaceQuadraticPanelCenterRestrict2D restrict_op_;
+    LaplaceNeumannExteriorRestrictMethod2D restrict_method_;
+    std::unique_ptr<LaplaceP2CrossingOwnerJointPolynomialRestrict2D>
+        joint_polynomial_restrict_op_;
 
     std::vector<int> active_interface_points_;
     std::vector<int> iface_to_active_;

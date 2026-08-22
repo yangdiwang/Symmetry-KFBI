@@ -13,8 +13,10 @@ using kfbim::app3d::RigidStudyCriterionStatus3D;
 using kfbim::app3d::combine_rigid_study_criteria_3d;
 using kfbim::app3d::make_l_prism_dirichlet_rigid_study_cases_3d;
 using kfbim::app3d::manufactured_harmonic_gradient_3d;
+using kfbim::app3d::manufactured_harmonic_hessian_3d;
 using kfbim::app3d::manufactured_harmonic_value_3d;
 using kfbim::app3d::transformed_manufactured_harmonic_gradient_3d;
+using kfbim::app3d::transformed_manufactured_harmonic_hessian_3d;
 using kfbim::app3d::transformed_manufactured_harmonic_value_3d;
 
 constexpr double kDegreesToRadians =
@@ -92,6 +94,14 @@ void test_transformed_harmonic_data_are_covariant()
                      item.transform.forward_vector(
                          manufactured_harmonic_gradient_3d(point))).norm() < 2.0e-14,
                     "transformed harmonic gradient is not covariant");
+            const Eigen::Matrix3d expected_hessian =
+                item.transform.rotation()
+                * manufactured_harmonic_hessian_3d(point)
+                * item.transform.rotation().transpose();
+            require((transformed_manufactured_harmonic_hessian_3d(
+                         item.transform, moved) - expected_hessian)
+                            .norm() < 3.0e-14,
+                    "transformed harmonic Hessian is not covariant");
         }
 
     }

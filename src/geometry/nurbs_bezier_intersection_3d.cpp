@@ -719,6 +719,14 @@ NativeNewtonOutcome native_newton(
     state = clamp_to_box(state);
     outcome.best_state = {state.x(), state.y(), state.z()};
 
+    // The geometric acceptance tolerance is intentionally looser than the
+    // parameter tolerance used to identify roots returned by independent
+    // seeds and neighboring query elements.  Stopping at the first accepted
+    // residual can therefore leave two approximations of the same transverse
+    // root farther apart in t than the deduplication tolerance.  Once a valid
+    // root has been found, keep Newton polishing it down to roundoff.  If a
+    // polishing step cannot improve the residual, retain the already valid
+    // root instead of turning a resolved intersection into a failure.
     for (int iteration = 0; iteration <= options.max_newton_iterations;
          ++iteration) {
         const NurbsSurfaceDerivatives3D derivatives =
@@ -759,7 +767,16 @@ NativeNewtonOutcome native_newton(
             root.reliable_transversality_tolerance =
                 reliable_transversality_tolerance(box, frame, options);
             outcome.root = std::move(root);
-            return outcome;
+            const double refinement_scale = std::max(
+                {1.0, derivatives.point.norm(), segment_point.norm(),
+                 frame.length});
+            const double refinement_tolerance =
+                64.0 * std::numeric_limits<double>::epsilon()
+                * refinement_scale;
+            if (residual <= refinement_tolerance
+                || iteration == options.max_newton_iterations) {
+                return outcome;
+            }
         }
         if (iteration == options.max_newton_iterations)
             break;
@@ -770,11 +787,15 @@ NativeNewtonOutcome native_newton(
         jacobian.col(2) = -frame.delta;
         Eigen::FullPivLU<Eigen::Matrix3d> factorization(jacobian);
         if (factorization.rank() < 3) {
+            if (outcome.root)
+                return outcome;
             outcome.ill_conditioned = true;
             return outcome;
         }
         const Eigen::Vector3d step = factorization.solve(-residual_vector);
         if (!step.allFinite()) {
+            if (outcome.root)
+                return outcome;
             outcome.ill_conditioned = true;
             return outcome;
         }
@@ -796,7 +817,9 @@ NativeNewtonOutcome native_newton(
                      - (frame.start + candidate.z() * frame.delta)).norm();
                 if (std::isfinite(candidate_residual)
                     && (candidate_residual < residual
-                        || candidate_residual <= options.geometry_tolerance)) {
+                        || (!outcome.root
+                            && candidate_residual
+                                   <= options.geometry_tolerance))) {
                     state = candidate;
                     accepted = true;
                     break;
@@ -805,10 +828,14 @@ NativeNewtonOutcome native_newton(
             step_scale *= 0.5;
         }
         if (!accepted) {
+            if (outcome.root)
+                return outcome;
             outcome.ill_conditioned = true;
             return outcome;
         }
     }
+    if (outcome.root)
+        return outcome;
     outcome.ill_conditioned = true;
     return outcome;
 }
@@ -1834,6 +1861,27 @@ NurbsElementIntersectionResult3D intersect_nurbs_bezier_element_3d(
             continue;
         }
 
+        const auto mark_unresolved = [&]() {
+            checked_increment_diagnostic(
+                result.diagnostics.unresolved_boxes,
+                "NURBS unresolved-box diagnostic overflow");
+            const double projection_scale = std::max({
+                1.0,
+                frame.length,
+                std::abs(ranges.longitudinal_min),
+                std::abs(ranges.longitudinal_max)});
+            const double pad =
+                8.0 * options.geometry_tolerance
+                + 64.0 * std::numeric_limits<double>::epsilon()
+                      * projection_scale;
+            result.diagnostics.unresolved_longitudinal_intervals.push_back({{
+                std::nextafter(
+                    ranges.longitudinal_min - pad,
+                    -std::numeric_limits<double>::infinity()),
+                std::nextafter(
+                    ranges.longitudinal_max + pad,
+                    std::numeric_limits<double>::infinity())}});
+        };
         const auto classify_terminal_box = [&]() {
             run_closest();
             const double contact_tolerance =
@@ -1843,9 +1891,7 @@ NurbsElementIntersectionResult3D intersect_nurbs_bezier_element_3d(
                 checked_increment_diagnostic(
                     result.diagnostics.closest_point_failures,
                     "NURBS closest-point failure diagnostic overflow");
-                checked_increment_diagnostic(
-                    result.diagnostics.unresolved_boxes,
-                    "NURBS unresolved-box diagnostic overflow");
+                mark_unresolved();
                 return;
             }
             if (closest_result->distance > contact_tolerance) {
@@ -1856,9 +1902,7 @@ NurbsElementIntersectionResult3D intersect_nurbs_bezier_element_3d(
                             - closest_result->segment_point,
                         options.geometry_tolerance,
                         result.diagnostics)) {
-                    checked_increment_diagnostic(
-                        result.diagnostics.unresolved_boxes,
-                        "NURBS unresolved-box diagnostic overflow");
+                    mark_unresolved();
                 } else {
                     checked_increment_diagnostic(
                         result.diagnostics.terminal_misses_by_closest_point,
@@ -1874,9 +1918,7 @@ NurbsElementIntersectionResult3D intersect_nurbs_bezier_element_3d(
                 checked_increment_diagnostic(
                     result.diagnostics.closest_point_failures,
                     "NURBS closest-point failure diagnostic overflow");
-                checked_increment_diagnostic(
-                    result.diagnostics.unresolved_boxes,
-                    "NURBS unresolved-box diagnostic overflow");
+                mark_unresolved();
                 return;
             }
             box_root = *closest_root;
@@ -1893,9 +1935,7 @@ NurbsElementIntersectionResult3D intersect_nurbs_bezier_element_3d(
                     result.diagnostics)) {
                 return;
             }
-            checked_increment_diagnostic(
-                result.diagnostics.unresolved_boxes,
-                "NURBS unresolved-box diagnostic overflow");
+            mark_unresolved();
         };
 
         if (current.depth >= options.max_subdivision_depth) {

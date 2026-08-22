@@ -147,6 +147,15 @@ LaplacePotentialEvalResult2D LaplacePotentialEval2D::evaluate(
     const std::vector<LaplaceJumpData2D>& jumps,
     const Eigen::VectorXd&                f_bulk) const
 {
+    return evaluate(
+        jumps, f_bulk, spread_.crossing_trace_stencil());
+}
+
+LaplacePotentialEvalResult2D LaplacePotentialEval2D::evaluate(
+    const std::vector<LaplaceJumpData2D>& jumps,
+    const Eigen::VectorXd&                f_bulk,
+    LaplaceCrossingTraceStencil2D         trace_stencil) const
+{
     const auto& iface = spread_.grid_pair().interface();
     const int   Nq    = iface.num_points();
     const int   n_dof = spread_.grid_pair().grid().num_dofs();
@@ -180,7 +189,8 @@ LaplacePotentialEvalResult2D LaplacePotentialEval2D::evaluate(
         stage_start = stage_end;
     }
 
-    auto spread_result = spread_.apply(jumps, rhs);
+    auto spread_result = spread_.apply_with_crossing_trace_stencil(
+        jumps, rhs, trace_stencil);
     if (profile) {
         const auto stage_end = ProfileClock2D::now();
         t_spread = profile_elapsed_2d(stage_start, stage_end);

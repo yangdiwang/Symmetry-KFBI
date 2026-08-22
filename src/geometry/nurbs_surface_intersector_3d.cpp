@@ -709,14 +709,77 @@ private:
     std::vector<int> parents_;
 };
 
+NurbsSurfaceRootOwner3D root_owner(
+    const NurbsSurfaceCrossing3D& root)
+{
+    NurbsSurfaceRootOwner3D owner;
+    owner.patch_index = root.patch_index;
+    owner.u = root.u;
+    owner.v = root.v;
+    owner.point = root.point;
+    owner.normal = root.normal;
+    owner.residual = root.residual;
+    owner.transversality = root.transversality;
+    owner.feature_edge_contact = root.feature_edge_contact;
+    owner.reliable_transversality_tolerance =
+        root.reliable_transversality_tolerance;
+    return owner;
+}
+
+void initialize_root_owners(NurbsSurfaceCrossing3D& root)
+{
+    if (root.owners.empty())
+        root.owners.push_back(root_owner(root));
+}
+
+void append_distinct_root_owners(
+    NurbsSurfaceCrossing3D& target,
+    const NurbsSurfaceCrossing3D& source,
+    const NurbsSurfaceModel3D& model)
+{
+    initialize_root_owners(target);
+    std::vector<NurbsSurfaceRootOwner3D> source_owners = source.owners;
+    if (source_owners.empty())
+        source_owners.push_back(root_owner(source));
+    for (const NurbsSurfaceRootOwner3D& candidate : source_owners) {
+        const double uv_tolerance = parameter_tolerance(
+            model.patch(candidate.patch_index));
+        const auto duplicate = std::find_if(
+            target.owners.begin(), target.owners.end(),
+            [&](const NurbsSurfaceRootOwner3D& existing) {
+                return existing.patch_index == candidate.patch_index
+                    && std::abs(existing.u - candidate.u) <= uv_tolerance
+                    && std::abs(existing.v - candidate.v) <= uv_tolerance;
+            });
+        if (duplicate == target.owners.end()) {
+            target.owners.push_back(candidate);
+        } else if (candidate.residual < duplicate->residual) {
+            *duplicate = candidate;
+        }
+    }
+    std::sort(
+        target.owners.begin(), target.owners.end(),
+        [](const NurbsSurfaceRootOwner3D& first,
+           const NurbsSurfaceRootOwner3D& second) {
+            if (first.patch_index != second.patch_index)
+                return first.patch_index < second.patch_index;
+            if (first.u != second.u)
+                return first.u < second.u;
+            return first.v < second.v;
+        });
+}
+
 std::vector<NurbsSurfaceCrossing3D> canonicalize_roots(
     std::vector<NurbsSurfaceCrossing3D> roots,
     const NurbsSurfaceModel3D& model,
     double geometry_tolerance,
     double segment_length,
     NurbsSurfaceIntersectionDiagnostics3D& diagnostics,
-    bool reject_unrelated_coincidence)
+    bool reject_unrelated_coincidence,
+    bool preserve_non_g1_root_owners)
 {
+    for (NurbsSurfaceCrossing3D& root : roots)
+        initialize_root_owners(root);
     std::sort(roots.begin(), roots.end(),
               [](const auto& first, const auto& second) {
                   if (first.patch_index != second.patch_index)
@@ -758,9 +821,14 @@ std::vector<NurbsSurfaceCrossing3D> canonicalize_roots(
     for (auto& root : patch_unique) {
         root.feature_edge_contact = root.feature_edge_contact
             || root_on_non_g1_feature(root, model);
+        if (root.feature_edge_contact) {
+            for (NurbsSurfaceRootOwner3D& owner : root.owners)
+                owner.feature_edge_contact = true;
+        }
     }
 
     DisjointSets seams(static_cast<int>(patch_unique.size()));
+    DisjointSets declared_topology(static_cast<int>(patch_unique.size()));
     for (int first = 0; first < static_cast<int>(patch_unique.size()); ++first) {
         for (int second = first + 1;
              second < static_cast<int>(patch_unique.size()); ++second) {
@@ -783,16 +851,24 @@ std::vector<NurbsSurfaceCrossing3D> canonicalize_roots(
             }
             if (declared_connection == nullptr)
                 continue;
+            declared_topology.unite(first, second);
             if (!declared_connection->g1) {
                 first_root.feature_edge_contact = true;
                 second_root.feature_edge_contact = true;
+                for (NurbsSurfaceRootOwner3D& owner : first_root.owners)
+                    owner.feature_edge_contact = true;
+                for (NurbsSurfaceRootOwner3D& owner : second_root.owners)
+                    owner.feature_edge_contact = true;
                 if (seams.find(first) != seams.find(second)) {
                     checked_increment_diagnostic(
                         diagnostics.non_g1_topology_merges,
                         "NURBS non-G1 topology-merge diagnostic overflow");
                 }
             }
-            seams.unite(first, second);
+            if (declared_connection->g1
+                || !preserve_non_g1_root_owners) {
+                seams.unite(first, second);
+            }
         }
     }
 
@@ -806,7 +882,8 @@ std::vector<NurbsSurfaceCrossing3D> canonicalize_roots(
                     patch_unique[static_cast<std::size_t>(first)],
                     patch_unique[static_cast<std::size_t>(second)],
                     geometry_tolerance, segment_length)
-                && seams.find(first) != seams.find(second)) {
+                && declared_topology.find(first)
+                       != declared_topology.find(second)) {
                 throw UnrelatedPatchCoincidence(patch_unique);
             }
         }
@@ -843,13 +920,19 @@ std::vector<NurbsSurfaceCrossing3D> canonicalize_roots(
                 canonical[static_cast<std::size_t>(output)];
             const NurbsSurfaceCrossing3D& candidate =
                 patch_unique[static_cast<std::size_t>(root_index)];
+            NurbsSurfaceCrossing3D combined = current;
+            append_distinct_root_owners(combined, candidate, model);
             const double minimum_transversality = std::min(
                 current.transversality, candidate.transversality);
             const double maximum_reliable_tolerance = std::max(
                 current.reliable_transversality_tolerance,
                 candidate.reliable_transversality_tolerance);
-            if (candidate.residual < current.residual)
+            if (candidate.residual < current.residual) {
                 current = candidate;
+                current.owners = std::move(combined.owners);
+            } else {
+                current.owners = std::move(combined.owners);
+            }
             current.feature_edge_contact = feature_contact;
             if (!feature_contact)
                 current.transversality = minimum_transversality;
@@ -1366,9 +1449,11 @@ NurbsSurfaceIntersector3D::intersect_segment(
 {
     NurbsSurfaceIntersectionResult3D result =
         intersect_segment_impl(start, end, nullptr);
-    (void)analyze_close_root_pairs(
-        result.crossings, model_, elements_, start, end,
-        geometry_tolerance_, result.diagnostics);
+    if (result.diagnostics.unresolved_candidates == 0) {
+        (void)analyze_close_root_pairs(
+            result.crossings, model_, elements_, start, end,
+            geometry_tolerance_, result.diagnostics);
+    }
     return result;
 }
 
@@ -1423,6 +1508,12 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
                     result.diagnostics.unresolved_candidates,
                     work.diagnostics.unresolved_boxes,
                     "NURBS unresolved-candidate diagnostic overflow");
+                result.diagnostics.unresolved_longitudinal_intervals.insert(
+                    result.diagnostics.unresolved_longitudinal_intervals.end(),
+                    work.diagnostics
+                        .unresolved_longitudinal_intervals.begin(),
+                    work.diagnostics
+                        .unresolved_longitudinal_intervals.end());
             }
             result.diagnostics.maximum_subdivision_depth_reached = std::max(
                 result.diagnostics.maximum_subdivision_depth_reached,
@@ -1505,11 +1596,17 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
             result.diagnostics.sample_seed_candidates,
             16, "NURBS sample-candidate diagnostic overflow");
         if (cartesian_edge == nullptr) {
-            const NurbsElementIntersectionResult3D local =
-                intersect_nurbs_bezier_element_3d(
-                    element, source_patch,
-                    start, end, candidate_options);
-            accumulate_local(local);
+            try {
+                const NurbsElementIntersectionResult3D local =
+                    intersect_nurbs_bezier_element_3d(
+                        element, source_patch,
+                        start, end, candidate_options);
+                accumulate_local(local);
+            } catch (const UnresolvedNurbsIntersectionCandidate3D& error) {
+                if (!options_.collect_unresolved_regions)
+                    throw;
+                accumulate_local(error.partial_result());
+            }
             continue;
         }
 
@@ -1583,7 +1680,8 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
     if (cartesian_edge == nullptr) {
         result.crossings = canonicalize_roots(
             std::move(roots), model_, geometry_tolerance_, segment_length,
-            result.diagnostics, true);
+            result.diagnostics, true,
+            options_.preserve_non_g1_root_owners);
         return result;
     }
     std::vector<NurbsSurfaceCrossing3D> all_roots = roots;
@@ -1607,7 +1705,8 @@ NurbsSurfaceIntersector3D::intersect_segment_impl(
     result.crossings = canonicalize_roots(
         std::move(all_roots), model_, geometry_tolerance_, segment_length,
         result.diagnostics,
-        result.diagnostics.unresolved_candidates == 0);
+        result.diagnostics.unresolved_candidates == 0,
+        options_.preserve_non_g1_root_owners);
 
     return result;
 }
@@ -1696,6 +1795,8 @@ std::vector<int> NurbsSurfaceIntersector3D::containing_components(
         {{0.2718281828459045, 0.5772156649015329, 1.0}}
     }};
 
+    std::vector<std::string> retry_diagnostics;
+    retry_diagnostics.reserve(direction_values.size());
     for (const auto& values : direction_values) {
         const Eigen::Vector3d direction(values[0], values[1], values[2]);
         const Eigen::Vector3d unit_direction = direction.normalized();
@@ -1770,10 +1871,15 @@ std::vector<int> NurbsSurfaceIntersector3D::containing_components(
         } catch (const std::runtime_error& error) {
             if (!is_retryable_ray_degeneracy(error.what()))
                 throw;
+            retry_diagnostics.emplace_back(error.what());
         }
     }
-    throw std::runtime_error(
-        "unable to classify point with three deterministic NURBS rays");
+    std::ostringstream message;
+    message << "unable to classify point with deterministic NURBS rays"
+            << ": point=" << point.transpose();
+    for (std::size_t ray = 0; ray < retry_diagnostics.size(); ++ray)
+        message << " | ray" << ray << '=' << retry_diagnostics[ray];
+    throw std::runtime_error(message.str());
 }
 
 std::vector<RationalBezierElement3D>

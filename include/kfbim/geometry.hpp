@@ -6,6 +6,7 @@
 #include "src/geometry/grid_pair_2d.hpp"
 #include "src/geometry/grid_pair_3d.hpp"
 #include "src/geometry/nurbs_basis.hpp"
+#include "src/geometry/nurbs_boundary_2d.hpp"
 #include "src/geometry/nurbs_curve.hpp"
 #include "src/geometry/nurbs_curve_2d.hpp"
 #include "src/geometry/nurbs_curve_3d.hpp"

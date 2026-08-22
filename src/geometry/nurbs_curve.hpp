@@ -140,6 +140,49 @@ public:
              / (denominator * denominator);
     }
 
+    [[nodiscard]] Vector second_derivative(double t) const
+    {
+        const double parameter = clamped_parameter(t);
+        const auto indices = basis_.active_basis_indices(parameter);
+        const auto values = basis_.evaluate_nonzero(parameter);
+        const auto first = basis_.evaluate_nonzero_first_derivatives(parameter);
+        const auto second =
+            basis_.evaluate_nonzero_second_derivatives(parameter);
+
+        Vector numerator = Vector::Zero();
+        Vector numerator_first = Vector::Zero();
+        Vector numerator_second = Vector::Zero();
+        double denominator = 0.0;
+        double denominator_first = 0.0;
+        double denominator_second = 0.0;
+        for (std::size_t local = 0; local < indices.size(); ++local) {
+            const int index = indices[local];
+            const double weight = weights_[static_cast<std::size_t>(index)];
+            const Vector& control =
+                control_points_[static_cast<std::size_t>(index)];
+            const double basis_value = values[local] * weight;
+            const double basis_first = first[local] * weight;
+            const double basis_second = second[local] * weight;
+            numerator += basis_value * control;
+            numerator_first += basis_first * control;
+            numerator_second += basis_second * control;
+            denominator += basis_value;
+            denominator_first += basis_first;
+            denominator_second += basis_second;
+        }
+        if (denominator <= basis_.tolerance())
+            throw std::runtime_error(
+                "NURBS curve denominator is zero or near zero");
+
+        const Vector value = numerator / denominator;
+        const Vector first_value =
+            (numerator_first - denominator_first * value) / denominator;
+        return (numerator_second
+                - 2.0 * denominator_first * first_value
+                - denominator_second * value)
+             / denominator;
+    }
+
     [[nodiscard]] Vector tangent(double t) const
     {
         return normalize_safe<Dim>(derivative(t), basis_.tolerance());

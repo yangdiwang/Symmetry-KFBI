@@ -4,6 +4,7 @@
 #include <Eigen/Dense>
 #include "../local_cauchy/jump_data.hpp"
 #include "../local_cauchy/laplace_corner_patch_solver_2d.hpp"
+#include "../transfer/laplace_crossing_trace_stencil_2d.hpp"
 
 namespace kfbim {
 
@@ -66,6 +67,11 @@ public:
     LaplacePotentialEvalResult2D evaluate(
         const std::vector<LaplaceJumpData2D>& jumps,
         const Eigen::VectorXd&                f_bulk) const;
+
+    LaplacePotentialEvalResult2D evaluate(
+        const std::vector<LaplaceJumpData2D>& jumps,
+        const Eigen::VectorXd&                f_bulk,
+        LaplaceCrossingTraceStencil2D         trace_stencil) const;
 
     // ── Double-layer potential D[φ] ──────────────────────────────────────
     // [u]=phi, [∂ₙu]=0, f=0

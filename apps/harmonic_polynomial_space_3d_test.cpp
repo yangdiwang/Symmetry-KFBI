@@ -38,6 +38,8 @@ void test_dimensions()
             "quadratic harmonic dimension");
     require(HarmonicPolynomialSpace3D(3).dimension() == 16,
             "cubic harmonic dimension");
+    require(HarmonicPolynomialSpace3D(4).dimension() == 25,
+            "quartic harmonic dimension");
     require(HarmonicPolynomialSpace3D(3).degree() == 3,
             "harmonic degree accessor");
     require_throws(
@@ -47,48 +49,55 @@ void test_dimensions()
 
 void test_basis_is_harmonic()
 {
-    const HarmonicPolynomialSpace3D space(3);
-    const Eigen::Vector3d point(0.17, -0.23, 0.31);
-    const double epsilon = 1.0e-4;
-    const double inverse_epsilon_sq = 1.0 / (epsilon * epsilon);
-    for (int coefficient = 0; coefficient < space.dimension(); ++coefficient) {
-        const auto value = [&](const Eigen::Vector3d& x) {
-            return space.basis(x.x(), x.y(), x.z())[coefficient];
-        };
-        double laplacian = 0.0;
-        for (int axis = 0; axis < 3; ++axis) {
-            Eigen::Vector3d plus = point;
-            Eigen::Vector3d minus = point;
-            plus[axis] += epsilon;
-            minus[axis] -= epsilon;
-            laplacian +=
-                (value(plus) - 2.0 * value(point) + value(minus))
-                * inverse_epsilon_sq;
+    for (int degree : {3, 4}) {
+        const HarmonicPolynomialSpace3D space(degree);
+        const Eigen::Vector3d point(0.17, -0.23, 0.31);
+        const double epsilon = 1.0e-4;
+        const double inverse_epsilon_sq = 1.0 / (epsilon * epsilon);
+        for (int coefficient = 0;
+             coefficient < space.dimension();
+             ++coefficient) {
+            const auto value = [&](const Eigen::Vector3d& x) {
+                return space.basis(x.x(), x.y(), x.z())[coefficient];
+            };
+            double laplacian = 0.0;
+            for (int axis = 0; axis < 3; ++axis) {
+                Eigen::Vector3d plus = point;
+                Eigen::Vector3d minus = point;
+                plus[axis] += epsilon;
+                minus[axis] -= epsilon;
+                laplacian +=
+                    (value(plus) - 2.0 * value(point) + value(minus))
+                    * inverse_epsilon_sq;
+            }
+            require(std::abs(laplacian) < 3.0e-6,
+                    "harmonic basis has nonzero Laplacian");
         }
-        require(std::abs(laplacian) < 2.0e-6,
-                "harmonic basis has nonzero Laplacian");
     }
 }
 
 void test_gradient_matches_centered_difference()
 {
-    const HarmonicPolynomialSpace3D space(3);
-    const Eigen::Vector3d point(-0.19, 0.13, 0.27);
-    const Eigen::MatrixXd gradient =
-        space.gradient(point.x(), point.y(), point.z());
-    const double epsilon = 1.0e-6;
-    for (int axis = 0; axis < 3; ++axis) {
-        Eigen::Vector3d plus = point;
-        Eigen::Vector3d minus = point;
-        plus[axis] += epsilon;
-        minus[axis] -= epsilon;
-        const Eigen::VectorXd finite_difference =
-            (space.basis(plus.x(), plus.y(), plus.z())
-             - space.basis(minus.x(), minus.y(), minus.z()))
-            / (2.0 * epsilon);
-        require((gradient.row(axis).transpose() - finite_difference).norm()
-                    < 2.0e-9,
+    for (int degree : {3, 4}) {
+        const HarmonicPolynomialSpace3D space(degree);
+        const Eigen::Vector3d point(-0.19, 0.13, 0.27);
+        const Eigen::MatrixXd gradient =
+            space.gradient(point.x(), point.y(), point.z());
+        const double epsilon = 1.0e-6;
+        for (int axis = 0; axis < 3; ++axis) {
+            Eigen::Vector3d plus = point;
+            Eigen::Vector3d minus = point;
+            plus[axis] += epsilon;
+            minus[axis] -= epsilon;
+            const Eigen::VectorXd finite_difference =
+                (space.basis(plus.x(), plus.y(), plus.z())
+                 - space.basis(minus.x(), minus.y(), minus.z()))
+                / (2.0 * epsilon);
+            require(
+                (gradient.row(axis).transpose() - finite_difference).norm()
+                    < 3.0e-9,
                 "harmonic basis gradient mismatch");
+        }
     }
 }
 

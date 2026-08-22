@@ -12,6 +12,23 @@
 
 namespace kfbim::geometry3d {
 
+// One parametric owner of a physical line/surface root.  A root on a
+// declared patch seam can have more than one owner even though it is one
+// geometric event.  The legacy scalar fields on NurbsSurfaceCrossing3D keep
+// the deterministic representative used by existing callers; owners retains
+// the complete canonical owner set for event-aware consumers.
+struct NurbsSurfaceRootOwner3D {
+    int patch_index = -1;
+    double u = 0.0;
+    double v = 0.0;
+    Eigen::Vector3d point = Eigen::Vector3d::Zero();
+    Eigen::Vector3d normal = Eigen::Vector3d::Zero();
+    double residual = 0.0;
+    double transversality = 0.0;
+    bool feature_edge_contact = false;
+    double reliable_transversality_tolerance = 0.0;
+};
+
 struct NurbsSurfaceCrossing3D {
     int patch_index = -1;
     int component = -1;
@@ -24,6 +41,7 @@ struct NurbsSurfaceCrossing3D {
     double transversality = 0.0;
     bool feature_edge_contact = false;
     double reliable_transversality_tolerance = 0.0;
+    std::vector<NurbsSurfaceRootOwner3D> owners;
 };
 
 struct NurbsSurfaceIntersectionDiagnostics3D {
@@ -55,6 +73,7 @@ struct NurbsSurfaceIntersectionDiagnostics3D {
     int ambiguous_root_clusters = 0;
     int non_g1_topology_merges = 0;
     int high_degree_fallbacks = 0;
+    std::vector<std::array<double, 2>> unresolved_longitudinal_intervals;
 };
 
 struct NurbsSurfaceIntersectionResult3D {
@@ -100,6 +119,15 @@ struct NurbsQueryElementSample3D {
 
 struct NurbsSurfaceIntersectorOptions3D {
     bool use_triangle_seeds = true;
+    // Preserve every declared non-G1 patch owner of a coincident physical
+    // root.  The default keeps the historical canonical one-root behavior;
+    // one-sided C0 restrict routes opt in so they can choose a G1 sheet using
+    // their own geometric criterion.
+    bool preserve_non_g1_root_owners = false;
+    // Continue across all candidate elements after an unresolved terminal
+    // box and return the aggregate certified roots plus conservative
+    // longitudinal intervals.  The default preserves the historical throw.
+    bool collect_unresolved_regions = false;
     int bvh_leaf_size = 8;
     double maximum_element_extent =
         std::numeric_limits<double>::infinity();

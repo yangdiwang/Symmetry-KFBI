@@ -37,6 +37,8 @@ struct EdgeCrossingRange3D {
 };
 struct EdgeIntersectionRecord3D {
     EdgeCrossingRange3D range;
+    int event_begin = 0;
+    int event_count = 0;
     NurbsCartesianEdgeClassification3D classification;
 };
 
@@ -67,6 +69,35 @@ int checked_size_to_int(std::size_t value, const char* message)
         throw std::overflow_error(message);
     }
     return static_cast<int>(value);
+}
+
+std::vector<int> build_patch_g1_components(
+    const NurbsSurfaceModel3D& model)
+{
+    const int patch_count = model.num_patches();
+    std::vector<int> parent(static_cast<std::size_t>(patch_count));
+    for (int patch = 0; patch < patch_count; ++patch)
+        parent[static_cast<std::size_t>(patch)] = patch;
+    const auto find = [&](int patch, const auto& self) -> int {
+        int& root = parent[static_cast<std::size_t>(patch)];
+        if (root != patch)
+            root = self(root, self);
+        return root;
+    };
+    for (const NurbsPatchEdgeConnection3D& connection : model.connections()) {
+        if (!connection.g1)
+            continue;
+        int first = find(connection.first.patch, find);
+        int second = find(connection.second.patch, find);
+        if (first == second)
+            continue;
+        const int root = std::min(first, second);
+        parent[static_cast<std::size_t>(first)] = root;
+        parent[static_cast<std::size_t>(second)] = root;
+    }
+    for (int patch = 0; patch < patch_count; ++patch)
+        parent[static_cast<std::size_t>(patch)] = find(patch, find);
+    return parent;
 }
 
 int checked_add_int(int first, int second, const char* message)
@@ -196,6 +227,10 @@ void accumulate_intersection_diagnostics(
         total.unresolved_candidates,
         increment.unresolved_candidates,
         "NURBS unresolved-candidate diagnostic overflow");
+    total.unresolved_longitudinal_intervals.insert(
+        total.unresolved_longitudinal_intervals.end(),
+        increment.unresolved_longitudinal_intervals.begin(),
+        increment.unresolved_longitudinal_intervals.end());
     total.maximum_subdivision_depth_reached = std::max(
         total.maximum_subdivision_depth_reached,
         increment.maximum_subdivision_depth_reached);
@@ -290,6 +325,435 @@ std::string strict_box_error(const NurbsAabb3D& surface,
 
 } // namespace
 
+namespace {
+
+NurbsSurfaceRootOwner3D event_owner_from_crossing(
+    const NurbsSurfaceCrossing3D& crossing)
+{
+    NurbsSurfaceRootOwner3D owner;
+    owner.patch_index = crossing.patch_index;
+    owner.u = crossing.u;
+    owner.v = crossing.v;
+    owner.point = crossing.point;
+    owner.normal = crossing.normal;
+    owner.residual = crossing.residual;
+    owner.transversality = crossing.transversality;
+    owner.feature_edge_contact = crossing.feature_edge_contact;
+    owner.reliable_transversality_tolerance =
+        crossing.reliable_transversality_tolerance;
+    return owner;
+}
+
+struct EventNormalCertification3D {
+    GridEdgeEventCertification3D certification =
+        GridEdgeEventCertification3D::IncompleteRootSet;
+    int canonical_sign = 0;
+    bool containment_eligible = false;
+};
+
+EventNormalCertification3D event_normal_certification(
+    const NurbsSurfaceCrossing3D& crossing,
+    const NurbsCartesianEdgeClassification3D& classification,
+    bool complete_edge_record,
+    const Eigen::Vector3d& canonical_direction)
+{
+    if (!complete_edge_record || !classification.root_count_known)
+        return {GridEdgeEventCertification3D::IncompleteRootSet, 0, false};
+    if (!classification.parity_known_from_roots)
+        return {GridEdgeEventCertification3D::UnknownParity, 0, false};
+    if (classification.has_near_tangent_candidate)
+        return {GridEdgeEventCertification3D::NearTangentEdge, 0, false};
+    const double oriented_normal_dot =
+        crossing.normal.dot(canonical_direction);
+    std::vector<NurbsSurfaceRootOwner3D> owners = crossing.owners;
+    if (owners.empty())
+        owners.push_back(event_owner_from_crossing(crossing));
+    const bool needs_incident_owner_agreement =
+        crossing.feature_edge_contact || owners.size() > 1;
+    if (needs_incident_owner_agreement) {
+        int common_sign = 0;
+        for (const NurbsSurfaceRootOwner3D& owner : owners) {
+            const double dot = owner.normal.dot(canonical_direction);
+            if (!owner.normal.allFinite()
+                || !std::isfinite(owner.transversality)
+                || !std::isfinite(
+                       owner.reliable_transversality_tolerance)
+                || owner.reliable_transversality_tolerance <= 0.0
+                || owner.transversality
+                       <= owner.reliable_transversality_tolerance
+                || !std::isfinite(dot)
+                || std::abs(dot)
+                       <= owner.reliable_transversality_tolerance) {
+                return {GridEdgeEventCertification3D::FeatureContact,
+                        0, true};
+            }
+            const int sign = dot > 0.0 ? 1 : -1;
+            if (common_sign != 0 && common_sign != sign)
+                return {GridEdgeEventCertification3D::FeatureContact,
+                        0, true};
+            common_sign = sign;
+        }
+        // A declared topological feature is still one physical event when all
+        // coincident owners certify the same transverse orientation.
+        return common_sign == 0
+            ? EventNormalCertification3D{
+                  GridEdgeEventCertification3D::FeatureContact, 0, true}
+            : EventNormalCertification3D{
+                  GridEdgeEventCertification3D::CertifiedTransverse,
+                  common_sign, false};
+    }
+    if (!std::isfinite(crossing.transversality)
+        || !std::isfinite(crossing.reliable_transversality_tolerance)
+        || crossing.reliable_transversality_tolerance <= 0.0
+        || crossing.transversality
+               <= crossing.reliable_transversality_tolerance
+        || !std::isfinite(oriented_normal_dot)
+        || std::abs(oriented_normal_dot)
+               <= crossing.reliable_transversality_tolerance) {
+        return {GridEdgeEventCertification3D::UnreliableTransversality,
+                0, false};
+    }
+    return {GridEdgeEventCertification3D::CertifiedTransverse,
+            oriented_normal_dot > 0.0 ? 1 : -1, false};
+}
+
+} // namespace
+
+bool grid_edge_root_set_requires_targeted_retry_3d(
+    const NurbsCartesianEdgeIntersections3D& intersections) noexcept
+{
+    return !intersections.root_count_known
+        || !intersections.parity_known_from_roots
+        || !intersections.ambiguous_clusters.empty()
+        || intersections.has_near_tangent_candidate
+        || intersections.diagnostics.unresolved_candidates != 0;
+}
+
+std::vector<GridEdgeEvent3D> build_canonical_grid_edge_events_3d(
+    int node_a,
+    int node_b,
+    const Eigen::Vector3d& point_a,
+    const Eigen::Vector3d& point_b,
+    const std::vector<NurbsSurfaceCrossing3D>& crossings,
+    const NurbsCartesianEdgeClassification3D& classification,
+    const GridEdgeComponentContainment3D& component_contains)
+{
+    if (node_a < 0 || node_b < 0 || node_a == node_b) {
+        throw std::invalid_argument(
+            "grid-edge event construction requires two distinct nonnegative nodes");
+    }
+    if (!point_a.allFinite() || !point_b.allFinite()) {
+        throw std::invalid_argument(
+            "grid-edge event construction requires finite endpoints");
+    }
+    const bool input_reversed = node_a > node_b;
+    const int first_node = std::min(node_a, node_b);
+    const int second_node = std::max(node_a, node_b);
+    const Eigen::Vector3d first_point =
+        input_reversed ? point_b : point_a;
+    const Eigen::Vector3d second_point =
+        input_reversed ? point_a : point_b;
+    const Eigen::Vector3d edge = second_point - first_point;
+    const double edge_length = edge.norm();
+    if (!std::isfinite(edge_length) || edge_length <= 0.0) {
+        throw std::invalid_argument(
+            "grid-edge event construction requires a nondegenerate edge");
+    }
+    const Eigen::Vector3d direction = edge / edge_length;
+    const bool complete_edge_record = classification.queried
+        && classification.confirmed_crossing_count == crossings.size()
+        && classification.ambiguous_cluster_count == 0;
+
+    struct OrderedCrossing {
+        const NurbsSurfaceCrossing3D* crossing = nullptr;
+        double canonical_parameter = 0.0;
+    };
+    std::vector<OrderedCrossing> ordered;
+    ordered.reserve(crossings.size());
+    for (const NurbsSurfaceCrossing3D& crossing : crossings) {
+        if (!std::isfinite(crossing.edge_parameter)
+            || crossing.edge_parameter < 0.0
+            || crossing.edge_parameter > 1.0
+            || crossing.component < 0 || !crossing.point.allFinite()
+            || !crossing.normal.allFinite()) {
+            throw std::invalid_argument(
+                "grid-edge event construction received an invalid crossing");
+        }
+        ordered.push_back({
+            &crossing,
+            input_reversed
+                ? 1.0 - crossing.edge_parameter
+                : crossing.edge_parameter});
+    }
+    std::sort(
+        ordered.begin(), ordered.end(),
+        [](const OrderedCrossing& first, const OrderedCrossing& second) {
+            if (first.canonical_parameter != second.canonical_parameter) {
+                return first.canonical_parameter
+                    < second.canonical_parameter;
+            }
+            if (first.crossing->component != second.crossing->component) {
+                return first.crossing->component
+                    < second.crossing->component;
+            }
+            if (first.crossing->patch_index
+                != second.crossing->patch_index) {
+                return first.crossing->patch_index
+                    < second.crossing->patch_index;
+            }
+            if (first.crossing->u != second.crossing->u)
+                return first.crossing->u < second.crossing->u;
+            return first.crossing->v < second.crossing->v;
+        });
+
+    // A Cartesian-domain query is configured to merge every declared
+    // topological owner of one feature event upstream.  If a caller supplies
+    // two numerically indistinguishable feature roots anyway, do not assign
+    // two ordinals (and hence double the PDE jump).  The uncertainty test uses
+    // residual/transversality bounds; it is intentionally not a bare |dt|
+    // tolerance and does not merge resolvable close roots.
+    for (std::size_t index = 1; index < ordered.size(); ++index) {
+        const NurbsSurfaceCrossing3D& first =
+            *ordered[index - 1].crossing;
+        const NurbsSurfaceCrossing3D& second =
+            *ordered[index].crossing;
+        if (!first.feature_edge_contact || !second.feature_edge_contact
+            || first.component != second.component) {
+            continue;
+        }
+        const auto parameter_uncertainty = [&](const auto& root) {
+            const double normal_dot =
+                std::abs(root.normal.dot(direction));
+            const double guarded_dot = std::max(
+                normal_dot,
+                std::max(root.reliable_transversality_tolerance,
+                         64.0 * std::numeric_limits<double>::epsilon()));
+            return std::max(0.0, root.residual)
+                     / (edge_length * guarded_dot)
+                + 64.0 * std::numeric_limits<double>::epsilon();
+        };
+        const double t_uncertainty =
+            parameter_uncertainty(first)
+            + parameter_uncertainty(second);
+        const double point_uncertainty =
+            std::max(0.0, first.residual)
+            + std::max(0.0, second.residual)
+            + edge_length * t_uncertainty;
+        if (std::abs(ordered[index].canonical_parameter
+                     - ordered[index - 1].canonical_parameter)
+                    <= t_uncertainty
+            && (first.point - second.point).norm()
+                   <= point_uncertainty) {
+            throw std::runtime_error(
+                "grid-edge event catalog received unmerged coincident feature owners");
+        }
+    }
+
+    std::vector<GridEdgeEvent3D> result;
+    result.reserve(ordered.size());
+    for (std::size_t ordinal = 0; ordinal < ordered.size(); ++ordinal) {
+        const NurbsSurfaceCrossing3D& crossing =
+            *ordered[ordinal].crossing;
+        EventNormalCertification3D orientation =
+            event_normal_certification(
+                crossing, classification, complete_edge_record, direction);
+        if (orientation.containment_eligible && component_contains) {
+            const double root_parameter =
+                ordered[ordinal].canonical_parameter;
+            const double left_parameter = ordinal == 0
+                ? 0.0
+                : ordered[ordinal - 1].canonical_parameter;
+            const double right_parameter = ordinal + 1 == ordered.size()
+                ? 1.0
+                : ordered[ordinal + 1].canonical_parameter;
+            const double before_parameter =
+                left_parameter + 0.5 * (root_parameter - left_parameter);
+            const double after_parameter =
+                root_parameter + 0.5 * (right_parameter - root_parameter);
+
+            // Midpoints maximize clearance from this root and its neighbors.
+            // If floating point cannot represent both strict open intervals,
+            // containment is not allowed to guess an orientation.
+            if (left_parameter < before_parameter
+                && before_parameter < root_parameter
+                && root_parameter < after_parameter
+                && after_parameter < right_parameter) {
+                const Eigen::Vector3d before_point =
+                    first_point + before_parameter * edge;
+                const Eigen::Vector3d after_point =
+                    first_point + after_parameter * edge;
+                bool before_contains = false;
+                bool after_contains = false;
+                try {
+                    before_contains = component_contains(
+                        before_point, crossing.component);
+                    after_contains = component_contains(
+                        after_point, crossing.component);
+                } catch (const std::exception& error) {
+                    std::ostringstream message;
+                    message
+                        << "grid-edge feature containment could not certify "
+                           "event "
+                        << ordinal << " on edge (" << first_node << ','
+                        << second_node << "): " << error.what();
+                    throw std::runtime_error(message.str());
+                }
+                if (before_contains != after_contains) {
+                    orientation.certification =
+                        GridEdgeEventCertification3D::CertifiedTransverse;
+                    // canonical_sign is inside_before - inside_after, equal
+                    // to sign(n dot canonical_edge) on a smooth crossing.
+                    orientation.canonical_sign =
+                        static_cast<int>(before_contains)
+                        - static_cast<int>(after_contains);
+                }
+            }
+        }
+        GridEdgeEvent3D event;
+        event.id = {
+            first_node,
+            second_node,
+            checked_size_to_int(
+                ordinal, "grid-edge event ordinal exceeds int range")};
+        event.canonical_parameter = ordered[ordinal].canonical_parameter;
+        event.component = crossing.component;
+        event.point = crossing.point;
+        event.normal = crossing.normal;
+        event.residual = crossing.residual;
+        event.transversality = crossing.transversality;
+        event.feature_edge_contact = crossing.feature_edge_contact;
+        event.certification = orientation.certification;
+        // Fail closed: a contact, tangent, or otherwise uncertified root is
+        // not exposed as a signed jump event.
+        if (event.certified_transverse())
+            event.canonical_sign = orientation.canonical_sign;
+        event.owners = crossing.owners;
+        if (event.owners.empty())
+            event.owners.push_back(event_owner_from_crossing(crossing));
+        std::sort(
+            event.owners.begin(), event.owners.end(),
+            [](const NurbsSurfaceRootOwner3D& first,
+               const NurbsSurfaceRootOwner3D& second) {
+                if (first.patch_index != second.patch_index)
+                    return first.patch_index < second.patch_index;
+                if (first.u != second.u)
+                    return first.u < second.u;
+                return first.v < second.v;
+            });
+        result.push_back(std::move(event));
+    }
+    return result;
+}
+
+GridEdgeEventView3D::GridEdgeEventView3D(
+    const GridEdgeEvent3D* event,
+    int first_node,
+    int second_node,
+    bool reversed) noexcept
+    : event_(event)
+    , first_node_(first_node)
+    , second_node_(second_node)
+    , reversed_(reversed)
+{}
+
+const GridEdgeEvent3D& GridEdgeEventView3D::canonical_event() const
+{
+    if (event_ == nullptr)
+        throw std::logic_error("empty grid-edge event view");
+    return *event_;
+}
+
+const GridEdgeEventId3D& GridEdgeEventView3D::id() const
+{
+    return canonical_event().id;
+}
+
+int GridEdgeEventView3D::first_node() const noexcept
+{
+    return first_node_;
+}
+
+int GridEdgeEventView3D::second_node() const noexcept
+{
+    return second_node_;
+}
+
+double GridEdgeEventView3D::edge_parameter() const noexcept
+{
+    return event_ == nullptr
+        ? 0.0
+        : (reversed_ ? 1.0 - event_->canonical_parameter
+                     : event_->canonical_parameter);
+}
+
+int GridEdgeEventView3D::sign() const noexcept
+{
+    return event_ == nullptr
+        ? 0
+        : (reversed_ ? -event_->canonical_sign
+                     : event_->canonical_sign);
+}
+
+int GridEdgeEventView3D::component() const noexcept
+{
+    return event_ == nullptr ? -1 : event_->component;
+}
+
+GridEdgeEventCertification3D
+GridEdgeEventView3D::certification() const noexcept
+{
+    return event_ == nullptr
+        ? GridEdgeEventCertification3D::IncompleteRootSet
+        : event_->certification;
+}
+
+bool GridEdgeEventView3D::certified_transverse() const noexcept
+{
+    return event_ != nullptr && event_->certified_transverse();
+}
+
+const std::vector<NurbsSurfaceRootOwner3D>&
+GridEdgeEventView3D::owners() const
+{
+    return canonical_event().owners;
+}
+
+std::vector<GridEdgeEventView3D> grid_edge_event_views_3d(
+    const std::vector<GridEdgeEvent3D>& canonical_events,
+    int node_a,
+    int node_b)
+{
+    if (node_a < 0 || node_b < 0 || node_a == node_b) {
+        throw std::invalid_argument(
+            "grid-edge event view requires two distinct nonnegative nodes");
+    }
+    const int first_node = std::min(node_a, node_b);
+    const int second_node = std::max(node_a, node_b);
+    for (const GridEdgeEvent3D& event : canonical_events) {
+        if (event.id.first_node != first_node
+            || event.id.second_node != second_node) {
+            throw std::invalid_argument(
+                "grid-edge event view received events from different edges");
+        }
+    }
+    const bool reversed = node_a > node_b;
+    std::vector<GridEdgeEventView3D> result;
+    result.reserve(canonical_events.size());
+    if (!reversed) {
+        for (const GridEdgeEvent3D& event : canonical_events) {
+            result.push_back(GridEdgeEventView3D(
+                &event, node_a, node_b, false));
+        }
+    } else {
+        for (auto event = canonical_events.rbegin();
+             event != canonical_events.rend(); ++event) {
+            result.push_back(GridEdgeEventView3D(
+                &*event, node_a, node_b, true));
+        }
+    }
+    return result;
+}
+
 struct NurbsCartesianDomain3D::Impl {
     DofLayout3D grid_layout = DofLayout3D::Node;
     std::array<int, 3> grid_cells{{0, 0, 0}};
@@ -301,12 +765,14 @@ struct NurbsCartesianDomain3D::Impl {
     std::array<std::vector<std::uint8_t>, 3> barriers;
     std::array<std::vector<std::uint8_t>, 3> interface_edges;
     std::vector<NurbsSurfaceCrossing3D> crossings;
+    std::vector<GridEdgeEvent3D> grid_edge_events;
     std::unordered_map<std::uint64_t, EdgeIntersectionRecord3D>
         edge_records_by_edge;
     std::vector<int> node_labels;
     NurbsCartesianDomainDiagnostics3D diagnostics;
     NurbsAabb3D bounds;
     double tolerance = 0.0;
+    std::vector<int> patch_g1_components;
 
     Impl(const CartesianGrid3D& grid,
          NurbsSurfaceModel3D model,
@@ -316,6 +782,7 @@ struct NurbsCartesianDomain3D::Impl {
         , grid_origin(grid.origin())
         , grid_spacing(grid.spacing())
     {
+        patch_g1_components = build_patch_g1_components(model);
         if (grid.layout() != DofLayout3D::Node) {
             throw std::invalid_argument(
                 "NurbsCartesianDomain3D requires a node-layout Cartesian grid");
@@ -389,6 +856,10 @@ struct NurbsCartesianDomain3D::Impl {
         intersector_options.use_triangle_seeds = options.use_triangle_seeds;
         intersector_options.maximum_element_extent = maximum_leaf_extent;
         intersector_options.local_max_subdivision_depth = 4;
+        // The Cartesian event catalog stores physical events, not per-patch
+        // roots.  Declared non-G1 owners therefore have to be merged upstream
+        // into one crossing with an owners list.
+        intersector_options.preserve_non_g1_root_owners = false;
         NurbsSurfaceIntersector3D intersector(
             std::move(model), intersector_options);
         bounds = intersector.bounds();
@@ -556,13 +1027,69 @@ struct NurbsCartesianDomain3D::Impl {
             candidate_keys.end());
         diagnostics.candidate_grid_edge_count = candidate_keys.size();
 
+        std::unique_ptr<NurbsSurfaceIntersector3D> retry_intersector;
+        std::unique_ptr<NurbsSurfaceIntersector3D> final_retry_intersector;
+        const auto deep_intersector = [&]()
+            -> NurbsSurfaceIntersector3D& {
+            if (!retry_intersector) {
+                NurbsSurfaceIntersectorOptions3D retry_options =
+                    intersector_options;
+                retry_options.local_max_subdivision_depth = 6;
+                retry_intersector =
+                    std::make_unique<NurbsSurfaceIntersector3D>(
+                        intersector.model(), retry_options);
+            }
+            return *retry_intersector;
+        };
+        const auto final_intersector = [&]()
+            -> NurbsSurfaceIntersector3D& {
+            if (!final_retry_intersector) {
+                NurbsSurfaceIntersectorOptions3D retry_options =
+                    intersector_options;
+                retry_options.local_max_subdivision_depth = 10;
+                final_retry_intersector =
+                    std::make_unique<NurbsSurfaceIntersector3D>(
+                        intersector.model(), retry_options);
+            }
+            return *final_retry_intersector;
+        };
+        const auto containing_components = [&](const Eigen::Vector3d& point) {
+            try {
+                return intersector.containing_components(point);
+            } catch (const std::runtime_error& error) {
+                if (std::string(error.what()).find(
+                        "unable to classify point with deterministic NURBS rays")
+                    == std::string::npos) {
+                    throw;
+                }
+                try {
+                    return deep_intersector().containing_components(point);
+                } catch (const std::runtime_error& retry_error) {
+                    if (std::string(retry_error.what()).find(
+                            "unable to classify point with deterministic NURBS rays")
+                        == std::string::npos) {
+                        throw;
+                    }
+                    return final_intersector().containing_components(point);
+                }
+            }
+        };
+        const GridEdgeComponentContainment3D component_contains =
+            [&](const Eigen::Vector3d& point, int component) {
+                const std::vector<int> containing =
+                    containing_components(point);
+                return std::find(
+                           containing.begin(), containing.end(), component)
+                    != containing.end();
+            };
+
         std::unordered_map<int, std::vector<int>> endpoint_membership_cache;
         const auto endpoint_membership = [&](int node) {
             const auto found = endpoint_membership_cache.find(node);
             if (found != endpoint_membership_cache.end())
                 return found->second;
-            std::vector<int> containing = intersector.containing_components(
-                as_vector(grid.coord(node)));
+            const Eigen::Vector3d point = as_vector(grid.coord(node));
+            std::vector<int> containing = containing_components(point);
             std::sort(containing.begin(), containing.end());
             endpoint_membership_cache.emplace(node, containing);
             diagnostics.endpoint_classification_query_count = checked_size_add(
@@ -572,17 +1099,12 @@ struct NurbsCartesianDomain3D::Impl {
             return containing;
         };
 
-        std::unique_ptr<NurbsSurfaceIntersector3D> retry_intersector;
         const auto targeted_retry = [&](const NurbsCartesianEdgeQuery3D& query) {
-            if (!retry_intersector) {
-                NurbsSurfaceIntersectorOptions3D retry_options =
-                    intersector_options;
-                retry_options.local_max_subdivision_depth = 6;
-                retry_intersector =
-                    std::make_unique<NurbsSurfaceIntersector3D>(
-                        intersector.model(), retry_options);
-            }
-            return retry_intersector->intersect_cartesian_edge(query);
+            NurbsCartesianEdgeIntersections3D result =
+                deep_intersector().intersect_cartesian_edge(query);
+            if (grid_edge_root_set_requires_targeted_retry_3d(result))
+                result = final_intersector().intersect_cartesian_edge(query);
+            return result;
         };
 
         for (const std::uint64_t key : candidate_keys) {
@@ -642,16 +1164,22 @@ struct NurbsCartesianDomain3D::Impl {
                             diagnostics.ambiguous_label_changing_edge_count,
                             std::size_t{1},
                             "NURBS ambiguous label-changing diagnostic overflow");
-                    diagnostics.targeted_retry_count = checked_size_add(
-                        diagnostics.targeted_retry_count,
-                        std::size_t{1},
-                        "NURBS targeted-retry diagnostic overflow");
-                    edge_result = targeted_retry(query);
-                    used_targeted_retry = true;
-                    accumulate_intersection_diagnostics(
-                        diagnostics.targeted_retry_intersections,
-                        edge_result.diagnostics);
                 }
+            }
+            // Endpoint parity is diagnostic information only.  Every
+            // candidate edge with an incomplete/ambiguous root set is retried,
+            // including same-label double crossings and unknown zero-root
+            // results.
+            if (grid_edge_root_set_requires_targeted_retry_3d(edge_result)) {
+                diagnostics.targeted_retry_count = checked_size_add(
+                    diagnostics.targeted_retry_count,
+                    std::size_t{1},
+                    "NURBS targeted-retry diagnostic overflow");
+                edge_result = targeted_retry(query);
+                used_targeted_retry = true;
+                accumulate_intersection_diagnostics(
+                    diagnostics.targeted_retry_intersections,
+                    edge_result.diagnostics);
             }
 
             if (edge_result.parity_known_from_roots) {
@@ -713,14 +1241,54 @@ struct NurbsCartesianDomain3D::Impl {
                 edge_result.ambiguous_clusters.size();
             record.classification.confirmed_transverse_count =
                 edge_result.confirmed_transverse_count;
+            const std::vector<GridEdgeEvent3D> edge_events =
+                build_canonical_grid_edge_events_3d(
+                    start_node, end_node, start, end,
+                    edge_result.crossings, record.classification,
+                    component_contains);
+            const bool root_set_certified =
+                !grid_edge_root_set_requires_targeted_retry_3d(edge_result);
+            const bool every_event_certified = std::all_of(
+                edge_events.begin(), edge_events.end(),
+                [](const GridEdgeEvent3D& event) {
+                    return event.certified_transverse();
+                });
+            record.classification.physical_events_certified =
+                root_set_certified
+                && edge_events.size() == edge_result.crossings.size()
+                && every_event_certified;
+            if (!record.classification.physical_events_certified) {
+                diagnostics.uncertified_grid_edge_count = checked_size_add(
+                    diagnostics.uncertified_grid_edge_count,
+                    std::size_t{1},
+                    "NURBS uncertified grid-edge diagnostic overflow");
+            }
             record.classification.correction_safe =
                 changes_component_membership
-                && edge_result.root_count_known
-                && edge_result.parity_known_from_roots
+                && record.classification.physical_events_certified
                 && edge_result.crossings.size() == 1
-                && edge_result.confirmed_transverse_count == 1
-                && edge_result.ambiguous_clusters.empty()
-                && !edge_result.has_near_tangent_candidate;
+                && edge_result.confirmed_transverse_count == 1;
+            record.event_begin = checked_size_to_int(
+                grid_edge_events.size(),
+                "NURBS grid-edge event range begin exceeds int range");
+            record.event_count = checked_size_to_int(
+                edge_events.size(),
+                "NURBS grid-edge event range count exceeds int range");
+            for (const GridEdgeEvent3D& event : edge_events) {
+                diagnostics.canonical_grid_edge_event_count =
+                    checked_size_add(
+                        diagnostics.canonical_grid_edge_event_count,
+                        std::size_t{1},
+                        "NURBS grid-edge event diagnostic overflow");
+                if (event.certified_transverse()) {
+                    diagnostics.certified_transverse_event_count =
+                        checked_size_add(
+                            diagnostics.certified_transverse_event_count,
+                            std::size_t{1},
+                            "NURBS certified-event diagnostic overflow");
+                }
+                grid_edge_events.push_back(event);
+            }
             if (record.classification.correction_safe) {
                 diagnostics.correction_safe_edge_count = checked_size_add(
                     diagnostics.correction_safe_edge_count,
@@ -735,7 +1303,7 @@ struct NurbsCartesianDomain3D::Impl {
             }
             if (used_targeted_retry) {
                 std::size_t& retry_result_count =
-                    record.classification.correction_safe
+                    record.classification.physical_events_certified
                     ? diagnostics.targeted_retry_resolved_count
                     : diagnostics.targeted_retry_unsafe_count;
                 retry_result_count = checked_size_add(
@@ -1161,6 +1729,45 @@ NurbsSurfaceCrossingRange3D NurbsCartesianDomain3D::crossings_between(
         static_cast<std::size_t>(range.count));
 }
 
+std::vector<GridEdgeEventView3D>
+NurbsCartesianDomain3D::grid_edge_events_between(
+    int node_a, int node_b) const
+{
+    const auto edge = impl_->adjacent_edge(node_a, node_b);
+    const auto found = impl_->edge_records_by_edge.find(
+        edge_key(edge.first, edge.second));
+    if (found == impl_->edge_records_by_edge.end()
+        || found->second.event_count == 0) {
+        return {};
+    }
+    const EdgeIntersectionRecord3D& record = found->second;
+    const bool reversed = node_a > node_b;
+    std::vector<GridEdgeEventView3D> result;
+    result.reserve(static_cast<std::size_t>(record.event_count));
+    for (int query_ordinal = 0;
+         query_ordinal < record.event_count; ++query_ordinal) {
+        const int canonical_ordinal = reversed
+            ? record.event_count - 1 - query_ordinal
+            : query_ordinal;
+        const std::size_t catalog_index = static_cast<std::size_t>(
+            record.event_begin + canonical_ordinal);
+        if (catalog_index >= impl_->grid_edge_events.size()) {
+            throw std::logic_error(
+                "NURBS grid-edge event record is outside the catalog");
+        }
+        result.push_back(GridEdgeEventView3D(
+            &impl_->grid_edge_events[catalog_index],
+            node_a, node_b, reversed));
+    }
+    return result;
+}
+
+const std::vector<GridEdgeEvent3D>&
+NurbsCartesianDomain3D::grid_edge_event_catalog() const
+{
+    return impl_->grid_edge_events;
+}
+
 const NurbsSurfaceCrossing3D& NurbsCartesianDomain3D::crossing_between(
     int node_a, int node_b) const
 {
@@ -1271,6 +1878,12 @@ const NurbsAabb3D& NurbsCartesianDomain3D::surface_bounds() const
 double NurbsCartesianDomain3D::geometry_tolerance() const
 {
     return impl_->tolerance;
+}
+
+const std::vector<int>&
+NurbsCartesianDomain3D::patch_g1_components() const
+{
+    return impl_->patch_g1_components;
 }
 
 bool NurbsCartesianDomain3D::is_compatible_grid(

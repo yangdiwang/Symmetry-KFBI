@@ -1,5 +1,14 @@
 # Symmetry-KFBI
 
+## 2D NURBS same-parameter route
+
+The L-shape exterior-trace app now uses the NURBS Same-Parameter Cauchy Jet
+(NSP-CJ) by default: exact NURBS geometry, cubic B-spline reconstruction of
+`phi=[u]`, quadratic B-spline reconstruction of `psi=[u_n]`, and one shared
+NURBS parameter at every crossing. The formulation, tests, convergence table,
+and rigid-transform comparison are documented in
+[`docs/nsp_cj_2d.md`](docs/nsp_cj_2d.md).
+
 ## 3D native-NURBS route
 
 The 3D app constructs the torus, hollow cylinder, and L prism from native
@@ -85,6 +94,25 @@ spread 和 restrict。restrict 采用 4×4×4 三次网格插值与法向三次�
 Dirichlet 外侧法向迹为零、以法向 jump 为未知量的二类格式；多层误差、GMRES
 残差和观测阶分别写入 `output/neumann_exterior_zero_trace_3d/` 下的
 `neumann_results.csv` 与 `dirichlet_normal_results.csv`。
+三维 Cauchy 邻域默认使用 `g1_nearest`，条件点仅来自本曲面片及其周期/G1 光滑
+邻域，不跨越非 G1 尖边。需要研究跨尖边条件点时，可显式设置
+`KFBIM_3D_CAUCHY_POLICY=topological_nearest`；该策略沿完整曲面拓扑扩展，但不会
+跳到空间上接近而拓扑无关的曲面片。Cauchy 策略同时作用于 Neumann 与程序附带的
+Dirichlet-normal 格式。
+Neumann 外侧值迹 restrict 默认使用 `joint_tricubic_crossing_owner`：插值模板中的
+错误侧节点若可靠地穿过外部 non-G1 曲面片，其 Cauchy 修正会重新归属到穿越面；
+可设置 `KFBIM_3D_NEUMANN_TRACE_RESTRICT=joint_tricubic_cauchy` 恢复旧路线。
+Dirichlet 外侧法向迹 restrict 也默认使用同一 crossing-owner 路线，并同时作用于
+算子项 `W_h(0,\sigma)` 和右端项 `W_h(f,0)`；可设置
+`KFBIM_3D_DIRICHLET_NORMAL_RESTRICT=joint_tricubic_cauchy` 恢复旧路线。
+拓扑仿射可执行目标默认设置
+`KFBIM_3D_DIRICHLET_JUMP_SPACE=analytic_j0_affine_j1`：已知值 jump
+`J_0=g_D` 直接由解析边界值、梯度和 Hessian 构造 crossing jet，未知法向 jump
+写成满足拓扑约束的仿射空间 `J_1=c_p+Gz`，不再对已知 jump 做面板样本拟合。
+非光滑 feature 上默认使用
+`KFBIM_3D_DIRICHLET_FEATURE_COUPLING=broken_sheets`；公共环境梯度 mortar 仅作为
+显式实验选项。拓扑 trace projector 还强制正权外迹采样点数严格大于最终自由度数，
+否则在 GMRES 前终止并报告 samples/coordinates。
 
 `neumann_harmonic_jet_python_compatible_2d` 的 `circle` 几何与
 `neumann_exterior_trace_circle_2d` 使用同一个圆：圆心 `(0.07, -0.04)`、半径

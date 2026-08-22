@@ -6,8 +6,12 @@ add_library(kfbim_core STATIC
     geometry/corner_patch_2d.cpp
     geometry/p2_projection_2d.cpp
     geometry/curve_resampler_2d.cpp
+    geometry/nurbs_boundary_2d.cpp
 
     # Layer 1 - Transfer operators and local Cauchy reconstruction
+    transfer/laplace_arc_length_bspline_crossing_jet_2d.cpp
+    transfer/nurbs_density_space_2d.cpp
+    transfer/laplace_nurbs_density_trace_state_2d.cpp
     transfer/laplace_spread_2d.cpp
     transfer/laplace_restrict_2d.cpp
 
@@ -18,6 +22,7 @@ add_library(kfbim_core STATIC
     potentials/laplace_potential.cpp
     operators/laplace_bvp_2d.cpp
     operators/laplace_neumann_exterior_trace_2d.cpp
+    operators/laplace_nsc_et_bvp_2d.cpp
     operators/laplace_transmission_2d.cpp
 
     # Layer 4 - Outer solver
