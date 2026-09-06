@@ -35,4 +35,10 @@ private:
     const Eigen::MatrixXd& matrix,
     double relative_cutoff);
 
+// Reuse a thin/full U,V decomposition already computed for rank/condition
+// diagnostics.  The cutoff and multiplication order match the matrix API.
+[[nodiscard]] Eigen::MatrixXd svd_pseudoinverse_from_decomposition_3d(
+    const Eigen::JacobiSVD<Eigen::MatrixXd>& decomposition,
+    double relative_cutoff);
+
 } // namespace kfbim::app3d

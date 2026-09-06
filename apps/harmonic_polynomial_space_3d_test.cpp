@@ -11,6 +11,7 @@ namespace {
 
 using kfbim::app3d::HarmonicPolynomialSpace3D;
 using kfbim::app3d::svd_pseudoinverse_3d;
+using kfbim::app3d::svd_pseudoinverse_from_decomposition_3d;
 
 void require(bool condition, const std::string& message)
 {
@@ -121,6 +122,48 @@ void test_pseudoinverse()
         "empty pseudoinverse input is rejected");
 }
 
+void test_reused_pseudoinverse()
+{
+    for (const bool wide : {false, true}) {
+        Eigen::MatrixXd matrix(5, 3);
+        matrix << 1.0, 0.2, -0.4,
+                  0.3, 1.1, 0.5,
+                  -0.2, 0.7, 1.3,
+                  0.9, -0.6, 0.8,
+                  1.2, 0.4, 0.1;
+        if (wide)
+            matrix = matrix.transpose().eval();
+        const Eigen::JacobiSVD<Eigen::MatrixXd> decomposition(
+            matrix, Eigen::ComputeThinU | Eigen::ComputeThinV);
+        const Eigen::MatrixXd reference = svd_pseudoinverse_3d(matrix, 3.0e-12);
+        const Eigen::MatrixXd reused =
+            svd_pseudoinverse_from_decomposition_3d(decomposition, 3.0e-12);
+        require((reference.array() == reused.array()).all(),
+                "reusing a decomposition changed pseudoinverse entries");
+        const Eigen::JacobiSVD<Eigen::MatrixXd> full_decomposition(
+            matrix, Eigen::ComputeFullU | Eigen::ComputeFullV);
+        const Eigen::MatrixXd full_reused =
+            svd_pseudoinverse_from_decomposition_3d(full_decomposition, 3.0e-12);
+        require(full_reused.rows() == matrix.cols()
+                    && full_reused.cols() == matrix.rows()
+                    && (full_reused - reference).norm() < 2.0e-13,
+                "full rectangular decomposition reuse changed pseudoinverse");
+        const Eigen::JacobiSVD<Eigen::MatrixXd> values_only(matrix);
+        require_throws([&] {
+            (void)svd_pseudoinverse_from_decomposition_3d(values_only, 3.0e-12);
+        }, "pseudoinverse reuse must reject a values-only decomposition");
+    }
+    Eigen::MatrixXd diagonal = Eigen::MatrixXd::Zero(4, 4);
+    diagonal.diagonal() << 1.0, 1.0e-8, 1.0e-13, 0.0;
+    const Eigen::JacobiSVD<Eigen::MatrixXd> decomposition(
+        diagonal, Eigen::ComputeThinU | Eigen::ComputeThinV);
+    const Eigen::MatrixXd reused =
+        svd_pseudoinverse_from_decomposition_3d(decomposition, 3.0e-12);
+    require(reused(0, 0) == 1.0 && reused(1, 1) == 1.0e8
+                && reused(2, 2) == 0.0 && reused(3, 3) == 0.0,
+            "reused decomposition must preserve the relative rank cutoff");
+}
+
 } // namespace
 
 int main()
@@ -130,6 +173,7 @@ int main()
         test_basis_is_harmonic();
         test_gradient_matches_centered_difference();
         test_pseudoinverse();
+        test_reused_pseudoinverse();
         std::cout << "3D harmonic polynomial space tests passed\n";
         return 0;
     } catch (const std::exception& error) {

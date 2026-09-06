@@ -94,13 +94,12 @@ struct NativeDensityGaussPoint3D {
     double surface_weight = 0.0;
 };
 
-// Optional affine compatibility data for a sharp feature edge.  The rows
-// assembled for one connection are ordered as
-//
-//   first-side co-normal equation, second-side co-normal equation
-//
-// for every scalar mortar test function.  The edge equations are weak line
-// moments and do not include the endpoints of the feature explicitly.
+// Optional affine compatibility data for a sharp feature edge.  The legacy
+// and solved-conormal operators order two side equations per scalar mortar
+// test function.  A direct ambient-gradient operator instead stores two
+// transverse world-gradient components per test function.  The edge
+// equations are weak line moments and do not include endpoint point values
+// explicitly.
 struct NativeFeatureEdgeJumpJetInfo3D {
     int connection = -1;
     int first_row = 0;
@@ -191,6 +190,11 @@ public:
         double v,
         int derivative_u,
         int derivative_v) const;
+    // Share the two one-dimensional basis evaluations across all six P2
+    // parameter-jet rows, ordered as value, u, v, uu, uv, vv.  Like the
+    // single-row API, indices refer to this density space's C0 coordinates.
+    std::array<NativeDensityC0Stencil3D, 6> c0_parameter_jet_stencils(
+        int patch, double u, double v) const;
     Eigen::RowVectorXd c0_parameter_derivative_row(
         int patch,
         double u,

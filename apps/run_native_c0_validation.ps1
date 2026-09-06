@@ -17,8 +17,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -Command `
 
 Use -DryRun to inspect the complete environment without launching a solve.
 The topology_affine variant selects the independent sparse-topology/local-SVD
-executable and its shared-Q10 cubic trace route; existing variants keep the
-legacy native executable.
+executable and its Q27 cover-3 all-event Cauchy trace route; existing variants
+keep the legacy native executable.
 #>
 [CmdletBinding()]
 param(
@@ -150,7 +150,8 @@ function Get-ExpectedOutputDirectory(
     [string] $rigidName,
     [string] $tag) {
     if ($variantName -eq 'topology_affine') {
-        $path = Join-Path $topologyOutputRoot 'tac_q10/nm_pc_tm_mf/topology_affine'
+        $path = Join-Path $topologyOutputRoot `
+            'q27_c3/nm_pc_tm_mf/topology_affine'
         if ($rigidName -ne 'baseline') {
             $rigidDirectory = if ($rigidName -eq 'rot_axis123_17deg_t_xyz_1') {
                 'rigid_r17_t1'
@@ -246,7 +247,7 @@ try {
                     $settings.KFBIM_3D_NEUMANN_COMPATIBILITY =
                         'trace_border_legacy'
                     $settings.KFBIM_3D_NEUMANN_TRACE_RESTRICT =
-                        'shared_q10_cubic_gridline_cauchy'
+                        'q27_cover3_all_event_cauchy'
                     $settings.KFBIM_3D_NEUMANN_BORDER_SOLVER =
                         'mean_free_pivot_elimination'
                     $settings.KFBIM_3D_NEUMANN_EDGE_JUMP_JET =
@@ -289,6 +290,19 @@ try {
                 $solveResults = Import-Csv -LiteralPath $solveCsv
                 $geometryResults = Import-Csv -LiteralPath $geometryCsv
                 foreach ($solve in $solveResults) {
+                    $expectedTraceRestrict = if (
+                        $variantName -eq 'topology_affine') {
+                        'q27_cover3_all_event_cauchy'
+                    } else {
+                        'global_cubic_exterior_branch_crossing_owner'
+                    }
+                    if ([string] $solve.trace_restrict_mode -ne
+                        $expectedTraceRestrict) {
+                        throw (
+                            "Unexpected trace_restrict_mode=" +
+                            "'$($solve.trace_restrict_mode)' in $solveCsv; " +
+                            "expected '$expectedTraceRestrict'")
+                    }
                     $ready = $geometryResults | Where-Object {
                         $_.geometry -eq $solve.geometry -and $_.N -eq $solve.N
                     } | Select-Object -First 1
@@ -297,6 +311,7 @@ try {
                     }
                     $rows.Add([pscustomobject]@{
                         variant = $variantName
+                        trace_restrict_mode = [string] $solve.trace_restrict_mode
                         rigid_case = $rigidName
                         geometry = $solve.geometry
                         N = [int] $solve.N
@@ -341,10 +356,12 @@ if (-not $DryRun) {
     $summary = Join-Path $outputRoot "native_c0_ab_${RunLabel}.csv"
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $summary) |
         Out-Null
-    $rows | Sort-Object variant, rigid_case, geometry, N |
+    $rows | Sort-Object variant, trace_restrict_mode, rigid_case, geometry, N |
         Export-Csv -LiteralPath $summary -NoTypeInformation
-    $rows | Sort-Object variant, rigid_case, geometry, N | Format-Table `
-        variant, rigid_case, geometry, N, ncoef, dofs, exact_crossings, `
+    $rows | Sort-Object variant, trace_restrict_mode, rigid_case, geometry, N |
+        Format-Table `
+        variant, trace_restrict_mode, rigid_case, geometry, N, ncoef, dofs, `
+        exact_crossings, `
         iterations, physical_converged, operator_residual_linf, `
         edge_constraint_residual_linf, interior_linf -AutoSize
     Write-Host "A/B summary: $summary"

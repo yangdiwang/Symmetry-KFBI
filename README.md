@@ -84,6 +84,7 @@ python -m pip install -r requirements.txt
 | `neumann_harmonic_jet_python_compatible_2d` | 新自由度与 restrict 格式比较，支持椭圆、花瓣和偏心圆 | `build/apps/neumann_harmonic_jet_python_compatible_2d circle 24` |
 | `dirichlet_harmonic_jet_python_compatible_2d` | 同一 spread/restrict 框架、并存一类/二类格式的 Dirichlet BVP | `build/apps/dirichlet_harmonic_jet_python_compatible_2d all 32 64 128 256 512` |
 | `neumann_exterior_zero_trace_3d` | 圆环、空心圆柱和 L 棱柱的三维 Neumann 一类/Dirichlet 法向二类收敛实验 | `build/apps/neumann_exterior_zero_trace_3d all 16 32 64` |
+| `kfbi_topology_affine_exterior_trace_3d` | 三维 topology-affine 正式基准：Neumann Q27-cover3 值迹与 Dirichlet Q64-cover4 法向迹 | `build/apps/kfbi_topology_affine_exterior_trace_3d all 32` |
 
 在 Windows 上可执行文件名带 `.exe`。研究计算可省略末尾的 `24`，使用程序内置的
 多层网格；快速命令只用于检查完整运行链路。
@@ -105,13 +106,26 @@ Neumann 外侧值迹 restrict 默认使用 `joint_tricubic_crossing_owner`：插
 Dirichlet 外侧法向迹 restrict 也默认使用同一 crossing-owner 路线，并同时作用于
 算子项 `W_h(0,\sigma)` 和右端项 `W_h(f,0)`；可设置
 `KFBIM_3D_DIRICHLET_NORMAL_RESTRICT=joint_tricubic_cauchy` 恢复旧路线。
+以上 crossing-owner 默认仅描述通用 `neumann_exterior_zero_trace_3d` 入口；独立的
+`kfbi_topology_affine_exterior_trace_3d` 正式默认采用两条 direct trace 路线：Neumann
+设置 `KFBIM_3D_NEUMANN_TRACE_RESTRICT=q27_cover3_all_event_cauchy`，在每个迹点使用
+一个 3×3×3 的 Q2 Cartesian tensor-product cover，把 27 个支撑节点沿各自的完整有序
+求交事件序列延拓到指定内/外分支后，直接计算界面值迹；Dirichlet 设置
+`KFBIM_3D_DIRICHLET_NORMAL_RESTRICT=q64_cover4_all_event_cauchy`，相同地延拓一个
+4×4×4 的 Q3 cover，并在迹点直接计算解析插值多项式的外法向导数
+`n·∇Q3`。两条路线都不使用离界面的法向采样层，也不做 `a1/h` 法向拟合恢复。
+`shared_q10_cubic_gridline_cauchy` 仍可通过上述两个 selector 显式选择，用作
+A/B/legacy comparison；它不再是 topology-affine 的基准主路线，也不会作为
+未认证事件的隐式回退。
 拓扑仿射可执行目标默认设置
 `KFBIM_3D_DIRICHLET_JUMP_SPACE=analytic_j0_affine_j1`：已知值 jump
 `J_0=g_D` 直接由解析边界值、梯度和 Hessian 构造 crossing jet，未知法向 jump
 写成满足拓扑约束的仿射空间 `J_1=c_p+Gz`，不再对已知 jump 做面板样本拟合。
 非光滑 feature 上默认使用
-`KFBIM_3D_DIRICHLET_FEATURE_COUPLING=broken_sheets`；公共环境梯度 mortar 仅作为
-显式实验选项。拓扑 trace projector 还强制正权外迹采样点数严格大于最终自由度数，
+`KFBIM_3D_DIRICHLET_FEATURE_COUPLING=broken_sheets`；当解析数据确实来自单一环境
+梯度时，可显式选择 `ambient_gradient_affine_mortar`，在 GMRES 前以只依赖左端算子的
+unisolvent 行抽取消去特征边与 Vertex/T-star 相容自由度；解析右端不会被拟合或投影。
+拓扑 trace projector 还强制正权外迹采样点数严格大于最终自由度数，
 否则在 GMRES 前终止并报告 samples/coordinates。
 
 `neumann_harmonic_jet_python_compatible_2d` 的 `circle` 几何与

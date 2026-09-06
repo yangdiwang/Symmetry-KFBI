@@ -3,9 +3,10 @@
 This document records the C++ implementation derived from
 `KFBI3D_Codex_Implementation_Spec.md`. It describes what is present in the
 repository, the boundary between the new route and shared legacy code, and
-the verification completed through 2026-08-21. The topology-affine route is an
-additional selectable scheme; it does not replace the legacy executable or
-its defaults.
+the implementation state through 2026-09-04. Numerical claims are limited to
+the verification records explicitly identified below. The topology-affine
+route is an additional selectable scheme; it does not replace the legacy
+executable or its defaults.
 
 ## Entry point, selectors, and defaults
 
@@ -13,8 +14,10 @@ its defaults.
 - Existing executable retained: `kfbi_native_c0_exterior_trace_3d`
 - Validation variant: `topology_affine` in
   `apps/run_native_c0_validation.ps1`
-- Validation output root:
-  `output/kfbi_topology_affine_3d/tac_q10/nm_pc_tm_mf/topology_affine`
+- Formal-default output root when both formulations run:
+  `output/kfbi_topology_affine_3d/q27_c3/d_q64_c4/nm_pc_tm_mf/topology_affine`
+- Neumann-only validation-runner output root:
+  `output/kfbi_topology_affine_3d/q27_c3/nm_pc_tm_mf/topology_affine`
 
 Both executables compile `apps/neumann_exterior_zero_trace_3d.cpp` and link
 the same `kfbim_3d_app_geometry` and `kfbim_core` libraries. The new target
@@ -38,16 +41,22 @@ the numerical runs below.
 | `KFBIM_3D_NEUMANN_DENSITY_COORDINATES` | `trace_mass` | same |
 | `KFBIM_3D_NEUMANN_COMPATIBILITY` | `trace_border_legacy` | same |
 | `KFBIM_3D_NEUMANN_BORDER_SOLVER` | `mean_free_pivot_elimination` | same |
-| `KFBIM_3D_NEUMANN_TRACE_RESTRICT` | `shared_q10_cubic_gridline_cauchy` | same |
-| `KFBIM_3D_DIRICHLET_NORMAL_RESTRICT` | `shared_q10_cubic_gridline_cauchy` | not exercised |
+| `KFBIM_3D_NEUMANN_TRACE_RESTRICT` | `q27_cover3_all_event_cauchy` | same |
+| `KFBIM_3D_DIRICHLET_NORMAL_RESTRICT` | `q64_cover4_all_event_cauchy` | not exercised |
 | `KFBIM_3D_NEUMANN_TRACE_SAMPLING` | `panel_centers` | same |
 | `KFBIM_3D_FEATURE_TRACE_FIT` | `geometric_feature` | same |
 | `KFBIM_3D_SOLVE_SELECTION` | `both` | `neumann_only` |
 
+The Neumann feature selector also accepts the opt-in A/B backend
+`topology_ambient_gradient_local_svd`.  The default remains
+`topology_affine_local_svd`, so this feature-constraint default is unchanged.
+
 These remain run-time selectors: setting an environment variable can override
 the corresponding compile-time fallback. In particular, the new executable
 does not imply `neumann_only`; that restriction comes from the validation
-script.
+script. The validation script selects Q27 explicitly so the formal Neumann
+baseline is auditable. Q10 must be chosen explicitly for a comparison run and
+is not an implicit fallback from either direct-cover route.
 
 ## Source map
 
@@ -64,10 +73,12 @@ script.
 | `apps/reduced_trace_projection_3d.{hpp,cpp}` | Opt-in weighted QR and large sparse Gram/Cholesky projector backends; legacy dense-LLT default retained |
 | `apps/direct_coefficient_cauchy_3d.{hpp,cpp}` | Analytic coefficient-to-Cauchy rows, rational geometry derivatives, inverse chain rule, and conversion of known Dirichlet value/ambient-gradient/ambient-Hessian data into crossing jets |
 | `apps/native_nurbs_surface_3d.{hpp,cpp}` | Multi-neighbor G1 topology and partial/reversed edge maps used by crossing ownership and sheet traversal |
-| `apps/shared_quadratic_restrict_3d.{hpp,cpp}` and the main driver | Shared ten-node Cartesian quadratic stencil machinery and the topology cubic six-sample recovery profile |
+| `apps/tensor_product_cover_restrict_3d.{hpp,cpp}` and the main driver | Formal-default Q27/Q64 Cartesian tensor-product covers, direct interface value weights, and direct outward-normal derivative weights |
+| `apps/shared_quadratic_restrict_3d.{hpp,cpp}` and the main driver | Comparison-only shared ten-node Cartesian quadratic stencil machinery and the topology cubic six-sample recovery profile |
 | `apps/restrict_crossing_selector_3d.{hpp,cpp}` | Nearest same-sheet grid-line crossing selection for wrong-side corrections |
 | `apps/csv_rfc4180.hpp` | Quoting of diagnostic string fields such as merged block keys |
 | `apps/run_native_c0_validation.ps1` | Legacy/topology variant selection and selectable build directory |
+| `apps/run_kfbi_3d_full_validation.ps1` | Seven-geometry and rigid-pose matrix that pins Q27 for topology Neumann and Q64 for topology Dirichlet and normalizes the result schemas |
 
 ## Preprocessing and affine coefficient space
 
@@ -186,6 +197,52 @@ feature equations exactly. Therefore
 `feature_target_constraints_exact=0` means that the projected feature target
 differs from the originally requested one by more than its tolerance; it does
 not mean that the final `C p=d_projected` or `C E=0` invariants were relaxed.
+
+### 5. Direct ambient-gradient Neumann feature backend
+
+For a non-G1 feature shared by patches `a` and `b`, the established backend
+first solves the common-gradient law for the two face conormal derivatives.
+With `m_i=n_i x t`, `c=n_a.n_b`, and `s=n_b.m_a`, it assembles
+
+```text
+d_ma J0_a = (J1_b-c J1_a)/s,
+d_mb J0_b = (c J1_b-J1_a)/s.
+```
+
+The optional `topology_ambient_gradient_local_svd` backend instead forms the
+two candidate world gradients directly,
+
+```text
+G_a = grad_Gamma(J0_a) + J1_a n_a,
+G_b = grad_Gamma(J0_b) + J1_b n_b,
+```
+
+and imposes two moment equations `r_i.(G_a-G_b)=0`, where `r_0,r_1` are a
+rigid-motion-covariant orthonormal basis of the plane perpendicular to the
+common edge tangent.  The frame starts from the two-normal bisector and uses
+its tangent cross product for the second direction.  Existing C0 trace
+continuity already supplies `t.(G_a-G_b)=0`, so adding a third Cartesian row
+would be redundant.  In coefficient form each row is
+
+```text
+[r_i.grad_Gamma(B_a) - r_i.grad_Gamma(B_b)] c_value
+    = [r_i.n_b B_b - r_i.n_a B_a] c_normal.
+```
+
+This form contains no `1/s` division.  It is pointwise equivalent to the
+solved-conormal equations whenever the C0 trace is exact and `s` is nonzero.
+For straight planar features (including the L- and U-prism edges), the two
+cellwise P0--P3 discretizations have the same row space after restriction to
+the C0 topology space.  On a curved feature the moving frames remain
+pointwise equivalent, but finite moment test spaces need not be identical;
+that case must be judged by reproduction, rank stability, and convergence,
+not by entrywise matrix equality.
+
+Both backends deliberately retain the same Neumann data path described in
+Section 4: sampled `g_N` is represented in the broken NormalTrace space and
+the requested feature target is projected to the reachable value-topology
+range.  Thus the new backend isolates the geometric C1 formulation for A/B
+testing; it is not yet an analytic-`g_N`, fail-on-unreachable strict mode.
 
 ## Trace projector and GMRES matvec
 
@@ -332,15 +389,32 @@ Inconsistent edge-tangent derivatives or a nearly degenerate dihedral sine
 cause setup to fail instead of silently weakening the equations.
 
 The common-ambient-gradient condition is a regularity assumption, not a
-universal corner law. It is therefore disabled by default and is enabled only
-with `KFBIM_3D_DIRICHLET_FEATURE_COUPLING=ambient_gradient_affine_mortar`.
-The production value `broken_sheets` leaves the one-sided normal jumps
-independent across physical features. This choice is required for general
-nonsmooth-domain solutions and avoids converting a manufactured-data
-regularity assumption into a mandatory density fit. The legacy Dirichlet
-branch retains its previous sample-fit implementation only for A/B
+universal corner law.  It therefore remains opt-in through
+`KFBIM_3D_DIRICHLET_FEATURE_COUPLING=ambient_gradient_affine_mortar`.
+Endpoint-cell moments from all incident feature edges are eliminated together
+in Vertex/T-star blocks; these are edge-cell mortar moment rows assigned to a
+vertex star, not extra point-value or point-gradient equations at a geometric
+vertex.  The remaining moments are eliminated in edge-interior blocks,
+matching the Neumann staged schedule.  Before affine elimination, a
+global rank-revealing QR certifies `rank(C G_topology)`.  A second QR first
+selects a maximal independent subset from all Vertex/T-star candidates; Edge
+candidates are then projected off the complete vertex row space and a final
+QR selects exactly the remaining rank increment.  Selection uses only the
+homogeneous left operator: the analytic right-hand side is not inspected until
+the retained row identities are final, after which those entries are copied
+unchanged, with no fit or reachable-target projection.  The default
+`broken_sheets` mode leaves the one-sided normal jumps independent across
+physical features for general nonsmooth-domain solutions.  The legacy
+Dirichlet branch retains its previous sample-fit implementation only for A/B
 comparison; none of that fitting is used by either analytic topology-affine
 feature mode.
+
+For the current U-prism regression, N32 has 256 Vertex/T-star candidates and
+no Edge candidates; 160 Vertex rows are retained.  N64 has 512 Vertex/T-star
+and 256 Edge candidates, but the Vertex stage already spans the complete
+restricted rank 272, so 272 Vertex rows and zero Edge rows are retained.  The
+N64 Edge catalog is therefore exercised and reported, but it contributes no
+new rank in the topology quotient and must not be retained artificially.
 
 ## Direct coefficient Cauchy and restriction
 
@@ -355,30 +429,65 @@ the analytic value/gradient/Hessian callback. A homogeneous Dirichlet matvec
 sets `J0` identically to zero and therefore performs neither a callback
 evaluation nor a panel fit for that component.
 
-The shared-Q10-only reduced-coefficient pipeline also does not construct the
-legacy panel-centred Cauchy maps during setup. Those maps remain mandatory for
-the legacy/standard trace routes, and any accidental call to them from the
-shared-only route fails explicitly. The independent crossing-centred direct
-row rank certification is still performed and is not relaxed by this change.
+The formal topology-affine restriction baseline uses direct tensor-product
+Cartesian covers. For a trace point `x_Gamma`, let `U_ijk^beta` denote the
+grid value at one support node after its complete support-to-trace event
+sequence has continued it to the requested branch `beta`. The Neumann value
+trace uses the 27 nodes of one 3-by-3-by-3 Q2 cover and evaluates
 
-The selected restrict route uses three samples on each side of the interface,
-with one shared ten-node Cartesian quadratic stencil for each side.  Every
-stencil-node-to-trace path is queried, including paths whose endpoint labels
-agree.  All certified transverse events are applied in strict path order;
-therefore an equal-label double crossing contributes two corrections instead
-of being skipped. A C0 feature contact whose exact before/after labels agree
-is retained as a certified zero-continuation event and contributes no jump
-correction. The exact trace endpoint is appended only if the open-path state
-has not reached the requested one-sided branch. Unresolved, overlapping,
+```text
+R_Q27^beta U(x_Gamma)
+  = sum_{i,j,k=0}^2 L_i^x(x_Gamma) L_j^y(x_Gamma) L_k^z(x_Gamma) U_ijk^beta.
+```
+
+The Dirichlet normal trace uses the 64 nodes of one 4-by-4-by-4 Q3 cover and
+evaluates its physical outward-normal derivative directly,
+
+```text
+R_n,Q64^beta U(x_Gamma)
+  = sum_{i,j,k=0}^3
+      n_Gamma dot grad(L_i^x L_j^y L_k^z)(x_Gamma) U_ijk^beta.
+```
+
+Thus `cover3` and `cover4` mean one Cartesian tensor-product interpolation
+cover at each trace point. They do not mean one cube shared by several
+off-interface normal queries. The 27 or 64 Cartesian support nodes are not
+additional topology trace samples and do not alter the strict
+`trace_sample_count > final_reduced_dofs` requirement. The formal selectors are
+`KFBIM_3D_NEUMANN_TRACE_RESTRICT=q27_cover3_all_event_cauchy` and
+`KFBIM_3D_DIRICHLET_NORMAL_RESTRICT=q64_cover4_all_event_cauchy`. In
+particular, the Dirichlet route neither samples normal layers nor recovers a
+coefficient `a1/h`; the `1/h` scaling is already present analytically in the
+Cartesian Lagrange derivative weights.
+
+Every cover-node-to-trace path is queried, including paths whose endpoint
+labels agree. All certified transverse events are applied in strict path
+order; therefore an equal-label double crossing contributes both corrections
+instead of being skipped. A C0 feature contact whose exact before/after labels
+agree is retained as a certified zero-continuation event and contributes no
+jump correction. The exact trace endpoint is appended only if the open-path
+state has not reached the requested one-sided branch. Unresolved, overlapping,
 unclassified smooth tangent, inconsistently oriented, or unordered events
-stop setup rather than selecting one root. The nearest Cartesian grid-line Cauchy
-anchor is retained only for a unique smooth event on the same G1 sheet;
-multi-event and C0-owner cases use their exact event centers.  The six
-corrected samples use the topology cubic profile to recover the exterior
-trace. Intersection searches, crossing ownership, coefficient rows, and
-local interpolation factorizations are prepared outside GMRES; coefficient
-row products, the bulk solve, and the trace-projector solve remain inside a
-matvec.
+stop setup rather than selecting one root. The nearest Cartesian grid-line
+Cauchy anchor is retained only for a unique smooth event on the same G1 sheet;
+multi-event and C0-owner cases use their exact event centers.
+
+The reduced-coefficient direct-cover pipeline does not construct the legacy
+panel-centred Cauchy maps during setup. Those maps remain mandatory for the
+legacy/standard trace routes, and any accidental call to them from a
+direct-cover-only run fails explicitly. Independent crossing-centred direct
+row rank certification is still performed. Intersection searches, crossing
+ownership, coefficient rows, cover indices, and interpolation/derivative
+weights are prepared outside GMRES; coefficient row products, the bulk solve,
+and the trace-projector solve remain inside a matvec.
+
+`shared_q10_cubic_gridline_cauchy` remains available only as an explicitly
+selected A/B/legacy comparison. It takes three samples on each side at
+`signed_distance/h = +/-{0.5, 0.75, 1.5}`, uses one shared ten-node
+complete-P2 Cartesian stencil for each three-query side, and fits all six
+continued values to one cubic normal profile. Its value and normal outputs are
+the fitted `a0` and `a1/h`. It is not the topology-affine default and is never
+an implicit fallback when Q27/Q64 event certification fails.
 
 ## CSV semantics
 
@@ -396,6 +505,10 @@ and physical diagnostics. Important interpretations are:
   rank one.
 - `topology_block_count` counts final sequential elimination records after
   support-component merging, not the number of original physical blocks.
+- `trace_restrict_mode` records the route actually used. The formal defaults
+  are `q27_cover3_all_event_cauchy` in `neumann_results.csv` and
+  `q64_cover4_all_event_cauchy` in `dirichlet_normal_results.csv`; a Q10 value
+  identifies an explicit comparison run rather than the production baseline.
 - `converged` is the GMRES algebraic flag. It does not certify the boundary
   conditions or gauge.
 - `mean_free_*` records the selected pivot, its observability/coordinate
@@ -416,10 +529,13 @@ and physical diagnostics. Important interpretations are:
 - For topology-affine Dirichlet, `known_value_jump=analytic_boundary_jet`
   certifies that crossing `J0` jets came from the value/gradient/Hessian
   callback. `edge_jump_jet=ambient_gradient_affine_mortar` identifies the
-  nonhomogeneous feature law. The separate
+  nonhomogeneous feature law. `edge_constraint_rows` is the overcomplete
+  candidate count, `edge_constraint_rank` is the retained unisolvent count,
+  and their difference is the discarded count. The separate
   `feature_vertex_residual_linf` and `feature_edge_residual_linf` values audit
-  the final `c_p+G z` against the endpoint/T-star and edge-interior feature
-  blocks.
+  the final `c_p+G z` against retained endpoint/T-star and edge-interior rows.
+  `feature_discarded_residual_linf` audits the original analytic equations that
+  were not retained; it is reported rather than fitted or projected away.
 - Dirichlet GMRES controls only the projected normal trace. To expose a
   possible unrepresented component, let `t_n` be the complete sampled
   exterior normal trace, `P_D t_n` its reduced trace-mass coordinates,
@@ -443,13 +559,15 @@ coordinates, residual audits, and retry count. Keys and merged source-key
 fields use RFC-4180 quoting; `source_keys` are pipe-joined within that single
 quoted field.
 
-## Previously recorded verification baseline
+## Previously recorded Q10 comparison baseline
 
-The results in this section were recorded before the analytic Dirichlet
-`J0=g_D`, `J1=c_p+G z` change described above. They remain useful as a
-Neumann and legacy-route baseline, but they do not validate the new
-Dirichlet affine operator. New-route verification is listed separately under
-"Items not yet verified."
+The results in this section were recorded with the explicit
+`shared_q10_cubic_gridline_cauchy` route, before Q27/Q64 became the formal
+defaults. The older rows also predate the analytic Dirichlet `J0=g_D`,
+`J1=c_p+G z` change described above. They remain useful as historical Neumann
+and Q10 A/B evidence, but they do not validate either direct-cover default or
+the new Dirichlet affine operator. Formal-default verification is listed
+separately under "Items not yet verified."
 
 A clean `build-topology-final` configuration built both
 `kfbi_topology_affine_exterior_trace_3d` and
@@ -474,10 +592,15 @@ These are CMake executable targets; the current CMake files do not register
 them with `add_test`, so “all thirteen tests passed” here means direct executable
 runs rather than one `ctest` invocation.
 
-### N=32 Neumann smoke results
+The newer `tensor_product_cover_restrict_3d_test` target checks Q27/Q64 tensor
+sizes and exact value/normal-derivative reproduction for every tensor monomial
+through Q2/Q3, respectively. It is not part of the historical thirteen-run
+claim above; one formal-default end-to-end smoke result is recorded below.
 
-The following baseline, manufactured-solution runs used N=32
-(`h=0.09375`), `neumann_only`,
+### Historical Q10 N=32 Neumann smoke results
+
+The following manufactured-solution comparison runs used N=32
+(`h=0.09375`), `neumann_only`, the explicit Q10 restrict,
 `g1_nearest`, automatically selected coefficient density, panel-center trace
 tests, and `gmres_tolerance=2e-10`.
 
@@ -509,7 +632,7 @@ The source CSVs are:
 
 ### Historical Dirichlet and rigid-transform smoke results
 
-The current analytic, broken-sheet Dirichlet route has completed a fresh
+The analytic, broken-sheet Dirichlet route has completed a fresh explicit-Q10
 L-prism N=32 smoke run. It used `ncoef=5`, 1050 positive-weight panel-center
 trace samples, and 260 final GMRES coordinates (margin 790, ratio 4.038). The
 known jump was reported as `analytic_boundary_jet`, feature coupling as
@@ -565,19 +688,39 @@ There is no silent global LSMR or weighted least-squares fallback. After the
 implemented support merge and feature-target projection, unresolved
 incompatibility is fail-fast and reports the unattempted upstream operations.
 
+## Formal Q27/Q64 U-prism smoke result
+
+A fresh untransformed U-prism run at `N=32` (`h=0.09375`) exercised both
+formal defaults in one process. The output is under
+`output/kfbi_topology_affine_3d/q27_c3/d_q64_c4/nm_pc_tm_mf/topology_affine/qsm2`.
+No segment or G1-sheet fallback was used, and both coefficient systems
+converged algebraically.
+
+| Problem | Restrict | GMRES it | GMRES relative residual | operator residual Linf | condition-trace Linf | density Linf | interior Linf | trace samples / final DOFs |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| Neumann | `q27_cover3_all_event_cauchy` | 15 | 6.489e-16 | 2.429e-17 | 3.077e-5 | 6.515e-5 | 5.986e-5 | 832 / 15 |
+| Dirichlet | `q64_cover4_all_event_cauchy` | 23 | 7.836e-11 | 6.334e-12 | 8.536e-6 | 1.538e-4 | 1.726e-5 | 832 / 224 |
+
+The oversampling margins are therefore 817 and 608, respectively. Both rows
+have `physical_converged=0`: their finite-grid condition-trace errors exceed
+the deliberately strict approximately `2e-9` physical acceptance threshold,
+even though GMRES converged. This one level is an integration smoke test, not
+a convergence study.
+
 ## Items not yet verified
 
-- No N=64/128 topology-affine runs or 32--128 convergence orders have been
-  produced from this final code state.
+- No N=64/128 formal-default runs or 32--128 convergence orders are recorded
+  for this code state.
 - Only one L-prism rigid transform at N=32 has been run; this is not the full
   multi-pose or multi-level stability suite required by the specification.
-- The analytic topology-affine Dirichlet route now has focused coverage and
-  one fresh L-prism N=32 end-to-end smoke run, including analytic known-J0
-  jets, broken-sheet affine reduction, all-event path continuation, and
-  strict trace oversampling. It still has no new 32--128 convergence or
-  rigid-transform suite.
+- The analytic topology-affine Dirichlet route has focused coverage and one
+  fresh explicit-Q10 L-prism N=32 end-to-end smoke run, including analytic
+  known-J0 jets, broken-sheet affine reduction, all-event path continuation,
+  and strict trace oversampling. The formal Q64 normal-trace route additionally
+  has the U-prism N=32 smoke result above, but no recorded 32--128 convergence
+  or rigid-transform suite.
 - Sphere, ellipsoid, torus, flower, and other catalog geometries have not been
-  numerically validated with this new route.
+  numerically validated with the formal direct-cover baseline.
 - The sparse `K>=512` projector backend has targeted unit coverage, but no
   end-to-end topology-affine PDE case at that size is recorded here.
 - Component locality and memory scaling are input dependent; the two N=32

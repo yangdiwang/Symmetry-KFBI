@@ -95,6 +95,7 @@ if(KFBIM_BUILD_3D)
         reduced_trace_projection_3d.cpp
         dirichlet_rigid_transform_study_3d.cpp
         shared_quadratic_restrict_3d.cpp
+        tensor_product_cover_restrict_3d.cpp
         topology_affine_reduction_3d.cpp
         topology_density_constraints_3d.cpp
         topology_mean_free_reduction_3d.cpp
@@ -200,6 +201,10 @@ if(KFBIM_BUILD_3D)
         shared_quadratic_restrict_3d_test.cpp
     )
 
+    add_executable(tensor_product_cover_restrict_3d_test
+        tensor_product_cover_restrict_3d_test.cpp
+    )
+
     add_executable(topology_affine_reduction_3d_test
         topology_affine_reduction_3d_test.cpp
     )
@@ -222,6 +227,11 @@ if(KFBIM_BUILD_3D)
 
     add_executable(direct_coefficient_cauchy_3d_test
         direct_coefficient_cauchy_3d_test.cpp
+        crossing_cauchy_plan_3d.cpp
+    )
+
+    add_executable(data_reuse_3d_benchmark
+        data_reuse_3d_benchmark.cpp
         crossing_cauchy_plan_3d.cpp
     )
 
@@ -503,6 +513,10 @@ if(KFBIM_BUILD_3D)
         kfbim_3d_app_geometry
     )
 
+    target_link_libraries(tensor_product_cover_restrict_3d_test PRIVATE
+        kfbim_3d_app_geometry
+    )
+
     target_link_libraries(topology_affine_reduction_3d_test PRIVATE
         kfbim_3d_app_geometry
     )
@@ -525,6 +539,10 @@ if(KFBIM_BUILD_3D)
     )
 
     target_link_libraries(direct_coefficient_cauchy_3d_test PRIVATE
+        kfbim_3d_app_geometry
+    )
+
+    target_link_libraries(data_reuse_3d_benchmark PRIVATE
         kfbim_3d_app_geometry
     )
 
@@ -699,6 +717,7 @@ if(KFBIM_BUILD_3D)
         restrict_crossing_feature_side_classifier_3d_test PRIVATE cxx_std_17)
     target_compile_features(restrict_crossing_path_state_3d_test PRIVATE cxx_std_17)
     target_compile_features(shared_quadratic_restrict_3d_test PRIVATE cxx_std_17)
+    target_compile_features(tensor_product_cover_restrict_3d_test PRIVATE cxx_std_17)
     target_compile_features(topology_affine_reduction_3d_test PRIVATE cxx_std_17)
     target_compile_features(topology_density_constraints_3d_test PRIVATE cxx_std_17)
     target_compile_features(topology_mean_free_reduction_3d_test PRIVATE cxx_std_17)
@@ -706,6 +725,7 @@ if(KFBIM_BUILD_3D)
         topology_reachable_target_projection_3d_test PRIVATE cxx_std_17)
     target_compile_features(topology_trace_projector_3d_test PRIVATE cxx_std_17)
     target_compile_features(direct_coefficient_cauchy_3d_test PRIVATE cxx_std_17)
+    target_compile_features(data_reuse_3d_benchmark PRIVATE cxx_std_17)
     target_compile_features(neumann_exterior_zero_trace_3d PRIVATE cxx_std_17)
     target_compile_features(
         neumann_exterior_zero_trace_3d_all_quartic PRIVATE cxx_std_17)

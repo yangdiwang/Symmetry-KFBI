@@ -2,17 +2,26 @@
 
 ## Baseline
 
-The immutable reference for this integration is commit
+The immutable historical integration anchor is commit
 `f68683eab514a6b2d2b9ad6fc9dea13204dc9d52`, tagged as
 `baseline/topology-affine-v1`.
 
-The integration branch must preserve the baseline behavior unless a route is
-selected explicitly.  In particular, the production topology target keeps:
+The current formal production baseline keeps the topology-affine coefficient,
+event, and reduction semantics of that anchor, but supersedes its restriction
+choice. Unless a route is selected explicitly, the production topology target
+uses:
 
 - the canonical all-event Cartesian-edge catalog and shared event identifiers;
 - fail-closed complete-root-set certification, including same-label multiple
   crossings and feature-owner classification;
-- direct-coefficient Cauchy jets and shared-Q10 restriction;
+- direct-coefficient Cauchy jets;
+- `q27_cover3_all_event_cauchy` for the Neumann value trace: one 3-by-3-by-3
+  Cartesian Q2 tensor-product cover per trace point, continued through every
+  ordered event and evaluated directly at the interface;
+- `q64_cover4_all_event_cauchy` for the Dirichlet normal trace: one 4-by-4-by-4
+  Cartesian Q3 tensor-product cover per trace point, continued through every
+  ordered event and differentiated directly as `n dot grad Q3` at the
+  interface;
 - topology-affine density coordinates;
 - mean-free pivot elimination for Neumann problems;
 - analytic `J0 = g_D` and affine `J1 = c_p + G z` for Dirichlet problems;
@@ -26,17 +35,21 @@ is supplementary.  Geometry certificates, mapped-candidate preprocessing,
 phase profiling, benchmarks, diagnostics, studies, and audit scripts may be
 used directly when they do not change the baseline operator.
 
-The following algorithms remain legacy or experimental until they pass the
-baseline validation gates:
+The following algorithms remain legacy, comparison-only, or experimental until
+they pass the baseline validation gates:
 
+- shared-Q10 three-plus-three-layer cubic recovery, selectable explicitly as
+  `shared_q10_cubic_gridline_cauchy` for A/B or legacy comparisons;
 - unique crossing-owner restriction;
 - non-G1 mass-projected panel-value density;
 - edge-augmented and two-level fitted Cauchy maps;
 - augmented Neumann solves with a Lagrange multiplier; and
 - sample-fitted Dirichlet jump data.
 
-No experimental route may be used as an implicit fallback from an uncertified
-baseline event.  It must be selected explicitly and reported in result data.
+No comparison, legacy, or experimental route may be used as an implicit
+fallback from an uncertified baseline event. It must be selected explicitly
+and reported in result data. In particular, Q10 is not a fallback for a failed
+Q27 or Q64 event sequence.
 
 Supplementary app-level algorithms are built only when
 `KFBIM_BUILD_EXPERIMENTAL_3D=ON`; the default is `OFF`.  The historical remote
@@ -68,6 +81,7 @@ The merged implementation must preserve:
 An experimental route may become a production candidate only after it:
 
 - passes the focused geometry, event, topology, projector, and Cauchy tests;
+- passes Q27/Q64 tensor-product value and direct-normal reproduction tests;
 - reproduces baseline geometry catalogs under rigid transformations;
 - converges algebraically for the seven-geometry N32 matrix;
 - completes the required N32/N64/N128 baseline and rigid sequences;

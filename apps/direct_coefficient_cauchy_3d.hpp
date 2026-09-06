@@ -97,6 +97,18 @@ build_direct_coefficient_value_jet_plan_3d(
     double v,
     const LocalOrthonormalFrame3D& frame);
 
+// Reuse the geometry jet already evaluated for this exact (patch,u,v).
+// The caller must supply the jet in the density surface's normalized
+// parameter coordinates; coefficient rows and diagnostics are unchanged.
+[[nodiscard]] DirectCoefficientValueJetPlan3D
+build_direct_coefficient_value_jet_plan_3d(
+    const NativeNurbsDensitySpace3D& density,
+    int patch,
+    double u,
+    double v,
+    const NativeSurfaceParameterJet3D& geometry,
+    const LocalOrthonormalFrame3D& frame);
+
 // Dirichlet counterpart: the unknown normal jump J1 only needs its value and
 // two first tangential derivatives.  Rows remain on the same local 4x4 cubic
 // support and may be precomposed with CauchyPolynomialWeights3D::w1.
@@ -122,6 +134,16 @@ build_direct_coefficient_normal_jet_plan_3d(
     int patch,
     double u,
     double v,
+    const LocalOrthonormalFrame3D& frame);
+
+// Geometry-reusing counterpart of the value-jet overload above.
+[[nodiscard]] DirectCoefficientNormalJetPlan3D
+build_direct_coefficient_normal_jet_plan_3d(
+    const NativeNurbsDensitySpace3D& density,
+    int patch,
+    double u,
+    double v,
+    const NativeSurfaceParameterJet3D& geometry,
     const LocalOrthonormalFrame3D& frame);
 
 // Analytic known Dirichlet data for the normal-density formulation.  The

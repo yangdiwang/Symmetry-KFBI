@@ -7,9 +7,11 @@ Each input is
 
   output/kfbi_3d_full_validation/<RunLabel>/all_results.csv
 
-Rows are de-duplicated by backend/geometry/formulation/pose/N.  Run labels are
+Rows are de-duplicated by
+backend/geometry/formulation/trace_restrict_mode/pose/N.  Run labels are
 processed from left to right, so a row from a later run label replaces the same
-row from an earlier run label.  Columns absent from the replacement schema are
+row from an earlier run label.  Different trace-restrict routes are always
+preserved as distinct records.  Columns absent from the replacement schema are
 retained from the earlier row, and the union of all input columns is preserved.
 
 The default, publication mode is deliberately strict.  Every source run must
@@ -20,8 +22,9 @@ ad-hoc subsets or repair inspection; in that mode the historical replacement
 semantics above remain available.
 
 The following convergence-order columns are recomputed within each
-backend/geometry/formulation/pose group, using adjacent increasing N values and
-the actual h ratio p=log(E_previous/E_current)/log(h_previous/h_current):
+backend/geometry/formulation/trace_restrict_mode/pose group, using adjacent
+increasing N values and the actual h ratio
+p=log(E_previous/E_current)/log(h_previous/h_current):
 
   * interior_order_linf
   * density_order_linf
@@ -83,6 +86,8 @@ $convergencePoseByBackend = @{
 }
 $canonicalLevels = @(32, 64, 128)
 $canonicalFormulations = @('dirichlet', 'neumann')
+$topologyNeumannTraceRestrict = 'q27_cover3_all_event_cauchy'
+$topologyDirichletTraceRestrict = 'q64_cover4_all_event_cauchy'
 $canonicalPoses = @(
     'baseline',
     'tx_p0137',
@@ -133,6 +138,22 @@ function Get-ConvergencePoseForBackend([string] $backend) {
         return [string] $convergencePoseByBackend[$normalized]
     }
     return ''
+}
+
+function Get-CanonicalTraceRestrictMode(
+    [string] $backend,
+    [string] $formulation) {
+    if (Test-SameText $backend 'topology_native') {
+        if (Test-SameText $formulation 'neumann') {
+            return $topologyNeumannTraceRestrict
+        }
+        if (Test-SameText $formulation 'dirichlet') {
+            return $topologyDirichletTraceRestrict
+        }
+    } elseif (Test-SameText $backend 'general_cap') {
+        return 'not_applicable'
+    }
+    throw "Unknown backend/formulation '$backend/$formulation'"
 }
 
 function Test-IsBackendConvergenceRecord($record) {
@@ -254,6 +275,7 @@ function New-ValidationKey(
     $backendValue,
     $geometryValue,
     $formulationValue,
+    $traceRestrictModeValue,
     $poseValue,
     $nValue,
     [string] $source) {
@@ -261,11 +283,14 @@ function New-ValidationKey(
     $geometry = Get-NormalizedKeyPart $geometryValue 'geometry' $source
     $formulation = Get-NormalizedKeyPart (
         $formulationValue) 'formulation' $source
+    $traceRestrictMode = Get-NormalizedKeyPart (
+        $traceRestrictModeValue) 'trace_restrict_mode' $source
     $pose = Get-NormalizedKeyPart $poseValue 'pose' $source
     $n = Get-PositiveGridLevel $nValue $source
     $separator = [char] 31
     return $backend + $separator + $geometry + $separator +
-        $formulation + $separator + $pose + $separator +
+        $formulation + $separator + $traceRestrictMode + $separator +
+        $pose + $separator +
         $n.ToString($invariantCulture)
 }
 
@@ -392,12 +417,14 @@ function Get-ArchivePrimaryKeys(
         foreach ($file in $files) {
             $path = Join-Path $archiveDirectory $file.Name
             $rows = @(Import-StableCsv $path "archived result for $caseDescription")
-            Assert-ObjectColumns $rows @('geometry', 'N') $path
+            Assert-ObjectColumns $rows @(
+                'geometry', 'trace_restrict_mode', 'N') $path
             foreach ($row in $rows) {
                 $key = New-ValidationKey `
                     $backend `
                     (Get-ObjectValue $row 'geometry') `
                     $file.Formulation `
+                    (Get-ObjectValue $row 'trace_restrict_mode') `
                     $pose `
                     (Get-ObjectValue $row 'N') `
                     $path
@@ -423,6 +450,7 @@ function Get-ArchivePrimaryKeys(
                 $backend `
                 (Get-ObjectValue $row 'shape') `
                 $formulation `
+                (Get-CanonicalTraceRestrictMode $backend $formulation) `
                 $pose `
                 (Get-ObjectValue $row 'N') `
                 $path
@@ -559,8 +587,11 @@ function Assert-CompletedRunSource(
             }
             foreach ($levelText in $statusLevels.Keys) {
                 foreach ($formulation in $canonicalFormulations) {
+                    $traceRestrictMode = Get-CanonicalTraceRestrictMode `
+                        $backend $formulation
                     $key = New-ValidationKey `
-                        $backend $geometry $formulation $pose $levelText $statusPath
+                        $backend $geometry $formulation $traceRestrictMode `
+                        $pose $levelText $statusPath
                     Add-UniqueKey $expectedCase $key "expected archive case $caseId"
                     Add-UniqueKey $expectedAll $key "expected run $runDirectory"
                 }
@@ -574,7 +605,8 @@ function Assert-CompletedRunSource(
 
     $allRows = @(Import-StableCsv $allResultsPath 'normalized all_results.csv')
     Assert-ObjectColumns $allRows @(
-        'case_id', 'backend', 'geometry', 'formulation', 'pose', 'N') `
+        'case_id', 'backend', 'geometry', 'formulation',
+        'trace_restrict_mode', 'pose', 'N') `
         $allResultsPath
     $actualAll = @{}
     $actualByCase = @{}
@@ -590,6 +622,7 @@ function Assert-CompletedRunSource(
             (Get-ObjectValue $row 'backend') `
             (Get-ObjectValue $row 'geometry') `
             (Get-ObjectValue $row 'formulation') `
+            (Get-ObjectValue $row 'trace_restrict_mode') `
             (Get-ObjectValue $row 'pose') `
             (Get-ObjectValue $row 'N') `
             $allResultsPath
@@ -734,6 +767,7 @@ function Get-SortedRecords([object[]] $records) {
         @{ Expression = { ([string] (Get-DataValue $_ 'backend')).ToLowerInvariant() } }, `
         @{ Expression = { ([string] (Get-DataValue $_ 'geometry')).ToLowerInvariant() } }, `
         @{ Expression = { ([string] (Get-DataValue $_ 'formulation')).ToLowerInvariant() } }, `
+        @{ Expression = { ([string] (Get-DataValue $_ 'trace_restrict_mode')).ToLowerInvariant() } }, `
         @{ Expression = { ([string] (Get-DataValue $_ 'pose')).ToLowerInvariant() } }, `
         @{ Expression = { $_.NValue } })
 }
@@ -780,6 +814,8 @@ function Get-CanonicalMatrixKeys {
                         $geometryEntry.Backend `
                         $geometryEntry.Geometry `
                         $formulation `
+                        (Get-CanonicalTraceRestrictMode `
+                            $geometryEntry.Backend $formulation) `
                         $pose `
                         $n `
                         'canonical seven-geometry matrix'
@@ -806,6 +842,7 @@ function Assert-CanonicalValidationMatrix(
             (Get-DataValue $record 'backend') `
             (Get-DataValue $record 'geometry') `
             (Get-DataValue $record 'formulation') `
+            (Get-DataValue $record 'trace_restrict_mode') `
             (Get-DataValue $record 'pose') `
             (Get-DataValue $record 'N') `
             'merged validation records'
@@ -909,13 +946,17 @@ function Merge-ValidationCsvs(
                 Get-DataValue $temporary 'geometry') 'geometry' $inputPath
             $formulation = Get-NormalizedKeyPart (
                 Get-DataValue $temporary 'formulation') 'formulation' $inputPath
+            $traceRestrictMode = Get-NormalizedKeyPart (
+                Get-DataValue $temporary 'trace_restrict_mode') `
+                'trace_restrict_mode' $inputPath
             $pose = Get-NormalizedKeyPart (
                 Get-DataValue $temporary 'pose') 'pose' $inputPath
             $n = Get-PositiveGridLevel (
                 Get-DataValue $temporary 'N') $inputPath
             $separator = [char] 31
             $groupKey = $backend + $separator + $geometry + $separator +
-                $formulation + $separator + $pose
+                $formulation + $separator + $traceRestrictMode + $separator +
+                $pose
             $key = $groupKey + $separator +
                 $n.ToString($invariantCulture)
 
@@ -1013,6 +1054,8 @@ function New-SyntheticRow(
         backend = 'topology_native'
         geometry = 'cylinder'
         formulation = $formulation
+        trace_restrict_mode = Get-CanonicalTraceRestrictMode `
+            'topology_native' $formulation
         pose = $pose
         N = [string] $n
         h = (3.0 / $n).ToString('R', $invariantCulture)
@@ -1073,6 +1116,8 @@ function New-StrictSyntheticRow(
         backend = $backend
         geometry = $geometry
         formulation = $formulation
+        trace_restrict_mode = Get-CanonicalTraceRestrictMode `
+            $backend $formulation
         pose = $pose
         N = [string] $n
         h = (3.0 / $n).ToString('R', $invariantCulture)
@@ -1152,6 +1197,7 @@ function Write-SyntheticTopologyRun(
         backend = 'topology_native'
         geometry = 'cylinder'
         formulation = 'neumann'
+        trace_restrict_mode = $topologyNeumannTraceRestrict
         pose = 'baseline'
         N = '32'
     })
@@ -1161,6 +1207,7 @@ function Write-SyntheticTopologyRun(
             backend = 'topology_native'
             geometry = 'cylinder'
             formulation = 'dirichlet'
+            trace_restrict_mode = $topologyDirichletTraceRestrict
             pose = 'baseline'
             N = '32'
         })
@@ -1173,12 +1220,20 @@ function Write-SyntheticTopologyRun(
         return
     }
     New-Item -ItemType Directory -Force -Path $archiveDirectory | Out-Null
-    [pscustomobject]@{ geometry = 'cylinder'; N = '32' } |
+    [pscustomobject]@{
+        geometry = 'cylinder'
+        trace_restrict_mode = $topologyNeumannTraceRestrict
+        N = '32'
+    } |
         Export-Csv -LiteralPath (
             Join-Path $archiveDirectory 'neumann_results.csv') `
             -NoTypeInformation -Encoding UTF8
     if (-not $omitArchiveDirichlet) {
-        [pscustomobject]@{ geometry = 'cylinder'; N = '32' } |
+        [pscustomobject]@{
+            geometry = 'cylinder'
+            trace_restrict_mode = $topologyDirichletTraceRestrict
+            N = '32'
+        } |
             Export-Csv -LiteralPath (
                 Join-Path $archiveDirectory 'dirichlet_normal_results.csv') `
                 -NoTypeInformation -Encoding UTF8
@@ -1220,11 +1275,13 @@ function Write-SyntheticGeneralCapRun([string] $runDirectory) {
     @(
         [pscustomobject]@{
             case_id = $caseId; backend = 'general_cap'; geometry = 'sphere'
-            formulation = 'neumann'; pose = 'baseline'; N = '32'
+            formulation = 'neumann'; trace_restrict_mode = 'not_applicable'
+            pose = 'baseline'; N = '32'
         },
         [pscustomobject]@{
             case_id = $caseId; backend = 'general_cap'; geometry = 'sphere'
-            formulation = 'dirichlet'; pose = 'baseline'; N = '32'
+            formulation = 'dirichlet'; trace_restrict_mode = 'not_applicable'
+            pose = 'baseline'; N = '32'
         }
     ) | Export-Csv -LiteralPath (
         Join-Path $runDirectory 'all_results.csv') `
@@ -1322,6 +1379,33 @@ function Invoke-SyntheticCsvTest {
             $summary.StrongRigidRows -ne 2 -or
             $summary.PoseN32Rows -ne 4) {
             throw "Synthetic category counts are wrong: $($summary | ConvertTo-Json -Compress)"
+        }
+
+        # Identical physical cases produced by different restrict routes must
+        # remain separate records; route changes are not replacement updates.
+        $routeInputDirectory = Join-Path $fixtureRoot 'route_identity_input'
+        New-Item -ItemType Directory -Force -Path $routeInputDirectory |
+            Out-Null
+        $routeInput = Join-Path $routeInputDirectory 'all_results.csv'
+        $routeCurrent = [pscustomobject] (New-SyntheticRow `
+            'neumann' 'baseline' 32 '.04' '.08' '.16' '.32' 11 'q27')
+        $routeAlternative = [pscustomobject] (New-SyntheticRow `
+            'neumann' 'baseline' 32 '.05' '.09' '.17' '.33' 12 'q10')
+        $routeAlternative.trace_restrict_mode =
+            'shared_q10_cubic_gridline_cauchy'
+        @($routeCurrent, $routeAlternative) |
+            Export-Csv -LiteralPath $routeInput -NoTypeInformation -Encoding UTF8
+        $routeSummary = Merge-ValidationCsvs `
+            @($routeInput) `
+            (Join-Path $fixtureRoot 'route_identity_merged') `
+            $false `
+            $true
+        if ($routeSummary.InputRows -ne 2 -or
+            $routeSummary.DuplicateRows -ne 0 -or
+            $routeSummary.MergedRows -ne 2) {
+            throw (
+                'Different trace_restrict_mode rows were incorrectly ' +
+                "coalesced: $($routeSummary | ConvertTo-Json -Compress)")
         }
 
         $roundTrip = @(Import-Csv -LiteralPath $summary.Paths.merged -Encoding UTF8)

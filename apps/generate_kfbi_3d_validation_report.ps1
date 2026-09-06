@@ -59,6 +59,8 @@ $convergencePoseCatalog = @(
 )
 $canonicalLevels = @(32, 64, 128)
 $canonicalFormulations = @('dirichlet', 'neumann')
+$topologyNeumannTraceRestrict = 'q27_cover3_all_event_cauchy'
+$topologyDirichletTraceRestrict = 'q64_cover4_all_event_cauchy'
 $canonicalGeometryCatalog = @(
     [pscustomobject]@{ Backend = 'general_cap'; Geometry = 'sphere' },
     [pscustomobject]@{ Backend = 'general_cap'; Geometry = 'ellipsoid' },
@@ -124,6 +126,22 @@ function Get-ConvergencePoseForBackend([string] $backend) {
         return ''
     }
     return [string] $entry.Pose
+}
+
+function Get-CanonicalTraceRestrictMode(
+    [string] $backend,
+    [string] $formulation) {
+    if (Test-SameText $backend 'topology_native') {
+        if (Test-SameText $formulation 'neumann') {
+            return $topologyNeumannTraceRestrict
+        }
+        if (Test-SameText $formulation 'dirichlet') {
+            return $topologyDirichletTraceRestrict
+        }
+    } elseif (Test-SameText $backend 'general_cap') {
+        return 'not_applicable'
+    }
+    throw "Unknown backend/formulation '$backend/$formulation'"
 }
 
 function Test-IsBackendConvergenceRow($row) {
@@ -282,6 +300,7 @@ function Get-SortedRows([object[]] $rows) {
         @{ Expression = { Get-NameRank (Get-TrimmedText (Get-RowValue $_ 'geometry')) $geometryOrder } }, `
         @{ Expression = { (Get-TrimmedText (Get-RowValue $_ 'geometry')).ToLowerInvariant() } }, `
         @{ Expression = { Get-NameRank (Get-TrimmedText (Get-RowValue $_ 'formulation')) $canonicalFormulations } }, `
+        @{ Expression = { (Get-TrimmedText (Get-RowValue $_ 'trace_restrict_mode')).ToLowerInvariant() } }, `
         @{ Expression = { Get-NameRank (Get-TrimmedText (Get-RowValue $_ 'pose')) @($canonicalPoses | ForEach-Object { $_.Id }) } }, `
         @{ Expression = { Get-IntegerValue $_ 'N' } })
 }
@@ -289,7 +308,13 @@ function Get-SortedRows([object[]] $rows) {
 function Get-CaseLabel($row) {
     $backend = Convert-ToMarkdownCell (Get-RowValue $row 'backend')
     $geometry = Convert-ToMarkdownCell (Get-RowValue $row 'geometry')
-    return "$backend / $geometry"
+    $traceRestrict = Get-TrimmedText (
+        Get-RowValue $row 'trace_restrict_mode')
+    if ([string]::IsNullOrWhiteSpace($traceRestrict) -or
+        (Test-SameText $traceRestrict 'not_applicable')) {
+        return "$backend / $geometry"
+    }
+    return "$backend / $geometry / $(Convert-ToMarkdownCell $traceRestrict)"
 }
 
 function Get-DofText($row) {
@@ -395,7 +420,7 @@ function Add-ConvergencePoseSection(
     } else {
         "后端 ``$backend``"
     }
-    $lines.Add("范围：$scope；姿态 ID：``$pose``。以下阶数由同一后端、几何、方程和姿态的相邻网格层计算；首个有效层没有前驱，阶通常为 `NaN`。")
+    $lines.Add("范围：$scope；姿态 ID：``$pose``。以下阶数由同一后端、几何、方程、trace-restrict 路线和姿态的相邻网格层计算；首个有效层没有前驱，阶通常为 `NaN`。")
     $lines.Add('')
     $poseRows = @($allRows | Where-Object {
         (Test-SameText `
@@ -465,14 +490,22 @@ function Add-PoseMatrix(
     # PowerShell 5, especially for the full 168-row publication matrix.
     $rowsByCell = @{}
     foreach ($row in $allRows) {
+        $backend = Get-TrimmedText (Get-RowValue $row 'backend')
+        $rowFormulation = Get-TrimmedText (
+            Get-RowValue $row 'formulation')
+        $expectedTraceRestrict = Get-CanonicalTraceRestrictMode `
+            $backend $rowFormulation
         if ((Get-IntegerValue $row 'N') -ne 32 -or
             -not (Test-SameText `
-                (Get-TrimmedText (Get-RowValue $row 'formulation')) `
-                $formulation)) {
+                $rowFormulation $formulation) -or
+            -not (Test-SameText `
+                (Get-TrimmedText (
+                    Get-RowValue $row 'trace_restrict_mode')) `
+                $expectedTraceRestrict)) {
             continue
         }
         $cellKey = (
-            (Get-TrimmedText (Get-RowValue $row 'backend')).ToLowerInvariant() +
+            $backend.ToLowerInvariant() +
             [char] 31 +
             (Get-TrimmedText (Get-RowValue $row 'geometry')).ToLowerInvariant() +
             [char] 31 +
@@ -567,26 +600,33 @@ function Add-StatusSummary(
     $lines.Add('')
     $lines.Add('`gmres_converged` 是代数收敛的唯一统计来源；`physical_converged` 为空时记为“未提供”，不会被当作失败。')
     $lines.Add('')
-    $lines.Add('| 后端 | 方程 | 行数 | 代数：是 | 代数：否 | 代数：未提供 | physical：是 | physical：否 | physical：未提供 | GMRES it 范围 |')
-    $lines.Add('|---|---|---:|---:|---:|---:|---:|---:|---:|---:|')
+    $lines.Add('| 后端 | 方程 | trace-restrict 路线 | 行数 | 代数：是 | 代数：否 | 代数：未提供 | physical：是 | physical：否 | physical：未提供 | GMRES it 范围 |')
+    $lines.Add('|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|')
     $groupKeys = @{}
     foreach ($row in $rows) {
         $backend = Get-TrimmedText (Get-RowValue $row 'backend')
         $formulation = Get-TrimmedText (Get-RowValue $row 'formulation')
+        $traceRestrict = Get-TrimmedText (
+            Get-RowValue $row 'trace_restrict_mode')
         $key = $backend.ToLowerInvariant() + [char] 31 +
-            $formulation.ToLowerInvariant()
+            $formulation.ToLowerInvariant() + [char] 31 +
+            $traceRestrict.ToLowerInvariant()
         if (-not $groupKeys.ContainsKey($key)) {
             $groupKeys[$key] = [pscustomobject]@{
                 Backend = $backend
                 Formulation = $formulation
+                TraceRestrict = $traceRestrict
             }
         }
     }
-    $groups = @($groupKeys.Values | Sort-Object Backend, Formulation)
+    $groups = @($groupKeys.Values |
+        Sort-Object Backend, Formulation, TraceRestrict)
     foreach ($group in $groups) {
         $selected = @($rows | Where-Object {
             (Test-SameText (Get-TrimmedText (Get-RowValue $_ 'backend')) $group.Backend) -and
-            (Test-SameText (Get-TrimmedText (Get-RowValue $_ 'formulation')) $group.Formulation)
+            (Test-SameText (Get-TrimmedText (Get-RowValue $_ 'formulation')) $group.Formulation) -and
+            (Test-SameText (Get-TrimmedText (
+                Get-RowValue $_ 'trace_restrict_mode')) $group.TraceRestrict)
         })
         $algYes = @($selected | Where-Object {
             (Get-TriState (Get-RowValue $_ 'gmres_converged')) -eq 1
@@ -613,7 +653,7 @@ function Add-StatusSummary(
         } else {
             "$(($iterations | Measure-Object -Minimum).Minimum)$([char] 0x2013)$(($iterations | Measure-Object -Maximum).Maximum)"
         }
-        $lines.Add("| $(Convert-ToMarkdownCell $group.Backend) | $(Convert-ToMarkdownCell $group.Formulation) | $($selected.Count) | $algYes | $algNo | $algUnknown | $physicalYes | $physicalNo | $physicalUnknown | $iterationRange |")
+        $lines.Add("| $(Convert-ToMarkdownCell $group.Backend) | $(Convert-ToMarkdownCell $group.Formulation) | $(Convert-ToMarkdownCell $group.TraceRestrict) | $($selected.Count) | $algYes | $algNo | $algUnknown | $physicalYes | $physicalNo | $physicalUnknown | $iterationRange |")
     }
     $lines.Add('')
 }
@@ -641,10 +681,16 @@ function Add-CoverageSummary(
             "$($convergenceEntry.Short) (``$convergencePose``)"
         }
         foreach ($formulation in $canonicalFormulations) {
+            $expectedTraceRestrict = Get-CanonicalTraceRestrictMode `
+                $geometryKey.Backend $formulation
             $selected = @($rows | Where-Object {
                 (Test-SameText (Get-TrimmedText (Get-RowValue $_ 'backend')) $geometryKey.Backend) -and
                 (Test-SameText (Get-TrimmedText (Get-RowValue $_ 'geometry')) $geometryKey.Geometry) -and
-                (Test-SameText (Get-TrimmedText (Get-RowValue $_ 'formulation')) $formulation)
+                (Test-SameText (Get-TrimmedText (Get-RowValue $_ 'formulation')) $formulation) -and
+                (Test-SameText `
+                    (Get-TrimmedText (
+                        Get-RowValue $_ 'trace_restrict_mode')) `
+                    $expectedTraceRestrict)
             })
             $baselineLevels = @($canonicalLevels | Where-Object {
                 $level = $_
@@ -781,7 +827,9 @@ function Assert-RequiredColumns([object[]] $rows, [string] $sourcePath) {
         throw "Input CSV contains no data rows: $sourcePath"
     }
     $names = @($rows[0].PSObject.Properties.Name)
-    foreach ($required in @('backend', 'geometry', 'formulation', 'pose', 'N')) {
+    foreach ($required in @(
+            'backend', 'geometry', 'formulation', 'trace_restrict_mode',
+            'pose', 'N')) {
         $found = $false
         foreach ($name in $names) {
             if (Test-SameText $name $required) {
@@ -940,11 +988,15 @@ function New-ReportValidationKey(
     $backendValue,
     $geometryValue,
     $formulationValue,
+    $traceRestrictModeValue,
     $poseValue,
     $nValue,
     [string] $source) {
-    $values = @($backendValue, $geometryValue, $formulationValue, $poseValue)
-    $names = @('backend', 'geometry', 'formulation', 'pose')
+    $values = @(
+        $backendValue, $geometryValue, $formulationValue,
+        $traceRestrictModeValue, $poseValue)
+    $names = @(
+        'backend', 'geometry', 'formulation', 'trace_restrict_mode', 'pose')
     $normalized = [Collections.Generic.List[string]]::new()
     for ($i = 0; $i -lt $names.Count; ++$i) {
         $text = Get-TrimmedText $values[$i]
@@ -993,6 +1045,8 @@ function Get-CanonicalReportKeys {
                         $geometryEntry.Backend `
                         $geometryEntry.Geometry `
                         $formulation `
+                        (Get-CanonicalTraceRestrictMode `
+                            $geometryEntry.Backend $formulation) `
                         $poseEntry.Id `
                         $n `
                         'canonical seven-geometry report matrix'
@@ -1014,6 +1068,7 @@ function Assert-CanonicalReportMatrix(
             (Get-RowValue $row 'backend') `
             (Get-RowValue $row 'geometry') `
             (Get-RowValue $row 'formulation') `
+            (Get-RowValue $row 'trace_restrict_mode') `
             (Get-RowValue $row 'pose') `
             (Get-RowValue $row 'N') `
             $sourcePath
@@ -1116,6 +1171,7 @@ function Write-ValidationReport(
         (Get-TrimmedText (Get-RowValue $_ 'backend')).ToLowerInvariant() + [char] 31 +
         (Get-TrimmedText (Get-RowValue $_ 'geometry')).ToLowerInvariant() + [char] 31 +
         (Get-TrimmedText (Get-RowValue $_ 'formulation')).ToLowerInvariant() + [char] 31 +
+        (Get-TrimmedText (Get-RowValue $_ 'trace_restrict_mode')).ToLowerInvariant() + [char] 31 +
         (Get-TrimmedText (Get-RowValue $_ 'pose')).ToLowerInvariant() + [char] 31 +
         (Get-TrimmedText (Get-RowValue $_ 'N')).ToLowerInvariant()
     } | Where-Object { $_.Count -gt 1 })
@@ -1146,7 +1202,17 @@ function Write-ValidationReport(
     $lines.Add('- 三层刚体收敛序列按后端选择：`general_cap` 使用绕 `(1,2,3)` 轴旋转 17 度再平移的 `R17+T1`，`topology_native` 使用纯平移 `Tx=(0.137,0,0)`。所有七个几何在 `N=32` 仍完整测试八种姿态。')
     $lines.Add('- 姿态常量：旋转轴为 `(1,2,3)/sqrt(14)`，旋转中心为 `(0.07,-0.07,0.02)`；`Ty=(0,-0.083,0)`、`Tz=(0,0,0.061)`、`T1=(0.137,-0.083,0.061)`、`T2=(-0.109,0.151,-0.047)`。')
     $lines.Add('- `topology_native` 未把 `R17+T1` 用作既有三层收敛姿态：先前 U 柱 `N=64` 运行暴露了一条含三个已认证物理交点的 Cartesian edge，当时的 correction/spread 路线只支持单事件并按 fail-closed 停止。当前实现已改为保存有序全事件并让 spread/restrict 共享稳定 event id，且不会放宽容差或只挑一个根；但该姿态尚未用新实现重跑三层，所以既有报告仍保留已完成的 `Tx` 收敛序列。')
-    $lines.Add('- 收敛阶使用同一“后端/几何/方程/姿态”内相邻网格的 `p=log(E_prev/E_cur)/log(h_prev/h_cur)`；本报告显示合并器写入的 order 字段，不自行伪造缺失阶。')
+    $lines.Add('- 收敛阶使用同一“后端/几何/方程/trace-restrict 路线/姿态”内相邻网格的 `p=log(E_prev/E_cur)/log(h_prev/h_cur)`；本报告显示合并器写入的 order 字段，不自行伪造缺失阶。')
+    $traceRestrictModes = @($rows | ForEach-Object {
+        Get-TrimmedText (Get-RowValue $_ 'trace_restrict_mode')
+    } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Sort-Object -Unique)
+    if ($traceRestrictModes.Count -gt 0) {
+        $lines.Add('- CSV 中出现的 `trace_restrict_mode`：' +
+            (($traceRestrictModes | ForEach-Object {
+                "``$(Convert-ToMarkdownCell $_)``"
+            }) -join '、') + '。')
+    }
     $lines.Add('- 代数收敛严格读取 `gmres_converged`。物理收敛严格读取 `physical_converged`；其阈值由求解程序定义，CSV 中未编码阈值时本报告不反推。')
     $lines.Add('- `topology_native` 的 `physical_converged` 还要求未投影外迹条件误差通过约 `10*GMRES tolerance=2e-9` 的严格阈值；有限网格上的离散误差可令该标志为假，即使 GMRES 和投影算子残差已经收敛。`general_cap` 未输出该布尔标志，报告保留为“未提供”。')
     $lines.Add('- 误差列：`Eint=interior_linf`，`Eρ=density_linf`，`Eext=exterior_condition_linf`，`Ebc=boundary_residual_linf`；`relres` 和 `op-res` 分别为 GMRES 相对残差与算子残差。')
@@ -1233,6 +1299,8 @@ function New-SyntheticReportRow(
         backend = $backend
         geometry = $geometry
         formulation = $formulation
+        trace_restrict_mode = Get-CanonicalTraceRestrictMode `
+            $backend $formulation
         pose = $pose
         N = $n
         h = 3.0 / $n
@@ -1452,8 +1520,8 @@ function Invoke-SelfTest {
         Assert-TextContains $text 'NaN' 'NaN rendering'
         Assert-TextContains $text '†' 'algebraic-failure marker'
         Assert-TextContains $text '逐行硬校验 `samples>final DOF`' 'strict trace oversampling explanation'
-        Assert-TextContains $text '| topology_native / cylinder | neumann | tx_p0137 | 2.000E-03 | 4.000E-03 | 1.000E-03 | N/A | 8 | 1.000E-11 | 2.000E-12 | 48→47 | 96 | 47 | 49 | 2.043 | 否 | 是 |' 'Neumann N=32 detail row'
-        Assert-TextContains $text '| topology_native / cylinder | dirichlet | baseline | 1.000E-03 | 2.000E-03 | 5.000E-04 | 2.500E-04 | 8 | 1.000E-11 | 2.000E-12 | 48→48 | 96 | 48 | 48 | 2.000 | 是 | 是 |' 'Dirichlet N=32 detail row'
+        Assert-TextContains $text '| topology_native / cylinder / q27_cover3_all_event_cauchy | neumann | tx_p0137 | 2.000E-03 | 4.000E-03 | 1.000E-03 | N/A | 8 | 1.000E-11 | 2.000E-12 | 48→47 | 96 | 47 | 49 | 2.043 | 否 | 是 |' 'Neumann N=32 detail row'
+        Assert-TextContains $text '| topology_native / cylinder / q64_cover4_all_event_cauchy | dirichlet | baseline | 1.000E-03 | 2.000E-03 | 5.000E-04 | 2.500E-04 | 8 | 1.000E-11 | 2.000E-12 | 48→48 | 96 | 48 | 48 | 2.000 | 是 | 是 |' 'Dirichlet N=32 detail row'
         Assert-TextContains $text '| general_cap / sphere | dirichlet | baseline | 1.000E-03 | 2.000E-03 | 5.000E-04 | N/A | 8 | 1.000E-11 | 2.000E-12 | 48→48 | 96 | 48 | 48 | 2.000 | 是 | 未提供 |' 'missing Dirichlet boundary-residual detail row'
         foreach ($pose in $canonicalPoses) {
             Assert-TextContains $text $pose.Id "pose $($pose.Id)"

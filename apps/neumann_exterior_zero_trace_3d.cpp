@@ -40,6 +40,7 @@
 #include "reduced_trace_projection_3d.hpp"
 #include "restrict_crossing_selector_3d.hpp"
 #include "shared_quadratic_restrict_3d.hpp"
+#include "tensor_product_cover_restrict_3d.hpp"
 #include "topology_affine_reduction_3d.hpp"
 #include "topology_density_constraints_3d.hpp"
 #include "topology_mean_free_reduction_3d.hpp"
@@ -148,6 +149,8 @@ enum class ExteriorNormalRestrictMode3D {
     GlobalCubicExteriorBranchCrossingOwner,
     SharedQuadraticGridlineCauchy,
     SharedQ10CubicGridlineCauchy,
+    Q27Cover3AllEventCauchy,
+    Q64Cover4AllEventCauchy,
     ExteriorOnlyHarmonicCubic
 };
 
@@ -465,7 +468,8 @@ bool selected_neumann_native_gauss_trace_sampling()
 enum class NeumannEdgeJumpJetMode3D {
     Disabled,
     StrongFeatureMortar,
-    TopologyAffineLocalSvd
+    TopologyAffineLocalSvd,
+    TopologyAmbientGradientLocalSvd
 };
 
 NeumannEdgeJumpJetMode3D selected_neumann_edge_jump_jet_mode()
@@ -489,9 +493,16 @@ NeumannEdgeJumpJetMode3D selected_neumann_edge_jump_jet_mode()
         || std::string(raw) == "local_affine_svd") {
         return NeumannEdgeJumpJetMode3D::TopologyAffineLocalSvd;
     }
+    if (std::string(raw) == "topology_ambient_gradient_local_svd"
+        || std::string(raw) == "topology_ambient_gradient"
+        || std::string(raw) == "ambient_gradient") {
+        return NeumannEdgeJumpJetMode3D::
+            TopologyAmbientGradientLocalSvd;
+    }
     throw std::invalid_argument(
         "KFBIM_3D_NEUMANN_EDGE_JUMP_JET must be disabled, "
-        "strong_feature_mortar, or topology_affine_local_svd");
+        "strong_feature_mortar, topology_affine_local_svd, or "
+        "topology_ambient_gradient_local_svd");
 }
 
 std::string neumann_edge_jump_jet_mode_name()
@@ -503,6 +514,8 @@ std::string neumann_edge_jump_jet_mode_name()
         return "strong_feature_mortar";
     case NeumannEdgeJumpJetMode3D::TopologyAffineLocalSvd:
         return "topology_affine_local_svd";
+    case NeumannEdgeJumpJetMode3D::TopologyAmbientGradientLocalSvd:
+        return "topology_ambient_gradient_local_svd";
     }
     throw std::runtime_error("unknown Neumann edge jump-jet mode");
 }
@@ -644,6 +657,10 @@ std::string trace_restrict_mode_name(ExteriorNormalRestrictMode3D mode)
         return "shared_quadratic_gridline_cauchy";
     case ExteriorNormalRestrictMode3D::SharedQ10CubicGridlineCauchy:
         return "shared_q10_cubic_gridline_cauchy";
+    case ExteriorNormalRestrictMode3D::Q27Cover3AllEventCauchy:
+        return "q27_cover3_all_event_cauchy";
+    case ExteriorNormalRestrictMode3D::Q64Cover4AllEventCauchy:
+        return "q64_cover4_all_event_cauchy";
     case ExteriorNormalRestrictMode3D::ExteriorOnlyHarmonicCubic:
         return "exterior_only_harmonic_cubic";
     }
@@ -656,7 +673,7 @@ ExteriorNormalRestrictMode3D selected_neumann_trace_restrict_mode()
     if (raw == nullptr || std::string(raw).empty()) {
 #ifdef KFBIM_3D_TOPOLOGY_AFFINE_DEFAULT
         return ExteriorNormalRestrictMode3D::
-            SharedQ10CubicGridlineCauchy;
+            Q27Cover3AllEventCauchy;
 #elif defined(KFBIM_3D_NATIVE_COEFFICIENT_DEFAULT)
         return ExteriorNormalRestrictMode3D::
             GlobalCubicExteriorBranchCrossingOwner;
@@ -690,12 +707,23 @@ ExteriorNormalRestrictMode3D selected_neumann_trace_restrict_mode()
         return ExteriorNormalRestrictMode3D::
             SharedQ10CubicGridlineCauchy;
     }
+    if (std::string(raw) == "q27_cover3_all_event_cauchy"
+        || std::string(raw) == "q27_cover3"
+        || std::string(raw) == "topology_affine_q27") {
+        return ExteriorNormalRestrictMode3D::Q27Cover3AllEventCauchy;
+    }
+    if (std::string(raw) == "q64_cover4_all_event_cauchy"
+        || std::string(raw) == "q64_cover4"
+        || std::string(raw) == "topology_affine_q64") {
+        return ExteriorNormalRestrictMode3D::Q64Cover4AllEventCauchy;
+    }
     throw std::invalid_argument(
         "KFBIM_3D_NEUMANN_TRACE_RESTRICT must be "
         "joint_tricubic_crossing_owner (or crossing_owner), "
         "global_cubic_exterior_branch_crossing_owner, or "
         "shared_quadratic_gridline_cauchy (or shared_quadratic), "
-        "shared_q10_cubic_gridline_cauchy, or "
+        "shared_q10_cubic_gridline_cauchy, q27_cover3_all_event_cauchy, "
+        "q64_cover4_all_event_cauchy, or "
         "joint_tricubic_cauchy (or legacy)");
 }
 
@@ -715,6 +743,20 @@ bool trace_restrict_uses_shared_quadratic(
                SharedQ10CubicGridlineCauchy;
 }
 
+bool trace_restrict_uses_tensor_cover(
+    ExteriorNormalRestrictMode3D mode)
+{
+    return mode == ExteriorNormalRestrictMode3D::Q27Cover3AllEventCauchy
+        || mode == ExteriorNormalRestrictMode3D::Q64Cover4AllEventCauchy;
+}
+
+bool trace_restrict_uses_all_event_path(
+    ExteriorNormalRestrictMode3D mode)
+{
+    return trace_restrict_uses_shared_quadratic(mode)
+        || trace_restrict_uses_tensor_cover(mode);
+}
+
 bool trace_restrict_uses_topology_affine_cubic(
     ExteriorNormalRestrictMode3D mode)
 {
@@ -729,7 +771,7 @@ ExteriorNormalRestrictMode3D selected_dirichlet_normal_restrict_mode()
     if (raw == nullptr || std::string(raw).empty()) {
 #ifdef KFBIM_3D_TOPOLOGY_AFFINE_DEFAULT
         return ExteriorNormalRestrictMode3D::
-            SharedQ10CubicGridlineCauchy;
+            Q64Cover4AllEventCauchy;
 #else
         return ExteriorNormalRestrictMode3D::JointTricubicCrossingOwner;
 #endif
@@ -754,11 +796,22 @@ ExteriorNormalRestrictMode3D selected_dirichlet_normal_restrict_mode()
         return ExteriorNormalRestrictMode3D::
             SharedQ10CubicGridlineCauchy;
     }
+    if (std::string(raw) == "q27_cover3_all_event_cauchy"
+        || std::string(raw) == "q27_cover3"
+        || std::string(raw) == "topology_affine_q27") {
+        return ExteriorNormalRestrictMode3D::Q27Cover3AllEventCauchy;
+    }
+    if (std::string(raw) == "q64_cover4_all_event_cauchy"
+        || std::string(raw) == "q64_cover4"
+        || std::string(raw) == "topology_affine_q64") {
+        return ExteriorNormalRestrictMode3D::Q64Cover4AllEventCauchy;
+    }
     throw std::invalid_argument(
         "KFBIM_3D_DIRICHLET_NORMAL_RESTRICT must be "
         "joint_tricubic_crossing_owner (or crossing_owner) or "
         "shared_quadratic_gridline_cauchy (or shared_quadratic), "
-        "shared_q10_cubic_gridline_cauchy, or "
+        "shared_q10_cubic_gridline_cauchy, q27_cover3_all_event_cauchy, "
+        "q64_cover4_all_event_cauchy, or "
         "joint_tricubic_cauchy (or legacy)");
 }
 
@@ -997,6 +1050,7 @@ struct SolveMetrics3D {
     double edge_nullspace_residual_linf = 0.0;
     double feature_vertex_residual_linf = 0.0;
     double feature_edge_residual_linf = 0.0;
+    double feature_discarded_residual_linf = 0.0;
     double trace_projection_leakage_relative_l2 = 0.0;
     double edge_normal_fit_linf = 0.0;
     double edge_target_projection_linf = 0.0;
@@ -1439,6 +1493,7 @@ CauchyStencilSet build_cauchy_stencils(const NativeNurbsSurface3D& surface,
 
 using app3d::HarmonicPolynomialSpace3D;
 using app3d::svd_pseudoinverse_3d;
+using app3d::svd_pseudoinverse_from_decomposition_3d;
 
 struct CauchyFitMap3D {
     Eigen::MatrixXd value_map;
@@ -1567,7 +1622,7 @@ public:
         if (!maps_enabled_) {
             throw std::runtime_error(
                 "legacy panel-centred Cauchy maps are disabled for the "
-                "shared-Q10-only pipeline");
+                "direct all-event cover pipeline");
         }
         Eigen::MatrixXd result(size, dimension());
         if (use_local_restrict_fit && local_maps_.empty()) {
@@ -1681,7 +1736,8 @@ private:
         }
 
         const Eigen::MatrixXd weighted = sqrt_weights.asDiagonal() * design;
-        Eigen::JacobiSVD<Eigen::MatrixXd> condition_svd(weighted);
+        Eigen::JacobiSVD<Eigen::MatrixXd> condition_svd(
+            weighted, Eigen::ComputeThinU | Eigen::ComputeThinV);
         const Eigen::VectorXd singular = condition_svd.singularValues();
         if (singular.size() != dimension() || singular.size() == 0
             || !singular.allFinite() || !(singular[0] > 0.0)
@@ -1692,7 +1748,8 @@ private:
         }
         CauchyFitMap3D result;
         result.condition = singular[0] / singular[singular.size() - 1];
-        const Eigen::MatrixXd pinv = svd_pseudoinverse_3d(weighted, 3.0e-12);
+        const Eigen::MatrixXd pinv =
+            svd_pseudoinverse_from_decomposition_3d(condition_svd, 3.0e-12);
         result.value_map.resize(dimension(), value_count);
         result.normal_map.resize(dimension(), normal_count);
         for (int k = 0; k < value_count; ++k)
@@ -2012,6 +2069,15 @@ struct SharedQuadraticTraceSidePlan3D {
     std::vector<SharedQuadraticGridlineCorrection3D> corrections;
 };
 
+// One tensor-product Cartesian cover at the trace point.  The interpolation
+// weights act directly at the interface; there are no auxiliary normal
+// layers and no a1/h profile recovery.  Interior and exterior plans share
+// the same cover but retain independent all-event branch continuations.
+struct TensorProductCoverTraceBranchPlan3D {
+    app3d::TensorProductCoverRestrictStencil3D interpolation;
+    std::vector<SharedQuadraticGridlineCorrection3D> corrections;
+};
+
 struct SharedQuadraticGridlineCrossing3D {
     int lo = -1;
     int hi = -1;
@@ -2075,7 +2141,9 @@ public:
                                  app3d::SharedQuadraticNormalProfile3D
                                      shared_normal_profile =
                                          app3d::SharedQuadraticNormalProfile3D::
-                                             LegacySplitQuadratic)
+                                             LegacySplitQuadratic,
+                                 bool build_q27_cover3_restrict = false,
+                                 bool build_q64_cover4_restrict = false)
         : grid_(grid)
         , grid_pair_(grid_pair)
         , native_surface_(native_surface)
@@ -2090,7 +2158,9 @@ public:
                selected_cauchy_value_trace_fit_mode(),
                local_restrict_value_count,
                local_restrict_normal_count,
-               !(build_shared_quadratic_restrict
+               !((build_shared_quadratic_restrict
+                  || build_q27_cover3_restrict
+                  || build_q64_cover4_restrict)
                  && !build_standard_trace_restrict
                  && selected_density_iteration_mode()
                         == DensityIterationMode3D::ReducedCoefficients))
@@ -2125,7 +2195,9 @@ public:
         } else if (build_standard_trace_restrict) {
             build_trace_templates(nullptr);
         }
-        if (build_shared_quadratic_restrict) {
+        if (build_shared_quadratic_restrict
+            || build_q27_cover3_restrict
+            || build_q64_cover4_restrict) {
             // Unlike the legacy route, all-event path continuation needs the
             // complete ordered root set.  Give endpoint queries a dedicated
             // deep subdivision budget and never accept per-element partials.
@@ -2137,14 +2209,35 @@ public:
             restrict_options.collect_unresolved_regions = true;
             const geometry3d::NurbsSurfaceIntersector3D shared_intersector(
                 native_surface_.geometry_model(), restrict_options);
-            build_shared_quadratic_trace_templates(shared_intersector);
-            shared_quadratic_templates_built_ = true;
+            if (build_shared_quadratic_restrict) {
+                build_shared_quadratic_trace_templates(shared_intersector);
+                shared_quadratic_templates_built_ = true;
+            }
+            if (build_q27_cover3_restrict) {
+                build_tensor_product_cover_trace_templates(
+                    shared_intersector,
+                    app3d::TensorProductCoverKind3D::Q27Cover3);
+                q27_cover3_templates_built_ = true;
+            }
+            if (build_q64_cover4_restrict) {
+                build_tensor_product_cover_trace_templates(
+                    shared_intersector,
+                    app3d::TensorProductCoverKind3D::Q64Cover4);
+                q64_cover4_templates_built_ = true;
+            }
+            // Dense recovery maps are needed only while composing retained
+            // all-event correction rows.  Both cover families must be built
+            // before this common cache is released.
+            shared_quadratic_cauchy_cache_.clear();
+            all_event_exact_cauchy_cache_.clear();
+            all_event_intersection_cache_.clear();
         }
         if (build_standard_trace_restrict) {
             build_joint_trace_fit();
             build_global_trace_fit();
         }
-        build_shared_quadratic_joint_trace_fit();
+        if (build_shared_quadratic_restrict)
+            build_shared_quadratic_joint_trace_fit();
     }
 
     int surface_size() const
@@ -2422,9 +2515,11 @@ public:
     const SharedQuadraticRestrictDiagnostics3D&
     shared_quadratic_restrict_diagnostics() const
     {
-        if (!shared_quadratic_templates_built_) {
+        if (!shared_quadratic_templates_built_
+            && !q27_cover3_templates_built_
+            && !q64_cover4_templates_built_) {
             throw std::runtime_error(
-                "shared quadratic gridline-Cauchy restrict was not initialized");
+                "all-event Cauchy restrict was not initialized");
         }
         return shared_quadratic_diagnostics_;
     }
@@ -2478,8 +2573,8 @@ public:
                     true);
             }
         } else {
-            // A shared-Q10-only trace reconstructs every continuation from
-            // the jump arrays below and never consumes panel-centred jets.
+            // An all-event direct-cover trace reconstructs every continuation
+            // from the jump arrays below and never consumes panel-centred jets.
             result.coefficients = Eigen::MatrixXd::Zero(
                 surface_size(), fit_.dimension());
             if (use_local_restrict_fit) {
@@ -2567,7 +2662,7 @@ public:
                 app3d::make_local_orthonormal_frame_3d(
                     normal, cached.geometry.x_u);
             cached.value = app3d::build_direct_coefficient_value_jet_plan_3d(
-                density, patch_index, u, v, frame);
+                density, patch_index, u, v, cached.geometry, frame);
             return cache.emplace(key, std::move(cached)).first->second;
         };
 
@@ -2604,8 +2699,8 @@ public:
             direct_coefficient_spread_rows_.push_back(std::move(row));
         }
 
-        for (SharedQuadraticTraceSidePlan3D& side :
-             shared_quadratic_plans_) {
+        const auto bind_cover_corrections = [&](auto& plans) {
+          for (auto& side : plans) {
             for (SharedQuadraticGridlineCorrection3D& correction :
                  side.corrections) {
                 const CachedPlan& cached =
@@ -2626,7 +2721,11 @@ public:
                 correction.direct_v = cached.value.v;
                 correction.direct_coefficient_ready = true;
             }
-        }
+          }
+        };
+        bind_cover_corrections(shared_quadratic_plans_);
+        bind_cover_corrections(q27_cover3_plans_);
+        bind_cover_corrections(q64_cover4_plans_);
         direct_coefficient_density_ = &density;
     }
 
@@ -2655,7 +2754,8 @@ public:
                 "direct coefficient crossing evaluation received incompatible data");
         }
         HarmonicJetField3D result;
-        // Shared-Q10 never reads this legacy panel-centred representation.
+        // All-event direct covers never read this legacy panel-centred
+        // representation.
         // Retain only the known normal part for compatibility with diagnostic
         // callers and deliberately do not fit the unknown value density.
         if (fit_.maps_enabled()) {
@@ -2754,7 +2854,7 @@ public:
                     normal, cached.geometry.x_u);
             cached.normal =
                 app3d::build_direct_coefficient_normal_jet_plan_3d(
-                    density, patch_index, u, v, frame);
+                    density, patch_index, u, v, cached.geometry, frame);
             return cache.emplace(key, std::move(cached)).first->second;
         };
 
@@ -2790,8 +2890,8 @@ public:
             direct_coefficient_normal_spread_rows_.push_back(std::move(row));
         }
 
-        for (SharedQuadraticTraceSidePlan3D& side :
-             shared_quadratic_plans_) {
+        const auto bind_cover_corrections = [&](auto& plans) {
+          for (auto& side : plans) {
             for (SharedQuadraticGridlineCorrection3D& correction :
                  side.corrections) {
                 const CachedPlan& cached =
@@ -2813,7 +2913,11 @@ public:
                 correction.direct_normal_coefficient_ready = true;
                 correction.direct_known_value_ready = true;
             }
-        }
+          }
+        };
+        bind_cover_corrections(shared_quadratic_plans_);
+        bind_cover_corrections(q27_cover3_plans_);
+        bind_cover_corrections(q64_cover4_plans_);
         direct_coefficient_normal_density_ = &density;
     }
 
@@ -2936,6 +3040,10 @@ public:
         const Eigen::VectorXd& normal_jump,
         ExteriorNormalRestrictMode3D mode) const
     {
+        if (trace_restrict_uses_tensor_cover(mode)) {
+            return recover_tensor_product_cover_trace(
+                field, value_jump, normal_jump, false, false, mode);
+        }
         if (trace_restrict_uses_shared_quadratic(mode)) {
             return recover_shared_quadratic_joint_trace(
                 shared_quadratic_continued_samples(
@@ -2971,6 +3079,10 @@ public:
         const Eigen::VectorXd& normal_jump,
         ExteriorNormalRestrictMode3D mode) const
     {
+        if (trace_restrict_uses_tensor_cover(mode)) {
+            return recover_tensor_product_cover_trace(
+                field, value_jump, normal_jump, true, false, mode);
+        }
         if (trace_restrict_uses_shared_quadratic(mode)) {
             return recover_shared_quadratic_joint_trace(
                 shared_quadratic_continued_samples(
@@ -3009,6 +3121,10 @@ public:
         const Eigen::VectorXd& normal_jump,
         ExteriorNormalRestrictMode3D mode) const
     {
+        if (trace_restrict_uses_tensor_cover(mode)) {
+            return recover_tensor_product_cover_trace(
+                field, value_jump, normal_jump, false, true, mode);
+        }
         if (trace_restrict_uses_shared_quadratic(mode)) {
             return recover_shared_quadratic_joint_trace(
                 shared_quadratic_continued_samples(
@@ -3048,6 +3164,10 @@ public:
         const Eigen::VectorXd& normal_jump,
         ExteriorNormalRestrictMode3D mode) const
     {
+        if (trace_restrict_uses_tensor_cover(mode)) {
+            return recover_tensor_product_cover_trace(
+                field, value_jump, normal_jump, true, true, mode);
+        }
         if (trace_restrict_uses_shared_quadratic(mode)) {
             return recover_shared_quadratic_joint_trace(
                 shared_quadratic_continued_samples(
@@ -3065,6 +3185,151 @@ public:
     }
 
 private:
+    double evaluate_all_event_cauchy_correction(
+        const SharedQuadraticGridlineCorrection3D& correction,
+        const HarmonicJetField3D& field,
+        const Eigen::VectorXd& value_jump,
+        const Eigen::VectorXd& normal_jump) const
+    {
+        double cauchy_value = 0.0;
+        if (field.direct_coefficient_cauchy) {
+            if (field.direct_known_value_jet) {
+                if (!correction.direct_known_value_ready) {
+                    throw std::runtime_error(
+                        "all-event restrict analytic Dirichlet correction was not bound");
+                }
+                const app3d::ValueJet3D value_jet =
+                    field.direct_known_value_jet(
+                        correction.direct_patch,
+                        correction.direct_u,
+                        correction.direct_v,
+                        correction.direct_geometry,
+                        correction.direct_frame);
+                if (!value_jet.allFinite()) {
+                    throw std::runtime_error(
+                        "all-event restrict known Dirichlet jet is not finite");
+                }
+                cauchy_value +=
+                    correction.direct_known_value_row.dot(value_jet);
+            } else if (field.direct_value_c0.size() != 0) {
+                if (!correction.direct_coefficient_ready) {
+                    throw std::runtime_error(
+                        "all-event restrict direct value correction was not bound");
+                }
+                cauchy_value +=
+                    correction.direct_value_row.dot(field.direct_value_c0);
+            } else {
+                for (int q = 0;
+                     q < static_cast<int>(correction.value_ids.size()); ++q) {
+                    cauchy_value += correction.value_weights[q]
+                        * value_jump[correction.value_ids[
+                            static_cast<std::size_t>(q)]];
+                }
+            }
+            if (field.direct_known_normal_jet) {
+                const app3d::NormalJet3D normal_jet =
+                    field.direct_known_normal_jet(
+                        correction.direct_patch,
+                        correction.direct_u,
+                        correction.direct_v,
+                        correction.direct_geometry,
+                        correction.direct_frame);
+                cauchy_value +=
+                    correction.direct_normal_row.dot(normal_jet);
+            } else if (field.direct_normal_c0.size() != 0) {
+                if (!correction.direct_normal_coefficient_ready) {
+                    throw std::runtime_error(
+                        "all-event restrict direct normal correction was not bound");
+                }
+                cauchy_value +=
+                    correction.direct_normal_coefficient_row.dot(
+                        field.direct_normal_c0);
+            } else {
+                for (int q = 0;
+                     q < static_cast<int>(correction.normal_ids.size()); ++q) {
+                    cauchy_value += correction.normal_weights[q]
+                        * normal_jump[correction.normal_ids[
+                            static_cast<std::size_t>(q)]];
+                }
+            }
+            return cauchy_value;
+        }
+
+        for (int q = 0;
+             q < static_cast<int>(correction.value_ids.size()); ++q) {
+            cauchy_value += correction.value_weights[q]
+                * value_jump[correction.value_ids[static_cast<std::size_t>(q)]];
+        }
+        for (int q = 0;
+             q < static_cast<int>(correction.normal_ids.size()); ++q) {
+            cauchy_value += correction.normal_weights[q]
+                * normal_jump[
+                    correction.normal_ids[static_cast<std::size_t>(q)]];
+        }
+        return cauchy_value;
+    }
+
+    Eigen::VectorXd recover_tensor_product_cover_trace(
+        const HarmonicJetField3D& field,
+        const Eigen::VectorXd& value_jump,
+        const Eigen::VectorXd& normal_jump,
+        bool interior_branch,
+        bool normal_derivative,
+        ExteriorNormalRestrictMode3D mode) const
+    {
+        const bool q27 =
+            mode == ExteriorNormalRestrictMode3D::Q27Cover3AllEventCauchy;
+        const bool q64 =
+            mode == ExteriorNormalRestrictMode3D::Q64Cover4AllEventCauchy;
+        if ((!q27 && !q64)
+            || (q27 && !q27_cover3_templates_built_)
+            || (q64 && !q64_cover4_templates_built_)) {
+            throw std::runtime_error(
+                "requested tensor-product cover restrict was not initialized");
+        }
+        const auto& plans = q27 ? q27_cover3_plans_ : q64_cover4_plans_;
+        const int size = surface_size();
+        if (plans.size() != static_cast<std::size_t>(2 * size)
+            || field.potential.size() != grid_.num_dofs()
+            || value_jump.size() != size || normal_jump.size() != size) {
+            throw std::invalid_argument(
+                "tensor-product cover restrict received incompatible data");
+        }
+
+        Eigen::VectorXd result(size);
+        const int branch_index = interior_branch ? 0 : 1;
+        for (int center = 0; center < size; ++center) {
+            const auto& plan = plans[static_cast<std::size_t>(
+                2 * center + branch_index)];
+            Eigen::VectorXd continued_nodes(plan.interpolation.grid_ids.size());
+            for (int q = 0; q < continued_nodes.size(); ++q) {
+                continued_nodes[q] = field.potential[
+                    plan.interpolation.grid_ids[static_cast<std::size_t>(q)]];
+            }
+            for (const auto& correction : plan.corrections) {
+                if (correction.stencil_node < 0
+                    || correction.stencil_node >= continued_nodes.size()) {
+                    throw std::logic_error(
+                        "tensor-product cover correction has an invalid slot");
+                }
+                continued_nodes[correction.stencil_node] +=
+                    static_cast<double>(correction.continuation_sign)
+                    * evaluate_all_event_cauchy_correction(
+                        correction, field, value_jump, normal_jump);
+            }
+            result[center] =
+                (normal_derivative
+                    ? plan.interpolation.normal_weights
+                    : plan.interpolation.value_weights)
+                    .dot(continued_nodes);
+        }
+        if (!result.allFinite()) {
+            throw std::runtime_error(
+                "tensor-product cover restrict produced NaN/Inf");
+        }
+        return result;
+    }
+
     Eigen::Matrix<double, Eigen::Dynamic,
                   app3d::kSharedQuadraticRestrictQueryCount3D>
     shared_quadratic_samples(
@@ -3734,7 +3999,8 @@ private:
         }
 
         const Eigen::MatrixXd weighted = sqrt_weights.asDiagonal() * design;
-        Eigen::JacobiSVD<Eigen::MatrixXd> condition_svd(weighted);
+        Eigen::JacobiSVD<Eigen::MatrixXd> condition_svd(
+            weighted, Eigen::ComputeThinU | Eigen::ComputeThinV);
         const Eigen::VectorXd singular = condition_svd.singularValues();
         if (singular.size() != dimension || singular.size() == 0
             || !singular.allFinite() || !(singular[0] > 0.0)
@@ -3744,7 +4010,7 @@ private:
                 "crossing-local Cauchy fit is rank deficient");
         }
         const Eigen::MatrixXd pinv =
-            svd_pseudoinverse_3d(weighted, 3.0e-12);
+            svd_pseudoinverse_from_decomposition_3d(condition_svd, 3.0e-12);
         result.value_map.resize(dimension, value_count);
         result.normal_map.resize(dimension, normal_count);
         for (int k = 0; k < value_count; ++k)
@@ -3876,33 +4142,30 @@ private:
             shared_quadratic_gridline_crossings_.size();
     }
 
-    SharedQuadraticTraceSidePlan3D
-    build_shared_quadratic_side_plan(
+    std::vector<SharedQuadraticGridlineCorrection3D>
+    build_all_event_trace_corrections(
         int center,
-        app3d::QuadraticRestrictNormalSide3D side,
+        bool desired_inside,
+        const std::vector<int>& grid_ids,
         const geometry3d::NurbsSurfaceIntersector3D& intersector,
         const app3d::G1PatchTopology3D& topology) const
     {
         const SurfaceDof& dof =
             cloud_.dofs[static_cast<std::size_t>(center)];
-        const auto queries = app3d::quadratic_restrict_normal_query_points_3d(
-            dof.point, dof.normal, h_, side, shared_normal_profile_);
-        SharedQuadraticTraceSidePlan3D result;
-        result.interpolation =
-            app3d::build_shared_quadratic_restrict_stencil_3d(grid_, queries);
-        const bool desired_inside =
-            side == app3d::QuadraticRestrictNormalSide3D::Interior;
+        if (grid_ids.empty()) {
+            throw std::invalid_argument(
+                "all-event trace correction received an empty cover");
+        }
+        std::vector<SharedQuadraticGridlineCorrection3D> result;
         const double tie_tolerance = std::max(
             16.0 * intersector.geometry_tolerance(), 1.0e-12 * h_);
         for (int stencil_node = 0;
-             stencil_node < app3d::kSharedQuadraticRestrictNodeCount3D;
+             stencil_node < static_cast<int>(grid_ids.size());
              ++stencil_node) {
-            const int node = result.interpolation.grid_ids[
-                static_cast<std::size_t>(stencil_node)];
+            const int node = grid_ids[static_cast<std::size_t>(stencil_node)];
             const bool node_inside = grid_pair_.domain_label(node) > 0;
             if (node_inside != desired_inside)
                 ++shared_quadratic_diagnostics_.wrong_side_nodes;
-            ++shared_quadratic_diagnostics_.segment_queries;
             const Eigen::Vector3d node_point = grid_point(grid_, node);
             const Eigen::Vector3d support_to_trace = dof.point - node_point;
             const double support_to_trace_length = support_to_trace.norm();
@@ -3937,9 +4200,22 @@ private:
             const double endpoint_extension = 4.0 * tie_tolerance;
             const Eigen::Vector3d certified_end =
                 dof.point + endpoint_extension * segment_direction;
-            geometry3d::NurbsSurfaceIntersectionResult3D
-                certified_intersection = intersector.intersect_segment(
-                    node_point, certified_end);
+            const std::pair<int, int> cache_key{center, node};
+            auto cached_intersection =
+                all_event_intersection_cache_.find(cache_key);
+            if (cached_intersection == all_event_intersection_cache_.end()) {
+                ++shared_quadratic_diagnostics_.segment_queries;
+                cached_intersection = all_event_intersection_cache_.emplace(
+                    cache_key,
+                    intersector.intersect_segment(node_point, certified_end))
+                                          .first;
+            }
+            // Interior/exterior branches and nested Q27/Q64 covers use the
+            // identical geometric support path.  Cache its certified raw
+            // event set once; branch continuation and endpoint handling below
+            // remain independent.
+            const geometry3d::NurbsSurfaceIntersectionResult3D&
+                certified_intersection = cached_intersection->second;
             const app3d::SegmentEndpointPartition3D endpoint_partition =
                 app3d::partition_certified_segment_endpoint_3d(
                     certified_intersection, node_point, dof.point,
@@ -4269,7 +4545,6 @@ private:
                     }
                 }
 
-                HarmonicCrossingDirectPlan3D exact_cauchy_plan;
                 const HarmonicCrossingDirectPlan3D* cauchy_plan = nullptr;
                 P2CrossingOwner3D correction_owner = exact_owner;
                 double correction_distance_over_h =
@@ -4306,9 +4581,25 @@ private:
                 } else {
                     const int crossing_center = surface_dof_for_crossing(
                         exact_owner, event.point);
-                    exact_cauchy_plan = build_direct_crossing_plan(
-                        exact_owner, event.point, crossing_center);
-                    cauchy_plan = &exact_cauchy_plan;
+                    // Repeated interior/exterior and nested Q27/Q64 plans see
+                    // the exact same certified owner parameters.  Reuse only
+                    // bit-for-bit identical parameter pairs; no tolerance
+                    // merge is allowed, so nearby physical roots remain
+                    // distinct events.
+                    const std::tuple<int, double, double> exact_key{
+                        exact_owner.nurbs_patch_index,
+                        exact_owner.nurbs_parameter.x(),
+                        exact_owner.nurbs_parameter.y()};
+                    auto cached = all_event_exact_cauchy_cache_.find(
+                        exact_key);
+                    if (cached == all_event_exact_cauchy_cache_.end()) {
+                        cached = all_event_exact_cauchy_cache_.emplace(
+                            exact_key,
+                            build_direct_crossing_plan(
+                                exact_owner, event.point, crossing_center))
+                                     .first;
+                    }
+                    cauchy_plan = &cached->second;
                 }
                 SharedQuadraticGridlineCorrection3D correction =
                     compose_shared_quadratic_correction(
@@ -4317,11 +4608,10 @@ private:
                 correction.continuation_sign = event.continuation_sign;
                 correction.direct_crossing_owner = correction_owner;
                 correction.direct_grid_node = node;
-                result.corrections.push_back(std::move(correction));
-                if (result.corrections.back().stencil_node != stencil_node
-                    || result.interpolation.grid_ids[
-                           static_cast<std::size_t>(
-                               result.corrections.back().stencil_node)]
+                result.push_back(std::move(correction));
+                if (result.back().stencil_node != stencil_node
+                    || grid_ids[static_cast<std::size_t>(
+                           result.back().stencil_node)]
                            != node) {
                     throw std::logic_error(
                         "shared quadratic correction confused a local stencil slot with a global grid node");
@@ -4345,10 +4635,55 @@ private:
         return result;
     }
 
+    SharedQuadraticTraceSidePlan3D
+    build_shared_quadratic_side_plan(
+        int center,
+        app3d::QuadraticRestrictNormalSide3D side,
+        const geometry3d::NurbsSurfaceIntersector3D& intersector,
+        const app3d::G1PatchTopology3D& topology) const
+    {
+        const SurfaceDof& dof =
+            cloud_.dofs[static_cast<std::size_t>(center)];
+        const auto queries = app3d::quadratic_restrict_normal_query_points_3d(
+            dof.point, dof.normal, h_, side, shared_normal_profile_);
+        SharedQuadraticTraceSidePlan3D result;
+        result.interpolation =
+            app3d::build_shared_quadratic_restrict_stencil_3d(grid_, queries);
+        const std::vector<int> grid_ids(
+            result.interpolation.grid_ids.begin(),
+            result.interpolation.grid_ids.end());
+        result.corrections = build_all_event_trace_corrections(
+            center,
+            side == app3d::QuadraticRestrictNormalSide3D::Interior,
+            grid_ids, intersector, topology);
+        return result;
+    }
+
+    TensorProductCoverTraceBranchPlan3D
+    build_tensor_product_cover_branch_plan(
+        int center,
+        bool desired_inside,
+        app3d::TensorProductCoverKind3D kind,
+        const geometry3d::NurbsSurfaceIntersector3D& intersector,
+        const app3d::G1PatchTopology3D& topology) const
+    {
+        const SurfaceDof& dof =
+            cloud_.dofs[static_cast<std::size_t>(center)];
+        TensorProductCoverTraceBranchPlan3D result;
+        result.interpolation =
+            app3d::build_tensor_product_cover_restrict_stencil_3d(
+                grid_, dof.point, dof.normal, kind);
+        result.corrections = build_all_event_trace_corrections(
+            center, desired_inside, result.interpolation.grid_ids,
+            intersector, topology);
+        return result;
+    }
+
     void build_shared_quadratic_trace_templates(
         const geometry3d::NurbsSurfaceIntersector3D& intersector)
     {
-        build_shared_quadratic_gridline_catalog();
+        if (shared_quadratic_gridline_crossings_.empty())
+            build_shared_quadratic_gridline_catalog();
         const app3d::G1PatchTopology3D topology =
             shared_quadratic_g1_topology();
         shared_quadratic_plans_.reserve(
@@ -4369,14 +4704,43 @@ private:
         }
         shared_quadratic_diagnostics_.side_plans =
             shared_quadratic_plans_.size();
-        // Dense recovery maps are needed only while composing the retained
-        // correction rows.  Releasing the cache prevents an O(crossings x
-        // Cauchy-neighborhood) memory increase during GMRES.
-        shared_quadratic_cauchy_cache_.clear();
         if (shared_quadratic_diagnostics_.segment_fallbacks != 0
             || shared_quadratic_diagnostics_.no_g1_gridline_fallbacks != 0) {
             throw std::runtime_error(
                 "shared quadratic restrict setup used a forbidden geometry fallback");
+        }
+    }
+
+    void build_tensor_product_cover_trace_templates(
+        const geometry3d::NurbsSurfaceIntersector3D& intersector,
+        app3d::TensorProductCoverKind3D kind)
+    {
+        if (shared_quadratic_gridline_crossings_.empty())
+            build_shared_quadratic_gridline_catalog();
+        const app3d::G1PatchTopology3D topology =
+            shared_quadratic_g1_topology();
+        std::vector<TensorProductCoverTraceBranchPlan3D>& plans =
+            kind == app3d::TensorProductCoverKind3D::Q27Cover3
+            ? q27_cover3_plans_ : q64_cover4_plans_;
+        plans.reserve(static_cast<std::size_t>(2 * surface_size()));
+        for (int center = 0; center < surface_size(); ++center) {
+            for (const bool desired_inside : {true, false}) {
+                plans.push_back(build_tensor_product_cover_branch_plan(
+                    center, desired_inside, kind, intersector, topology));
+                const auto& interpolation = plans.back().interpolation;
+                shared_quadratic_diagnostics_.interpolation_condition_max =
+                    std::max(
+                        shared_quadratic_diagnostics_.
+                            interpolation_condition_max,
+                        std::max(interpolation.value_weight_l1,
+                                 interpolation.scaled_normal_weight_l1));
+            }
+        }
+        shared_quadratic_diagnostics_.side_plans += plans.size();
+        if (shared_quadratic_diagnostics_.segment_fallbacks != 0
+            || shared_quadratic_diagnostics_.no_g1_gridline_fallbacks != 0) {
+            throw std::runtime_error(
+                "tensor-product cover setup used a forbidden geometry fallback");
         }
     }
 
@@ -4519,9 +4883,8 @@ private:
             const HarmonicCrossingDirectPlan3D plan =
                 build_direct_crossing_plan(owner, hit, center);
             ++direct_crossing_unique_plan_count_;
-            // Preserve the legacy condition-number and pseudoinverse algebra:
-            // one values-only SVD plus the SVD inside svd_pseudoinverse_3d.
-            direct_crossing_svd_count_ += 2;
+            // Rank/condition diagnostics and pseudoinverse share one SVD.
+            ++direct_crossing_svd_count_;
 
             for (std::size_t pos = group_begin; pos < group_end; ++pos) {
                 const std::size_t op_index = refs[pos].op_index;
@@ -5181,6 +5544,8 @@ private:
         app3d::SharedQuadraticNormalProfile3D::LegacySplitQuadratic;
     bool crossing_owner_templates_built_ = false;
     bool shared_quadratic_templates_built_ = false;
+    bool q27_cover3_templates_built_ = false;
+    bool q64_cover4_templates_built_ = false;
     double h_ = 0.0;
     PanelCenterCauchyFit3D fit_;
     std::unique_ptr<app3d::ExteriorOnlyCubicNormalRestrict3D>
@@ -5201,12 +5566,21 @@ private:
     std::size_t direct_crossing_svd_count_ = 0;
     std::vector<HarmonicTraceSample3D> trace_samples_;
     std::vector<SharedQuadraticTraceSidePlan3D> shared_quadratic_plans_;
+    std::vector<TensorProductCoverTraceBranchPlan3D> q27_cover3_plans_;
+    std::vector<TensorProductCoverTraceBranchPlan3D> q64_cover4_plans_;
     std::vector<SharedQuadraticGridlineCrossing3D>
         shared_quadratic_gridline_crossings_;
     std::vector<app3d::CartesianGridlineCrossingRecord3D>
         shared_quadratic_gridline_records_;
     mutable std::map<std::tuple<int, int, int>, HarmonicCrossingDirectPlan3D>
         shared_quadratic_cauchy_cache_;
+    mutable std::map<
+        std::tuple<int, double, double>, HarmonicCrossingDirectPlan3D>
+        all_event_exact_cauchy_cache_;
+    mutable std::map<
+        std::pair<int, int>,
+        geometry3d::NurbsSurfaceIntersectionResult3D>
+        all_event_intersection_cache_;
     mutable SharedQuadraticRestrictDiagnostics3D
         shared_quadratic_diagnostics_;
     std::vector<LocalRestrictCauchyPlan3D> local_restrict_plans_;
@@ -6193,7 +6567,7 @@ public:
               make_density_options(
                   coefficients_per_direction, field, reduction_backend))
         , sample_stencils_(make_sample_stencils(density_, samples))
-        , c0_design_(make_c0_design(density_, samples))
+        , c0_design_(make_c0_design(density_, sample_stencils_))
         , weights_(make_weights(samples))
         , projection_(make_projection(density_, c0_design_, weights_))
         , coordinates_(make_coordinates(density_))
@@ -6522,19 +6896,18 @@ private:
 
     static Eigen::SparseMatrix<double> make_c0_design(
         const app3d::NativeNurbsDensitySpace3D& density,
-        const SurfaceDofCloud& samples)
+        const std::vector<app3d::NativeDensityC0Stencil3D>& sample_stencils)
     {
         Eigen::SparseMatrix<double> result(
-            static_cast<int>(samples.dofs.size()),
+            static_cast<int>(sample_stencils.size()),
             density.c0_coefficient_count());
         std::vector<Eigen::Triplet<double>> triplets;
-        triplets.reserve(samples.dofs.size() * 16);
-        for (int row = 0; row < static_cast<int>(samples.dofs.size()); ++row) {
-            const SurfaceDof& sample =
-                samples.dofs[static_cast<std::size_t>(row)];
-            const app3d::NativeDensityC0Stencil3D stencil =
-                density.c0_basis_stencil(
-                    sample.patch_id, sample.u, sample.v);
+        triplets.reserve(sample_stencils.size() * 16);
+        // The same rows are retained for sample evaluation.  Reuse them here
+        // without repeating B-spline evaluation or changing COO entry order.
+        for (int row = 0; row < static_cast<int>(sample_stencils.size()); ++row) {
+            const app3d::NativeDensityC0Stencil3D& stencil =
+                sample_stencils[static_cast<std::size_t>(row)];
             for (int q = 0; q < stencil.count; ++q) {
                 triplets.emplace_back(
                     row,
@@ -7008,14 +7381,17 @@ solve_exterior_zero_trace_neumann_coefficients_3d(
         selected_neumann_edge_jump_jet_mode();
     const bool use_edge_jump_jet = edge_jump_jet_mode
         == NeumannEdgeJumpJetMode3D::StrongFeatureMortar;
+    const bool use_topology_ambient_gradient = edge_jump_jet_mode
+        == NeumannEdgeJumpJetMode3D::TopologyAmbientGradientLocalSvd;
     const bool use_topology_affine = edge_jump_jet_mode
-        == NeumannEdgeJumpJetMode3D::TopologyAffineLocalSvd;
+            == NeumannEdgeJumpJetMode3D::TopologyAffineLocalSvd
+        || use_topology_ambient_gradient;
     const bool use_mean_free_pivot =
         selected_neumann_mean_free_pivot_elimination();
     if (use_mean_free_pivot && !use_topology_affine) {
         throw std::invalid_argument(
             "mean_free_pivot_elimination is implemented only for the "
-            "topology_affine_local_svd density space");
+            "topology-affine density spaces");
     }
     if (use_galerkin_projection && use_trace_mass_coordinates) {
         throw std::invalid_argument(
@@ -7038,13 +7414,13 @@ solve_exterior_zero_trace_neumann_coefficients_3d(
         && compatibility_mode
                != NeumannCompatibilityMode3D::TraceBorderLegacy) {
         throw std::invalid_argument(
-            "topology_affine_local_svd keeps the prescribed, pre-mean-removed "
+            "topology-affine modes keep the prescribed, pre-mean-removed "
             "Neumann data unchanged; select trace_border_legacy (the legacy "
             "configuration name now denotes this no-flux-correction mode)");
     }
     if (use_topology_affine && use_gauss_restrict) {
         throw std::invalid_argument(
-            "topology_affine_local_svd currently uses the panel-center "
+            "topology-affine modes currently use the panel-center "
             "independent geometric test set; native_gauss is a separate "
             "projection backend");
     }
@@ -7182,7 +7558,9 @@ solve_exterior_zero_trace_neumann_coefficients_3d(
     Eigen::VectorXd topology_final_jump;
     CoefficientExteriorZeroTraceSolution3D result;
     result.edge_jump_jet = use_topology_affine
-        ? "topology_affine_local_svd"
+        ? (use_topology_ambient_gradient
+               ? "topology_ambient_gradient_local_svd"
+               : "topology_affine_local_svd")
         : (use_edge_jump_jet ? "strong_feature_mortar" : "disabled");
     result.reduction_scheme = use_topology_affine
         ? "topology_affine_local_svd"
@@ -7193,7 +7571,7 @@ solve_exterior_zero_trace_neumann_coefficients_3d(
         selected_neumann_householder_border_elimination();
     if (use_topology_affine && !use_mean_free_pivot) {
         throw std::invalid_argument(
-            "topology_affine_local_svd eliminates the global density mean "
+            "topology-affine modes eliminate the global density mean "
             "before GMRES; select KFBIM_3D_NEUMANN_BORDER_SOLVER="
             "mean_free_pivot_elimination");
     }
@@ -7261,7 +7639,10 @@ solve_exterior_zero_trace_neumann_coefficients_3d(
                 value_plan.system, value_plan.blocks, reduction_options);
         const app3d::TopologyFeatureJumpJetOperators3D feature =
             app3d::make_topology_feature_jump_jet_operators_3d(
-                value_transfer.density(), normal_transfer->density());
+                value_transfer.density(), normal_transfer->density(), {}, {},
+                use_topology_ambient_gradient
+                    ? app3d::TopologyNeumannFeatureC1Form3D::AmbientGradient
+                    : app3d::TopologyNeumannFeatureC1Form3D::ConormalSolved);
         ConstraintSystem3D feature_system =
             feature.bind_normal_target(normal_c0);
         const app3d::ReachableConstraintTargetProjection3D
@@ -7874,9 +8255,11 @@ struct CoefficientExteriorNormalTraceSolution3D {
     std::string feature_constraint_mode = "broken_sheets";
     int feature_edge_count = 0;
     int feature_constraint_rows = 0;
+    int feature_constraint_rank = 0;
     double feature_constraint_residual_linf = 0.0;
     double feature_vertex_residual_linf = 0.0;
     double feature_edge_residual_linf = 0.0;
+    double feature_discarded_residual_linf = 0.0;
     double trace_projection_leakage_relative_l2 = 0.0;
     int topology_constraint_rows = 0;
     int topology_constraint_rank = 0;
@@ -7938,9 +8321,9 @@ solve_exterior_zero_normal_dirichlet_coefficients_3d(
                 "topology-affine Dirichlet requires direct normal-density "
                 "coefficient Cauchy rows");
         }
-        if (!trace_restrict_uses_shared_quadratic(mode)) {
+        if (!trace_restrict_uses_all_event_path(mode)) {
             throw std::invalid_argument(
-                "topology-affine analytic Dirichlet requires the shared-Q10 "
+                "topology-affine analytic Dirichlet requires an all-event "
                 "normal-trace route");
         }
         const app3d::KnownDirichletJetCallback3D known_value_jet =
@@ -7967,10 +8350,33 @@ solve_exterior_zero_normal_dirichlet_coefficients_3d(
         feature_options.enabled = feature_coupling_mode
             == DirichletFeatureCouplingMode3D::
                    AmbientGradientAffineMortar;
-        const app3d::TopologyDirichletFeatureConstraintPlan3D feature_plan =
+        const app3d::TopologyDirichletFeatureConstraintPlan3D
+            feature_candidates =
             app3d::make_topology_dirichlet_feature_constraint_plan_3d(
                 normal_transfer.density(), known_dirichlet,
                 feature_options);
+
+        app3d::AffineReductionOptions3D reduction_options;
+        reduction_options.schedule =
+            app3d::AffineEliminationSchedule3D::StagedVertexThenEdge;
+        app3d::TopologyDirichletUnisolventConstraintPlan3D feature_plan;
+        Eigen::Index topology_only_reduced_size = base_size;
+        if (feature_candidates.constraint_count() > 0) {
+            const app3d::AffineReduction3D topology_only_reduction =
+                app3d::affine_eliminate_local_svd_3d(
+                    topology_plan.system, topology_plan.blocks,
+                    reduction_options);
+            topology_only_reduced_size =
+                topology_only_reduction.reduced_size();
+            feature_plan =
+                app3d::select_topology_dirichlet_unisolvent_constraints_3d(
+                    feature_candidates,
+                    topology_only_reduction.homogeneous_base(),
+                    reduction_options.relative_rank_tolerance);
+        } else {
+            feature_plan.system = feature_candidates.system;
+            feature_plan.blocks = feature_candidates.blocks;
+        }
 
         const Eigen::Index topology_rows = topology_plan.system.C.rows();
         const Eigen::Index feature_rows = feature_plan.system.C.rows();
@@ -8014,12 +8420,19 @@ solve_exterior_zero_normal_dirichlet_coefficients_3d(
                 row += topology_rows;
             blocks.push_back(std::move(block));
         }
-        app3d::AffineReductionOptions3D reduction_options;
-        reduction_options.schedule =
-            app3d::AffineEliminationSchedule3D::StagedVertexThenEdge;
         const app3d::AffineReduction3D reduction =
             app3d::affine_eliminate_local_svd_3d(
                 std::move(combined), std::move(blocks), reduction_options);
+        int feature_constraint_rank = 0;
+        if (feature_rows > 0) {
+            feature_constraint_rank = static_cast<int>(
+                topology_only_reduced_size - reduction.reduced_size());
+            if (feature_constraint_rank != feature_rows) {
+                throw std::runtime_error(
+                    "unisolvent Dirichlet feature rows did not reduce the "
+                    "topology coordinate space one-for-one");
+            }
+        }
         const app3d::TopologyTraceProjector3D projector(
             normal_transfer.c0_design(), identity, reduction,
             normal_transfer.weights());
@@ -8094,9 +8507,10 @@ solve_exterior_zero_normal_dirichlet_coefficients_3d(
         result.jump_space = "analytic_j0_affine_j1";
         result.feature_constraint_mode =
             dirichlet_feature_coupling_mode_name(feature_coupling_mode);
-        result.feature_edge_count = feature_plan.feature_edge_count();
+        result.feature_edge_count = feature_candidates.feature_edge_count();
         result.feature_constraint_rows =
-            feature_plan.constraint_count();
+            feature_candidates.constraint_count();
+        result.feature_constraint_rank = feature_constraint_rank;
         const Eigen::VectorXd feature_residual =
             feature_plan.system.C * final_c0 - feature_plan.system.d;
         result.feature_constraint_residual_linf =
@@ -8115,6 +8529,24 @@ solve_exterior_zero_normal_dirichlet_coefficients_3d(
             } else {
                 result.feature_edge_residual_linf = std::max(
                     result.feature_edge_residual_linf, block_residual);
+            }
+        }
+        if (feature_candidates.constraint_count() > 0) {
+            const Eigen::VectorXd candidate_residual =
+                feature_candidates.system.C * final_c0
+                - feature_candidates.system.d;
+            std::vector<bool> retained(
+                static_cast<std::size_t>(candidate_residual.size()), false);
+            for (Eigen::Index row :
+                 feature_plan.retained_candidate_rows) {
+                retained[static_cast<std::size_t>(row)] = true;
+            }
+            for (Eigen::Index row = 0; row < candidate_residual.size(); ++row) {
+                if (!retained[static_cast<std::size_t>(row)]) {
+                    result.feature_discarded_residual_linf = std::max(
+                        result.feature_discarded_residual_linf,
+                        std::abs(candidate_residual[row]));
+                }
             }
         }
         const Eigen::VectorXd projected_trace_c0 =
@@ -9005,6 +9437,7 @@ SolveMetrics3D run_dirichlet_normal_coefficient_case(
     result.edge_jump_jet = solution.feature_constraint_mode;
     result.edge_feature_edges = solution.feature_edge_count;
     result.edge_constraint_rows = solution.feature_constraint_rows;
+    result.edge_constraint_rank = solution.feature_constraint_rank;
     result.edge_reduced_dofs = solution.topology_reduced_coordinates;
     result.edge_constraint_residual_linf =
         solution.feature_constraint_residual_linf;
@@ -9014,6 +9447,8 @@ SolveMetrics3D run_dirichlet_normal_coefficient_case(
         solution.feature_vertex_residual_linf;
     result.feature_edge_residual_linf =
         solution.feature_edge_residual_linf;
+    result.feature_discarded_residual_linf =
+        solution.feature_discarded_residual_linf;
     result.trace_projection_leakage_relative_l2 =
         solution.trace_projection_leakage_relative_l2;
     result.reduction_scheme = solution.reduction_scheme;
@@ -9618,10 +10053,10 @@ ReadinessResult run_readiness_case(GeometryKind kind,
                 && trace_restrict_uses_shared_quadratic(
                        dirichlet_normal_restrict_mode)),
         (solve_selection != SolveSelection3D::DirichletNormalOnly
-         && !trace_restrict_uses_shared_quadratic(
+         && !trace_restrict_uses_all_event_path(
                 neumann_trace_restrict_mode))
             || (solve_selection != SolveSelection3D::NeumannOnly
-                && !trace_restrict_uses_shared_quadratic(
+                && !trace_restrict_uses_all_event_path(
                        dirichlet_normal_restrict_mode)),
         ((solve_selection != SolveSelection3D::DirichletNormalOnly
           && trace_restrict_uses_topology_affine_cubic(
@@ -9630,7 +10065,21 @@ ReadinessResult run_readiness_case(GeometryKind kind,
              && trace_restrict_uses_topology_affine_cubic(
                     dirichlet_normal_restrict_mode)))
             ? app3d::SharedQuadraticNormalProfile3D::TopologyAffineCubic
-            : app3d::SharedQuadraticNormalProfile3D::LegacySplitQuadratic);
+            : app3d::SharedQuadraticNormalProfile3D::LegacySplitQuadratic,
+        (solve_selection != SolveSelection3D::DirichletNormalOnly
+         && neumann_trace_restrict_mode
+                == ExteriorNormalRestrictMode3D::Q27Cover3AllEventCauchy)
+            || (solve_selection != SolveSelection3D::NeumannOnly
+                && dirichlet_normal_restrict_mode
+                       == ExteriorNormalRestrictMode3D::
+                              Q27Cover3AllEventCauchy),
+        (solve_selection != SolveSelection3D::DirichletNormalOnly
+         && neumann_trace_restrict_mode
+                == ExteriorNormalRestrictMode3D::Q64Cover4AllEventCauchy)
+            || (solve_selection != SolveSelection3D::NeumannOnly
+                && dirichlet_normal_restrict_mode
+                       == ExteriorNormalRestrictMode3D::
+                              Q64Cover4AllEventCauchy));
     const std::vector<double> panel_cauchy_conditions =
         harmonic_pipeline.cauchy_condition_values();
     if (!panel_cauchy_conditions.empty()) {
@@ -9657,10 +10106,10 @@ ReadinessResult run_readiness_case(GeometryKind kind,
             crossing_condition_statistics.maximum;
     }
     if ((solve_selection != SolveSelection3D::DirichletNormalOnly
-         && trace_restrict_uses_shared_quadratic(
+         && trace_restrict_uses_all_event_path(
                 neumann_trace_restrict_mode))
         || (solve_selection != SolveSelection3D::NeumannOnly
-            && trace_restrict_uses_shared_quadratic(
+            && trace_restrict_uses_all_event_path(
                    dirichlet_normal_restrict_mode))) {
         result.shared_quadratic_restrict =
             harmonic_pipeline.shared_quadratic_restrict_diagnostics();
@@ -9784,9 +10233,14 @@ ReadinessResult run_readiness_case(GeometryKind kind,
 
         std::unique_ptr<NativeDensityTransfer3D> value_transfer;
         std::unique_ptr<NativeDensityTransfer3D> normal_transfer;
+        const NeumannEdgeJumpJetMode3D selected_neumann_feature_mode =
+            selected_neumann_edge_jump_jet_mode();
         const bool use_neumann_topology_affine_density =
-            selected_neumann_edge_jump_jet_mode()
-            == NeumannEdgeJumpJetMode3D::TopologyAffineLocalSvd;
+               selected_neumann_feature_mode
+                   == NeumannEdgeJumpJetMode3D::TopologyAffineLocalSvd
+            || selected_neumann_feature_mode
+                   == NeumannEdgeJumpJetMode3D::
+                          TopologyAmbientGradientLocalSvd;
         const bool use_dirichlet_analytic_affine_density =
             solve_selection != SolveSelection3D::NeumannOnly
             && selected_dirichlet_jump_space_mode()
@@ -10224,14 +10678,19 @@ ReadinessResult run_readiness_case(GeometryKind kind,
               << result.dirichlet_normal.dirichlet_jump_space
               << " known_J0="
               << result.dirichlet_normal.known_value_jump
-              << " feature_mode/edges/rows="
+              << " feature_mode/edges/candidate/retained/discarded="
               << result.dirichlet_normal.edge_jump_jet << '/'
               << result.dirichlet_normal.edge_feature_edges << '/'
-              << result.dirichlet_normal.edge_constraint_rows
+              << result.dirichlet_normal.edge_constraint_rows << '/'
+              << result.dirichlet_normal.edge_constraint_rank << '/'
+              << (result.dirichlet_normal.edge_constraint_rows
+                  - result.dirichlet_normal.edge_constraint_rank)
               << " feature_residual/star/edge="
               << result.dirichlet_normal.edge_constraint_residual_linf << '/'
               << result.dirichlet_normal.feature_vertex_residual_linf << '/'
               << result.dirichlet_normal.feature_edge_residual_linf
+              << " discarded_feature_defect="
+              << result.dirichlet_normal.feature_discarded_residual_linf
               << " projection_leakage="
               << result.dirichlet_normal
                      .trace_projection_leakage_relative_l2
@@ -10622,7 +11081,8 @@ void write_solve_summaries(const std::filesystem::path& output_dir,
                "dirichlet_jump_space,topology_trace_samples,"
                "topology_trace_final_dofs,"
                "topology_trace_oversampling_margin,"
-               "topology_trace_oversampling_ratio\n";
+               "topology_trace_oversampling_ratio,"
+               "feature_discarded_residual_linf\n";
         std::map<std::string, const ReadinessResult*> previous;
         for (const ReadinessResult* row : rows) {
             const SolveMetrics3D& metric = select_metric(*row);
@@ -10765,7 +11225,8 @@ void write_solve_summaries(const std::filesystem::path& output_dir,
                 << metric.topology_trace_samples << ','
                 << metric.topology_reduced_coordinates << ','
                 << metric.topology_trace_oversampling_margin << ','
-                << metric.topology_trace_oversampling_ratio << '\n';
+                << metric.topology_trace_oversampling_ratio << ','
+                << metric.feature_discarded_residual_linf << '\n';
             previous[row->geometry] = row;
         }
     };
@@ -11446,6 +11907,10 @@ const char* normal_restrict_route_name(ExteriorNormalRestrictMode3D mode)
     case ExteriorNormalRestrictMode3D::SharedQ10CubicGridlineCauchy:
         throw std::invalid_argument(
             "shared Q10 cubic route is not part of the legacy causal probe");
+    case ExteriorNormalRestrictMode3D::Q27Cover3AllEventCauchy:
+    case ExteriorNormalRestrictMode3D::Q64Cover4AllEventCauchy:
+        throw std::invalid_argument(
+            "direct tensor-cover routes are not part of the legacy causal probe");
     case ExteriorNormalRestrictMode3D::ExteriorOnlyHarmonicCubic:
         return "exterior_only_harmonic_cubic";
     }
@@ -11465,8 +11930,10 @@ int normal_restrict_route_index(ExteriorNormalRestrictMode3D mode)
             "global exterior-branch route is value-trace only");
     case ExteriorNormalRestrictMode3D::SharedQuadraticGridlineCauchy:
     case ExteriorNormalRestrictMode3D::SharedQ10CubicGridlineCauchy:
+    case ExteriorNormalRestrictMode3D::Q27Cover3AllEventCauchy:
+    case ExteriorNormalRestrictMode3D::Q64Cover4AllEventCauchy:
         throw std::invalid_argument(
-            "shared Q10 routes are not part of the legacy causal probe");
+            "all-event cover routes are not part of the legacy causal probe");
     case ExteriorNormalRestrictMode3D::ExteriorOnlyHarmonicCubic:
         return 2;
     }
@@ -12135,19 +12602,22 @@ void print_usage(const char* executable)
 {
 #ifdef KFBIM_3D_TOPOLOGY_AFFINE_DEFAULT
     constexpr const char* compiled_defaults =
-        "topology_affine_local_svd, shared_q10_cubic_gridline_cauchy, "
+        "topology_affine_local_svd, Neumann q27_cover3_all_event_cauchy, "
+        "Dirichlet q64_cover4_all_event_cauchy, "
         "trace_mass, mean_free_pivot_elimination";
     constexpr const char* compatibility_default = "trace_border_legacy";
     constexpr const char* neumann_restrict_default =
-        "shared_q10_cubic_gridline_cauchy";
+        "q27_cover3_all_event_cauchy";
     constexpr const char* border_solver_default =
         "mean_free_pivot_elimination";
     constexpr const char* edge_jump_jet_default =
         "topology_affine_local_svd";
     constexpr const char* dirichlet_restrict_default =
-        "shared_q10_cubic_gridline_cauchy";
+        "q64_cover4_all_event_cauchy";
     constexpr const char* dirichlet_jump_space_default =
         "analytic_j0_affine_j1";
+    constexpr const char* dirichlet_feature_coupling_default =
+        "broken_sheets";
 #elif defined(KFBIM_3D_NATIVE_COEFFICIENT_DEFAULT)
     constexpr const char* compiled_defaults =
         "legacy_native, global_cubic_exterior_branch_crossing_owner, "
@@ -12161,6 +12631,8 @@ void print_usage(const char* executable)
         "joint_tricubic_crossing_owner";
     constexpr const char* dirichlet_jump_space_default =
         "legacy_sample_fit";
+    constexpr const char* dirichlet_feature_coupling_default =
+        "broken_sheets";
 #else
     constexpr const char* compiled_defaults =
         "surface_samples, joint_tricubic_crossing_owner, c0_euclidean, "
@@ -12174,6 +12646,8 @@ void print_usage(const char* executable)
         "joint_tricubic_crossing_owner";
     constexpr const char* dirichlet_jump_space_default =
         "legacy_sample_fit";
+    constexpr const char* dirichlet_feature_coupling_default =
+        "broken_sheets";
 #endif
     std::cout
         << "usage: " << executable
@@ -12207,10 +12681,14 @@ void print_usage(const char* executable)
         << "  KFBIM_3D_NEUMANN_TRACE_RESTRICT selects\n"
         << "  global_cubic_exterior_branch_crossing_owner,\n"
         << "  joint_tricubic_crossing_owner, shared_quadratic_gridline_cauchy,\n"
-        << "  shared_q10_cubic_gridline_cauchy, or joint_tricubic_cauchy\n"
+        << "  shared_q10_cubic_gridline_cauchy, q27_cover3_all_event_cauchy,\n"
+        << "  q64_cover4_all_event_cauchy, or joint_tricubic_cauchy\n"
         << "  (compiled default: " << neumann_restrict_default << ").\n"
-        << "  Native coefficient and legacy defaults remain global-cubic and\n"
-        << "  joint-tricubic crossing-owner, respectively.  The shared route\n"
+        << "  The topology default uses one direct 3x3x3 Q2 cover for the\n"
+        << "  Neumann value trace.  Every support-to-trace path processes its\n"
+        << "  complete ordered event sequence before interpolation.  The old\n"
+        << "  shared-Q10 route remains selectable only as a comparison route.\n"
+        << "  The shared-Q10 route\n"
         << "  uses three\n"
         << "  points per normal side with one common 10-node complete-P2\n"
         << "  stencil; opposite-side nodes use the nearest support-to-trace\n"
@@ -12241,9 +12719,12 @@ void print_usage(const char* executable)
         << "  elimination routes recover and\n"
         << "  audit the original bordered system after GMRES.\n"
         << "  KFBIM_3D_NEUMANN_EDGE_JUMP_JET selects disabled,\n"
-        << "  strong_feature_mortar, or topology_affine_local_svd\n"
+        << "  strong_feature_mortar, topology_affine_local_svd, or\n"
+        << "  topology_ambient_gradient_local_svd\n"
         << "  (compiled default: " << edge_jump_jet_default << ").  The\n"
-        << "  strong mode imposes the known\n"
+        << "  ambient-gradient mode directly equates the two reconstructed\n"
+        << "  world gradients in the two directions transverse to the edge;\n"
+        << "  it does not divide by the dihedral sine.  The strong mode imposes the known\n"
         << "  Neumann jump-jet relation only at non-G1 feature edges and\n"
         << "  eliminates the intrinsic surface-mean nullspace directly.\n"
         << "  KFBIM_3D_NEUMANN_TRACE_SAMPLING selects panel_centers\n"
@@ -12253,16 +12734,20 @@ void print_usage(const char* executable)
            "joint_tricubic_crossing_owner,\n"
         << "  shared_quadratic_gridline_cauchy, "
            "shared_q10_cubic_gridline_cauchy,\n"
+        << "  q27_cover3_all_event_cauchy, q64_cover4_all_event_cauchy,\n"
         << "  or joint_tricubic_cauchy (compiled default: "
         << dirichlet_restrict_default << ")\n"
-        << "  for both the operator and RHS.\n"
+        << "  for both the operator and RHS.  The topology default directly\n"
+        << "  evaluates n dot grad of one 4x4x4 Q3 cover at the interface;\n"
+        << "  it does not use Q10 normal layers or an a1/h recovery.\n"
         << "  KFBIM_3D_DIRICHLET_JUMP_SPACE selects legacy_sample_fit or\n"
         << "  analytic_j0_affine_j1 (compiled default: "
         << dirichlet_jump_space_default << ").  The analytic-affine route\n"
         << "  inserts known J0=g_D analytically and iterates only the\n"
         << "  homogeneous part of J1=c_p+Gz; it performs no g_D fit.\n"
-        << "  KFBIM_3D_DIRICHLET_FEATURE_COUPLING selects broken_sheets\n"
-        << "  (default) or ambient_gradient_affine_mortar.  broken_sheets\n"
+        << "  KFBIM_3D_DIRICHLET_FEATURE_COUPLING selects broken_sheets or\n"
+        << "  ambient_gradient_affine_mortar (compiled default: "
+        << dirichlet_feature_coupling_default << ").  broken_sheets\n"
         << "  keeps J1 independent across physical C0 sheets; the mortar\n"
         << "  option adds the stronger common-ambient-gradient assumption.\n"
         << "  KFBIM_3D_SOLVE_SELECTION selects both (default), "
@@ -12408,11 +12893,11 @@ int main(int argc, char** argv)
         if (solve_selection != SolveSelection3D::NeumannOnly
             && dirichlet_jump_space_mode
                    == DirichletJumpSpaceMode3D::AnalyticJ0AffineJ1
-            && !trace_restrict_uses_topology_affine_cubic(
+            && !trace_restrict_uses_all_event_path(
                    dirichlet_normal_restrict_mode)) {
             throw std::invalid_argument(
                 "analytic_j0_affine_j1 Dirichlet requires "
-                "shared_q10_cubic_gridline_cauchy normal restrict");
+                "an all-event direct-coefficient normal restrict");
         }
         if (solve_selection != SolveSelection3D::NeumannOnly
             && dirichlet_feature_coupling_mode
@@ -12433,18 +12918,18 @@ int main(int argc, char** argv)
                 "global exterior-branch Neumann restrict currently "
                 "requires reduced_coefficients density iteration");
         }
-        const bool selected_shared_quadratic =
+        const bool selected_all_event_restrict =
             (solve_selection != SolveSelection3D::DirichletNormalOnly
-             && trace_restrict_uses_shared_quadratic(
+             && trace_restrict_uses_all_event_path(
                     neumann_trace_restrict_mode))
             || (solve_selection != SolveSelection3D::NeumannOnly
-                && trace_restrict_uses_shared_quadratic(
+                && trace_restrict_uses_all_event_path(
                        dirichlet_normal_restrict_mode));
-        if (selected_shared_quadratic
+        if (selected_all_event_restrict
             && density_iteration_mode
                    != DensityIterationMode3D::ReducedCoefficients) {
             throw std::invalid_argument(
-                "shared quadratic gridline-Cauchy restrict requires "
+                "all-event Cauchy restrict requires "
                 "reduced_coefficients density iteration so spread and "
                 "restrict use the same crossing-local Cauchy extension");
         }
@@ -12528,8 +13013,16 @@ int main(int argc, char** argv)
                 output_dir /= "global_exterior_branch";
             } else if (neumann_trace_restrict_mode
                        == ExteriorNormalRestrictMode3D::
-                              SharedQ10CubicGridlineCauchy) {
+                               SharedQ10CubicGridlineCauchy) {
                 output_dir /= "tac_q10";
+            } else if (neumann_trace_restrict_mode
+                       == ExteriorNormalRestrictMode3D::
+                              Q27Cover3AllEventCauchy) {
+                output_dir /= "q27_c3";
+            } else if (neumann_trace_restrict_mode
+                       == ExteriorNormalRestrictMode3D::
+                              Q64Cover4AllEventCauchy) {
+                output_dir /= "q64_c4";
             } else {
                 output_dir /= trace_restrict_mode_name(
                     neumann_trace_restrict_mode);
@@ -12552,9 +13045,18 @@ int main(int argc, char** argv)
         if (solve_selection != SolveSelection3D::NeumannOnly
             && dirichlet_normal_restrict_mode
             != ExteriorNormalRestrictMode3D::JointTricubicCrossingOwner) {
-            output_dir /= "dirichlet_"
-                        + trace_restrict_mode_name(
-                              dirichlet_normal_restrict_mode);
+            if (dirichlet_normal_restrict_mode
+                == ExteriorNormalRestrictMode3D::Q64Cover4AllEventCauchy) {
+                output_dir /= "d_q64_c4";
+            } else if (dirichlet_normal_restrict_mode
+                       == ExteriorNormalRestrictMode3D::
+                              Q27Cover3AllEventCauchy) {
+                output_dir /= "d_q27_c3";
+            } else {
+                output_dir /= "dirichlet_"
+                            + trace_restrict_mode_name(
+                                  dirichlet_normal_restrict_mode);
+            }
         }
         if (solve_selection != SolveSelection3D::DirichletNormalOnly) {
             // Keep this segment compact for Windows builds rooted in a long
@@ -12567,10 +13069,17 @@ int main(int argc, char** argv)
                    == NeumannEdgeJumpJetMode3D::StrongFeatureMortar) {
             output_dir /= "edge_jj";
         } else if (solve_selection != SolveSelection3D::DirichletNormalOnly
-                   && neumann_edge_jump_jet_mode
-                          == NeumannEdgeJumpJetMode3D::
-                                 TopologyAffineLocalSvd) {
-            output_dir /= "topology_affine";
+                   && (neumann_edge_jump_jet_mode
+                           == NeumannEdgeJumpJetMode3D::
+                                  TopologyAffineLocalSvd
+                       || neumann_edge_jump_jet_mode
+                           == NeumannEdgeJumpJetMode3D::
+                                  TopologyAmbientGradientLocalSvd)) {
+            output_dir /= (neumann_edge_jump_jet_mode
+                        == NeumannEdgeJumpJetMode3D::
+                               TopologyAmbientGradientLocalSvd
+                    ? "topology_ambient_gradient"
+                    : "topology_affine");
         }
         if (rigid_case.id != "baseline") {
             // The longest catalog ID puts several diagnostic CSV paths at

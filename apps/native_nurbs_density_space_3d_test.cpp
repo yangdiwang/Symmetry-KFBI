@@ -3,6 +3,7 @@
 #include <Eigen/Dense>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <iostream>
 #include <random>
@@ -718,6 +719,74 @@ void check_feature_edge_jump_jet(
             context + " disabled jump jet is a shaped empty operator");
 }
 
+void test_batched_parameter_jet_stencils()
+{
+    constexpr std::array<std::array<int, 2>, 6> derivatives{{
+        {{0, 0}}, {{1, 0}}, {{0, 1}}, {{2, 0}}, {{1, 1}}, {{0, 2}}}};
+    for (const GeometryKind3D kind : {GeometryKind3D::HollowCylinder,
+                                    GeometryKind3D::LPrism,
+                                    GeometryKind3D::UPrism}) {
+        for (const int coefficients : {4, 6}) {
+            std::vector<double> parameters{0.0, 0.23, 0.5, 0.79, 1.0};
+            const int elements = coefficients - 3;
+            for (int knot = 1; knot < elements; ++knot) {
+                const double parameter = static_cast<double>(knot) / elements;
+                parameters.push_back(std::nextafter(parameter, 0.0));
+                parameters.push_back(parameter);
+                parameters.push_back(std::nextafter(parameter, 1.0));
+            }
+            for (const NativeDensityField3D field : {
+                     NativeDensityField3D::ValueTrace,
+                     NativeDensityField3D::NormalTrace}) {
+                NativeNurbsDensityOptions3D options;
+                options.field = field;
+                options.coefficients_per_direction = coefficients;
+                options.reduction_backend = kfbim::app3d::
+                    NativeDensityReductionBackend3D::BaseOnly;
+                NativeNurbsDensitySpace3D space(
+                    make_native_nurbs_surface_3d(kind), options);
+                const std::string context = "batch parameter jet geometry="
+                    + std::to_string(static_cast<int>(kind)) + " field="
+                    + std::to_string(static_cast<int>(field)) + " n="
+                    + std::to_string(coefficients);
+                for (int patch = 0; patch < space.patch_count(); ++patch) {
+                    for (const double u : parameters) {
+                        for (const double v : parameters) {
+                            const auto jet = space.c0_parameter_jet_stencils(
+                                patch, u, v);
+                            for (std::size_t row = 0; row < jet.size(); ++row) {
+                                const auto expected =
+                                    space.c0_parameter_derivative_stencil(
+                                        patch, u, v,
+                                        derivatives[row][0], derivatives[row][1]);
+                                require(jet[row].count == expected.count,
+                                        context + " active count");
+                                // Exact equality also verifies zero-product
+                                // pruning, C0 index order, and cancellation
+                                // after contributions share a C0 coordinate.
+                                require(jet[row].indices == expected.indices,
+                                        context + " C0 indices");
+                                require(jet[row].weights == expected.weights,
+                                        context + " coefficient weights");
+                            }
+                        }
+                    }
+                }
+                for (const int invalid_patch : {-1, space.patch_count()}) {
+                    bool rejected = false;
+                    try {
+                        (void)space.c0_parameter_jet_stencils(
+                            invalid_patch, 0.5, 0.5);
+                    } catch (const std::out_of_range&) {
+                        rejected = true;
+                    }
+                    require(rejected, context + " invalid patch rejected");
+                }
+            }
+        }
+    }
+}
+
 void test_hollow_cylinder()
 {
     NativeNurbsDensityOptions3D underintegrated;
@@ -826,6 +895,7 @@ void test_l_prism()
 int main()
 {
     try {
+        test_batched_parameter_jet_stencils();
         test_hollow_cylinder();
         test_l_prism();
         std::cout << "native NURBS density-space tests passed\n";

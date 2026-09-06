@@ -8,6 +8,20 @@
 
 namespace kfbim::app3d {
 
+// Alternative weak realizations of the same physical feature-edge law for
+// the Neumann formulation.  ConormalSolved is the established two-equation
+// form obtained after solving with the dihedral sine.  AmbientGradient
+// reconstructs
+//
+//     grad_Gamma(J0) + J1*n
+//
+// on both incident surfaces and equates its two components transverse to the
+// common edge tangent.  The latter has no division by the dihedral sine.
+enum class TopologyNeumannFeatureC1Form3D {
+    ConormalSolved,
+    AmbientGradient
+};
+
 // Homogeneous topology layer for the BaseOnly native density space.  Feature
 // jet right-hand sides deliberately live in a separate boundary-condition
 // layer; this object assembles only C*y0 = 0 topology equations.
@@ -52,6 +66,8 @@ struct TopologyDensityConstraintPlan3D {
 // the legacy solve route.
 struct TopologyFeatureJumpJetOperators3D {
     NativeFeatureEdgeJumpJetOptions3D options;
+    TopologyNeumannFeatureC1Form3D formulation =
+        TopologyNeumannFeatureC1Form3D::ConormalSolved;
     SparseMatrixCSR3D value_matrix;
     SparseMatrixCSR3D normal_target_matrix;
     std::vector<ConstraintMeta3D> meta;
@@ -96,6 +112,10 @@ struct TopologyDirichletFeatureConstraintOptions3D {
     int mortar_gauss_order = 5;
     double minimum_abs_dihedral_sine = 1.0e-8;
     bool normalize_rows = true;
+    // A single ambient trace must have the same value on both incident
+    // sheets.  Reject patch-dependent analytic callbacks before assembling
+    // derivative compatibility rows.
+    double value_compatibility_tolerance = 2.0e-9;
     // The edge-tangent derivative cannot be repaired by either J1 value.
     // Reject analytically inconsistent two-sided g_D data relative to
     // max(1, |grad_a|, |grad_b|).
@@ -110,6 +130,7 @@ struct TopologyDirichletFeatureConstraintPlan3D {
     Eigen::VectorXd row_scalings;
     double maximum_point_mismatch = 0.0;
     double minimum_abs_dihedral_sine = 1.0;
+    double maximum_value_mismatch = 0.0;
     double maximum_tangential_derivative_mismatch = 0.0;
 
     [[nodiscard]] int feature_edge_count() const noexcept
@@ -121,6 +142,40 @@ struct TopologyDirichletFeatureConstraintPlan3D {
         return static_cast<int>(system.C.rows());
     }
 };
+
+// The analytic feature equations are intentionally assembled as an
+// overcomplete cellwise mortar catalog.  For non-polynomial boundary data,
+// algebraically dependent left-hand-side rows need not have exactly dependent
+// analytic right-hand sides in a finite cubic trace space.  This helper keeps
+// a deterministic maximal independent subset after restriction to the
+// already-admissible homogeneous topology space.  Vertex/T-star candidates
+// are rank-revealed first; Edge candidates are then rank-revealed modulo the
+// complete vertex row space.  Selection depends only on C*G (never on d): the
+// retained analytic boundary values are copied without fitting, projection,
+// or modification.
+struct TopologyDirichletUnisolventConstraintPlan3D {
+    ConstraintSystem3D system;
+    std::vector<ConstraintBlock3D> blocks;
+    std::vector<Eigen::Index> retained_candidate_rows;
+    int candidate_constraint_count = 0;
+    int retained_vertex_rows = 0;
+    int retained_edge_rows = 0;
+
+    [[nodiscard]] int constraint_count() const noexcept
+    {
+        return static_cast<int>(system.C.rows());
+    }
+    [[nodiscard]] int discarded_constraint_count() const noexcept
+    {
+        return candidate_constraint_count - constraint_count();
+    }
+};
+
+[[nodiscard]] TopologyDirichletUnisolventConstraintPlan3D
+select_topology_dirichlet_unisolvent_constraints_3d(
+    const TopologyDirichletFeatureConstraintPlan3D& candidates,
+    const SparseMatrixCSR3D& topology_homogeneous,
+    double relative_rank_tolerance = 1.0e-11);
 
 // Assemble cellwise Legendre P0..P3 moments over the union of the two sides'
 // knot images.  ValueTrace couples C0 across features but not C1;
@@ -145,15 +200,19 @@ make_topology_density_constraint_plan_3d(
     TopologyDensityConstraintOptions3D options = {});
 
 // Assemble feature-edge jump-jet moments directly in sparse Base/C0
-// coordinates.  Every knot-overlay cell owns Legendre P0..P3 rows, ordered as
-// first-side then second-side for each mode.  Endpoint-cell rows enter the
-// physical Vertex/T-star block; only interior-cell rows remain edge-local.
+// coordinates.  Every knot-overlay cell owns Legendre P0..P3 rows.  The
+// solved-conormal form orders first-side then second-side equations; the
+// ambient-gradient form orders two transverse world-gradient components.
+// Endpoint-cell rows enter the physical Vertex/T-star block; only
+// interior-cell rows remain edge-local.
 [[nodiscard]] TopologyFeatureJumpJetOperators3D
 make_topology_feature_jump_jet_operators_3d(
     const NativeNurbsDensitySpace3D& value_base_space,
     const NativeNurbsDensitySpace3D& normal_base_space,
     NativeFeatureEdgeJumpJetOptions3D options = {},
     TopologyDensityConstraintOptions3D topology_options = {},
+    TopologyNeumannFeatureC1Form3D formulation =
+        TopologyNeumannFeatureC1Form3D::ConormalSolved,
     double coefficient_drop_tolerance = 1.0e-15);
 
 // Assemble only the affine feature rows C_feature*c=d_feature for a

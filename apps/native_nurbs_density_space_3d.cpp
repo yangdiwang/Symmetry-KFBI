@@ -692,6 +692,63 @@ struct NativeNurbsDensitySpace3D::Impl {
         return stencil;
     }
 
+    std::array<NativeDensityC0Stencil3D, 6> c0_parameter_jet_stencils(
+        int patch, double u, double v) const
+    {
+        if (patch < 0 || patch >= static_cast<int>(surface.patches.size()))
+            throw std::out_of_range("Density stencil patch is out of range");
+
+        const std::vector<int> iu = spline.active_basis_indices(u);
+        const std::vector<int> iv = spline.active_basis_indices(v);
+        const std::array<std::vector<double>, 3> bu{{
+            spline.evaluate_nonzero(u),
+            spline.evaluate_nonzero_first_derivatives(u),
+            spline.evaluate_nonzero_second_derivatives(u)}};
+        const std::array<std::vector<double>, 3> bv{{
+            spline.evaluate_nonzero(v),
+            spline.evaluate_nonzero_first_derivatives(v),
+            spline.evaluate_nonzero_second_derivatives(v)}};
+        constexpr std::array<int, 6> derivative_u{{0, 1, 0, 2, 1, 0}};
+        constexpr std::array<int, 6> derivative_v{{0, 0, 1, 0, 1, 2}};
+        std::array<NativeDensityC0Stencil3D, 6> result{};
+        const int n = options.coefficients_per_direction;
+        const int per_patch = n * n;
+        for (std::size_t a = 0; a < iu.size(); ++a) {
+            for (std::size_t b = 0; b < iv.size(); ++b) {
+                const int raw = patch * per_patch + iu[a] * n + iv[b];
+                const int index =
+                    local_to_c0_map[static_cast<std::size_t>(raw)];
+                for (std::size_t row = 0; row < result.size(); ++row) {
+                    const double weight =
+                        bu[static_cast<std::size_t>(derivative_u[row])][a]
+                        * bv[static_cast<std::size_t>(derivative_v[row])][b];
+                    if (weight == 0.0)
+                        continue;
+                    NativeDensityC0Stencil3D& stencil = result[row];
+                    // Preserve the single-row API's traversal, zero-product
+                    // pruning, and repeated-C0-index accumulation order.
+                    int entry = 0;
+                    while (entry < stencil.count
+                           && stencil.indices[static_cast<std::size_t>(entry)]
+                                  != index) {
+                        ++entry;
+                    }
+                    if (entry == stencil.count) {
+                        if (stencil.count
+                            >= static_cast<int>(stencil.indices.size())) {
+                            throw std::runtime_error(
+                                "Native cubic density stencil exceeded 16 entries");
+                        }
+                        stencil.indices[static_cast<std::size_t>(entry)] = index;
+                        ++stencil.count;
+                    }
+                    stencil.weights[static_cast<std::size_t>(entry)] += weight;
+                }
+            }
+        }
+        return result;
+    }
+
     NativeDensityC0Stencil3D physical_directional_stencil(
         int patch,
         double u,
@@ -1355,6 +1412,13 @@ NativeNurbsDensitySpace3D::c0_parameter_derivative_stencil(
 {
     return impl_->c0_stencil(
         patch, u, v, derivative_u, derivative_v);
+}
+
+std::array<NativeDensityC0Stencil3D, 6>
+NativeNurbsDensitySpace3D::c0_parameter_jet_stencils(
+    int patch, double u, double v) const
+{
+    return impl_->c0_parameter_jet_stencils(patch, u, v);
 }
 
 Eigen::RowVectorXd

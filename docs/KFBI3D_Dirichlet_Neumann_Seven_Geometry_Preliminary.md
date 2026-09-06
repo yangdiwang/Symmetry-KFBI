@@ -1,5 +1,10 @@
 ﻿# KFBI 3D Dirichlet / Neumann 数值验证报告
 
+> **历史 Q10 对照报告（2026-08-20 快照）。** 本文数据早于当前生产基准，不能用于验证
+> Neumann `Q27-cover3` 或 Dirichlet `Q64-cover4`。其中关于“单事件数据结构”的描述也已
+> 过时；当前生产路线使用认证的 all-event support-path 延拓。新的 Q27/Q64 数值结论应只
+> 从带 `trace_restrict_mode` 列的重新生成报告中引用。
+
 - 数据源：`output/kfbi_3d_full_validation/preliminary0820/merged_all_results.csv`
 - 记录数：150；后端/几何组合数：7；重复主键组：0
 - 生成时间：2026-08-20 20:22:25 +08:00

@@ -62,8 +62,16 @@ jobs:
           ./build/apps/restrict_crossing_feature_side_classifier_3d_test
           ./build/apps/restrict_crossing_path_state_3d_test
           ./build/apps/direct_coefficient_cauchy_3d_test
+          ./build/apps/tensor_product_cover_restrict_3d_test
           ./build/apps/topology_trace_projector_3d_test
           ./build/apps/topology_density_constraints_3d_test
+          topology_help="$(
+            ./build/apps/kfbi_topology_affine_exterior_trace_3d --help
+          )"
+          printf '%s\n' "$topology_help" | grep -Fq \
+            'compiled default: q27_cover3_all_event_cauchy'
+          printf '%s\n' "$topology_help" | grep -Fq \
+            'compiled default: q64_cover4_all_event_cauchy'
           three_d_output="$(
             env -u KFBIM_3D_CAUCHY_POLICY \
               -u KFBIM_3D_DIRICHLET_JUMP_SPACE \
@@ -385,6 +393,14 @@ jobs:
             'converged=yes'
           ./build/apps/transmission_center_perturb_2d --samples 1 --levels 24 --jitter 0.01 --out output/smoke_transmission_center
           ./build/apps/shape_opt_transmission_2d --N 24 --iters 1 --save-every 1 --out output/smoke_shape_opt
+
+      - name: Validate 3D report pipelines
+        shell: pwsh
+        run: |
+          ./apps/run_kfbi_3d_full_validation.ps1 -PathSelfTest
+          ./apps/run_kfbi_3d_full_validation.ps1 -SyntheticCsvTest
+          ./apps/merge_kfbi_3d_validation_reports.ps1 -SyntheticCsvTest
+          ./apps/generate_kfbi_3d_validation_report.ps1 -SelfTest
 
       - name: Run both visualization apps
         env:

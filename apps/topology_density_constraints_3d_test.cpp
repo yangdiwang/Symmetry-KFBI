@@ -1,5 +1,6 @@
 #include "topology_density_constraints_3d.hpp"
 #include "csv_rfc4180.hpp"
+#include "native_nurbs_surface_transform_3d.hpp"
 
 #include <Eigen/Core>
 #include <Eigen/QR>
@@ -16,6 +17,11 @@
 namespace {
 
 using kfbim::app3d::ConstraintBlockKind3D;
+using kfbim::app3d::ConstraintBlock3D;
+using kfbim::app3d::ConstraintSystem3D;
+using kfbim::app3d::AffineEliminationSchedule3D;
+using kfbim::app3d::AffineReduction3D;
+using kfbim::app3d::AffineReductionOptions3D;
 using kfbim::app3d::GeometryKind3D;
 using kfbim::app3d::KnownDirichletValueGradientHessian3D;
 using kfbim::app3d::KnownDirichletValueGradientHessianCallback3D;
@@ -24,21 +30,75 @@ using kfbim::app3d::NativeDensityReductionBackend3D;
 using kfbim::app3d::NativeDensitySeamCoupling3D;
 using kfbim::app3d::NativeNurbsDensityOptions3D;
 using kfbim::app3d::NativeNurbsDensitySpace3D;
+using kfbim::app3d::NativeNurbsSurface3D;
+using kfbim::app3d::RigidTransform3D;
 using kfbim::app3d::TopologyDensityConstraintPlan3D;
 using kfbim::app3d::TopologyDirichletFeatureConstraintOptions3D;
 using kfbim::app3d::TopologyDirichletFeatureConstraintPlan3D;
 using kfbim::app3d::TopologyFeatureJumpJetOperators3D;
+using kfbim::app3d::TopologyNeumannFeatureC1Form3D;
+using kfbim::app3d::SparseMatrixCSR3D;
+using kfbim::app3d::affine_eliminate_local_svd_3d;
 using kfbim::app3d::make_native_nurbs_surface_3d;
 using kfbim::app3d::make_topology_dirichlet_feature_constraint_plan_3d;
 using kfbim::app3d::make_topology_feature_jump_jet_operators_3d;
 using kfbim::app3d::make_topology_density_constraint_plan_3d;
 using kfbim::app3d::physical_smooth_sheet_ids_3d;
 using kfbim::app3d::rfc4180_csv_field;
+using kfbim::app3d::select_topology_dirichlet_unisolvent_constraints_3d;
+using kfbim::app3d::transform_native_nurbs_surface_3d;
 
 void require(bool condition, const std::string& message)
 {
     if (!condition)
         throw std::runtime_error(message);
+}
+
+std::pair<ConstraintSystem3D, std::vector<ConstraintBlock3D>>
+combine_constraint_plans(
+    const ConstraintSystem3D& first,
+    const std::vector<ConstraintBlock3D>& first_blocks,
+    const ConstraintSystem3D& second,
+    const std::vector<ConstraintBlock3D>& second_blocks)
+{
+    require(first.C.cols() == second.C.cols(),
+            "combined constraint plans use the same coefficient space");
+    const Eigen::Index first_rows = first.C.rows();
+    ConstraintSystem3D combined;
+    combined.C.resize(first.C.rows() + second.C.rows(), first.C.cols());
+    combined.d.resize(first.d.size() + second.d.size());
+    combined.d.head(first.d.size()) = first.d;
+    combined.d.tail(second.d.size()) = second.d;
+    combined.meta = first.meta;
+    combined.meta.insert(
+        combined.meta.end(), second.meta.begin(), second.meta.end());
+    std::vector<Eigen::Triplet<double>> triplets;
+    triplets.reserve(static_cast<std::size_t>(
+        first.C.nonZeros() + second.C.nonZeros()));
+    for (Eigen::Index row = 0; row < first.C.rows(); ++row) {
+        for (SparseMatrixCSR3D::InnerIterator entry(first.C, row);
+             entry; ++entry) {
+            triplets.emplace_back(row, entry.col(), entry.value());
+        }
+    }
+    for (Eigen::Index row = 0; row < second.C.rows(); ++row) {
+        for (SparseMatrixCSR3D::InnerIterator entry(second.C, row);
+             entry; ++entry) {
+            triplets.emplace_back(
+                first_rows + row, entry.col(), entry.value());
+        }
+    }
+    combined.C.setFromTriplets(triplets.begin(), triplets.end());
+    combined.C.makeCompressed();
+    combined.validate();
+
+    std::vector<ConstraintBlock3D> blocks = first_blocks;
+    for (ConstraintBlock3D block : second_blocks) {
+        for (Eigen::Index& row : block.row_ids)
+            row += first_rows;
+        blocks.push_back(std::move(block));
+    }
+    return {std::move(combined), std::move(blocks)};
 }
 
 NativeNurbsDensitySpace3D make_base(GeometryKind3D geometry,
@@ -52,6 +112,18 @@ NativeNurbsDensitySpace3D make_base(GeometryKind3D geometry,
         NativeDensityReductionBackend3D::TopologyBase;
     return NativeNurbsDensitySpace3D(
         make_native_nurbs_surface_3d(geometry), options);
+}
+
+NativeNurbsDensitySpace3D make_base(NativeNurbsSurface3D surface,
+                                    NativeDensityField3D field,
+                                    int coefficients)
+{
+    NativeNurbsDensityOptions3D options;
+    options.field = field;
+    options.coefficients_per_direction = coefficients;
+    options.reduction_backend =
+        NativeDensityReductionBackend3D::TopologyBase;
+    return NativeNurbsDensitySpace3D(std::move(surface), options);
 }
 
 void check_base_only(const NativeNurbsDensitySpace3D& space,
@@ -386,7 +458,9 @@ Eigen::VectorXd fit_affine_c0_trace(
 void check_cellwise_feature_jump_jet(
     GeometryKind3D geometry,
     int expected_feature_edges,
-    const std::string& context)
+    const std::string& context,
+    TopologyNeumannFeatureC1Form3D formulation =
+        TopologyNeumannFeatureC1Form3D::ConormalSolved)
 {
     NativeNurbsDensitySpace3D value = make_base(
         geometry, NativeDensityField3D::ValueTrace, 6);
@@ -396,9 +470,10 @@ void check_cellwise_feature_jump_jet(
     feature_options.mortar_gauss_order = 5;
     const TopologyFeatureJumpJetOperators3D feature =
         make_topology_feature_jump_jet_operators_3d(
-            value, normal, feature_options);
+            value, normal, feature_options, {}, formulation);
 
-    require(feature.feature_edge_count() == expected_feature_edges
+    require(feature.formulation == formulation
+                && feature.feature_edge_count() == expected_feature_edges
                 && feature.constraint_count() > 0
                 && feature.value_matrix.isCompressed()
                 && feature.normal_target_matrix.isCompressed(),
@@ -420,10 +495,16 @@ void check_cellwise_feature_jump_jet(
         for (int local = 0; local < edge.row_count; ++local) {
             const auto& meta = feature.meta[static_cast<std::size_t>(
                 edge.first_row + local)];
-            require(meta.kind == "feature_jet"
+            const bool metadata_matches = formulation
+                    == TopologyNeumannFeatureC1Form3D::ConormalSolved
+                ? (meta.kind == "feature_jet"
+                   && (meta.side == "first" || meta.side == "second"))
+                : (meta.kind == "feature_ambient_gradient"
+                   && (meta.side == "transverse_0"
+                       || meta.side == "transverse_1"));
+            require(metadata_matches
                         && meta.connection == edge.connection
                         && meta.mode >= 0 && meta.mode <= 3
-                        && (meta.side == "first" || meta.side == "second")
                         && meta.sheet_id < 0,
                     context + " feature row metadata is complete");
             cells.insert(meta.cell);
@@ -493,7 +574,11 @@ void check_cellwise_feature_jump_jet(
         require(std::abs(std::sqrt(squared_norm) - 1.0) < 3.0e-12,
                 context + " preserves unit combined row normalization");
     }
-    require(maximum_value_support <= 16 && maximum_normal_support <= 8,
+    const Eigen::Index expected_maximum_value_support = formulation
+            == TopologyNeumannFeatureC1Form3D::ConormalSolved
+        ? 16 : 32;
+    require(maximum_value_support <= expected_maximum_value_support
+                && maximum_normal_support <= 8,
             context + " retains knot-cell-local cubic support");
     require(feature.constant_value_residual < 2.0e-11
                 && feature.maximum_point_mismatch < 2.0e-11
@@ -524,6 +609,133 @@ void test_cellwise_feature_jump_jets()
         GeometryKind3D::HollowCylinder, 16, "cylinder");
     check_cellwise_feature_jump_jet(
         GeometryKind3D::LPrism, 22, "L-prism");
+    check_cellwise_feature_jump_jet(
+        GeometryKind3D::UPrism, 32, "U-prism ambient gradient",
+        TopologyNeumannFeatureC1Form3D::AmbientGradient);
+}
+
+Eigen::Index numerical_row_rank(const Eigen::MatrixXd& matrix,
+                                double relative_tolerance = 1.0e-11)
+{
+    Eigen::ColPivHouseholderQR<Eigen::MatrixXd> qr(matrix.transpose());
+    qr.setThreshold(relative_tolerance);
+    return qr.rank();
+}
+
+void test_u_prism_neumann_ambient_gradient_row_space()
+{
+    NativeNurbsDensitySpace3D value = make_base(
+        GeometryKind3D::UPrism, NativeDensityField3D::ValueTrace, 4);
+    NativeNurbsDensitySpace3D normal = make_base(
+        GeometryKind3D::UPrism, NativeDensityField3D::NormalTrace, 4);
+    const TopologyDensityConstraintPlan3D topology =
+        make_topology_density_constraint_plan_3d(value);
+    AffineReductionOptions3D reduction_options;
+    reduction_options.schedule =
+        AffineEliminationSchedule3D::StagedVertexThenEdge;
+    const AffineReduction3D topology_reduction =
+        affine_eliminate_local_svd_3d(
+            topology.system, topology.blocks, reduction_options);
+
+    kfbim::app3d::NativeFeatureEdgeJumpJetOptions3D feature_options;
+    feature_options.mortar_gauss_order = 5;
+    const TopologyFeatureJumpJetOperators3D solved =
+        make_topology_feature_jump_jet_operators_3d(
+            value, normal, feature_options, {},
+            TopologyNeumannFeatureC1Form3D::ConormalSolved);
+    const TopologyFeatureJumpJetOperators3D ambient =
+        make_topology_feature_jump_jet_operators_3d(
+            value, normal, feature_options, {},
+            TopologyNeumannFeatureC1Form3D::AmbientGradient);
+
+    const SparseMatrixCSR3D solved_restricted =
+        solved.value_matrix * topology_reduction.homogeneous_base();
+    const SparseMatrixCSR3D ambient_restricted =
+        ambient.value_matrix * topology_reduction.homogeneous_base();
+    const Eigen::MatrixXd solved_dense(solved_restricted);
+    const Eigen::MatrixXd ambient_dense(ambient_restricted);
+    Eigen::MatrixXd stacked(
+        solved_dense.rows() + ambient_dense.rows(), solved_dense.cols());
+    stacked.topRows(solved_dense.rows()) = solved_dense;
+    stacked.bottomRows(ambient_dense.rows()) = ambient_dense;
+    const Eigen::Index solved_rank = numerical_row_rank(solved_dense);
+    const Eigen::Index ambient_rank = numerical_row_rank(ambient_dense);
+    const Eigen::Index stacked_rank = numerical_row_rank(stacked);
+    require(solved_rank > 0 && solved_rank == ambient_rank
+                && stacked_rank == solved_rank,
+            "U-prism direct ambient gradients and solved conormals have "
+            "the same C0-quotient row space; solved/ambient/union ranks="
+                + std::to_string(solved_rank) + "/"
+                + std::to_string(ambient_rank) + "/"
+                + std::to_string(stacked_rank));
+
+    const Eigen::Vector3d gradient(0.31, -0.22, 0.17);
+    const Eigen::VectorXd value_c0 = fit_affine_c0_trace(
+        value, gradient, 0.37, "U-prism ambient row-space value");
+    const Eigen::VectorXd normal_c0 = fit_affine_c0_trace(
+        normal, gradient, 0.0, "U-prism ambient row-space normal");
+    require(ambient.residual(value_c0, normal_c0)
+                    .lpNorm<Eigen::Infinity>() < 8.0e-8,
+            "U-prism direct ambient C1 reproduces one common affine "
+            "world gradient");
+    require(ambient.residual(value_c0, -normal_c0)
+                    .lpNorm<Eigen::Infinity>() > 1.0e-3,
+            "U-prism direct ambient C1 detects a reversed Neumann sign");
+}
+
+void test_u_prism_neumann_ambient_gradient_rigid_covariance()
+{
+    const NativeNurbsSurface3D source =
+        make_native_nurbs_surface_3d(GeometryKind3D::UPrism);
+    constexpr double pi = 3.141592653589793238462643383279502884;
+    const RigidTransform3D transform = RigidTransform3D::from_axis_angle(
+        {1.0, 2.0, 3.0}, 17.0 * pi / 180.0,
+        {0.07, -0.07, 0.02}, {0.137, -0.083, 0.061});
+    NativeNurbsDensitySpace3D value_source = make_base(
+        source, NativeDensityField3D::ValueTrace, 4);
+    NativeNurbsDensitySpace3D normal_source = make_base(
+        source, NativeDensityField3D::NormalTrace, 4);
+    NativeNurbsDensitySpace3D value_moved = make_base(
+        transform_native_nurbs_surface_3d(source, transform),
+        NativeDensityField3D::ValueTrace, 4);
+    NativeNurbsDensitySpace3D normal_moved = make_base(
+        transform_native_nurbs_surface_3d(source, transform),
+        NativeDensityField3D::NormalTrace, 4);
+
+    kfbim::app3d::NativeFeatureEdgeJumpJetOptions3D feature_options;
+    feature_options.mortar_gauss_order = 5;
+    const TopologyFeatureJumpJetOperators3D original =
+        make_topology_feature_jump_jet_operators_3d(
+            value_source, normal_source, feature_options, {},
+            TopologyNeumannFeatureC1Form3D::AmbientGradient);
+    const TopologyFeatureJumpJetOperators3D moved =
+        make_topology_feature_jump_jet_operators_3d(
+            value_moved, normal_moved, feature_options, {},
+            TopologyNeumannFeatureC1Form3D::AmbientGradient);
+    require(original.feature_edge_count() == moved.feature_edge_count()
+                && original.constraint_count() == moved.constraint_count(),
+            "rigid U-prism preserves ambient-gradient feature catalog");
+    require((Eigen::MatrixXd(original.value_matrix)
+             - Eigen::MatrixXd(moved.value_matrix))
+                    .cwiseAbs().maxCoeff() < 2.0e-10
+                && (Eigen::MatrixXd(original.normal_target_matrix)
+                    - Eigen::MatrixXd(moved.normal_target_matrix))
+                           .cwiseAbs().maxCoeff() < 2.0e-10,
+            "ambient-gradient coefficient operators are rigid-motion "
+            "covariant");
+
+    const Eigen::Vector3d gradient(0.31, -0.22, 0.17);
+    const Eigen::Vector3d moved_gradient =
+        transform.forward_vector(gradient);
+    const Eigen::VectorXd moved_value_c0 = fit_affine_c0_trace(
+        value_moved, moved_gradient, 0.37,
+        "rigid U-prism ambient value");
+    const Eigen::VectorXd moved_normal_c0 = fit_affine_c0_trace(
+        normal_moved, moved_gradient, 0.0,
+        "rigid U-prism ambient normal");
+    require(moved.residual(moved_value_c0, moved_normal_c0)
+                    .lpNorm<Eigen::Infinity>() < 8.0e-8,
+            "rigid U-prism reproduces the rotated common ambient gradient");
 }
 
 void test_dirichlet_affine_feature_constraints_on_right_angle_planes()
@@ -622,6 +834,288 @@ void test_dirichlet_affine_feature_constraints_on_right_angle_planes()
             "residual=" + std::to_string(residual));
 }
 
+void test_u_prism_dirichlet_feature_vertex_blocks()
+{
+    NativeNurbsDensitySpace3D normal = make_base(
+        GeometryKind3D::UPrism, NativeDensityField3D::NormalTrace, 6);
+    const Eigen::Vector3d gradient(0.31, -0.22, 0.17);
+    constexpr double offset = 0.37;
+    const KnownDirichletValueGradientHessianCallback3D known_dirichlet =
+        [gradient](int, double, double, const Eigen::Vector3d& point,
+                   const Eigen::Vector3d&) {
+            KnownDirichletValueGradientHessian3D data;
+            data.value = offset + gradient.dot(point);
+            data.ambient_gradient = gradient;
+            data.ambient_hessian.setZero();
+            return data;
+        };
+    TopologyDirichletFeatureConstraintOptions3D options;
+    options.enabled = true;
+    const TopologyDirichletFeatureConstraintPlan3D feature =
+        make_topology_dirichlet_feature_constraint_plan_3d(
+            normal, known_dirichlet, options);
+    feature.system.validate();
+    require(feature.feature_edge_count() == 32
+                && feature.constraint_count() > 0
+                && feature.maximum_value_mismatch < 2.0e-12,
+            "U-prism covers every C0 feature interval with compatible data");
+
+    bool seen_vertex = false;
+    bool seen_edge = false;
+    bool seen_multi_connection_star = false;
+    for (const auto& block : feature.blocks) {
+        seen_vertex = seen_vertex
+            || block.kind == ConstraintBlockKind3D::Vertex;
+        seen_edge = seen_edge || block.kind == ConstraintBlockKind3D::Edge;
+        if (block.kind != ConstraintBlockKind3D::Vertex)
+            continue;
+        std::set<int> connections;
+        for (Eigen::Index row : block.row_ids) {
+            connections.insert(feature.system.meta[
+                static_cast<std::size_t>(row)].connection);
+        }
+        seen_multi_connection_star = seen_multi_connection_star
+            || connections.size() >= 3;
+    }
+    require(seen_vertex && seen_edge && seen_multi_connection_star,
+            "U-prism feature moments form edge-interior and multi-edge "
+            "Vertex/T-star blocks");
+
+    const Eigen::VectorXd normal_c0 = fit_affine_c0_trace(
+        normal, gradient, 0.0, "U-prism Dirichlet normal trace");
+    require((feature.system.C * normal_c0 - feature.system.d)
+                    .lpNorm<Eigen::Infinity>() < 8.0e-8,
+            "U-prism ambient affine J1 satisfies edge and vertex-star rows");
+
+    const KnownDirichletValueGradientHessianCallback3D discontinuous_value =
+        [gradient](int patch, double, double, const Eigen::Vector3d& point,
+                   const Eigen::Vector3d&) {
+            KnownDirichletValueGradientHessian3D data;
+            data.value = offset + gradient.dot(point)
+                       + 0.01 * static_cast<double>(patch);
+            data.ambient_gradient = gradient;
+            data.ambient_hessian.setZero();
+            return data;
+        };
+    bool rejected_discontinuous_value = false;
+    try {
+        (void)make_topology_dirichlet_feature_constraint_plan_3d(
+            normal, discontinuous_value, options);
+    } catch (const std::runtime_error& error) {
+        rejected_discontinuous_value =
+            std::string(error.what()).find("incompatible feature-edge values")
+            != std::string::npos;
+    }
+    require(rejected_discontinuous_value,
+            "Dirichlet feature setup rejects patch-dependent g_D values");
+}
+
+void test_dirichlet_unisolvent_selection_is_vertex_first_and_rhs_blind()
+{
+    TopologyDirichletFeatureConstraintPlan3D candidates;
+    candidates.system.C.resize(3, 2);
+    const std::vector<Eigen::Triplet<double>> triplets{
+        {0, 0, 1.0},   // Vertex row retained first.
+        {1, 0, 10.0},  // Larger but dependent Edge row must be discarded.
+        {2, 1, 1.0}};  // Independent Edge increment.
+    candidates.system.C.setFromTriplets(triplets.begin(), triplets.end());
+    candidates.system.C.makeCompressed();
+    candidates.system.d = Eigen::Vector3d(0.25, -7.0, 0.5);
+    candidates.system.meta.resize(3);
+    candidates.system.meta[0].kind = "dirichlet_feature_jet";
+    candidates.system.meta[0].connection = 0;
+    candidates.system.meta[0].mode = 0;
+    candidates.system.meta[0].star = std::array<double, 3>{{0.0, 0.0, 0.0}};
+    candidates.system.meta[1].kind = "dirichlet_feature_jet";
+    candidates.system.meta[1].connection = 1;
+    candidates.system.meta[1].mode = 0;
+    candidates.system.meta[2].kind = "dirichlet_feature_jet";
+    candidates.system.meta[2].connection = 2;
+    candidates.system.meta[2].mode = 0;
+    candidates.system.validate();
+
+    ConstraintBlock3D vertex;
+    vertex.kind = ConstraintBlockKind3D::Vertex;
+    vertex.key = "vertex";
+    vertex.row_ids = {0};
+    ConstraintBlock3D edge;
+    edge.kind = ConstraintBlockKind3D::Edge;
+    edge.key = "edge";
+    edge.row_ids = {1, 2};
+    candidates.blocks = {vertex, edge};
+
+    SparseMatrixCSR3D topology_homogeneous(2, 2);
+    topology_homogeneous.setIdentity();
+    topology_homogeneous.makeCompressed();
+    const auto selected =
+        select_topology_dirichlet_unisolvent_constraints_3d(
+            candidates, topology_homogeneous);
+    const std::vector<Eigen::Index> expected_rows{0, 2};
+    require(selected.retained_candidate_rows == expected_rows
+                && selected.candidate_constraint_count == 3
+                && selected.constraint_count() == 2
+                && selected.discarded_constraint_count() == 1
+                && selected.retained_vertex_rows == 1
+                && selected.retained_edge_rows == 1,
+            "unisolvent selection retains Vertex rows before dependent Edge "
+            "rows");
+
+    TopologyDirichletFeatureConstraintPlan3D changed_rhs = candidates;
+    changed_rhs.system.d = Eigen::Vector3d(900.0, -0.125, 41.0);
+    const auto selected_changed_rhs =
+        select_topology_dirichlet_unisolvent_constraints_3d(
+            changed_rhs, topology_homogeneous);
+    require(selected_changed_rhs.retained_candidate_rows
+                    == selected.retained_candidate_rows,
+            "unisolvent row identities depend only on C*G, never on d");
+    for (Eigen::Index row = 0;
+         row < selected_changed_rhs.system.C.rows(); ++row) {
+        const Eigen::Index source =
+            selected_changed_rhs.retained_candidate_rows[
+                static_cast<std::size_t>(row)];
+        require(selected_changed_rhs.system.d[row]
+                        == changed_rhs.system.d[source],
+                "changed analytic RHS entries are copied exactly after "
+                "RHS-blind selection");
+    }
+}
+
+void test_u_prism_dirichlet_unisolvent_affine_reduction()
+{
+    const KnownDirichletValueGradientHessianCallback3D harmonic =
+        [](int, double, double, const Eigen::Vector3d& point,
+           const Eigen::Vector3d&) {
+            constexpr double ax = 0.35;
+            constexpr double by = 0.21;
+            constexpr double cz = 0.28;
+            const double exponential = std::exp(ax * point.x());
+            const double cos_y = std::cos(by * point.y());
+            const double sin_y = std::sin(by * point.y());
+            const double cos_z = std::cos(cz * point.z());
+            const double sin_z = std::sin(cz * point.z());
+            KnownDirichletValueGradientHessian3D data;
+            data.value = exponential * cos_y * cos_z;
+            data.ambient_gradient = {
+                ax * data.value,
+                -by * exponential * sin_y * cos_z,
+                -cz * exponential * cos_y * sin_z};
+            data.ambient_hessian.setZero();
+            return data;
+        };
+
+    struct Expected {
+        int ncoef;
+        int topology_size;
+        int candidate_rows;
+        int candidate_vertex_rows;
+        int candidate_edge_rows;
+        int feature_rank;
+        int retained_vertex_rows;
+        int retained_edge_rows;
+        int final_size;
+    };
+    const std::array<Expected, 2> expected{{
+        {4, 224, 256, 256, 0, 160, 160, 0, 64},
+        {6, 552, 768, 512, 256, 272, 272, 0, 280}}};
+    for (const Expected& item : expected) {
+        NativeNurbsDensitySpace3D normal = make_base(
+            GeometryKind3D::UPrism, NativeDensityField3D::NormalTrace,
+            item.ncoef);
+        const TopologyDensityConstraintPlan3D topology =
+            make_topology_density_constraint_plan_3d(normal);
+        AffineReductionOptions3D reduction_options;
+        reduction_options.schedule =
+            AffineEliminationSchedule3D::StagedVertexThenEdge;
+        const AffineReduction3D topology_reduction =
+            affine_eliminate_local_svd_3d(
+                topology.system, topology.blocks, reduction_options);
+        require(topology_reduction.reduced_size() == item.topology_size,
+                "U-prism topology-only dimension matches the baseline");
+
+        TopologyDirichletFeatureConstraintOptions3D feature_options;
+        feature_options.enabled = true;
+        const TopologyDirichletFeatureConstraintPlan3D candidates =
+            make_topology_dirichlet_feature_constraint_plan_3d(
+                normal, harmonic, feature_options);
+        int candidate_vertex_rows = 0;
+        int candidate_edge_rows = 0;
+        for (const ConstraintBlock3D& block : candidates.blocks) {
+            if (block.kind == ConstraintBlockKind3D::Vertex)
+                candidate_vertex_rows += static_cast<int>(block.row_ids.size());
+            else
+                candidate_edge_rows += static_cast<int>(block.row_ids.size());
+        }
+        require(candidate_vertex_rows == item.candidate_vertex_rows
+                    && candidate_edge_rows == item.candidate_edge_rows,
+                "U-prism candidate catalog has the expected explicit "
+                "Vertex/Edge split: ncoef=" + std::to_string(item.ncoef));
+        const auto selected =
+            select_topology_dirichlet_unisolvent_constraints_3d(
+                candidates, topology_reduction.homogeneous_base(),
+                reduction_options.relative_rank_tolerance);
+        require(candidates.constraint_count() == item.candidate_rows
+                    && selected.candidate_constraint_count
+                           == item.candidate_rows
+                    && selected.constraint_count() == item.feature_rank
+                    && selected.discarded_constraint_count()
+                           == item.candidate_rows - item.feature_rank,
+                "U-prism retains the expected independent analytic feature "
+                "rows: ncoef=" + std::to_string(item.ncoef)
+                + ", candidates="
+                + std::to_string(candidates.constraint_count())
+                + ", retained="
+                + std::to_string(selected.constraint_count()));
+        require(selected.retained_vertex_rows
+                        + selected.retained_edge_rows == item.feature_rank
+                    && selected.retained_vertex_rows
+                           == item.retained_vertex_rows
+                    && selected.retained_edge_rows
+                           == item.retained_edge_rows,
+                "U-prism retains the expected Neumann-style Vertex/T-star "
+                "then edge increment: "
+                "candidate_vertex="
+                + std::to_string(candidate_vertex_rows)
+                + ", candidate_edge="
+                + std::to_string(candidate_edge_rows)
+                + ", retained_vertex="
+                + std::to_string(selected.retained_vertex_rows)
+                + ", retained_edge="
+                + std::to_string(selected.retained_edge_rows)
+                + ", ncoef=" + std::to_string(item.ncoef));
+        for (Eigen::Index row = 0; row < selected.system.C.rows(); ++row) {
+            const Eigen::Index source = selected.retained_candidate_rows[
+                static_cast<std::size_t>(row)];
+            require(selected.system.d[row] == candidates.system.d[source],
+                    "unisolvent selection copies analytic RHS values exactly");
+        }
+
+        auto combined = combine_constraint_plans(
+            topology.system, topology.blocks,
+            selected.system, selected.blocks);
+        const AffineReduction3D reduction =
+            affine_eliminate_local_svd_3d(
+                std::move(combined.first), std::move(combined.second),
+                reduction_options);
+        require(reduction.reduced_size() == item.final_size
+                    && topology_reduction.reduced_size()
+                           - reduction.reduced_size()
+                           == item.feature_rank,
+                "U-prism analytic feature rows reduce the iteration space "
+                "by their restricted rank");
+        require(reduction.particular_residual_linf() < 2.0e-9
+                    && reduction.homogeneous_residual_linf() < 2.0e-9,
+                "U-prism retained analytic affine constraints close to "
+                "roundoff");
+
+        const Eigen::VectorXd full_candidate_residual =
+            candidates.system.C * reduction.particular_base()
+            - candidates.system.d;
+        require(full_candidate_residual.lpNorm<Eigen::Infinity>() > 1.0e-9,
+                "non-polynomial analytic data expose discarded dependent "
+                "mortar defects instead of fitting them");
+    }
+}
+
 void test_rfc4180_csv_field()
 {
     require(rfc4180_csv_field("plain") == "plain",
@@ -644,7 +1138,12 @@ int main()
         test_cylinder();
         test_l_prism();
         test_cellwise_feature_jump_jets();
+        test_u_prism_neumann_ambient_gradient_row_space();
+        test_u_prism_neumann_ambient_gradient_rigid_covariance();
         test_dirichlet_affine_feature_constraints_on_right_angle_planes();
+        test_u_prism_dirichlet_feature_vertex_blocks();
+        test_dirichlet_unisolvent_selection_is_vertex_first_and_rhs_blind();
+        test_u_prism_dirichlet_unisolvent_affine_reduction();
         test_rfc4180_csv_field();
         std::cout << "topology density constraint tests passed\n";
         return 0;

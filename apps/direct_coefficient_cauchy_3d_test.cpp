@@ -1,9 +1,11 @@
 #include "direct_coefficient_cauchy_3d.hpp"
 #include "native_nurbs_surface_3d.hpp"
+#include "native_nurbs_surface_transform_3d.hpp"
 
 #include <Eigen/Core>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
@@ -384,6 +386,135 @@ void test_direct_normal_density_stencils()
                  "precomposed direct normal Cauchy coefficient row");
 }
 
+void require_identical_stencil(const NativeDensityC0Stencil3D& actual,
+                               const NativeDensityC0Stencil3D& expected,
+                               const std::string& context)
+{
+    require(actual.count == expected.count, context + " support size");
+    for (int entry = 0; entry < actual.count; ++entry) {
+        const auto index = static_cast<std::size_t>(entry);
+        require(actual.indices[index] == expected.indices[index],
+                context + " support index");
+        require_near(actual.weights[index], expected.weights[index], 0.0,
+                     context + " coefficient weight");
+    }
+}
+
+template <typename Plan>
+void require_identical_plan(const Plan& actual,
+                           const Plan& expected,
+                           const std::string& context)
+{
+    require(actual.patch == expected.patch, context + " patch");
+    require_near(actual.u, expected.u, 0.0, context + " parameter u");
+    require_near(actual.v, expected.v, 0.0, context + " parameter v");
+    require((actual.frame.normal - expected.frame.normal).norm() == 0.0
+                && (actual.frame.tangent1 - expected.frame.tangent1).norm()
+                       == 0.0
+                && (actual.frame.tangent2 - expected.frame.tangent2).norm()
+                       == 0.0,
+            context + " frame");
+    require_near(actual.graph_hessian.h11, expected.graph_hessian.h11, 0.0,
+                 context + " graph h11");
+    require_near(actual.graph_hessian.h12, expected.graph_hessian.h12, 0.0,
+                 context + " graph h12");
+    require_near(actual.graph_hessian.h22, expected.graph_hessian.h22, 0.0,
+                 context + " graph h22");
+    require_near(actual.diagnostics.parameter_to_tangent_determinant,
+                 expected.diagnostics.parameter_to_tangent_determinant, 0.0,
+                 context + " determinant diagnostic");
+    require_near(actual.diagnostics.parameter_to_tangent_condition,
+                 expected.diagnostics.parameter_to_tangent_condition, 0.0,
+                 context + " condition diagnostic");
+    require_near(actual.diagnostics.tangent_plane_residual,
+                 expected.diagnostics.tangent_plane_residual, 0.0,
+                 context + " tangent-plane diagnostic");
+    for (std::size_t row = 0; row < actual.cauchy_rows.size(); ++row) {
+        require_identical_stencil(actual.cauchy_rows[row],
+                                  expected.cauchy_rows[row], context);
+    }
+}
+
+void test_precomputed_geometry_overloads()
+{
+    constexpr double pi = 3.141592653589793238462643383279502884;
+    const RigidTransform3D transform = RigidTransform3D::from_axis_angle(
+        {1.0, 2.0, 3.0}, 17.0 * pi / 180.0,
+        {0.07, -0.07, 0.02}, {0.137, -0.083, 0.061});
+    const std::array<std::array<double, 2>, 3> parameters{{
+        {{0.0, 0.0}}, {{0.37, 0.41}}, {{1.0, 0.63}}}};
+    for (const GeometryKind3D kind :
+         {GeometryKind3D::LPrism, GeometryKind3D::HollowCylinder}) {
+        const NativeNurbsSurface3D source = make_native_nurbs_surface_3d(kind);
+        const std::array<NativeNurbsSurface3D, 2> surfaces{{
+            source, transform_native_nurbs_surface_3d(source, transform)}};
+        for (const NativeNurbsSurface3D& surface : surfaces) {
+            for (const NativeDensityField3D field :
+                 {NativeDensityField3D::ValueTrace,
+                  NativeDensityField3D::NormalTrace}) {
+                NativeNurbsDensityOptions3D options;
+                options.field = field;
+                options.reduction_backend =
+                    NativeDensityReductionBackend3D::BaseOnly;
+                options.coefficients_per_direction = 7;
+                const NativeNurbsDensitySpace3D density(surface, options);
+                for (int patch = 0; patch < density.patch_count(); ++patch) {
+                    for (const auto& uv : parameters) {
+                        const double u = uv[0];
+                        const double v = uv[1];
+                        const NativeSurfaceParameterJet3D geometry =
+                            native_surface_parameter_jet_3d(
+                                density, patch, u, v);
+                        const LocalOrthonormalFrame3D frame =
+                            make_local_orthonormal_frame_3d(
+                                geometry.normal,
+                                geometry.x_u + 0.23 * geometry.x_v);
+                        const Eigen::Vector3d target = geometry.point
+                            + 0.017 * frame.tangent1 - 0.011 * frame.tangent2
+                            + 0.008 * frame.normal;
+                        const std::string context = surface.name + " patch "
+                            + std::to_string(patch)
+                            + (field == NativeDensityField3D::ValueTrace
+                                   ? " value geometry reuse"
+                                   : " normal geometry reuse");
+                        if (field == NativeDensityField3D::ValueTrace) {
+                            const auto expected =
+                                build_direct_coefficient_value_jet_plan_3d(
+                                    density, patch, u, v, frame);
+                            const auto actual =
+                                build_direct_coefficient_value_jet_plan_3d(
+                                    density, patch, u, v, geometry, frame);
+                            require_identical_plan(actual, expected, context);
+                            const auto weights = cauchy_polynomial_weights_3d(
+                                geometry.point, frame,
+                                expected.graph_hessian, target);
+                            require_identical_stencil(
+                                actual.compose_value_row(weights.w0),
+                                expected.compose_value_row(weights.w0),
+                                context + " composed row");
+                        } else {
+                            const auto expected =
+                                build_direct_coefficient_normal_jet_plan_3d(
+                                    density, patch, u, v, frame);
+                            const auto actual =
+                                build_direct_coefficient_normal_jet_plan_3d(
+                                    density, patch, u, v, geometry, frame);
+                            require_identical_plan(actual, expected, context);
+                            const auto weights = cauchy_polynomial_weights_3d(
+                                geometry.point, frame,
+                                expected.graph_hessian, target);
+                            require_identical_stencil(
+                                actual.compose_normal_row(weights.w1),
+                                expected.compose_normal_row(weights.w1),
+                                context + " composed row");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 } // namespace
 
 int main()
@@ -395,6 +526,7 @@ int main()
         test_known_dirichlet_analytic_jet(density);
         test_direct_density_stencils(density);
         test_direct_normal_density_stencils();
+        test_precomputed_geometry_overloads();
         std::cout << "direct_coefficient_cauchy_3d_test: PASS\n";
         return 0;
     } catch (const std::exception& error) {

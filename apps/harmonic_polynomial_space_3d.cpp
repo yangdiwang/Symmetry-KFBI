@@ -153,6 +153,17 @@ Eigen::MatrixXd svd_pseudoinverse_3d(
     }
     Eigen::JacobiSVD<Eigen::MatrixXd> svd(
         matrix, Eigen::ComputeThinU | Eigen::ComputeThinV);
+    return svd_pseudoinverse_from_decomposition_3d(svd, relative_cutoff);
+}
+
+Eigen::MatrixXd svd_pseudoinverse_from_decomposition_3d(
+    const Eigen::JacobiSVD<Eigen::MatrixXd>& svd,
+    double relative_cutoff)
+{
+    if (!svd.computeU() || !svd.computeV()) {
+        throw std::invalid_argument(
+            "Cauchy pseudoinverse reuse requires both singular-vector matrices");
+    }
     const Eigen::VectorXd singular = svd.singularValues();
     if (singular.size() == 0 || !(singular[0] > 0.0)) {
         throw std::runtime_error(
@@ -162,6 +173,13 @@ Eigen::MatrixXd svd_pseudoinverse_3d(
     const double cutoff = relative_cutoff * singular[0];
     for (int i = 0; i < inverse.size(); ++i)
         inverse[i] = singular[i] > cutoff ? 1.0 / singular[i] : 0.0;
+    // Full decompositions of rectangular matrices have additional null-space
+    // columns.  Retain the original expression for the common thin case.
+    if (svd.matrixV().cols() != inverse.size()
+        || svd.matrixU().cols() != inverse.size()) {
+        return svd.matrixV().leftCols(inverse.size()) * inverse.asDiagonal()
+             * svd.matrixU().leftCols(inverse.size()).transpose();
+    }
     return svd.matrixV() * inverse.asDiagonal() * svd.matrixU().transpose();
 }
 

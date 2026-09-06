@@ -1,5 +1,7 @@
 #include "topology_density_constraints_3d.hpp"
 
+#include <Eigen/QR>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -8,6 +10,7 @@
 #include <map>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 
@@ -524,6 +527,7 @@ make_topology_feature_jump_jet_operators_3d(
     const NativeNurbsDensitySpace3D& normal_base_space,
     NativeFeatureEdgeJumpJetOptions3D options,
     TopologyDensityConstraintOptions3D topology_options,
+    TopologyNeumannFeatureC1Form3D formulation,
     double coefficient_drop_tolerance)
 {
     validate_options(topology_options);
@@ -569,6 +573,7 @@ make_topology_feature_jump_jet_operators_3d(
 
     TopologyFeatureJumpJetOperators3D result;
     result.options = std::move(options);
+    result.formulation = formulation;
     const Eigen::Index value_columns =
         value_base_space.c0_coefficient_count();
     const Eigen::Index normal_columns =
@@ -698,8 +703,10 @@ make_topology_feature_jump_jet_operators_3d(
                 const double sine = geometry_b.normal.dot(conormal_a);
                 const double abs_sine = std::abs(sine);
                 if (!std::isfinite(abs_sine)
-                    || abs_sine
-                           < result.options.minimum_abs_dihedral_sine) {
+                    || (result.formulation
+                            == TopologyNeumannFeatureC1Form3D::ConormalSolved
+                        && abs_sine
+                               < result.options.minimum_abs_dihedral_sine)) {
                     throw std::runtime_error(
                         "Sparse feature jump-jet dihedral angle is singular");
                 }
@@ -708,14 +715,6 @@ make_topology_feature_jump_jet_operators_3d(
                 info.maximum_abs_dihedral_sine = std::max(
                     info.maximum_abs_dihedral_sine, abs_sine);
 
-                const NativeDensityC0Stencil3D value_a =
-                    value_base_space
-                        .c0_physical_directional_derivative_stencil(
-                            connection.first.patch, ua, va, conormal_a);
-                const NativeDensityC0Stencil3D value_b =
-                    value_base_space
-                        .c0_physical_directional_derivative_stencil(
-                            connection.second.patch, ub, vb, conormal_b);
                 const NativeDensityC0Stencil3D normal_a =
                     normal_base_space.c0_basis_stencil(
                         connection.first.patch, ua, va);
@@ -723,31 +722,141 @@ make_topology_feature_jump_jet_operators_3d(
                     normal_base_space.c0_basis_stencil(
                         connection.second.patch, ub, vb);
 
+                std::array<NativeDensityC0Stencil3D, 2>
+                    ambient_value_a{};
+                std::array<NativeDensityC0Stencil3D, 2>
+                    ambient_value_b{};
+                std::array<Eigen::Vector3d, 2> transverse_directions{};
+                NativeDensityC0Stencil3D conormal_value_a;
+                NativeDensityC0Stencil3D conormal_value_b;
+                if (result.formulation
+                    == TopologyNeumannFeatureC1Form3D::ConormalSolved) {
+                    conormal_value_a = value_base_space
+                        .c0_physical_directional_derivative_stencil(
+                            connection.first.patch, ua, va, conormal_a);
+                    conormal_value_b = value_base_space
+                        .c0_physical_directional_derivative_stencil(
+                            connection.second.patch, ub, vb, conormal_b);
+                } else {
+                    // C0 already supplies equality of the edge-tangential
+                    // derivative.  It is therefore sufficient, and minimal,
+                    // to compare the reconstructed ambient gradients in an
+                    // orthonormal basis of t^perp.  A normal bisector makes
+                    // that frame symmetric in the two incident surfaces and
+                    // covariant under rigid transformations.
+                    Eigen::Vector3d transverse0 =
+                        geometry_a.normal + geometry_b.normal;
+                    transverse0 -= tangent * transverse0.dot(tangent);
+                    if (transverse0.norm() <= 1.0e-12) {
+                        transverse0 = geometry_a.normal - geometry_b.normal;
+                        transverse0 -= tangent * transverse0.dot(tangent);
+                    }
+                    if (transverse0.norm() <= 1.0e-12)
+                        transverse0 = geometry_a.normal;
+                    const double transverse0_norm = transverse0.norm();
+                    if (!(transverse0_norm > 0.0)
+                        || !std::isfinite(transverse0_norm)) {
+                        throw std::runtime_error(
+                            "Sparse ambient-gradient transverse frame is "
+                            "degenerate");
+                    }
+                    transverse0 /= transverse0_norm;
+                    Eigen::Vector3d transverse1 =
+                        tangent.cross(transverse0);
+                    const double transverse1_norm = transverse1.norm();
+                    if (!(transverse1_norm > 0.0)
+                        || !std::isfinite(transverse1_norm)) {
+                        throw std::runtime_error(
+                            "Sparse ambient-gradient transverse frame is "
+                            "degenerate");
+                    }
+                    transverse1 /= transverse1_norm;
+                    transverse_directions = {transverse0, transverse1};
+
+                    auto gradient_component_stencil = [&] (
+                        int patch, double u, double v,
+                        const Eigen::Vector3d& normal,
+                        const Eigen::Vector3d& direction) {
+                        Eigen::Vector3d tangential =
+                            direction - normal * direction.dot(normal);
+                        // A vanishing projection means that this component
+                        // contains only prescribed Neumann data on this side.
+                        if (tangential.norm() <= 1.0e-13)
+                            return NativeDensityC0Stencil3D{};
+                        tangential -= normal * tangential.dot(normal);
+                        return value_base_space
+                            .c0_physical_directional_derivative_stencil(
+                                patch, u, v, tangential);
+                    };
+                    for (int component = 0; component < 2; ++component) {
+                        ambient_value_a[static_cast<std::size_t>(component)] =
+                            gradient_component_stencil(
+                                connection.first.patch, ua, va,
+                                geometry_a.normal,
+                                transverse_directions[
+                                    static_cast<std::size_t>(component)]);
+                        ambient_value_b[static_cast<std::size_t>(component)] =
+                            gradient_component_stencil(
+                                connection.second.patch, ub, vb,
+                                geometry_b.normal,
+                                transverse_directions[
+                                    static_cast<std::size_t>(component)]);
+                    }
+                }
+
                 const double factor = quadrature_weight * ds_dxi;
                 for (int mode = 0;
                      mode <= topology_options.moment_degree; ++mode) {
                     const double moment = factor
                         * legendre_value(mode, local_coordinate);
-                    SparseRow& value_first = local_value_rows[
-                        static_cast<std::size_t>(2 * mode)];
-                    SparseRow& normal_first = local_normal_rows[
-                        static_cast<std::size_t>(2 * mode)];
-                    SparseRow& value_second = local_value_rows[
-                        static_cast<std::size_t>(2 * mode + 1)];
-                    SparseRow& normal_second = local_normal_rows[
-                        static_cast<std::size_t>(2 * mode + 1)];
-                    accumulate_stencil(value_first, value_a, moment);
-                    accumulate_stencil(value_second, value_b, moment);
-                    accumulate_stencil(
-                        normal_first, normal_b, moment / sine);
-                    accumulate_stencil(
-                        normal_first, normal_a,
-                        -moment * cosine / sine);
-                    accumulate_stencil(
-                        normal_second, normal_b,
-                        moment * cosine / sine);
-                    accumulate_stencil(
-                        normal_second, normal_a, -moment / sine);
+                    if (result.formulation
+                        == TopologyNeumannFeatureC1Form3D::ConormalSolved) {
+                        SparseRow& value_first = local_value_rows[
+                            static_cast<std::size_t>(2 * mode)];
+                        SparseRow& normal_first = local_normal_rows[
+                            static_cast<std::size_t>(2 * mode)];
+                        SparseRow& value_second = local_value_rows[
+                            static_cast<std::size_t>(2 * mode + 1)];
+                        SparseRow& normal_second = local_normal_rows[
+                            static_cast<std::size_t>(2 * mode + 1)];
+                        accumulate_stencil(
+                            value_first, conormal_value_a, moment);
+                        accumulate_stencil(
+                            value_second, conormal_value_b, moment);
+                        accumulate_stencil(
+                            normal_first, normal_b, moment / sine);
+                        accumulate_stencil(
+                            normal_first, normal_a,
+                            -moment * cosine / sine);
+                        accumulate_stencil(
+                            normal_second, normal_b,
+                            moment * cosine / sine);
+                        accumulate_stencil(
+                            normal_second, normal_a, -moment / sine);
+                    } else {
+                        for (int component = 0; component < 2; ++component) {
+                            const std::size_t index = static_cast<std::size_t>(
+                                2 * mode + component);
+                            const std::size_t direction_index =
+                                static_cast<std::size_t>(component);
+                            SparseRow& value_row = local_value_rows[index];
+                            SparseRow& normal_row = local_normal_rows[index];
+                            const Eigen::Vector3d& direction =
+                                transverse_directions[direction_index];
+                            accumulate_stencil(
+                                value_row,
+                                ambient_value_a[direction_index], moment);
+                            accumulate_stencil(
+                                value_row,
+                                ambient_value_b[direction_index], -moment);
+                            accumulate_stencil(
+                                normal_row, normal_b,
+                                moment * direction.dot(geometry_b.normal));
+                            accumulate_stencil(
+                                normal_row, normal_a,
+                                -moment * direction.dot(geometry_a.normal));
+                        }
+                    }
                 }
             }
 
@@ -765,7 +874,14 @@ make_topology_feature_jump_jet_operators_3d(
                         "feature_jet", topology_options);
                     meta.macro = "feature:" + info.label;
                     meta.segment = meta.macro;
-                    meta.side = side == 0 ? "first" : "second";
+                    if (result.formulation
+                        == TopologyNeumannFeatureC1Form3D::ConormalSolved) {
+                        meta.side = side == 0 ? "first" : "second";
+                    } else {
+                        meta.kind = "feature_ambient_gradient";
+                        meta.side = side == 0
+                            ? "transverse_0" : "transverse_1";
+                    }
                     result.meta.push_back(std::move(meta));
                 }
             }
@@ -896,6 +1012,12 @@ make_topology_dirichlet_feature_constraint_plan_3d(
         || !std::isfinite(options.tangential_compatibility_tolerance)) {
         throw std::invalid_argument(
             "Dirichlet feature tangential compatibility tolerance must be "
+            "finite and nonnegative");
+    }
+    if (!(options.value_compatibility_tolerance >= 0.0)
+        || !std::isfinite(options.value_compatibility_tolerance)) {
+        throw std::invalid_argument(
+            "Dirichlet feature value compatibility tolerance must be "
             "finite and nonnegative");
     }
 
@@ -1062,6 +1184,20 @@ make_topology_dirichlet_feature_constraint_plan_3d(
                     throw std::runtime_error(
                         "Dirichlet feature callback returned non-finite data");
                 }
+                const double value_mismatch =
+                    std::abs(known_a.value - known_b.value);
+                result.maximum_value_mismatch = std::max(
+                    result.maximum_value_mismatch, value_mismatch);
+                const double value_scale = std::max(
+                    {1.0, std::abs(known_a.value),
+                     std::abs(known_b.value)});
+                if (value_mismatch
+                    > result.options.value_compatibility_tolerance
+                        * value_scale) {
+                    throw std::runtime_error(
+                        "Known Dirichlet data have incompatible feature-edge "
+                        "values");
+                }
                 const double tangent_derivative_mismatch = std::abs(
                     known_a.ambient_gradient.dot(tangent)
                     - known_b.ambient_gradient.dot(tangent));
@@ -1190,6 +1326,257 @@ make_topology_dirichlet_feature_constraint_plan_3d(
         result.system,
         topology_options.merge_blocks_by_support,
         topology_options.coefficient_drop_tolerance);
+    return result;
+}
+
+TopologyDirichletUnisolventConstraintPlan3D
+select_topology_dirichlet_unisolvent_constraints_3d(
+    const TopologyDirichletFeatureConstraintPlan3D& candidates,
+    const SparseMatrixCSR3D& topology_homogeneous,
+    double relative_rank_tolerance)
+{
+    if (!(relative_rank_tolerance > 0.0)
+        || !(relative_rank_tolerance < 1.0)
+        || !std::isfinite(relative_rank_tolerance)) {
+        throw std::invalid_argument(
+            "Dirichlet unisolvent rank tolerance must be finite and in "
+            "(0,1)");
+    }
+    if (topology_homogeneous.rows() != candidates.system.C.cols()
+        || topology_homogeneous.cols() <= 0) {
+        throw std::invalid_argument(
+            "Dirichlet unisolvent topology basis dimensions are invalid");
+    }
+    if (static_cast<Eigen::Index>(candidates.system.meta.size())
+            != candidates.system.C.rows()) {
+        throw std::invalid_argument(
+            "Dirichlet unisolvent candidate matrix and metadata shapes "
+            "disagree");
+    }
+    for (int outer = 0; outer < candidates.system.C.outerSize(); ++outer) {
+        for (SparseMatrixCSR3D::InnerIterator entry(
+                 candidates.system.C, outer);
+             entry; ++entry) {
+            if (!std::isfinite(entry.value())) {
+                throw std::invalid_argument(
+                    "Dirichlet unisolvent candidate matrix is not finite");
+            }
+        }
+    }
+
+    TopologyDirichletUnisolventConstraintPlan3D result;
+    result.candidate_constraint_count = candidates.constraint_count();
+    result.system.C.resize(0, candidates.system.C.cols());
+    result.system.d.resize(0);
+    if (candidates.constraint_count() == 0) {
+        candidates.system.validate();
+        result.system.validate();
+        return result;
+    }
+
+    std::vector<int> ownership(
+        static_cast<std::size_t>(candidates.system.C.rows()), 0);
+    std::vector<Eigen::Index> vertex_rows;
+    std::vector<Eigen::Index> edge_rows;
+    vertex_rows.reserve(
+        static_cast<std::size_t>(candidates.system.C.rows()));
+    edge_rows.reserve(
+        static_cast<std::size_t>(candidates.system.C.rows()));
+    bool seen_edge = false;
+    for (const ConstraintBlock3D& block : candidates.blocks) {
+        if (block.kind == ConstraintBlockKind3D::Edge)
+            seen_edge = true;
+        else if (seen_edge) {
+            throw std::logic_error(
+                "Dirichlet candidate blocks are not vertex-before-edge");
+        }
+        for (Eigen::Index row : block.row_ids) {
+            if (row < 0 || row >= candidates.system.C.rows()) {
+                throw std::out_of_range(
+                    "Dirichlet candidate block row is out of range");
+            }
+            ++ownership[static_cast<std::size_t>(row)];
+            if (block.kind == ConstraintBlockKind3D::Vertex)
+                vertex_rows.push_back(row);
+            else
+                edge_rows.push_back(row);
+        }
+    }
+    if (!std::all_of(ownership.begin(), ownership.end(),
+                     [](int count) { return count == 1; })) {
+        throw std::logic_error(
+            "Dirichlet candidate rows do not have unique block ownership");
+    }
+    SparseMatrixCSR3D restricted =
+        candidates.system.C * topology_homogeneous;
+    restricted.makeCompressed();
+    Eigen::MatrixXd restricted_dense(restricted);
+    if (!restricted_dense.allFinite()) {
+        throw std::runtime_error(
+            "Dirichlet restricted feature matrix is not finite");
+    }
+
+    // Rank-revealing column pivoting on M^T selects original rows of
+    // M=C*G.  The global factorization supplies the total-rank certificate;
+    // the two stage factorizations below enforce the topology schedule:
+    // retain a maximal Vertex/T-star subset first, then retain only the Edge
+    // rows that add rank modulo the complete vertex row space.  No
+    // right-hand-side value participates in any factorization or pivot.
+    Eigen::ColPivHouseholderQR<Eigen::MatrixXd> global_qr(
+        restricted_dense.transpose());
+    global_qr.setThreshold(relative_rank_tolerance);
+    const Eigen::Index restricted_rank = global_qr.rank();
+    if (restricted_rank <= 0) {
+        throw std::runtime_error(
+            "Enabled Dirichlet feature catalog has no independent row in "
+            "the topology space");
+    }
+
+    const Eigen::Index topology_coordinates = restricted_dense.cols();
+    auto gather_rows = [&](const std::vector<Eigen::Index>& rows) {
+        Eigen::MatrixXd gathered(
+            static_cast<Eigen::Index>(rows.size()), topology_coordinates);
+        for (Eigen::Index local = 0;
+             local < static_cast<Eigen::Index>(rows.size()); ++local) {
+            gathered.row(local) = restricted_dense.row(
+                rows[static_cast<std::size_t>(local)]);
+        }
+        return gathered;
+    };
+
+    const Eigen::MatrixXd vertex_dense = gather_rows(vertex_rows);
+    Eigen::ColPivHouseholderQR<Eigen::MatrixXd> vertex_qr(
+        vertex_dense.transpose());
+    vertex_qr.setThreshold(relative_rank_tolerance);
+    const Eigen::Index vertex_rank = vertex_rows.empty()
+        ? 0 : vertex_qr.rank();
+    if (vertex_rank < 0 || vertex_rank > restricted_rank) {
+        throw std::runtime_error(
+            "Dirichlet vertex-first rank exceeds the global feature rank");
+    }
+
+    result.retained_candidate_rows.reserve(
+        static_cast<std::size_t>(restricted_rank));
+    for (Eigen::Index pivot = 0; pivot < vertex_rank; ++pivot) {
+        const Eigen::Index local =
+            vertex_qr.colsPermutation().indices()[pivot];
+        result.retained_candidate_rows.push_back(
+            vertex_rows[static_cast<std::size_t>(local)]);
+    }
+
+    const Eigen::Index edge_increment = restricted_rank - vertex_rank;
+    if (edge_increment > 0) {
+        if (edge_increment > static_cast<Eigen::Index>(edge_rows.size())) {
+            throw std::runtime_error(
+                "Dirichlet edge catalog cannot supply the certified "
+                "incremental rank");
+        }
+        const Eigen::MatrixXd edge_dense = gather_rows(edge_rows);
+        Eigen::MatrixXd edge_modulo_vertex = edge_dense;
+        if (vertex_rank > 0) {
+            const Eigen::MatrixXd vertex_span =
+                vertex_qr.householderQ()
+                * Eigen::MatrixXd::Identity(
+                      topology_coordinates, vertex_rank);
+            const Eigen::MatrixXd vertex_projection =
+                edge_dense * vertex_span;
+            edge_modulo_vertex.noalias() -=
+                vertex_projection * vertex_span.transpose();
+        }
+        Eigen::ColPivHouseholderQR<Eigen::MatrixXd> edge_qr(
+            edge_modulo_vertex.transpose());
+        edge_qr.setThreshold(relative_rank_tolerance);
+        for (Eigen::Index pivot = 0; pivot < edge_increment; ++pivot) {
+            const Eigen::Index local =
+                edge_qr.colsPermutation().indices()[pivot];
+            result.retained_candidate_rows.push_back(
+                edge_rows[static_cast<std::size_t>(local)]);
+        }
+    }
+
+    // Fail closed if stagewise pivoting did not retain a full-rank basis of
+    // the same global row space.  This certificate also protects against a
+    // tolerance mismatch caused by an ill-conditioned projected Edge stage.
+    const Eigen::MatrixXd retained_dense =
+        gather_rows(result.retained_candidate_rows);
+    Eigen::ColPivHouseholderQR<Eigen::MatrixXd> retained_qr(
+        retained_dense.transpose());
+    retained_qr.setThreshold(relative_rank_tolerance);
+    if (static_cast<Eigen::Index>(result.retained_candidate_rows.size())
+            != restricted_rank
+        || retained_qr.rank() != restricted_rank) {
+        throw std::runtime_error(
+            "Dirichlet vertex-first unisolvent selection lost global rank");
+    }
+
+    std::vector<ConstraintBlockKind3D> candidate_kinds(
+        static_cast<std::size_t>(candidates.system.C.rows()),
+        ConstraintBlockKind3D::Edge);
+    for (Eigen::Index row : vertex_rows) {
+        candidate_kinds[static_cast<std::size_t>(row)] =
+            ConstraintBlockKind3D::Vertex;
+    }
+    std::stable_sort(
+        result.retained_candidate_rows.begin(),
+        result.retained_candidate_rows.end(),
+        [&](Eigen::Index first_row, Eigen::Index second_row) {
+            const ConstraintBlockKind3D first_kind = candidate_kinds[
+                static_cast<std::size_t>(first_row)];
+            const ConstraintBlockKind3D second_kind = candidate_kinds[
+                static_cast<std::size_t>(second_row)];
+            const int first_stage = first_kind
+                    == ConstraintBlockKind3D::Vertex ? 0 : 1;
+            const int second_stage = second_kind
+                    == ConstraintBlockKind3D::Vertex ? 0 : 1;
+            const ConstraintMeta3D& first = candidates.system.meta[
+                static_cast<std::size_t>(first_row)];
+            const ConstraintMeta3D& second = candidates.system.meta[
+                static_cast<std::size_t>(second_row)];
+            return std::tie(first_stage, first.mode, first.connection,
+                            first.cell, first.side, first_row)
+                 < std::tie(second_stage, second.mode, second.connection,
+                            second.cell, second.side, second_row);
+        });
+    for (Eigen::Index row : result.retained_candidate_rows) {
+        if (candidate_kinds[static_cast<std::size_t>(row)]
+                == ConstraintBlockKind3D::Vertex) {
+            ++result.retained_vertex_rows;
+        } else {
+            ++result.retained_edge_rows;
+        }
+    }
+
+    result.system.C.resize(
+        static_cast<Eigen::Index>(result.retained_candidate_rows.size()),
+        candidates.system.C.cols());
+    // The retained row identities are now final.  Validate and copy d only
+    // after every rank and pivot decision has been made from C*G alone.
+    candidates.system.validate();
+    result.system.d.resize(
+        static_cast<Eigen::Index>(result.retained_candidate_rows.size()));
+    result.system.meta.reserve(result.retained_candidate_rows.size());
+    std::vector<Eigen::Triplet<double>> triplets;
+    for (Eigen::Index selected = 0;
+         selected
+             < static_cast<Eigen::Index>(
+                   result.retained_candidate_rows.size());
+         ++selected) {
+        const Eigen::Index source = result.retained_candidate_rows[
+            static_cast<std::size_t>(selected)];
+        result.system.d[selected] = candidates.system.d[source];
+        result.system.meta.push_back(candidates.system.meta[
+            static_cast<std::size_t>(source)]);
+        for (SparseMatrixCSR3D::InnerIterator entry(
+                 candidates.system.C, source);
+             entry; ++entry) {
+            triplets.emplace_back(selected, entry.col(), entry.value());
+        }
+    }
+    result.system.C.setFromTriplets(triplets.begin(), triplets.end());
+    result.system.C.makeCompressed();
+    result.system.validate();
+    result.blocks = build_topology_density_constraint_blocks_3d(
+        result.system, false, relative_rank_tolerance);
     return result;
 }
 

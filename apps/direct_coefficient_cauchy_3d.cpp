@@ -366,19 +366,23 @@ build_direct_coefficient_value_jet_plan_3d(
 {
     const NativeSurfaceParameterJet3D geometry =
         native_surface_parameter_jet_3d(density, patch, u, v);
+    return build_direct_coefficient_value_jet_plan_3d(
+        density, patch, u, v, geometry, frame);
+}
+
+DirectCoefficientValueJetPlan3D
+build_direct_coefficient_value_jet_plan_3d(
+    const NativeNurbsDensitySpace3D& density,
+    int patch,
+    double u,
+    double v,
+    const NativeSurfaceParameterJet3D& geometry,
+    const LocalOrthonormalFrame3D& frame)
+{
     const Eigen::Matrix<double, 6, 6> transform =
         parameter_to_cauchy_value_jet_matrix_3d(geometry, frame);
-    const std::array<std::array<int, 2>, 6> derivatives{{
-        {{0, 0}}, {{1, 0}}, {{0, 1}},
-        {{2, 0}}, {{1, 1}}, {{0, 2}}}};
-    std::array<NativeDensityC0Stencil3D, 6> parameter_rows;
-    for (int q = 0; q < 6; ++q) {
-        parameter_rows[static_cast<std::size_t>(q)] =
-            density.c0_parameter_derivative_stencil(
-                patch, u, v,
-                derivatives[static_cast<std::size_t>(q)][0],
-                derivatives[static_cast<std::size_t>(q)][1]);
-    }
+    const std::array<NativeDensityC0Stencil3D, 6> parameter_rows =
+        density.c0_parameter_jet_stencils(patch, u, v);
 
     DirectCoefficientValueJetPlan3D result;
     result.patch = patch;
@@ -435,6 +439,19 @@ build_direct_coefficient_normal_jet_plan_3d(
 {
     const NativeSurfaceParameterJet3D geometry =
         native_surface_parameter_jet_3d(density, patch, u, v);
+    return build_direct_coefficient_normal_jet_plan_3d(
+        density, patch, u, v, geometry, frame);
+}
+
+DirectCoefficientNormalJetPlan3D
+build_direct_coefficient_normal_jet_plan_3d(
+    const NativeNurbsDensitySpace3D& density,
+    int patch,
+    double u,
+    double v,
+    const NativeSurfaceParameterJet3D& geometry,
+    const LocalOrthonormalFrame3D& frame)
+{
     const Eigen::Matrix2d jacobian =
         parameter_to_tangent_jacobian(geometry, frame);
     const Eigen::Matrix2d inverse = jacobian.inverse();

@@ -9,8 +9,10 @@ The default matrix contains seven geometries and eight rigid poses:
   * the other six poses at N=32.
 
 The topology/native executable covers torus, cylinder, l_prism, and u_prism.
-The general-cap executable covers sphere, ellipsoid, and flower.  Every real
-run sets KFBIM_3D_SOLVE_SELECTION=both.  Topology solver output is first
+It explicitly uses q27_cover3_all_event_cauchy for Neumann and
+q64_cover4_all_event_cauchy for Dirichlet.  The general-cap executable covers
+sphere, ellipsoid, and flower.  Every real run sets
+KFBIM_3D_SOLVE_SELECTION=both.  Topology solver output is first
 written below a short system-temporary root and then archived, while source
 CSVs and stdout/stderr logs are preserved below
 output/kfbi_3d_full_validation/<RunLabel>.  The two source schemas are
@@ -90,8 +92,10 @@ param(
 
     [string] $BuildDirectory = 'build-topology-final',
 
-    [string] $TopologyTransientRoot = [IO.Path]::Combine(
-        [IO.Path]::GetTempPath(), 'kfbim3v'),
+    # The solver uses compact q27_c3/d_q64_c4 path components.  Use the system
+    # temp directory itself as their parent so the longest Windows diagnostic
+    # path remains below the safety budget.
+    [string] $TopologyTransientRoot = [IO.Path]::GetTempPath(),
 
     [switch] $SkipBuild,
     [switch] $Resume,
@@ -135,6 +139,8 @@ $generalCapExe = Join-Path $build 'apps/kfbi_general_cap_exterior_trace_3d.exe'
 $topologyGeometries = @('torus', 'cylinder', 'l_prism', 'u_prism')
 $topologyAllGeometries = @('cylinder', 'l_prism', 'u_prism')
 $generalCapGeometries = @('sphere', 'ellipsoid', 'flower')
+$topologyNeumannTraceRestrict = 'q27_cover3_all_event_cauchy'
+$topologyDirichletTraceRestrict = 'q64_cover4_all_event_cauchy'
 $convergencePoses = @('baseline', 'rot_axis123_17deg_t_xyz_1')
 $poseCodes = @{
     baseline = 'b'
@@ -182,6 +188,7 @@ $resultColumns = @(
     'backend',
     'geometry',
     'formulation',
+    'trace_restrict_mode',
     'pose',
     'N',
     'h',
@@ -270,7 +277,7 @@ function Get-TopologySourceDirectory([string] $pose, [string] $tag) {
     # With solve_selection=both the Dirichlet route contributes its own path
     # component before the compact Neumann mean-free mode component.
     $path = Join-Path $topologyOutputRoot `
-        'tac_q10/dirichlet_shared_q10_cubic_gridline_cauchy/nm_pc_tm_mf/topology_affine'
+        'q27_c3/d_q64_c4/nm_pc_tm_mf/topology_affine'
     $rigidDirectory = Get-RigidDirectory $pose
     if ($null -ne $rigidDirectory) {
         $path = Join-Path $path $rigidDirectory
@@ -324,6 +331,21 @@ function Assert-TopologyTransientPathBudget {
 
 function Get-GeneralCapSourceDirectory([string] $pose) {
     return Join-Path $generalCapOutputRoot "pose_$pose/both"
+}
+
+function Get-ExpectedTraceRestrictMode(
+    [string] $backend,
+    [string] $formulation) {
+    if ($backend -ne 'topology_native') {
+        return 'not_applicable'
+    }
+    if ($formulation -eq 'neumann') {
+        return $topologyNeumannTraceRestrict
+    }
+    if ($formulation -eq 'dirichlet') {
+        return $topologyDirichletTraceRestrict
+    }
+    throw "Unknown topology formulation '$formulation'"
 }
 
 function New-RunCase(
@@ -445,7 +467,7 @@ function Get-CaseEnvironment($case) {
         $settings.KFBIM_3D_FEATURE_TRACE_FIT = 'geometric_feature'
         $settings.KFBIM_3D_NEUMANN_COMPATIBILITY = 'trace_border_legacy'
         $settings.KFBIM_3D_NEUMANN_TRACE_RESTRICT =
-            'shared_q10_cubic_gridline_cauchy'
+            $topologyNeumannTraceRestrict
         $settings.KFBIM_3D_NEUMANN_RESTRICT_VALUE_COUNT = '24'
         $settings.KFBIM_3D_NEUMANN_RESTRICT_NORMAL_COUNT = '12'
         $settings.KFBIM_3D_NEUMANN_RESTRICT_VALUE_JET = 'c0_one_sided'
@@ -456,7 +478,7 @@ function Get-CaseEnvironment($case) {
         $settings.KFBIM_3D_NEUMANN_EDGE_JUMP_JET =
             'topology_affine_local_svd'
         $settings.KFBIM_3D_DIRICHLET_NORMAL_RESTRICT =
-            'shared_q10_cubic_gridline_cauchy'
+            $topologyDirichletTraceRestrict
         $settings.KFBIM_3D_DIRICHLET_JUMP_SPACE =
             'analytic_j0_affine_j1'
         $settings.KFBIM_3D_DIRICHLET_FEATURE_COUPLING =
@@ -707,6 +729,17 @@ function Convert-TopologyArchive($case, [string] $archiveDirectory) {
             throw "Missing archived topology result: $path"
         }
         foreach ($row in (Import-Csv -LiteralPath $path)) {
+            $traceRestrictMode = [string] (
+                Get-RowValue $row 'trace_restrict_mode')
+            $expectedTraceRestrictMode = Get-ExpectedTraceRestrictMode `
+                'topology_native' $item.Formulation
+            if ([string]::IsNullOrWhiteSpace($traceRestrictMode) -or
+                $traceRestrictMode -ne $expectedTraceRestrictMode) {
+                throw (
+                    "Topology $($item.Formulation) archive has " +
+                    "trace_restrict_mode='$traceRestrictMode'; expected " +
+                    "'$expectedTraceRestrictMode': $path")
+            }
             $sourceDofs = Convert-ToInt (Get-RowValue $row 'dofs')
             $preMeanDofs = if ($item.Formulation -eq 'neumann') {
                 Convert-ToNullableInt (Get-FirstRowValue $row @(
@@ -736,6 +769,7 @@ function Convert-TopologyArchive($case, [string] $archiveDirectory) {
                 backend = 'topology_native'
                 geometry = [string] (Get-RowValue $row 'geometry')
                 formulation = $item.Formulation
+                trace_restrict_mode = $traceRestrictMode
                 pose = $case.Pose
                 N = Convert-ToInt (Get-RowValue $row 'N')
                 h = Convert-ToDoubleOrNaN (Get-RowValue $row 'h')
@@ -868,6 +902,8 @@ function Convert-GeneralCapArchive($case, [string] $archiveDirectory) {
                 backend = 'general_cap'
                 geometry = [string] (Get-RowValue $row 'shape')
                 formulation = $formulation
+                trace_restrict_mode = Get-ExpectedTraceRestrictMode `
+                    'general_cap' $formulation
                 pose = [string] (Get-RowValue $row 'pose')
                 N = Convert-ToInt (Get-RowValue $row 'N')
                 h = Convert-ToDoubleOrNaN (Get-RowValue $row 'h')
@@ -985,7 +1021,8 @@ function Assert-ExpectedCaseRows($case, [object[]] $rows) {
 }
 
 function Add-RecomputedInteriorOrders([object[]] $rows) {
-    $groups = $rows | Group-Object backend, geometry, formulation, pose
+    $groups = $rows | Group-Object `
+        backend, geometry, formulation, trace_restrict_mode, pose
     foreach ($group in $groups) {
         $ordered = @($group.Group | Sort-Object N)
         $previous = $null
@@ -1084,7 +1121,7 @@ function Write-AllResults([string] $path, [object[]] $rows) {
         return
     }
     $ordered = @($rows | Sort-Object `
-        backend, geometry, formulation, pose, N)
+        backend, geometry, formulation, trace_restrict_mode, pose, N)
     $ordered | Select-Object $resultColumns |
         Export-Csv -LiteralPath $path -NoTypeInformation -Encoding UTF8
 }
@@ -1121,12 +1158,18 @@ function Invoke-SyntheticCsvTest {
                 seconds = 0.1
             }
         }
-        $topologyCommon | Export-Csv -LiteralPath (
+        $topologyCommon | Select-Object *, @{
+            Name = 'trace_restrict_mode'
+            Expression = { $topologyNeumannTraceRestrict }
+        } | Export-Csv -LiteralPath (
             Join-Path $topologyArchive 'neumann_results.csv') `
             -NoTypeInformation -Encoding UTF8
         $topologyCommon | ForEach-Object {
             $_.interior_linf = 2.0 * $_.interior_linf
             $_
+        } | Select-Object *, @{
+            Name = 'trace_restrict_mode'
+            Expression = { $topologyDirichletTraceRestrict }
         } | Export-Csv -LiteralPath (
             Join-Path $topologyArchive 'dirichlet_normal_results.csv') `
             -NoTypeInformation -Encoding UTF8
@@ -1222,6 +1265,16 @@ function Invoke-SyntheticCsvTest {
         $topologyCurrent = @($rows | Where-Object {
             $_.backend -eq 'topology_native'
         })
+        if (@($topologyCurrent | Where-Object {
+                ($_.formulation -eq 'neumann' -and
+                    $_.trace_restrict_mode -ne
+                        $topologyNeumannTraceRestrict) -or
+                ($_.formulation -eq 'dirichlet' -and
+                    $_.trace_restrict_mode -ne
+                        $topologyDirichletTraceRestrict)
+            }).Count -ne 0) {
+            throw 'Synthetic topology trace restrict modes were not preserved'
+        }
         if (@($topologyCurrent | Where-Object {
                 $_.trace_samples -le $_.trace_final_dofs -or
                 $_.trace_oversampling_margin -ne 16 -or
