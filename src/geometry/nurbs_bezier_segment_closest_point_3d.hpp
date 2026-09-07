@@ -9,10 +9,13 @@
 
 namespace kfbim::geometry3d {
 
+class NurbsPatchPolarEvaluator3D;
+
 struct NurbsElementSegmentClosestPointOptions3D {
     double distance_tolerance = 1.0e-12;
     double parameter_tolerance = 1.0e-12;
     int max_iterations = 36;
+    const NurbsPatchPolarEvaluator3D* surface_evaluator = nullptr;
 };
 
 struct NurbsElementSegmentClosestPointResult3D {

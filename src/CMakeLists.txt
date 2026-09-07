@@ -54,6 +54,8 @@ if(KFBIM_BUILD_3D)
         geometry/native_nurbs_exact_geometry_3d.cpp
         geometry/native_endpoint_path_3d.cpp
         geometry/nurbs_bezier_extraction_3d.cpp
+        geometry/nurbs_patch_polar_evaluator_3d.cpp
+        geometry/nurbs_surface_closest_point_3d.cpp
         geometry/rational_bezier_element_3d.cpp
         geometry/rational_bezier_subdivision_3d.cpp
         geometry/nurbs_surface_model_3d.cpp
@@ -90,11 +92,13 @@ if(KFBIM_BUILD_3D)
         set_source_files_properties(
             geometry/native_nurbs_exact_geometry_3d.cpp
             geometry/native_endpoint_path_3d.cpp
+            geometry/nurbs_surface_closest_point_3d.cpp
             PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
     elseif(MSVC)
         set_source_files_properties(
             geometry/native_nurbs_exact_geometry_3d.cpp
             geometry/native_endpoint_path_3d.cpp
+            geometry/nurbs_surface_closest_point_3d.cpp
             PROPERTIES COMPILE_OPTIONS "/fp:strict")
     endif()
 endif()
@@ -119,4 +123,5 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/kfbim
 install(DIRECTORY ${PROJECT_SOURCE_DIR}/src/
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/src
     FILES_MATCHING PATTERN "*.hpp"
+    PATTERN "support" EXCLUDE
 )

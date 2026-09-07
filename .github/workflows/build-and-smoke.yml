@@ -397,15 +397,15 @@ jobs:
       - name: Validate 3D report pipelines
         shell: pwsh
         run: |
-          ./apps/run_kfbi_3d_full_validation.ps1 -PathSelfTest
-          ./apps/run_kfbi_3d_full_validation.ps1 -SyntheticCsvTest
-          ./apps/merge_kfbi_3d_validation_reports.ps1 -SyntheticCsvTest
-          ./apps/generate_kfbi_3d_validation_report.ps1 -SelfTest
+          ./scripts/validation/run_kfbi_3d_full_validation.ps1 -PathSelfTest
+          ./scripts/validation/run_kfbi_3d_full_validation.ps1 -SyntheticCsvTest
+          ./scripts/validation/merge_kfbi_3d_validation_reports.ps1 -SyntheticCsvTest
+          ./scripts/validation/generate_kfbi_3d_validation_report.ps1 -SelfTest
 
       - name: Run both visualization apps
         env:
           MPLBACKEND: Agg
         run: |
-          python3 -m py_compile apps/visualize_shape_opt_2d.py apps/visualize_transmission_center_perturb_2d.py
-          python3 apps/visualize_shape_opt_2d.py output/smoke_shape_opt
-          python3 apps/visualize_transmission_center_perturb_2d.py output/smoke_transmission_center
+          python3 -m py_compile scripts/visualization/visualize_shape_opt_2d.py scripts/visualization/visualize_transmission_center_perturb_2d.py
+          python3 scripts/visualization/visualize_shape_opt_2d.py output/smoke_shape_opt
+          python3 scripts/visualization/visualize_transmission_center_perturb_2d.py output/smoke_transmission_center

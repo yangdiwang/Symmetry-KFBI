@@ -1,4 +1,5 @@
 #include "nurbs_bezier_intersection_3d.hpp"
+#include "nurbs_patch_polar_evaluator_3d.hpp"
 #include "nurbs_bezier_segment_closest_point_3d.hpp"
 
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
@@ -736,6 +737,16 @@ NativeNewtonOutcome native_newton(
     state = clamp_to_box(state);
     outcome.best_state = {state.x(), state.y(), state.z()};
 
+    NurbsPolarEvaluationWorkspace3D workspace;
+    const auto evaluate = [&](double u, double v) {
+        return options.surface_evaluator
+            ? options.surface_evaluator->evaluate_with_derivatives(
+                patch, u, v, workspace)
+            : patch.evaluate_with_derivatives(u, v);
+    };
+    // The accepted line-search jet already belongs to the next clamped state.
+    NurbsSurfaceDerivatives3D derivatives = evaluate(state.x(), state.y());
+
     // The geometric acceptance tolerance is intentionally looser than the
     // parameter tolerance used to identify roots returned by independent
     // seeds and neighboring query elements.  Stopping at the first accepted
@@ -746,8 +757,6 @@ NativeNewtonOutcome native_newton(
     // root instead of turning a resolved intersection into a failure.
     for (int iteration = 0; iteration <= options.max_newton_iterations;
          ++iteration) {
-        const NurbsSurfaceDerivatives3D derivatives =
-            patch.evaluate_with_derivatives(state.x(), state.y());
         const Eigen::Vector3d segment_point =
             frame.start + state.z() * frame.delta;
         const Eigen::Vector3d residual_vector =
@@ -827,8 +836,7 @@ NativeNewtonOutcome native_newton(
             if (in_box(candidate)) {
                 candidate = clamp_to_box(candidate);
                 const NurbsSurfaceDerivatives3D candidate_derivatives =
-                    patch.evaluate_with_derivatives(
-                        candidate.x(), candidate.y());
+                    evaluate(candidate.x(), candidate.y());
                 const double candidate_residual =
                     (candidate_derivatives.point
                      - (frame.start + candidate.z() * frame.delta)).norm();
@@ -838,6 +846,7 @@ NativeNewtonOutcome native_newton(
                             && candidate_residual
                                    <= options.geometry_tolerance))) {
                     state = candidate;
+                    derivatives = candidate_derivatives;
                     accepted = true;
                     break;
                 }
@@ -1183,6 +1192,7 @@ NurbsElementSegmentClosestPointResult3D run_closest_point_assistance(
     bool record_terminal_diagnostics = true)
 {
     NurbsElementSegmentClosestPointOptions3D closest_options;
+    closest_options.surface_evaluator = options.surface_evaluator;
     closest_options.distance_tolerance = options.geometry_tolerance;
     closest_options.parameter_tolerance = options.parameter_tolerance;
     closest_options.max_iterations =

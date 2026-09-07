@@ -1,6 +1,7 @@
 #pragma once
 
 #include "nurbs_bezier_intersection_3d.hpp"
+#include "nurbs_patch_polar_evaluator_3d.hpp"
 #include "nurbs_surface_model_3d.hpp"
 #include "rational_bezier_element_3d.hpp"
 
@@ -220,6 +221,8 @@ struct NurbsSurfaceIntersectorOptions3D {
     int local_max_subdivision_depth = 4;
     int terminal_separation_subdivision_depth =
         kDefaultTerminalSeparationSubdivisionDepth3D;
+    // Keep the reference evaluator available for numerical/performance checks.
+    bool use_polar_surface_evaluation = true;
 };
 
 class NurbsSurfaceIntersector3D {
@@ -326,6 +329,7 @@ private:
     double geometry_tolerance_ = 1e-14;
     double maximum_query_element_extent_ = 0.0;
     std::vector<RationalBezierElement3D> elements_;
+    std::vector<NurbsPatchPolarEvaluator3D> surface_evaluators_;
     std::vector<bool> element_touches_non_g1_feature_;
     std::vector<NurbsQueryElementDescriptor3D> query_elements_;
     std::vector<std::array<NurbsQueryElementSample3D, 16>> element_samples_;

@@ -1,4 +1,5 @@
 #include "nurbs_bezier_segment_closest_point_3d.hpp"
+#include "nurbs_patch_polar_evaluator_3d.hpp"
 
 #include <Eigen/Cholesky>
 
@@ -79,13 +80,17 @@ Evaluation evaluate(const RationalBezierElement3D& element,
                     const Eigen::Vector3d& segment_delta,
                     double segment_length_squared,
                     const Eigen::Vector2d& unit,
-                    double parameter_tolerance)
+                    const NurbsElementSegmentClosestPointOptions3D& options,
+                    NurbsPolarEvaluationWorkspace3D& workspace)
 {
     Evaluation result;
     result.parameter = clamp_unit(unit);
     const Eigen::Vector2d native = native_parameter(element, result.parameter);
     const NurbsSurfaceDerivatives3D derivatives =
-        patch.evaluate_with_derivatives(native.x(), native.y());
+        options.surface_evaluator
+        ? options.surface_evaluator->evaluate_with_derivatives(
+            patch, native.x(), native.y(), workspace)
+        : patch.evaluate_with_derivatives(native.x(), native.y());
     if (!derivatives.point.allFinite() || !derivatives.du.allFinite()
         || !derivatives.dv.allFinite()) {
         return result;
@@ -115,7 +120,7 @@ Evaluation evaluate(const RationalBezierElement3D& element,
     result.jacobian.col(1) = tangent_v;
     result.gradient = result.jacobian.transpose() * result.residual;
     result.projected_gradient = projected_gradient(
-        result.gradient, result.parameter, parameter_tolerance);
+        result.gradient, result.parameter, options.parameter_tolerance);
     return result;
 }
 
@@ -184,11 +189,12 @@ NurbsElementSegmentClosestPointResult3D solve_from_seed(
     const Eigen::Vector3d& segment_delta,
     double segment_length_squared,
     const NurbsElementSegmentClosestPointOptions3D& options,
-    Eigen::Vector2d parameter)
+    Eigen::Vector2d parameter,
+    NurbsPolarEvaluationWorkspace3D& workspace)
 {
     Evaluation current = evaluate(
         element, patch, segment_start, segment_delta,
-        segment_length_squared, parameter, options.parameter_tolerance);
+        segment_length_squared, parameter, options, workspace);
     if (!finite(current))
         return make_result(element, current, false, 0);
 
@@ -238,7 +244,7 @@ NurbsElementSegmentClosestPointResult3D solve_from_seed(
                 candidate = evaluate(
                     element, patch, segment_start, segment_delta,
                     segment_length_squared, trial,
-                    options.parameter_tolerance);
+                    options, workspace);
                 if (finite(candidate)
                     && candidate.objective < current.objective) {
                     return true;
@@ -370,10 +376,11 @@ closest_point_nurbs_bezier_element_to_segment_3d(
     const double segment_length_squared = segment_delta.squaredNorm();
     NurbsElementSegmentClosestPointResult3D best;
     int total_iterations = 0;
+    NurbsPolarEvaluationWorkspace3D workspace;
     for (const Eigen::Vector2d& seed : seeds) {
         const auto candidate = solve_from_seed(
             element, patch, segment_start, segment_delta,
-            segment_length_squared, options, seed);
+            segment_length_squared, options, seed, workspace);
         total_iterations += candidate.iterations;
         const bool closer = candidate.distance < best.distance;
         const bool equally_close =

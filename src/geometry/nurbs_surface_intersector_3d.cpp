@@ -1359,6 +1359,19 @@ NurbsSurfaceIntersector3D::NurbsSurfaceIntersector3D(
     }
     std::vector<RationalBezierElement3D> base_elements =
         extract_rational_bezier_elements_3d(model_);
+    if (options_.use_polar_surface_evaluation) {
+        std::vector<std::vector<RationalBezierElement3D>> patch_elements(
+            static_cast<std::size_t>(model_.num_patches()));
+        for (const auto& element : base_elements)
+            patch_elements[static_cast<std::size_t>(element.patch_index)]
+                .push_back(element);
+        surface_evaluators_.reserve(patch_elements.size());
+        for (int patch = 0; patch < model_.num_patches(); ++patch) {
+            surface_evaluators_.emplace_back(
+                model_.patch(patch),
+                std::move(patch_elements[static_cast<std::size_t>(patch)]));
+        }
+    }
     if (std::isfinite(options_.maximum_element_extent)) {
         elements_ = subdivide_rational_bezier_elements_to_extent_3d(
             base_elements, options_.maximum_element_extent);
@@ -1524,6 +1537,9 @@ NurbsSurfaceIntersector3D::certify_candidate_segment(
     const RationalBezierElement3D& element =
         elements_[candidate.query_element_];
     NurbsElementIntersectionOptions3D options;
+    if (options_.use_polar_surface_evaluation)
+        options.surface_evaluator =
+            &surface_evaluators_[static_cast<std::size_t>(element.patch_index)];
     options.geometry_tolerance = geometry_tolerance_;
     options.use_triangle_seed = options_.use_triangle_seeds;
     options.max_subdivision_depth =
@@ -1945,6 +1961,9 @@ NurbsSurfaceIntersector3D::intersect_segment_candidate_indices(
         const NurbsSurfacePatch3D& source_patch =
             model_.patch(element.patch_index);
         NurbsElementIntersectionOptions3D candidate_options = local_options;
+        if (options_.use_polar_surface_evaluation)
+            candidate_options.surface_evaluator = &surface_evaluators_[
+                static_cast<std::size_t>(element.patch_index)];
         candidate_options.use_closest_point_prefilter =
             local_options.use_closest_point_prefilter
             && !element_touches_non_g1_feature_[

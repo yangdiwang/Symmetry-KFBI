@@ -19,7 +19,7 @@
 
 ### 2.1 批量密度参数 jet
 
-接口位于 [native_nurbs_density_space_3d.hpp](../apps/native_nurbs_density_space_3d.hpp)，实现位于 [native_nurbs_density_space_3d.cpp](../apps/native_nurbs_density_space_3d.cpp)：
+接口位于 [native_nurbs_density_space_3d.hpp](../src/support/density/native_nurbs_density_space_3d.hpp)，实现位于 [native_nurbs_density_space_3d.cpp](../src/support/density/native_nurbs_density_space_3d.cpp)：
 
 ```cpp
 std::array<NativeDensityC0Stencil3D, 6>
@@ -39,15 +39,15 @@ B_{ij}(u,v)=N_i(u)N_j(v),
 
 ### 2.2 复用已经计算的几何 jet
 
-[direct_coefficient_cauchy_3d.hpp](../apps/direct_coefficient_cauchy_3d.hpp) 为 value/normal plan builder 增加带有 `NativeSurfaceParameterJet3D` 参数的 overload。旧接口保留，并在自行计算几何后转调新接口。
+[direct_coefficient_cauchy_3d.hpp](../src/support/cauchy/direct_coefficient_cauchy_3d.hpp) 为 value/normal plan builder 增加带有 `NativeSurfaceParameterJet3D` 参数的 overload。旧接口保留，并在自行计算几何后转调新接口。
 
-[主 driver](../apps/neumann_exterior_zero_trace_3d.cpp) 在 direct value/normal plan 的绑定过程中，传入已经计算的 `cached.geometry`。该数据来自同一 density surface、同一 patch 及相同的归一化参数 `(u,v)`。法向定向、局部 frame、参数到切平面的变换、graph Hessian 和 Cauchy 行组合公式不变。
+[主 driver](../apps/laplace/3d/neumann_exterior_zero_trace_3d.cpp) 在 direct value/normal plan 的绑定过程中，传入已经计算的 `cached.geometry`。该数据来自同一 density surface、同一 patch 及相同的归一化参数 `(u,v)`。法向定向、局部 frame、参数到切平面的变换、graph Hessian 和 Cauchy 行组合公式不变。
 
 新 overload 的契约是调用方提供正确位置及参数坐标下的几何 jet；不能用邻近点、其他 patch 或其他刚体姿态的数据替代。密度 P2 jet 的批量接口用于 value plan，normal plan 的所需导数阶次不因此改变。
 
 ### 2.3 同一次 SVD 用于诊断与伪逆
 
-[harmonic_polynomial_space_3d.hpp](../apps/harmonic_polynomial_space_3d.hpp) 新增：
+[harmonic_polynomial_space_3d.hpp](../src/support/cauchy/harmonic_polynomial_space_3d.hpp) 新增：
 
 ```cpp
 Eigen::MatrixXd svd_pseudoinverse_from_decomposition_3d(
@@ -73,7 +73,7 @@ driver 的两处 recovery 使用相同的 \(\tau=3\times10^{-12}\) 和严格大�
 
 ### 2.4 已保存样点 stencil 直接装配 design
 
-[主 driver](../apps/neumann_exterior_zero_trace_3d.cpp) 的 `NativeDensityTransfer3D` 先初始化 `sample_stencils_`，再用它构造 `c0_design_`。每行仍按 stencil 原有条目顺序生成 `(row, column, weight)`，随后调用相同的 `setFromTriplets` 和 `makeCompressed`。
+[主 driver](../apps/laplace/3d/neumann_exterior_zero_trace_3d.cpp) 的 `NativeDensityTransfer3D` 先初始化 `sample_stencils_`，再用它构造 `c0_design_`。每行仍按 stencil 原有条目顺序生成 `(row, column, weight)`，随后调用相同的 `setFromTriplets` 和 `makeCompressed`。
 
 此项不更改采样点、权重、C0 列编号或投影矩阵的数学内容，也不改变 projector 的满秩和条件数检查。
 
@@ -96,9 +96,9 @@ driver 的两处 recovery 使用相同的 \(\tau=3\times10^{-12}\) 和严格大�
 
 本轮在 `build-3d` 的 Release 构建下执行了以下三个测试程序，均正常退出（exit code 0）：
 
-- [native_nurbs_density_space_3d_test.cpp](../apps/native_nurbs_density_space_3d_test.cpp)：圆柱、L 柱、U 柱；`ncoef=4/6`；ValueTrace 与 NormalTrace 两种 C0 映射；各 patch 的端点、内部点、内部结点及左右相邻浮点值。六行逐一与旧单行 API 比较 count、完整索引数组和系数数组，并检查非法 patch。
-- [direct_coefficient_cauchy_3d_test.cpp](../apps/direct_coefficient_cauchy_3d_test.cpp)：平面与曲面、原姿态与刚体变换姿态、两种密度场，在相同 frame 输入下比较旧接口与几何复用 overload 的 stencil、graph Hessian、诊断量及预组合 Cauchy 行。
-- [harmonic_polynomial_space_3d_test.cpp](../apps/harmonic_polynomial_space_3d_test.cpp)：矩阵接口与复用分解接口的伪逆一致性、秩截断、values-only 分解拒绝，以及矩形矩阵的 thin/full U/V 支持。
+- [native_nurbs_density_space_3d_test.cpp](../tests/density/native_nurbs_density_space_3d_test.cpp)：圆柱、L 柱、U 柱；`ncoef=4/6`；ValueTrace 与 NormalTrace 两种 C0 映射；各 patch 的端点、内部点、内部结点及左右相邻浮点值。六行逐一与旧单行 API 比较 count、完整索引数组和系数数组，并检查非法 patch。
+- [direct_coefficient_cauchy_3d_test.cpp](../tests/cauchy/direct_coefficient_cauchy_3d_test.cpp)：平面与曲面、原姿态与刚体变换姿态、两种密度场，在相同 frame 输入下比较旧接口与几何复用 overload 的 stencil、graph Hessian、诊断量及预组合 Cauchy 行。
+- [harmonic_polynomial_space_3d_test.cpp](../tests/cauchy/harmonic_polynomial_space_3d_test.cpp)：矩阵接口与复用分解接口的伪逆一致性、秩截断、values-only 分解拒绝，以及矩形矩阵的 thin/full U/V 支持。
 
 这些测试用于检查所改局部代数的等价性。完整算例仍需比较已有基线与新实现的误差、残差、自由度和 GMRES 迭代记录；不能以局部测试替代完整数值结果。
 
@@ -116,7 +116,7 @@ $env:Path = 'C:\tools\msys64\mingw64\bin;C:\Strawberry\c\bin;' + $env:Path
 & "$reuseBuildDir/apps/data_reuse_3d_benchmark.exe" --iterations 10000
 ```
 
-[data_reuse_3d_benchmark.cpp](../apps/data_reuse_3d_benchmark.cpp) 不求解 PDE；对局部工作先做等价性检查，再输出 CSV。`cpu_seconds` 为本进程 CPU 时间，`wall_seconds` 为经过时间；样本几何及矩阵的公共准备在计时之前完成。两边都执行相同的 checksum 工作以保留可观察输出。
+[data_reuse_3d_benchmark.cpp](../benchmarks/3d/data_reuse_3d_benchmark.cpp) 不求解 PDE；对局部工作先做等价性检查，再输出 CSV。`cpu_seconds` 为本进程 CPU 时间，`wall_seconds` 为经过时间；样本几何及矩阵的公共准备在计时之前完成。两边都执行相同的 checksum 工作以保留可观察输出。
 
 `density_jet6` 比较六次单行求值与一次批量装配。`value_plan` 和 `normal_plan` 仅比较重复计算几何与传入已有几何：其中旧 value overload 已使用本批的批量密度 jet，因此 `value_plan` 的比率只表示几何复用的局部收益，不是整个 value builder 从旧版本到新版本的总收益。`svd_48x16` 在固定矩形矩阵上比较两次分解与一次分解。
 

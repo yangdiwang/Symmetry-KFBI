@@ -11,6 +11,18 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # mode unless this compatibility definition is present.  zFFT uses M_PI.
 add_compile_definitions(_USE_MATH_DEFINES)
 
+option(KFBIM_BUILD_APPS "Build standalone solver examples" ON)
+option(KFBIM_BUILD_BENCHMARKS "Build performance and convergence benchmarks" ${KFBIM_BUILD_APPS})
+option(BUILD_TESTING "Build and register regression tests" ${KFBIM_BUILD_APPS})
+option(KFBIM_BUILD_EXPERIMENTAL_3D
+    "Build supplementary remote 3D algorithms, studies, and benchmarks" OFF)
+option(KFBIM_BUILD_REMOTE_SOLVER_ROUTE_TEST
+    "Build the legacy remote solver route test (requires an API adapter)" OFF)
+if(KFBIM_BUILD_REMOTE_SOLVER_ROUTE_TEST AND NOT KFBIM_BUILD_EXPERIMENTAL_3D)
+    message(FATAL_ERROR
+        "KFBIM_BUILD_REMOTE_SOLVER_ROUTE_TEST requires KFBIM_BUILD_EXPERIMENTAL_3D=ON")
+endif()
+
 # Eigen is required by all targets. Prefer an installed package and fetch the
 # fixed 3.4.0 release when it is not available.
 find_package(Eigen3 3.4 QUIET NO_MODULE)
@@ -25,8 +37,11 @@ if(NOT Eigen3_FOUND)
     )
     set(EIGEN_BUILD_DOC OFF CACHE BOOL "" FORCE)
     set(EIGEN_BUILD_PKGCONFIG OFF CACHE BOOL "" FORCE)
-    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(_kfbim_build_testing ${BUILD_TESTING})
+    set(BUILD_TESTING OFF)
     FetchContent_MakeAvailable(Eigen3)
+    set(BUILD_TESTING ${_kfbim_build_testing})
+    unset(_kfbim_build_testing)
 endif()
 
 # The 3D interface/crossing pipeline uses CGAL. Keep it enabled by default so
@@ -40,9 +55,19 @@ endif()
 add_subdirectory(third_party/zfft)
 add_subdirectory(src)
 
-option(KFBIM_BUILD_APPS "Build all standalone examples" ON)
+if(KFBIM_BUILD_APPS OR KFBIM_BUILD_BENCHMARKS OR BUILD_TESTING)
+    add_subdirectory(src/support)
+endif()
+
 if(KFBIM_BUILD_APPS)
     add_subdirectory(apps)
+endif()
+if(KFBIM_BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
+endif()
+if(BUILD_TESTING)
+    enable_testing()
+    add_subdirectory(tests)
 endif()
 
 install(EXPORT SymmetryKFBITargets

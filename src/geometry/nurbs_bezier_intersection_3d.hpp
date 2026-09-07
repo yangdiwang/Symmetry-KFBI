@@ -11,6 +11,8 @@
 
 namespace kfbim::geometry3d {
 
+class NurbsPatchPolarEvaluator3D;
+
 struct NurbsElementRoot3D {
     int patch_index = -1;
     int component = -1;
@@ -114,6 +116,8 @@ struct NurbsElementIntersectionOptions3D {
     bool use_affine_planar_fast_path = false;
     bool use_closest_point_prefilter = false;
     std::vector<NurbsElementParameterSeed3D> parameter_seeds;
+    // Optional immutable evaluator for this patch. Must outlive this query.
+    const NurbsPatchPolarEvaluator3D* surface_evaluator = nullptr;
 };
 
 NurbsElementSegmentCertificate3D certify_nurbs_bezier_element_segment_3d(

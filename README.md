@@ -21,9 +21,16 @@ it therefore cannot jump between spatially close but topologically unrelated
 surface sheets. Detailed `N=16,32,64` convergence results are recorded in
 [`docs/superpowers/results/2026-07-21-3d-harmonic-jet-results.md`](docs/superpowers/results/2026-07-21-3d-harmonic-jet-results.md).
 
-这是从原 KFBI 工作区中独立整理出的二维与三维算例仓库。仓库包含 `apps` 下的全部
-八个 C++ 算例、两个 Python 可视化脚本，以及它们实际依赖的 KFBI 核心源码和
-zFFT。构建不依赖原代码库的相对路径。
+空心圆柱的 Q27 预处理新增可选的 `KFBIM_3D_SUPPORT_PATH=closest_point` 分支：
+使用网格节点到真实 NURBS 边界的最近点构造局部跳跃延拓，并缓存节点投影。
+运行入口、适用条件和验证结果见[最近点延拓说明](docs/KFBI3D_Closest_Point_Extension_20260907.md)。
+
+这是从原 KFBI 工作区中独立整理出的二维与三维算例仓库。可执行入口按 Laplace
+（`apps/laplace/2d/`、`apps/laplace/3d/`）、传输问题（`apps/transmission/`）和形状优化
+（`apps/shape_optimization/`）分组；回归测试、性能基准和工具脚本分别位于 `tests/`、
+`benchmarks/` 与 `scripts/`，共享但不公开安装的支撑代码位于 `src/support/`。完整目录职责、
+构建开关和逐文件迁移索引见[仓库布局与迁移说明](docs/architecture/README.md)。构建不依赖
+原代码库的相对路径。
 
 ## 依赖与构建
 
@@ -165,8 +172,8 @@ RHS spread 和 normal restrict 共用这套逐自由度多项式及其系数。
 形状优化和中心扰动结果可分别绘图：
 
 ```bash
-python apps/visualize_shape_opt_2d.py output/shape_opt_transmission_2d
-python apps/visualize_transmission_center_perturb_2d.py output/transmission_center_perturb_2d
+python scripts/visualization/visualize_shape_opt_2d.py output/shape_opt_transmission_2d
+python scripts/visualization/visualize_transmission_center_perturb_2d.py output/transmission_center_perturb_2d
 ```
 
 ## 新自由度与 restrict 分支
@@ -270,7 +277,7 @@ KFBIM_PYJET_RESTRICT_MODE=compare \
 三维 `all 16` readiness 中，圆环、空心圆柱和 L 棱柱的网格标签不一致数均为 0；
 常数 jump 探针的最大无穷范数误差为 `1.77e-14`。
 
-GitHub Actions 会在每次 push 和 pull request 时安装 CGAL、重新构建全部目标、
-运行八个快速 C++ 算例，并执行两个可视化脚本。
+GitHub Actions 会在每次 push 和 pull request 时安装依赖、重新构建默认启用的目标、
+运行 C++ smoke 矩阵和验证脚本自测，并执行两个可视化脚本。
 
 第三方依赖说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

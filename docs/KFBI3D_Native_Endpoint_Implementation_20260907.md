@@ -26,10 +26,10 @@ Q27-cover3 / Q64-cover4 的 restrict 需要查询从 Cartesian 支撑节点到�
 | [native_nurbs_exact_geometry_3d.hpp](../src/geometry/native_nurbs_exact_geometry_3d.hpp)、[.cpp](../src/geometry/native_nurbs_exact_geometry_3d.cpp) | 原始 NURBS 的精确齐次 Bézier 提取、精确求值、保守 AABB |
 | [native_endpoint_path_3d.hpp](../src/geometry/native_endpoint_path_3d.hpp)、[.cpp](../src/geometry/native_endpoint_path_3d.cpp) | 根证明、参数盒覆盖、排序、方向与代表精度认证；预算及失败信息 |
 | [nurbs_surface_intersector_3d.hpp](../src/geometry/nurbs_surface_intersector_3d.hpp)、[.cpp](../src/geometry/nurbs_surface_intersector_3d.cpp) | `intersect_segment_to_native_endpoint()` 入口及每个 intersector 的懒初始化精确几何缓存 |
-| [native_endpoint_path_adapter_3d.hpp](../apps/native_endpoint_path_adapter_3d.hpp)、[.cpp](../apps/native_endpoint_path_adapter_3d.cpp) | 将完整认证路径转换为现有 all-event correction 接口；按迹侧条件加入端点项 |
-| [neumann_exterior_zero_trace_3d.cpp](../apps/neumann_exterior_zero_trace_3d.cpp) | 环境变量、输出隔离、`build_all_event_trace_corrections()` 接入和 setup 内路径缓存 |
-| [native_nurbs_exact_geometry_3d_test.cpp](../apps/native_nurbs_exact_geometry_3d_test.cpp) | 精确提取基础层回归 |
-| [native_endpoint_path_3d_test.cpp](../apps/native_endpoint_path_3d_test.cpp) | 有界几何路径与适配器回归，不求解 PDE |
+| [native_endpoint_path_adapter_3d.hpp](../src/support/trace/native_endpoint_path_adapter_3d.hpp)、[.cpp](../src/support/trace/native_endpoint_path_adapter_3d.cpp) | 将完整认证路径转换为现有 all-event correction 接口；按迹侧条件加入端点项 |
+| [neumann_exterior_zero_trace_3d.cpp](../apps/laplace/3d/neumann_exterior_zero_trace_3d.cpp) | 环境变量、输出隔离、`build_all_event_trace_corrections()` 接入和 setup 内路径缓存 |
+| [native_nurbs_exact_geometry_3d_test.cpp](../tests/geometry/native_nurbs_exact_geometry_3d_test.cpp) | 精确提取基础层回归 |
+| [native_endpoint_path_3d_test.cpp](../tests/geometry/native_endpoint_path_3d_test.cpp) | 有界几何路径与适配器回归，不求解 PDE |
 
 推荐顺序是：先看公共结果类型，再看 `make_element()`、`known_endpoint_attempt()`、`ordinary_attempt()`、`root_relation()`、`run_pass()`，最后看适配器和 driver 接入。
 
