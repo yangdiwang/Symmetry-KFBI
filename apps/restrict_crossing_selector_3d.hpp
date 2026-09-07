@@ -3,6 +3,7 @@
 #include <Eigen/Dense>
 
 #include <functional>
+#include <cstdint>
 #include <vector>
 
 namespace kfbim::app3d {
@@ -71,6 +72,9 @@ struct SegmentPhysicalCrossingEvent3D {
     int component = -1;
     int continuation_sign = 0;
     bool feature_edge_contact = false;
+    // Path-local certificate identities; zero denotes a legacy event.
+    std::uint64_t native_event_id = 0;
+    std::uint64_t native_proof_id = 0;
 };
 
 enum class SegmentPhysicalEventSequenceKind3D {

@@ -92,6 +92,7 @@ if(KFBIM_BUILD_3D)
         native_nurbs_density_space_3d.cpp
         native_nurbs_surface_3d.cpp
         native_nurbs_surface_transform_3d.cpp
+        native_endpoint_path_adapter_3d.cpp
         reduced_trace_projection_3d.cpp
         dirichlet_rigid_transform_study_3d.cpp
         shared_quadratic_restrict_3d.cpp
@@ -126,6 +127,21 @@ if(KFBIM_BUILD_3D)
     add_executable(native_nurbs_surface_3d_test
         native_nurbs_surface_3d_test.cpp
     )
+
+    # Bounded single-path regressions; this target does not launch a PDE solve.
+    add_executable(native_endpoint_path_3d_test
+        native_endpoint_path_3d_test.cpp
+    )
+    target_link_libraries(native_endpoint_path_3d_test PRIVATE
+        kfbim_3d_app_geometry kfbim_core CGAL::CGAL)
+    target_compile_features(native_endpoint_path_3d_test PRIVATE cxx_std_17)
+
+    add_executable(native_nurbs_exact_geometry_3d_test
+        native_nurbs_exact_geometry_3d_test.cpp
+    )
+    target_link_libraries(native_nurbs_exact_geometry_3d_test PRIVATE
+        kfbim_core CGAL::CGAL)
+    target_compile_features(native_nurbs_exact_geometry_3d_test PRIVATE cxx_std_17)
 
     add_executable(grid_edge_event_3d_test
         grid_edge_event_3d_test.cpp

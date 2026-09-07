@@ -1,6 +1,8 @@
 #include "nurbs_surface_intersector_3d.hpp"
 
 #include "nurbs_bezier_extraction_3d.hpp"
+#include "native_endpoint_path_3d.hpp"
+#include "native_nurbs_exact_geometry_3d.hpp"
 #include "nurbs_bezier_intersection_3d.hpp"
 #include "nurbs_bezier_segment_stationary_points_3d.hpp"
 #include "rational_bezier_subdivision_3d.hpp"
@@ -13,6 +15,7 @@
 #include <exception>
 #include <iomanip>
 #include <numeric>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -21,6 +24,12 @@
 #include <vector>
 
 namespace kfbim::geometry3d {
+
+struct NativeEndpointGeometryCache3D {
+    std::once_flag initialization;
+    std::vector<ExactNativeBezierElement3D> elements;
+    std::vector<NurbsAabb3D> bounds;
+};
 
 namespace {
 
@@ -1325,6 +1334,7 @@ NurbsSurfaceIntersector3D::NurbsSurfaceIntersector3D(
     NurbsSurfaceIntersectorOptions3D options)
     : model_(std::move(model))
     , options_(options)
+    , native_endpoint_geometry_(std::make_shared<NativeEndpointGeometryCache3D>())
 {
     (void)model_.validate_closed();
     bounds_ = model_.control_bounds();
@@ -1652,6 +1662,48 @@ NurbsSurfaceIntersector3D::intersect_segment(
             geometry_tolerance_, result.diagnostics);
     }
     return result;
+}
+
+NativeEndpointPathResult3D
+NurbsSurfaceIntersector3D::intersect_segment_to_native_endpoint(
+    const Eigen::Vector3d& start,
+    const NativeSurfaceEndpoint3D& endpoint) const
+{
+    NativeEndpointQueryOptions3D options;
+    options.point_tolerance = geometry_tolerance_;
+    return intersect_segment_to_native_endpoint(
+        start, endpoint, options, PathCertificationBudget3D{});
+}
+
+NativeEndpointPathResult3D
+NurbsSurfaceIntersector3D::intersect_segment_to_native_endpoint(
+    const Eigen::Vector3d& start,
+    const NativeSurfaceEndpoint3D& endpoint,
+    const NativeEndpointQueryOptions3D& options,
+    const PathCertificationBudget3D& budget) const
+{
+    if (!native_endpoint_geometry_)
+        throw std::logic_error("native endpoint query on a moved-from intersector");
+    try {
+        std::call_once(native_endpoint_geometry_->initialization, [&] {
+            auto elements = extract_exact_native_bezier_elements_3d(model_);
+            std::vector<NurbsAabb3D> bounds;
+            bounds.reserve(elements.size());
+            for (const auto& element : elements)
+                bounds.push_back(element.bounds());
+            native_endpoint_geometry_->elements = std::move(elements);
+            native_endpoint_geometry_->bounds = std::move(bounds);
+        });
+    } catch (const std::invalid_argument& error) {
+        NativeEndpointPathResult3D result;
+        result.status = PathStatus3D::InvalidInput;
+        result.diagnostics.reason = "ExactNativeGeometryUnavailable";
+        result.message = error.what();
+        return result;
+    }
+    return certify_native_endpoint_path_3d(
+        model_, native_endpoint_geometry_->elements, start, endpoint,
+        options, budget, &native_endpoint_geometry_->bounds);
 }
 
 NurbsSurfaceIntersectionResult3D

@@ -36,6 +36,7 @@
 #include "harmonic_polynomial_space_3d.hpp"
 #include "native_density_resolution_3d.hpp"
 #include "native_nurbs_density_space_3d.hpp"
+#include "native_endpoint_path_adapter_3d.hpp"
 #include "native_nurbs_surface_3d.hpp"
 #include "reduced_trace_projection_3d.hpp"
 #include "restrict_crossing_selector_3d.hpp"
@@ -98,17 +99,37 @@ constexpr int kJointNormalCoefficientCount =
     2 * kRestrictNormalDegree;
 constexpr int kGlobalTraceCoefficientCount = 4;
 
+bool selected_native_endpoint_support_path()
+{
+    const char* raw = std::getenv("KFBIM_3D_SUPPORT_PATH");
+    if (raw == nullptr || std::string(raw).empty()
+        || std::string(raw) == "legacy")
+        return false;
+    if (std::string(raw) == "native_certified")
+        return true;
+    throw std::invalid_argument(
+        "KFBIM_3D_SUPPORT_PATH must be legacy or native_certified");
+}
+
+std::filesystem::path support_path_output_root_3d(std::filesystem::path root)
+{
+    // Keep opt-in certification runs away from existing convergence baselines.
+    if (selected_native_endpoint_support_path())
+        root /= "native_endpoint";
+    return root;
+}
+
 std::filesystem::path application_output_root_3d()
 {
     if (const char* override_root =
             std::getenv("KFBIM_3D_OUTPUT_ROOT")) {
         if (*override_root != '\0')
-            return std::filesystem::path(override_root);
+            return support_path_output_root_3d(std::filesystem::path(override_root));
     }
 #ifdef KFBIM_APP_OUTPUT_DIR
-    return std::filesystem::path(KFBIM_APP_OUTPUT_DIR);
+    return support_path_output_root_3d(std::filesystem::path(KFBIM_APP_OUTPUT_DIR));
 #else
-    return std::filesystem::path("output");
+    return support_path_output_root_3d(std::filesystem::path("output"));
 #endif
 }
 
@@ -962,6 +983,23 @@ double positive_environment_double(const char* name, double default_value)
                                     + " must be a positive finite number");
     }
     return value;
+}
+
+geometry3d::PathCertificationBudget3D selected_native_endpoint_budget()
+{
+    geometry3d::PathCertificationBudget3D budget;
+    budget.max_candidate_regions = positive_environment_integer(
+        "KFBIM_3D_NATIVE_PATH_MAX_CANDIDATES",
+        static_cast<int>(budget.max_candidate_regions));
+    budget.max_subdivision_nodes = positive_environment_integer(
+        "KFBIM_3D_NATIVE_PATH_MAX_BOXES",
+        static_cast<int>(budget.max_subdivision_nodes));
+    budget.max_newton_steps = positive_environment_integer(
+        "KFBIM_3D_NATIVE_PATH_MAX_NEWTON",
+        static_cast<int>(budget.max_newton_steps));
+    budget.max_precision_bits = static_cast<unsigned>(positive_environment_integer(
+        "KFBIM_3D_NATIVE_PATH_MAX_BITS", static_cast<int>(budget.max_precision_bits)));
+    return budget;
 }
 
 struct GeometryBundle {
@@ -2000,6 +2038,8 @@ struct HarmonicTraceSample3D {
 // so restrict apply only reads surface jump samples and performs dot products.
 struct SharedQuadraticGridlineCorrection3D {
     int stencil_node = -1;
+    std::uint64_t native_event_id = 0;
+    std::uint64_t native_proof_id = 0;
     // Branch change for this one physical event along the oriented
     // support-node -> trace path: inside_after - inside_before.  Keeping the
     // sign on the event is essential when a path intersects the interface
@@ -2143,7 +2183,8 @@ public:
                                          app3d::SharedQuadraticNormalProfile3D::
                                              LegacySplitQuadratic,
                                  bool build_q27_cover3_restrict = false,
-                                 bool build_q64_cover4_restrict = false)
+                                 bool build_q64_cover4_restrict = false,
+                                 bool use_native_endpoint_paths = false)
         : grid_(grid)
         , grid_pair_(grid_pair)
         , native_surface_(native_surface)
@@ -2152,6 +2193,7 @@ public:
         , cloud_(cloud)
         , stencils_(stencils)
         , shared_normal_profile_(shared_normal_profile)
+        , native_endpoint_paths_(use_native_endpoint_paths)
         , h_(grid.spacing()[0])
         , fit_(native_surface, cloud, stencils, h_,
                kCauchyPolynomialDegree,
@@ -2168,6 +2210,12 @@ public:
         , correction_support_(build_laplace_correction_support_3d(
               grid_pair, "PanelCenterHarmonicJetKFBI3D"))
     {
+        if (native_endpoint_paths_) {
+            if (!build_q27_cover3_restrict && !build_q64_cover4_restrict)
+                throw std::invalid_argument(
+                    "native endpoint support paths require a Q27/Q64 cover route");
+            native_endpoint_budget_ = selected_native_endpoint_budget();
+        }
         const auto spacing = grid_.spacing();
         if (std::abs(spacing[0] - spacing[1]) > 1.0e-13
             || std::abs(spacing[0] - spacing[2]) > 1.0e-13) {
@@ -2231,6 +2279,7 @@ public:
             shared_quadratic_cauchy_cache_.clear();
             all_event_exact_cauchy_cache_.clear();
             all_event_intersection_cache_.clear();
+            native_endpoint_path_cache_.clear();
         }
         if (build_standard_trace_restrict) {
             build_joint_trace_fit();
@@ -4167,6 +4216,48 @@ private:
             if (node_inside != desired_inside)
                 ++shared_quadratic_diagnostics_.wrong_side_nodes;
             const Eigen::Vector3d node_point = grid_point(grid_, node);
+            geometry3d::NurbsSurfaceIntersectionResult3D intersection;
+            app3d::SegmentPhysicalEventSequence3D sequence;
+            if (native_endpoint_paths_) {
+                const std::pair<int, int> cache_key{center, node};
+                auto cached = native_endpoint_path_cache_.find(cache_key);
+                if (cached == native_endpoint_path_cache_.end()) {
+                    geometry3d::NativeEndpointQueryOptions3D options;
+                    options.point_tolerance = intersector.geometry_tolerance();
+                    options.expected_start_inside = node_inside;
+                    ++shared_quadratic_diagnostics_.segment_queries;
+                    auto path = intersector.intersect_segment_to_native_endpoint(
+                        node_point, {dof.patch_id, dof.u, dof.v},
+                        options, native_endpoint_budget_);
+                    if (path.status != geometry3d::PathStatus3D::Certified) {
+                        ++shared_quadratic_diagnostics_.segment_fallbacks;
+                        std::ostringstream message;
+                        message << std::setprecision(17)
+                                << "native endpoint support path failed; center="
+                                << center << " grid_node=" << node
+                                << " stencil_slot=" << stencil_node
+                                << " side=" << (desired_inside ? "interior" : "exterior")
+                                << " status="
+                                << geometry3d::native_endpoint_path_status_name_3d(path.status)
+                                << " reason=" << path.diagnostics.reason
+                                << " message=" << path.message << '\n' << path.dump;
+                        throw std::runtime_error(message.str());
+                    }
+                    // Failure dumps are retained above. Successful certificates
+                    // are reused by both sides without retaining verbose text
+                    // for every cover node at N=64/128.
+                    path.dump.clear();
+                    path.dump.shrink_to_fit();
+                    cached = native_endpoint_path_cache_.emplace(
+                        cache_key, std::move(path)).first;
+                }
+                auto selected = app3d::select_native_endpoint_path_events_3d(
+                    cached->second, node_inside, desired_inside);
+                intersection = std::move(selected.intersection);
+                sequence = std::move(selected.sequence);
+            } else {
+            // Legacy explicit A/B route: it is never an automatic fallback
+            // from the native certificate path.
             const Eigen::Vector3d support_to_trace = dof.point - node_point;
             const double support_to_trace_length = support_to_trace.norm();
             if (!std::isfinite(support_to_trace_length)
@@ -4246,7 +4337,6 @@ private:
                         << " endpoint_extension=" << endpoint_extension;
                 throw std::runtime_error(message.str());
             }
-            geometry3d::NurbsSurfaceIntersectionResult3D intersection;
             intersection.diagnostics = certified_intersection.diagnostics;
             intersection.overlap_detected =
                 certified_intersection.overlap_detected;
@@ -4269,7 +4359,7 @@ private:
                     distance_along / support_to_trace_length;
                 intersection.crossings.push_back(std::move(crossing));
             }
-            app3d::SegmentPhysicalEventSequence3D sequence =
+            sequence =
                 app3d::select_certified_segment_physical_events_3d(
                     intersection, node_point, dof.point, tie_tolerance,
                     native_surface_.exact_inside);
@@ -4386,6 +4476,7 @@ private:
                         "shared quadratic restrict conditional endpoint has the wrong event orientation");
                 }
             }
+            } // explicit legacy support-path route
             if (sequence.events.size() > 1)
                 ++shared_quadratic_diagnostics_.multiple_root_selections;
 
@@ -4400,7 +4491,8 @@ private:
                         "shared quadratic restrict event signs do not form a valid inside/outside path");
                 }
                 continuation_state = next_state;
-                if ((event.point - dof.point).norm() <= tie_tolerance)
+                if (native_endpoint_paths_ ? event.edge_parameter == 1.0
+                    : (event.point - dof.point).norm() <= tie_tolerance)
                     ++shared_quadratic_diagnostics_.trace_endpoint_selections;
                 if (event.crossing_indices.size() != 1) {
                     ++shared_quadratic_diagnostics_.segment_fallbacks;
@@ -4606,6 +4698,8 @@ private:
                         stencil_node, node, *cauchy_plan,
                         correction_distance_over_h);
                 correction.continuation_sign = event.continuation_sign;
+                correction.native_event_id = event.native_event_id;
+                correction.native_proof_id = event.native_proof_id;
                 correction.direct_crossing_owner = correction_owner;
                 correction.direct_grid_node = node;
                 result.push_back(std::move(correction));
@@ -5546,6 +5640,8 @@ private:
     bool shared_quadratic_templates_built_ = false;
     bool q27_cover3_templates_built_ = false;
     bool q64_cover4_templates_built_ = false;
+    bool native_endpoint_paths_ = false;
+    geometry3d::PathCertificationBudget3D native_endpoint_budget_;
     double h_ = 0.0;
     PanelCenterCauchyFit3D fit_;
     std::unique_ptr<app3d::ExteriorOnlyCubicNormalRestrict3D>
@@ -5581,6 +5677,10 @@ private:
         std::pair<int, int>,
         geometry3d::NurbsSurfaceIntersectionResult3D>
         all_event_intersection_cache_;
+    // The immutable pipeline owns the model and grid: (center,node) therefore
+    // fixes native endpoint, start point, direction, precision and budget.
+    mutable std::map<std::pair<int, int>, geometry3d::NativeEndpointPathResult3D>
+        native_endpoint_path_cache_;
     mutable SharedQuadraticRestrictDiagnostics3D
         shared_quadratic_diagnostics_;
     std::vector<LocalRestrictCauchyPlan3D> local_restrict_plans_;
@@ -10079,7 +10179,8 @@ ReadinessResult run_readiness_case(GeometryKind kind,
             || (solve_selection != SolveSelection3D::NeumannOnly
                 && dirichlet_normal_restrict_mode
                        == ExteriorNormalRestrictMode3D::
-                              Q64Cover4AllEventCauchy));
+                              Q64Cover4AllEventCauchy),
+        selected_native_endpoint_support_path());
     const std::vector<double> panel_cauchy_conditions =
         harmonic_pipeline.cauchy_condition_values();
     if (!panel_cauchy_conditions.empty()) {
@@ -12658,6 +12759,11 @@ void print_usage(const char* executable)
         << "  Rigid-study default levels: 32, 64, 128.\n"
         << "  Restrict-probe default levels: 32, 64.\n"
         << "  Compiled target defaults: " << compiled_defaults << ".\n"
+        << "  KFBIM_3D_SUPPORT_PATH selects legacy (default) or native_certified.\n"
+        << "  Native certification requires Q27/Q64 and fails closed; outputs\n"
+        << "  use a separate native_endpoint directory. Optional positive\n"
+        << "  KFBIM_3D_NATIVE_PATH_MAX_CANDIDATES / MAX_BOXES / MAX_NEWTON /\n"
+        << "  MAX_BITS suffixes configure per-path work limits.\n"
         << "  This stage builds native NURBS density data, topology-filtered\n"
         << "  48/28 Cauchy stencils, validates\n"
         << "  fixed transfer routes, and executes the Neumann value-jump and\n"
@@ -12787,6 +12893,11 @@ int main(int argc, char** argv)
         if (selection == "--help" || selection == "-h") {
             print_usage(argv[0]);
             return 0;
+        }
+        if (restrict_probe && selected_native_endpoint_support_path()) {
+            throw std::invalid_argument(
+                "--restrict-probe is a legacy joint-tricubic diagnostic; "
+                "native_certified requires the Q27/Q64 production routes");
         }
         if (argc >= 3) {
             levels.clear();
@@ -13095,6 +13206,9 @@ int main(int argc, char** argv)
             output_dir /= output_tag;
 
         std::cout << "KFBI3D harmonic-jet convergence study\n"
+                  << "  support_path="
+                  << (selected_native_endpoint_support_path()
+                        ? "native_certified" : "legacy") << '\n'
                   << "  Neumann target: exterior value trace = 0\n"
                   << "  Dirichlet target: exterior normal trace = 0\n"
                   << "  current stage: native NURBS surface DOFs + "

@@ -9,11 +9,17 @@
 #include <array>
 #include <cstddef>
 #include <limits>
+#include <memory>
 #include <vector>
 
 namespace kfbim::geometry3d {
 
 class NurbsSurfaceIntersector3D;
+struct NativeSurfaceEndpoint3D;
+struct NativeEndpointQueryOptions3D;
+struct PathCertificationBudget3D;
+struct NativeEndpointPathResult3D;
+struct NativeEndpointGeometryCache3D;
 
 class NurbsSurfaceCandidate3D {
 public:
@@ -250,6 +256,16 @@ public:
     NurbsSurfaceIntersectionResult3D intersect_segment(
         const Eigen::Vector3d& start,
         const Eigen::Vector3d& end) const;
+    // Unlike intersect_segment, the endpoint is the native NURBS expression
+    // S_patch(u,v), not an independently rounded Cartesian point.
+    NativeEndpointPathResult3D intersect_segment_to_native_endpoint(
+        const Eigen::Vector3d& start,
+        const NativeSurfaceEndpoint3D& endpoint) const;
+    NativeEndpointPathResult3D intersect_segment_to_native_endpoint(
+        const Eigen::Vector3d& start,
+        const NativeSurfaceEndpoint3D& endpoint,
+        const NativeEndpointQueryOptions3D& options,
+        const PathCertificationBudget3D& budget) const;
     NurbsCartesianEdgeIntersections3D intersect_cartesian_edge(
         const NurbsCartesianEdgeQuery3D& edge) const;
     NurbsCartesianEdgeIntersections3D intersect_cartesian_edge(
@@ -316,6 +332,9 @@ private:
     std::vector<int> element_order_;
     std::vector<BvhNode> bvh_nodes_;
     int bvh_root_ = -1;
+    // Shared copies have the same immutable model; extraction is lazy and
+    // synchronized, so legacy-only callers do not pay for exact knot insertion.
+    std::shared_ptr<NativeEndpointGeometryCache3D> native_endpoint_geometry_;
 };
 
 } // namespace kfbim::geometry3d

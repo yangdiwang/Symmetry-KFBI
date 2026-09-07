@@ -51,6 +51,8 @@ if(KFBIM_BUILD_3D)
         geometry/nurbs_bezier_segment_stationary_points_3d.cpp
         geometry/nurbs_cartesian_domain_3d.cpp
         geometry/nurbs_surface_intersector_3d.cpp
+        geometry/native_nurbs_exact_geometry_3d.cpp
+        geometry/native_endpoint_path_3d.cpp
         geometry/nurbs_bezier_extraction_3d.cpp
         geometry/rational_bezier_element_3d.cpp
         geometry/rational_bezier_subdivision_3d.cpp
@@ -66,6 +68,35 @@ if(KFBIM_BUILD_3D)
     )
     target_link_libraries(kfbim_core PRIVATE CGAL::CGAL)
     target_compile_definitions(kfbim_core PUBLIC KFBIM_HAS_CGAL)
+
+    option(KFBIM_NATIVE_ENDPOINT_MPFR
+        "Enable directed-rounding MPFR refinement for native endpoint certificates" ON)
+    if(KFBIM_NATIVE_ENDPOINT_MPFR)
+        if(MPFR_INCLUDE_DIR AND MPFR_LIBRARIES)
+            target_include_directories(kfbim_core PRIVATE ${MPFR_INCLUDE_DIR})
+            target_link_libraries(kfbim_core PRIVATE ${MPFR_LIBRARIES})
+            set_source_files_properties(geometry/native_endpoint_path_3d.cpp
+                PROPERTIES COMPILE_DEFINITIONS KFBIM_NATIVE_ENDPOINT_HAS_MPFR=1)
+        else()
+            message(WARNING
+                "MPFR was not found: native endpoint refinement will fail closed "
+                "when binary64 cannot certify a query")
+        endif()
+    endif()
+
+    # A certificate must not be compiled with transformations that discard
+    # the directed/outward rounding used by its arithmetic backend.
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        set_source_files_properties(
+            geometry/native_nurbs_exact_geometry_3d.cpp
+            geometry/native_endpoint_path_3d.cpp
+            PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
+    elseif(MSVC)
+        set_source_files_properties(
+            geometry/native_nurbs_exact_geometry_3d.cpp
+            geometry/native_endpoint_path_3d.cpp
+            PROPERTIES COMPILE_OPTIONS "/fp:strict")
+    endif()
 endif()
 
 target_compile_features(kfbim_core PUBLIC cxx_std_17)
