@@ -59,6 +59,11 @@ if(KFBIM_BUILD_3D)
         geometry/rational_bezier_element_3d.cpp
         geometry/rational_bezier_subdivision_3d.cpp
         geometry/nurbs_surface_model_3d.cpp
+        geometry/industrial_nurbs_models_3d.cpp
+        geometry/industrial_nurbs_sleeve_3d.cpp
+        geometry/industrial_nurbs_bracket_3d.cpp
+        geometry/industrial_nurbs_flange_3d.cpp
+        geometry/industrial_nurbs_impeller_3d.cpp
         local_cauchy/edge_patch_laplacian_3d.cpp
         local_cauchy/edge_singular_bspline_fit_3d.cpp
         local_cauchy/edge_singular_fit_3d.cpp

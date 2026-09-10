@@ -2,6 +2,10 @@
 # Target names and per-target options are preserved for compatibility.
 
 if(KFBIM_BUILD_3D)
+    add_executable(industrial_nurbs_gallery_3d
+        ${PROJECT_SOURCE_DIR}/apps/geometry/industrial_nurbs_gallery_3d.cpp)
+    target_link_libraries(industrial_nurbs_gallery_3d PRIVATE kfbim_core)
+
     add_executable(kfbi_trace93_study_3d
         ${PROJECT_SOURCE_DIR}/apps/laplace/3d/trace93_study_3d.cpp)
     target_link_libraries(kfbi_trace93_study_3d PRIVATE kfbim_3d_app_geometry kfbim_core)

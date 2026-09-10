@@ -2,6 +2,11 @@
 # Target names and per-target options are preserved for compatibility.
 
 if(KFBIM_BUILD_3D)
+    add_executable(industrial_nurbs_models_3d_test
+        ${PROJECT_SOURCE_DIR}/tests/geometry/industrial_nurbs_models_3d_test.cpp)
+    target_link_libraries(industrial_nurbs_models_3d_test PRIVATE kfbim_core)
+    add_test(NAME industrial_nurbs_models_3d_test COMMAND industrial_nurbs_models_3d_test)
+
     foreach(case IN ITEMS extended_tubular_cauchy_3d python_torus_density_layout_3d trace_first_case_3d nurbs_grid_line_cache_3d trace_first_resource_3d nurbs_torus_empty_edge_replay_3d trace93_case_3d trace93_density_layout_3d trace93_resource_3d)
         if(case STREQUAL "extended_tubular_cauchy_3d")
             set(case_dir cauchy)
