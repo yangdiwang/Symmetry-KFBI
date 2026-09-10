@@ -85,6 +85,11 @@ struct SurfaceDofCloud3D {
 [[nodiscard]] NativeNurbsSurface3D make_native_nurbs_surface_3d(
     GeometryKind3D kind);
 
+// Exact 16-patch rational-biquadratic torus; historical defaults unchanged.
+[[nodiscard]] NativeNurbsSurface3D make_native_nurbs_torus_3d(
+    double major_radius, double minor_radius,
+    const Eigen::Vector3d& center = Eigen::Vector3d::Zero());
+
 [[nodiscard]] SurfaceDofCloud3D make_native_surface_dofs_3d(
     const NativeNurbsSurface3D& surface,
     double h);

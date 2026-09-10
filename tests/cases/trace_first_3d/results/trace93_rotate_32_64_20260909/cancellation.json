@@ -1,0 +1,12 @@
+{
+  "reason": "User selected delivery after both L-prism N32 boundary conditions completed.",
+  "stopped_at": "2026-09-09T19:05:02.3338973+08:00",
+  "status": "partial_completed_user_requested_stop",
+  "completed": [{"geometry": "l", "transform": "rotate", "N": 32, "bvp": ["neumann", "dirichlet"], "exit_code": 0}],
+  "interrupted": {"geometry": "u", "transform": "rotate", "N": 32, "bvp": "neumann", "phase": "PDE setup", "result_available": false},
+  "not_run": ["u dirichlet rotate N32 PDE", "cylinder rotate N32 PDE", "l/u/cylinder rotate N64 PDE", "all N128 PDE", "other transforms PDE"],
+  "runner_process_stopped": 25960,
+  "owned_solver_process_stopped": 11464,
+  "matching_solver_processes_remaining": 0,
+  "notes": "Completed L results and the existing incomplete U geometry diagnostics are preserved. This is user-requested cancellation, not a convergence failure. Separate geometry-only and density-layout tests are reported independently."
+}

@@ -1,6 +1,27 @@
 # Source ownership follows the functional repository layout.
 # Target names and per-target options are preserved for compatibility.
 
+if(KFBIM_BUILD_3D)
+    foreach(case IN ITEMS extended_tubular_cauchy_3d python_torus_density_layout_3d trace_first_case_3d nurbs_grid_line_cache_3d trace_first_resource_3d nurbs_torus_empty_edge_replay_3d trace93_case_3d trace93_density_layout_3d trace93_resource_3d)
+        if(case STREQUAL "extended_tubular_cauchy_3d")
+            set(case_dir cauchy)
+        elseif(case STREQUAL "python_torus_density_layout_3d" OR case STREQUAL "trace93_density_layout_3d")
+            set(case_dir density)
+        elseif(case STREQUAL "trace_first_resource_3d" OR case STREQUAL "trace93_resource_3d")
+            set(case_dir trace)
+        else()
+            set(case_dir geometry)
+        endif()
+        add_executable(${case}_test ${PROJECT_SOURCE_DIR}/tests/${case_dir}/${case}_test.cpp)
+        target_link_libraries(${case}_test PRIVATE kfbim_3d_app_geometry kfbim_core)
+        target_include_directories(${case}_test PRIVATE ${PROJECT_SOURCE_DIR})
+        target_compile_features(${case}_test PRIVATE cxx_std_17)
+        set_target_properties(${case}_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/apps")
+        add_test(NAME ${case}_test COMMAND $<TARGET_FILE:${case}_test>)
+        set_tests_properties(${case}_test PROPERTIES WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
+    endforeach()
+endif()
+
 add_executable(benchmark_nurbs_geometries_2d_test
     ${PROJECT_SOURCE_DIR}/tests/geometry/benchmark_nurbs_geometries_2d_test.cpp
 )
@@ -22,6 +43,22 @@ add_executable(nurbs_density_space_2d_test
 )
 
 if(KFBIM_BUILD_3D)
+    add_executable(direct_coefficient_cubic_cauchy_3d_test
+        ${PROJECT_SOURCE_DIR}/tests/cauchy/direct_coefficient_cubic_cauchy_3d_test.cpp
+        ${PROJECT_SOURCE_DIR}/src/support/cauchy/crossing_cauchy_plan_3d.cpp)
+    target_link_libraries(direct_coefficient_cubic_cauchy_3d_test PRIVATE kfbim_3d_app_geometry)
+    target_compile_features(direct_coefficient_cubic_cauchy_3d_test PRIVATE cxx_std_17)
+
+    add_executable(restrict_resource_plan_3d_test
+        ${PROJECT_SOURCE_DIR}/tests/trace/restrict_resource_plan_3d_test.cpp)
+    target_link_libraries(restrict_resource_plan_3d_test PRIVATE kfbim_3d_app_geometry)
+    target_compile_features(restrict_resource_plan_3d_test PRIVATE cxx_std_17)
+
+    add_executable(resource_restrict_assembly_3d_test
+        ${PROJECT_SOURCE_DIR}/tests/trace/resource_restrict_assembly_3d_test.cpp)
+    target_link_libraries(resource_restrict_assembly_3d_test PRIVATE kfbim_3d_app_geometry)
+    target_compile_features(resource_restrict_assembly_3d_test PRIVATE cxx_std_17)
+
     add_executable(closest_point_trace_extension_3d_test
         ${PROJECT_SOURCE_DIR}/tests/trace/closest_point_trace_extension_3d_test.cpp
         ${PROJECT_SOURCE_DIR}/src/support/cauchy/crossing_cauchy_plan_3d.cpp)
@@ -533,6 +570,9 @@ if(KFBIM_BUILD_3D)
 endif()
 
 foreach(target IN ITEMS
+    restrict_resource_plan_3d_test
+    resource_restrict_assembly_3d_test
+    direct_coefficient_cubic_cauchy_3d_test
     benchmark_nurbs_geometries_2d_test
     laplace_nsc_et_bvp_2d_test
     curve_resampler_2d_test

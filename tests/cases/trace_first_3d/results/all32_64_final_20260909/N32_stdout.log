@@ -1,0 +1,5 @@
+building native grid crossing catalog N=32 whole_lines=1
+neumann density full=560 carrier_c0=576 reduced=239 traces=2048
+neumann N=32 error=0.001147212531 iter=19 residual=1.971345688e-10 seconds=13.8797668
+dirichlet density full=560 carrier_c0=576 reduced=240 traces=2048
+dirichlet N=32 error=0.0001681273766 iter=14 residual=2.995913518e-11 seconds=16.9364523

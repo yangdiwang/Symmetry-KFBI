@@ -1,0 +1,29 @@
+{
+  "schema": "kfbi-trace93-case-registry-v1",
+  "source_archive": "KFBI3D-TracePointFirst-93-SourceAndSummary-20260909.zip",
+  "source_sha256": "409570644d3e71a88adbb2c3dd628e8c1d120b3d475cbd3c92ed1d2e79832256",
+  "native_geometry_degree": [3, 3],
+  "density_degree": [3, 3],
+  "geometry_and_analysis_parameters_are_distinct": true,
+  "background_box": [[-1, -1, -1], [1, 1, 1]],
+  "levels": [32, 64, 128],
+  "bvp": ["neumann", "dirichlet"],
+  "geometries": [
+    {"id": "cylinder", "solid": true, "radius": 0.54, "z": [-0.5, 0.5], "cap_center_halfwidth": 0.22, "patches": 14, "analysis_chart": "linear_angle_side_and_trigonometric_cap_ring"},
+    {"id": "l", "xy_bounds": [-0.5, 0.5], "cut": -0.1, "z": [-0.5, 0.5], "patches": 14, "analysis_chart": "affine_rectangles"},
+    {"id": "u", "outer_halfwidth": 0.55, "inner_halfwidth": 0.22, "notch_bottom": -0.1, "z": [-0.5, 0.5], "patches": 22, "analysis_chart": "affine_rectangles"}
+  ],
+  "transforms": {
+    "translation": [0.037, -0.029, 0.041],
+    "rotation_order": "Rz Ry Rx",
+    "rotate_degrees_xyz": [17, -11, 13],
+    "rotate_translate_degrees_xyz": [31, 19, -23],
+    "names": ["translate", "rotate", "rotate_same_translate", "rotate_translate"]
+  },
+  "trace_event_radius_over_h": 1.75,
+  "trace_target_radius_over_h": 3.25,
+  "cover_endpoint_snap_in_grid_coordinates": 1e-13,
+  "default_event_mode": "python93",
+  "alternative_event_mode": "all",
+  "note": "Portable specification mirrored by typed C++ factories and tests; not a runtime JSON geometry parser. Archive benchmarks are in python_reference_trace93.json."
+}

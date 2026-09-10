@@ -1,6 +1,23 @@
 # Source ownership follows the functional repository layout.
 # Target names and per-target options are preserved for compatibility.
 
+if(KFBIM_BUILD_3D)
+    add_executable(kfbi_trace93_study_3d
+        ${PROJECT_SOURCE_DIR}/apps/laplace/3d/trace93_study_3d.cpp)
+    target_link_libraries(kfbi_trace93_study_3d PRIVATE kfbim_3d_app_geometry kfbim_core)
+    target_include_directories(kfbi_trace93_study_3d PRIVATE ${PROJECT_SOURCE_DIR})
+    target_compile_features(kfbi_trace93_study_3d PRIVATE cxx_std_17)
+    set_target_properties(kfbi_trace93_study_3d PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/apps")
+    add_executable(kfbi_trace_first_study_3d
+        ${PROJECT_SOURCE_DIR}/apps/laplace/3d/trace_first_study_3d.cpp)
+    target_link_libraries(kfbi_trace_first_study_3d PRIVATE kfbim_3d_app_geometry kfbim_core)
+    target_include_directories(kfbi_trace_first_study_3d PRIVATE ${PROJECT_SOURCE_DIR})
+    target_compile_features(kfbi_trace_first_study_3d PRIVATE cxx_std_17)
+    set_target_properties(kfbi_trace_first_study_3d PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/apps")
+endif()
+
 add_executable(shape_opt_transmission_2d
     ${PROJECT_SOURCE_DIR}/apps/shape_optimization/shape_opt_transmission_2d.cpp
 )

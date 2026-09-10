@@ -7,9 +7,21 @@ add_library(kfbim_2d_benchmark_geometry STATIC
 
 if(KFBIM_BUILD_3D)
     add_library(kfbim_3d_app_geometry STATIC
+        ${PROJECT_SOURCE_DIR}/src/support/geometry/trace93_case_3d.cpp
+        ${PROJECT_SOURCE_DIR}/src/support/density/trace93_density_layout_3d.cpp
+        ${PROJECT_SOURCE_DIR}/src/support/trace/trace93_resource_3d.cpp
+        ${PROJECT_SOURCE_DIR}/src/support/geometry/trace_first_case_3d.cpp
+        ${PROJECT_SOURCE_DIR}/src/support/density/python_torus_density_layout_3d.cpp
+        ${PROJECT_SOURCE_DIR}/src/support/cauchy/extended_tubular_cauchy_3d.cpp
+        ${PROJECT_SOURCE_DIR}/src/support/cauchy/crossing_cauchy_plan_3d.cpp
+        ${PROJECT_SOURCE_DIR}/src/support/trace/trace_first_resource_3d.cpp
         ${PROJECT_SOURCE_DIR}/src/support/trace/closest_point_trace_extension_3d.cpp
         ${PROJECT_SOURCE_DIR}/src/support/trace/crossing_owner_restrict_3d.cpp
         ${PROJECT_SOURCE_DIR}/src/support/cauchy/direct_coefficient_cauchy_3d.cpp
+        ${PROJECT_SOURCE_DIR}/src/support/cauchy/direct_coefficient_cubic_cauchy_3d.cpp
+        ${PROJECT_SOURCE_DIR}/src/support/trace/restrict_resource_plan_3d.cpp
+        ${PROJECT_SOURCE_DIR}/src/support/trace/resource_restrict_assembly_3d.cpp
+        ${PROJECT_SOURCE_DIR}/src/support/trace/spread_restrict_resource_3d.cpp
         ${PROJECT_SOURCE_DIR}/src/support/trace/restrict_crossing_selector_3d.cpp
         ${PROJECT_SOURCE_DIR}/src/support/trace/restrict_crossing_path_state_3d.cpp
         ${PROJECT_SOURCE_DIR}/src/support/topology/edge_jump_jet_reduction_3d.cpp

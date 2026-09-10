@@ -103,6 +103,10 @@ if(KFBIM_BUILD_3D)
     endif()
 endif()
 
+if(KFBIM_BUILD_3D)
+    target_sources(kfbim_core PRIVATE geometry/nurbs_grid_line_cache_3d.cpp)
+endif()
+
 target_compile_features(kfbim_core PUBLIC cxx_std_17)
 
 if(MINGW)

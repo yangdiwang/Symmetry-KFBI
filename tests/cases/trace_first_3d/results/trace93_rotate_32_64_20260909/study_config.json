@@ -1,0 +1,19 @@
+{
+  "geometries": [
+    "l",
+    "u",
+    "cylinder"
+  ],
+  "levels": [
+    32,
+    64
+  ],
+  "transforms": [
+    "rotate"
+  ],
+  "bvp": "both",
+  "policy": "trace",
+  "event_mode": "python93",
+  "grid_lines": "on",
+  "reference_sha256": "409570644d3e71a88adbb2c3dd628e8c1d120b3d475cbd3c92ed1d2e79832256"
+}

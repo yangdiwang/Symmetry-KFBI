@@ -1,0 +1,13 @@
+{
+  "source_revision": "1ff60b20c21183ea85b3fccf493d480f6b28f512",
+  "dirty": true,
+  "runs": [
+    {
+      "N": 64,
+      "exit_code": 1,
+      "timed_out": false,
+      "process_seconds": 24.1373747
+    }
+  ],
+  "results": []
+}

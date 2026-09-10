@@ -1,0 +1,15 @@
+N=64 grid_lines=true uncertified_grid_edge_count=4
+
+EDGE axis=2 ijk=24,29,28 nodes=120209,124434 start=-0.25,-0.09375,-0.125 end=-0.25,-0.09375,-0.09375 labels=0,0
+CLASS queried=true root_count_known=false parity_known=false near_tangent=false targeted_retry=true confirmed_count=0 confirmed_transverse=0 ambiguous_clusters=1 physical_events_certified=false correction_safe=false
+
+EDGE axis=0 ijk=46,36,29 nodes=124911,124912 start=0.4375,0.125,-0.09375 end=0.46875,0.125,-0.09375 labels=0,0
+CLASS queried=true root_count_known=false parity_known=false near_tangent=false targeted_retry=true confirmed_count=0 confirmed_transverse=0 ambiguous_clusters=1 physical_events_certified=false correction_safe=false
+
+EDGE axis=0 ijk=17,28,35 nodes=149712,149713 start=-0.46875,-0.125,0.09375 end=-0.4375,-0.125,0.09375 labels=0,0
+CLASS queried=true root_count_known=false parity_known=false near_tangent=false targeted_retry=true confirmed_count=0 confirmed_transverse=0 ambiguous_clusters=1 physical_events_certified=false correction_safe=false
+
+EDGE axis=2 ijk=40,35,35 nodes=150190,154415 start=0.25,0.09375,0.09375 end=0.25,0.09375,0.125 labels=0,0
+CLASS queried=true root_count_known=false parity_known=false near_tangent=false targeted_retry=true confirmed_count=0 confirmed_transverse=0 ambiguous_clusters=1 physical_events_certified=false correction_safe=false
+
+DUMPED_EDGES=4

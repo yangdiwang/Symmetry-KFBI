@@ -2069,6 +2069,25 @@ NurbsElementSegmentCertificate3D certify_nurbs_bezier_element_segment_3d(
         checked_increment_diagnostic(
             diagnostics.closest_point_failures,
             "NURBS closest-point failure diagnostic overflow");
+        // Closest-point iteration only proposes a separating direction;
+        // its convergence is not required by the independent positive-
+        // weight control-hull/recursive separation certificate.  Even a
+        // zero proposal is valid: the certificate enumerates support
+        // directions and must prove separation of the entire element.
+        Eigen::Vector3d separation =
+            closest.surface_point - closest.segment_point;
+        if (!separation.allFinite())
+            separation.setZero();
+        if (certifies_terminal_separation(
+                element, frame, separation,
+                options.geometry_tolerance, diagnostics,
+                options.terminal_separation_subdivision_depth)) {
+            checked_increment_diagnostic(
+                diagnostics.terminal_misses_by_closest_point,
+                "NURBS terminal-miss diagnostic overflow");
+            return {CertificateKind::CertifiedMiss, std::nullopt,
+                    diagnostics, false};
+        }
         checked_increment_diagnostic(
             diagnostics.unresolved_boxes,
             "NURBS unresolved-box diagnostic overflow");
@@ -2474,6 +2493,25 @@ NurbsElementIntersectionResult3D intersect_nurbs_bezier_element_3d(
                 checked_increment_diagnostic(
                     result.diagnostics.closest_point_failures,
                     "NURBS closest-point failure diagnostic overflow");
+                // Do not let a failed iterative aid veto an independently
+                // provable empty box.  No distance/endpoint-label heuristic
+                // enters this decision, and a box with a found root cannot
+                // be reclassified as empty through this recovery path.
+                Eigen::Vector3d separation =
+                    closest_result->surface_point
+                        - closest_result->segment_point;
+                if (!separation.allFinite())
+                    separation.setZero();
+                if (!box_root && certifies_terminal_separation(
+                        current.element, frame, separation,
+                        options.geometry_tolerance,
+                        result.diagnostics,
+                        options.terminal_separation_subdivision_depth)) {
+                    checked_increment_diagnostic(
+                        result.diagnostics.terminal_misses_by_closest_point,
+                        "NURBS terminal-miss diagnostic overflow");
+                    return;
+                }
                 mark_unresolved();
                 return;
             }

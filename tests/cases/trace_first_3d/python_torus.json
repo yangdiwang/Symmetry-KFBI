@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "case_id": "python_torus_20260909",
+  "source_package": "KFBI3D-NURBS-TraceFirst-Consolidated-Full-20260909.zip",
+  "source_core": "01_current_core/torus_nurbs_density_refinement/src",
+  "geometry": {
+    "type": "exact_rational_nurbs_torus", "major_radius": 0.46, "minor_radius": 0.18,
+    "local_center": [0, 0, 0], "degree": [2, 2], "patches": 16,
+    "control_points_per_patch": [3, 3], "patch_id": "4 * major_quarter + minor_quarter",
+    "parameter_u": "major angle quarter", "parameter_v": "minor angle quarter",
+    "knots_u": [0, 0, 0, 1, 1, 1], "knots_v": [0, 0, 0, 1, 1, 1],
+    "quarter_arc_weights": [1, 0.7071067811865475244, 1], "weights": "tensor product"
+  },
+  "transforms": {
+    "convention": "world = Rz(az) Ry(ay) Rx(ax) local + translation; angles in degrees",
+    "default": "rotate",
+    "translate": {"angles": [0, 0, 0], "translation": [0.037, -0.029, 0.041]},
+    "rotate": {"angles": [17, -11, 13], "translation": [0, 0, 0]},
+    "rotate_same_translate": {"angles": [17, -11, 13], "translation": [0.037, -0.029, 0.041]},
+    "rotate_translate": {"angles": [31, 19, -23], "translation": [0.037, -0.029, 0.041]}
+  },
+  "grid": {"lower": [-1, -1, -1], "upper": [1, 1, 1], "layout": "nodes", "N": [32, 64, 128]},
+  "equation": {
+    "pde": "Laplace u = 0",
+    "exact_local_raw": "exp(sqrt(0.72^2+0.43^2)*x)*cos(0.72*y)*cos(0.43*z)+0.18*(x*x-y*y)+0.11*x*y*z+0.07*x-0.05*z",
+    "exact": "raw(inverse_rigid(world)) - boundary_mean_shift",
+    "boundary_mean_shift": "surface integral of raw / surface area, 8x8 Gauss once per geometry patch",
+    "dirichlet": "g_D = exact", "neumann": "g_N = outward_normal dot gradient(exact)"
+  },
+  "density": {
+    "basis": "nonrational tensor cubic B-splines", "degree": [3, 3],
+    "base_N": 32, "base_spans": [4, 2], "refinement": "dyadic midpoint insertion per doubling of N",
+    "trace_gauss_per_analysis_span": [4, 4], "neumann_gauge_gauss_per_analysis_span": [8, 8],
+    "full_counts": [560, 1232, 3344], "dirichlet_reduced_counts": [240, 720, 2448],
+    "neumann_reduced_counts": [239, 719, 2447],
+    "constraints": "periodic C0 and C1 at regular quarter seams; Neumann adds zero mean"
+  },
+  "python_reference": {"policy": "trace_polynomial_first", "chart": "extended", "gmres_rtol": 2e-10}
+}

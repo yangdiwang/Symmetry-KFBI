@@ -181,7 +181,7 @@ public:
     Eigen::RowVectorXd c0_basis_row(
         int patch, double u, double v) const;
     // Exact tensor-product B-spline parameter derivatives in the Base/C0
-    // coefficient space.  derivative_u + derivative_v may be at most two;
+    // coefficient space.  derivative_u + derivative_v may be at most three;
     // in particular these expose the six rows needed by direct coefficient
     // Cauchy closure without refitting the unknown density from samples.
     NativeDensityC0Stencil3D c0_parameter_derivative_stencil(
@@ -194,6 +194,10 @@ public:
     // parameter-jet rows, ordered as value, u, v, uu, uv, vv.  Like the
     // single-row API, indices refer to this density space's C0 coordinates.
     std::array<NativeDensityC0Stencil3D, 6> c0_parameter_jet_stencils(
+        int patch, double u, double v) const;
+    // Same span and C0 indices, sharing basis evaluations through third order.
+    // Ordering: value,u,v,uu,uv,vv,uuu,uuv,uvv,vvv.
+    std::array<NativeDensityC0Stencil3D, 10> c0_parameter_cubic_jet_stencils(
         int patch, double u, double v) const;
     Eigen::RowVectorXd c0_parameter_derivative_row(
         int patch,

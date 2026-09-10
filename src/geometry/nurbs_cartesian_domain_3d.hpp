@@ -128,6 +128,9 @@ struct NurbsCartesianDomainOptions3D {
         std::numeric_limits<double>::infinity();
     NurbsCartesianPreprocessStrategy3D strategy =
         NurbsCartesianPreprocessStrategy3D::CertifiedBaseline;
+    // Opt-in: query each candidate axis line once, partition all certified
+    // interior roots, and retain per-edge certification for ambiguous lines.
+    bool use_whole_grid_lines = false;
 };
 struct NurbsCartesianEdgeClassification3D {
     bool queried = false;
@@ -183,6 +186,14 @@ std::vector<GridEdgeEventView3D> grid_edge_event_views_3d(
     int node_b);
 
 struct NurbsCartesianDomainDiagnostics3D {
+    std::size_t whole_line_query_count = 0;
+    std::size_t whole_line_accepted_count = 0;
+    std::size_t whole_line_fallback_count = 0;
+    std::size_t whole_line_reused_edge_count = 0;
+    // Initial individual-edge queries; targeted retries are counted separately.
+    std::size_t direct_edge_query_count = 0;
+    // Subset of edge_intersection_seconds, not an additional setup phase.
+    double whole_line_intersection_seconds = 0.0;
     int nurbs_patch_count = 0;
     int bezier_element_count = 0;
     int acceleration_leaf_count = 0;

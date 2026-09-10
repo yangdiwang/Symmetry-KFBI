@@ -263,13 +263,11 @@ void connect_feature(NativeNurbsSurface3D& surface,
 }
 
 NurbsSurfacePatch3D make_torus_quarter_patch(int u_quarter,
-                                             int v_quarter)
+                                             int v_quarter,
+                                             double major_radius,
+                                             double minor_radius,
+                                             const Eigen::Vector3d& center)
 {
-    constexpr double cx = 0.07;
-    constexpr double cy = -0.04;
-    constexpr double cz = 0.03;
-    constexpr double major_radius = 0.55;
-    constexpr double minor_radius = 0.20;
     const RationalQuarterArc2D u_arc = quarter_arc(0.5 * kPi * u_quarter);
     const RationalQuarterArc2D v_arc = quarter_arc(0.5 * kPi * v_quarter);
 
@@ -281,9 +279,9 @@ NurbsSurfacePatch3D make_torus_quarter_patch(int u_quarter,
             const double rho = major_radius
                              + minor_radius * v_arc.controls[j].x();
             controls[i][j] = {
-                cx + rho * u_arc.controls[i].x(),
-                cy + rho * u_arc.controls[i].y(),
-                cz + minor_radius * v_arc.controls[j].y()};
+                center.x() + rho * u_arc.controls[i].x(),
+                center.y() + rho * u_arc.controls[i].y(),
+                center.z() + minor_radius * v_arc.controls[j].y()};
             weights[i][j] = u_arc.weights[i] * v_arc.weights[j];
         }
     }
@@ -292,7 +290,9 @@ NurbsSurfacePatch3D make_torus_quarter_patch(int u_quarter,
         std::move(controls), std::move(weights));
 }
 
-NativeNurbsSurface3D make_torus()
+NativeNurbsSurface3D make_torus(
+    double major_radius = 0.55, double minor_radius = 0.20,
+    const Eigen::Vector3d& center = Eigen::Vector3d(0.07, -0.04, 0.03))
 {
     NativeNurbsSurface3D surface;
     surface.name = "torus";
@@ -302,7 +302,7 @@ NativeNurbsSurface3D make_torus()
             append_patch(surface,
                          "torus_u" + std::to_string(iu)
                              + "_v" + std::to_string(iv),
-                         make_torus_quarter_patch(iu, iv));
+                         make_torus_quarter_patch(iu, iv, major_radius, minor_radius, center));
         }
     }
     auto patch_id = [](int iu, int iv) {
@@ -320,11 +320,12 @@ NativeNurbsSurface3D make_torus()
                            false);
         }
     }
-    surface.expected_area = 4.0 * kPi * kPi * 0.55 * 0.20;
-    surface.exact_inside = [](const Eigen::Vector3d& x) {
-        const double rho = std::hypot(x.x() - 0.07, x.y() + 0.04);
-        return (rho - 0.55) * (rho - 0.55)
-             + (x.z() - 0.03) * (x.z() - 0.03) < 0.20 * 0.20;
+    surface.expected_area = 4.0 * kPi * kPi * major_radius * minor_radius;
+    surface.exact_inside = [major_radius, minor_radius, center](const Eigen::Vector3d& x) {
+        const Eigen::Vector3d local = x - center;
+        const double rho = std::hypot(local.x(), local.y());
+        return (rho - major_radius) * (rho - major_radius)
+             + local.z() * local.z() < minor_radius * minor_radius;
     };
     return surface;
 }
@@ -755,6 +756,16 @@ NativeNurbsSurface3D make_native_nurbs_surface_3d(GeometryKind3D kind)
         return make_u_prism();
     }
     throw std::invalid_argument("unknown native 3D geometry kind");
+}
+
+NativeNurbsSurface3D make_native_nurbs_torus_3d(
+    double major_radius, double minor_radius, const Eigen::Vector3d& center)
+{
+    if (!std::isfinite(major_radius) || !std::isfinite(minor_radius)
+        || !(major_radius > minor_radius) || !(minor_radius > 0.0)
+        || !center.allFinite())
+        throw std::invalid_argument("torus requires finite R > r > 0 and center");
+    return make_torus(major_radius, minor_radius, center);
 }
 
 namespace {

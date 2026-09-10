@@ -1,0 +1,9 @@
+building native grid crossing catalog N=32 whole_lines=1
+neumann building Python93 analysis density and affine constraints
+neumann density raw=350 reduced=67 constraints=303 traces=896
+neumann geometry plan ready in 268.234 s; assembling fixed P3/P2 operators
+neumann N=32 error=2.947229324e-05 iter=22 residual=1.124185177e-10 seconds=286.8023221
+dirichlet building Python93 analysis density and affine constraints
+dirichlet density raw=350 reduced=122 constraints=280 traces=896
+dirichlet geometry plan ready in 750.015671 s; assembling fixed P3/P2 operators
+dirichlet N=32 error=3.559894747e-06 iter=16 residual=5.517878852e-11 seconds=755.8590436

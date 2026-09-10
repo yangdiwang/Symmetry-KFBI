@@ -43,6 +43,7 @@
 #include "src/support/trace/restrict_crossing_selector_3d.hpp"
 #include "src/support/trace/shared_quadratic_restrict_3d.hpp"
 #include "src/support/trace/tensor_product_cover_restrict_3d.hpp"
+#include "src/support/trace/spread_restrict_resource_3d.hpp"
 #include "src/support/topology/topology_affine_reduction_3d.hpp"
 #include "src/support/topology/topology_density_constraints_3d.hpp"
 #include "src/support/topology/topology_mean_free_reduction_3d.hpp"
@@ -101,7 +102,7 @@ constexpr int kJointNormalCoefficientCount =
     2 * kRestrictNormalDegree;
 constexpr int kGlobalTraceCoefficientCount = 4;
 
-enum class SupportPathMode3D { Legacy, NativeCertified, ClosestPoint };
+enum class SupportPathMode3D { Legacy, NativeCertified, ClosestPoint, ResourceMixed };
 
 SupportPathMode3D selected_support_path_mode()
 {
@@ -113,8 +114,33 @@ SupportPathMode3D selected_support_path_mode()
         return SupportPathMode3D::NativeCertified;
     if (std::string(raw) == "closest_point")
         return SupportPathMode3D::ClosestPoint;
+    if (std::string(raw) == "near_surface_anchor_mixed")
+        return SupportPathMode3D::ResourceMixed;
     throw std::invalid_argument(
-        "KFBIM_3D_SUPPORT_PATH must be legacy, native_certified, or closest_point");
+        "KFBIM_3D_SUPPORT_PATH must be legacy, native_certified, closest_point, or near_surface_anchor_mixed");
+}
+
+bool selected_resource_mixed_support_path()
+{
+    return selected_support_path_mode() == SupportPathMode3D::ResourceMixed;
+}
+
+app3d::RestrictResourceMode3D selected_resource_engine()
+{
+    const char* raw = std::getenv("KFBIM_3D_RESOURCE_ENGINE");
+    if (!raw || std::string(raw).empty() || std::string(raw) == "reuse")
+        return app3d::RestrictResourceMode3D::ReuseBySheetNode;
+    if (std::string(raw) == "reference")
+        return app3d::RestrictResourceMode3D::ReferencePerVisit;
+    throw std::invalid_argument("KFBIM_3D_RESOURCE_ENGINE must be reference or reuse");
+}
+
+bool resource_flag(const char* name)
+{
+    const char* raw = std::getenv(name);
+    if (!raw || !*raw || std::string(raw) == "0") return false;
+    if (std::string(raw) == "1") return true;
+    throw std::invalid_argument(std::string(name) + " must be 0 or 1");
 }
 
 bool selected_native_endpoint_support_path()
@@ -132,6 +158,7 @@ const char* selected_support_path_name()
     switch (selected_support_path_mode()) {
     case SupportPathMode3D::NativeCertified: return "native_certified";
     case SupportPathMode3D::ClosestPoint: return "closest_point";
+    case SupportPathMode3D::ResourceMixed: return "near_surface_anchor_mixed";
     default: return "legacy";
     }
 }
@@ -153,6 +180,11 @@ std::filesystem::path support_path_output_root_3d(std::filesystem::path root)
         root /= "native_endpoint";
     else if (selected_closest_point_support_path())
         root /= "closest_point";
+    else if (selected_resource_mixed_support_path()) {
+        root /= "resource_mixed";
+        root /= selected_resource_engine() == app3d::RestrictResourceMode3D::ReferencePerVisit
+            ? "reference" : "reuse";
+    }
     if (selected_preprocess_only())
         root /= "preprocess_only";
     return root;
@@ -718,9 +750,11 @@ std::string trace_restrict_mode_name(ExteriorNormalRestrictMode3D mode)
     case ExteriorNormalRestrictMode3D::SharedQ10CubicGridlineCauchy:
         return "shared_q10_cubic_gridline_cauchy";
     case ExteriorNormalRestrictMode3D::Q27Cover3AllEventCauchy:
-        return "q27_cover3_all_event_cauchy";
+        return selected_resource_mixed_support_path()
+            ? "resource_p3_p2_3p3_q27_cover3" : "q27_cover3_all_event_cauchy";
     case ExteriorNormalRestrictMode3D::Q64Cover4AllEventCauchy:
-        return "q64_cover4_all_event_cauchy";
+        return selected_resource_mixed_support_path()
+            ? "resource_p3_p2_3p3_q64_cover4" : "q64_cover4_all_event_cauchy";
     case ExteriorNormalRestrictMode3D::ExteriorOnlyHarmonicCubic:
         return "exterior_only_harmonic_cubic";
     }
@@ -1974,6 +2008,7 @@ struct HarmonicJetField3D {
     app3d::KnownDirichletJetCallback3D direct_known_value_jet;
     app3d::KnownNeumannJetCallback3D direct_known_normal_jet;
     bool direct_coefficient_cauchy = false;
+    bool resource_constant_jump = false;
 };
 
 constexpr int kLocalRestrictSampleCount = 9;
@@ -2290,6 +2325,38 @@ public:
             throw std::invalid_argument(
                 "harmonic-jet KFBI3D requires an isotropic Cartesian grid");
         }
+        if (resource_mixed_) {
+            if (build_standard_trace_restrict || build_shared_quadratic_restrict
+                || (!build_q27_cover3_restrict && !build_q64_cover4_restrict)
+                || selected_density_iteration_mode() != DensityIterationMode3D::ReducedCoefficients)
+                throw std::invalid_argument("resource mixed requires direct coefficient Q27/Q64 routes");
+            std::vector<app3d::RestrictResourceAnchor3D> anchors;
+            for (const auto& dof : cloud_.dofs) {
+                app3d::RestrictResourceAnchor3D anchor;
+                anchor.point = dof.point; anchor.patch_id = dof.patch_id;
+                anchor.u = dof.u; anchor.v = dof.v;
+                anchors.push_back(anchor);
+            }
+            const auto build = [&](app3d::TensorProductCoverKind3D kind) {
+                return std::make_unique<app3d::ResourceGeometryPlan3D>(
+                    app3d::build_resource_geometry_plan_3d(grid_, grid_pair_, native_surface_,
+                        correction_support_, anchors, kind, selected_resource_engine()));
+            };
+            if (build_q27_cover3_restrict) {
+                resource_q27_ = build(app3d::TensorProductCoverKind3D::Q27Cover3);
+                q27_cover3_templates_built_ = true;
+            }
+            if (build_q64_cover4_restrict) {
+                resource_q64_ = build(app3d::TensorProductCoverKind3D::Q64Cover4);
+                q64_cover4_templates_built_ = true;
+            }
+            for (const auto* plan : {resource_q27_.get(), resource_q64_.get()}) {
+                if (!plan) continue;
+                shared_quadratic_diagnostics_.side_plans += 2 * plan->stencils.size();
+                shared_quadratic_diagnostics_.wrong_side_nodes += plan->restrict_plan.counts.wrong_side_visits;
+            }
+            return; // no legacy sample fits or support-path intersections
+        }
         if (build_exterior_only_restrict) {
             exterior_only_restrict_ =
                 std::make_unique<app3d::ExteriorOnlyCubicNormalRestrict3D>(
@@ -2367,6 +2434,93 @@ public:
     const ClosestPointDiagnostics& closest_point_diagnostics() const noexcept
     {
         return closest_point_diagnostics_;
+    }
+
+    void prepare_resource_operators(
+        const app3d::ResourceKnownAmbientCallback3D& known, double neumann_mean,
+        const std::filesystem::path& output, bool do_neumann, bool do_dirichlet)
+    {
+        if (!resource_mixed_) return;
+        const auto build = [&](bool neumann) {
+            const auto* density = neumann ? direct_coefficient_density_ : direct_coefficient_normal_density_;
+            if (!density) throw std::runtime_error("resource route requires topology-affine analytic coefficient density");
+            const auto mode = neumann ? selected_neumann_trace_restrict_mode() : selected_dirichlet_normal_restrict_mode();
+            const bool q27 = mode == ExteriorNormalRestrictMode3D::Q27Cover3AllEventCauchy;
+            const auto* plan = q27 ? resource_q27_.get() : resource_q64_.get();
+            if (!plan) throw std::logic_error("resource cover geometry was not prepared");
+            const auto field = neumann ? app3d::NativeDensityField3D::ValueTrace : app3d::NativeDensityField3D::NormalTrace;
+            auto op = std::make_unique<app3d::ResourceBvpOperators3D>(
+                app3d::build_resource_bvp_operators_3d(*plan, grid_, grid_pair_, correction_support_,
+                    *density, field, known, neumann ? neumann_mean : 0.0));
+            double ab_error = 0.0;
+            const bool check = resource_flag("KFBIM_3D_RESOURCE_CHECK_AB");
+            if (check) {
+                const auto opposite = selected_resource_engine() == app3d::RestrictResourceMode3D::ReferencePerVisit
+                    ? app3d::RestrictResourceMode3D::ReuseBySheetNode : app3d::RestrictResourceMode3D::ReferencePerVisit;
+                const auto comparison_geometry = app3d::build_resource_geometry_plan_3d(
+                    grid_, grid_pair_, native_surface_, correction_support_, plan->trace_anchors,
+                    q27 ? app3d::TensorProductCoverKind3D::Q27Cover3 : app3d::TensorProductCoverKind3D::Q64Cover4,
+                    opposite);
+                const auto comparison = app3d::build_resource_bvp_operators_3d(comparison_geometry,
+                    grid_, grid_pair_, correction_support_, *density, field, known, neumann ? neumann_mean : 0.0);
+                ab_error = app3d::resource_operator_max_difference_3d(*op, comparison);
+                if (ab_error > 5.0e-10) throw std::runtime_error("resource reference/reuse matrix comparison failed");
+            }
+            std::filesystem::create_directories(output);
+            const std::string name = neumann ? "neumann" : "dirichlet";
+            std::ofstream json(output / (name + "_resource_setup.json"));
+            const auto& s = op->statistics;
+            json << std::setprecision(17)
+                 << "{\n  \"policy\": \"near_surface_anchor_mixed\",\n"
+                 << "  \"engine\": \"" << (selected_resource_engine() == app3d::RestrictResourceMode3D::ReferencePerVisit ? "reference" : "reuse") << "\",\n"
+                 << "  \"path_certified\": false,\n  \"spread_degree\": 3,\n  \"restrict_jump_degree\": 2,\n  \"normal_samples\": 6,\n"
+                 << "  \"support_visits\": " << s.planning.support_visits << ",\n"
+                 << "  \"wrong_side_visits\": " << s.planning.wrong_side_visits << ",\n"
+                 << "  \"requests\": " << s.planning.requests << ",\n"
+                 << "  \"trace_requests\": " << s.planning.trace_requests << ",\n"
+                 << "  \"spread_requests\": " << s.planning.spread_requests << ",\n"
+                 << "  \"trace_rows\": " << op->restrict.Rg_value.rows() << ",\n"
+                 << "  \"density_c0_columns\": " << op->S.cols() << ",\n"
+                 << "  \"spread_nnz\": " << op->S.nonZeros() << ",\n"
+                 << "  \"restrict_grid_value_nnz\": " << op->restrict.Rg_value.nonZeros() << ",\n"
+                 << "  \"restrict_grid_normal_nnz\": " << op->restrict.Rg_normal.nonZeros() << ",\n"
+                 << "  \"restrict_density_value_nnz\": " << op->restrict.exterior.Rc_value.nonZeros() << ",\n"
+                 << "  \"restrict_density_normal_nnz\": " << op->restrict.exterior.Rc_normal.nonZeros() << ",\n"
+                 << "  \"spread_centers\": " << s.spread_centers << ",\n"
+                 << "  \"retained_crossing_centers\": " << s.retained_crossing_centers << ",\n"
+                 << "  \"p2_centers\": " << s.p2_centers << ",\n"
+                 << "  \"p2_from_p3\": " << s.p2_from_p3 << ",\n"
+                 << "  \"endpoint_row_hits\": " << s.endpoint_row_hits << ",\n"
+                 << "  \"p2_row_evaluations\": " << s.p2_row_evaluations << ",\n"
+                 << "  \"too_far_requests\": " << s.planning.too_far_requests << ",\n"
+                 << "  \"competing_sheet_requests\": " << s.planning.competing_sheet_requests << ",\n"
+                 << "  \"planning_seconds\": " << s.planning_seconds << ",\n"
+                 << "  \"spread_seconds\": " << s.spread_seconds << ",\n"
+                 << "  \"restrict_seconds\": " << s.restrict_seconds << ",\n"
+                 << "  \"retained_p2_seconds\": " << s.retained_p2_seconds << ",\n"
+                 << "  \"endpoint_p2_seconds\": " << s.endpoint_p2_seconds << ",\n"
+                 << "  \"restrict_equivalent_seconds\": " << s.planning_seconds + s.restrict_seconds + s.retained_p2_seconds + s.endpoint_p2_seconds << ",\n"
+                 << "  \"operator_setup_seconds\": " << s.planning_seconds + s.spread_seconds + s.restrict_seconds << ",\n"
+                 << "  \"temporary_centers_after_build\": " << s.temporary_centers_after_build << ",\n"
+                 << "  \"matrix_ab_checked\": " << (check ? "true" : "false") << ",\n"
+                 << "  \"matrix_ab_max_error\": " << ab_error << "\n}\n";
+            if (!json) throw std::runtime_error("resource setup report failed");
+            if (resource_flag("KFBIM_3D_RESOURCE_DUMP"))
+                app3d::dump_resource_operators_3d(*op, (output / (name + "_resource_matrices")).string());
+            // NativeDensityTransfer already owns the trace design used by its
+            // fixed projector. This duplicate is only for matrix auditing;
+            // do not retain it through GMRES or claim the old QR cache as new.
+            op->trace_basis.resize(0, 0);
+            op->trace_basis.data().squeeze();
+            std::cout << "[resource] " << name << " visits=" << s.planning.wrong_side_visits
+                      << " requests=" << s.planning.requests << " P2_centers=" << s.p2_centers
+                      << " P3_to_P2=" << s.p2_from_p3 << " matrix_ab_error=" << ab_error << '\n';
+            return op;
+        };
+        if (do_neumann) resource_value_ = build(true);
+        if (do_dirichlet) resource_normal_ = build(false);
+        // The constant probe ran before binding. GMRES needs matrices only.
+        resource_q27_.reset(); resource_q64_.reset();
     }
 
     double surface_area() const
@@ -2674,6 +2828,17 @@ public:
         bool anchor_center_cauchy = false,
         bool use_local_restrict_fit = false) const
     {
+        if (resource_mixed_) {
+            if (!(value_jump.array() == 1.0).all() || !normal_jump.isZero(0.0))
+                throw std::invalid_argument("resource sampled entry is only the constant diagnostic; use direct coefficient rows");
+            HarmonicJetField3D field;
+            Eigen::VectorXd rhs = Eigen::VectorXd::Zero(grid_.num_dofs());
+            for (const auto& op : correction_support_.crossing_ops)
+                rhs[op.rhs_node] += static_cast<double>(op.side_delta) * op.stencil_weight;
+            bulk_.solve(-rhs, field.potential);
+            field.resource_constant_jump = true;
+            return field;
+        }
         if (value_jump.size() != surface_size()
             || normal_jump.size() != surface_size()
             || !value_at_surface_dof || !normal_at_surface_dof) {
@@ -2732,6 +2897,10 @@ public:
     void bind_direct_coefficient_value_density(
         const app3d::NativeNurbsDensitySpace3D& density)
     {
+        if (resource_mixed_) {
+            direct_coefficient_density_ = &density;
+            return;
+        }
         if (density.patch_count()
             != static_cast<int>(native_surface_.patches.size())) {
             throw std::invalid_argument(
@@ -2856,6 +3025,7 @@ public:
     bool has_direct_coefficient_value_density(
         const app3d::NativeNurbsDensitySpace3D& density) const noexcept
     {
+        if (resource_mixed_) return direct_coefficient_density_ == &density;
         return direct_coefficient_density_ == &density
             && direct_coefficient_spread_rows_.size()
                    == correction_support_.crossing_ops.size();
@@ -2878,6 +3048,17 @@ public:
                 "direct coefficient crossing evaluation received incompatible data");
         }
         HarmonicJetField3D result;
+        if (resource_mixed_) {
+            if (!resource_value_) throw std::logic_error("resource value matrices were not prepared");
+            result.direct_value_c0 = value_c0;
+            result.direct_known_normal_jet = known_normal_jet;
+            result.direct_coefficient_cauchy = true;
+            Eigen::VectorXd rhs = resource_value_->S * value_c0;
+            if (known_normal_jet) rhs += resource_value_->known_spread;
+            else if (!normal_jump.isZero(0.0)) throw std::invalid_argument("resource known Neumann data require analytic callback");
+            bulk_.solve(-rhs, result.potential);
+            return result; // No unused panel-coefficient matrix allocation.
+        }
         // All-event direct covers never read this legacy panel-centred
         // representation.
         // Retain only the known normal part for compatibility with diagnostic
@@ -2923,6 +3104,10 @@ public:
     void bind_direct_coefficient_normal_density(
         const app3d::NativeNurbsDensitySpace3D& density)
     {
+        if (resource_mixed_) {
+            direct_coefficient_normal_density_ = &density;
+            return;
+        }
         if (density.patch_count()
             != static_cast<int>(native_surface_.patches.size())) {
             throw std::invalid_argument(
@@ -3048,6 +3233,7 @@ public:
     bool has_direct_coefficient_normal_density(
         const app3d::NativeNurbsDensitySpace3D& density) const noexcept
     {
+        if (resource_mixed_) return direct_coefficient_normal_density_ == &density;
         return direct_coefficient_normal_density_ == &density
             && direct_coefficient_normal_spread_rows_.size()
                    == correction_support_.crossing_ops.size();
@@ -3071,6 +3257,17 @@ public:
                 "direct normal coefficient crossing evaluation received incompatible data");
         }
         HarmonicJetField3D result;
+        if (resource_mixed_) {
+            if (!resource_normal_) throw std::logic_error("resource normal matrices were not prepared");
+            result.direct_normal_c0 = normal_c0;
+            result.direct_known_value_jet = known_value_jet;
+            result.direct_coefficient_cauchy = true;
+            Eigen::VectorXd rhs = resource_normal_->S * normal_c0;
+            if (known_value_jet) rhs += resource_normal_->known_spread;
+            else if (!value_jump.isZero(0.0)) throw std::invalid_argument("resource known Dirichlet data require analytic callback");
+            bulk_.solve(-rhs, result.potential);
+            return result;
+        }
         // An analytic known-J0 callback is the topology-native affine route:
         // it is evaluated at each exact crossing and never enters the panel
         // sample fit.  The homogeneous topology matvec supplies J0 == 0 and
@@ -3401,6 +3598,29 @@ private:
         bool normal_derivative,
         ExteriorNormalRestrictMode3D mode) const
     {
+        if (resource_mixed_) {
+            if (field.resource_constant_jump) {
+                const auto* plan = mode == ExteriorNormalRestrictMode3D::Q27Cover3AllEventCauchy
+                    ? resource_q27_.get() : resource_q64_.get();
+                if (!plan) throw std::logic_error("resource constant probe must precede temporary-plan release");
+                return app3d::resource_constant_trace_3d(*plan, grid_pair_, field.potential,
+                                                       interior_branch, normal_derivative);
+            }
+            const bool value_density = field.direct_value_c0.size() != 0;
+            const auto* op = value_density ? resource_value_.get() : resource_normal_.get();
+            if (!op || !field.direct_coefficient_cauchy)
+                throw std::logic_error("resource restrict requires prepared direct coefficient data");
+            const auto& c = value_density ? field.direct_value_c0 : field.direct_normal_c0;
+            const auto& branch = interior_branch ? op->restrict.interior : op->restrict.exterior;
+            Eigen::VectorXd result = normal_derivative
+                ? Eigen::VectorXd(op->restrict.Rg_normal * field.potential + branch.Rc_normal * c)
+                : Eigen::VectorXd(op->restrict.Rg_value * field.potential + branch.Rc_value * c);
+            if (value_density ? static_cast<bool>(field.direct_known_normal_jet)
+                              : static_cast<bool>(field.direct_known_value_jet))
+                result += normal_derivative ? branch.known_normal : branch.known_value;
+            if (!result.allFinite()) throw std::runtime_error("resource restrict produced nonfinite trace");
+            return result;
+        }
         const bool q27 =
             mode == ExteriorNormalRestrictMode3D::Q27Cover3AllEventCauchy;
         const bool q64 =
@@ -5833,6 +6053,9 @@ private:
     bool q64_cover4_templates_built_ = false;
     bool native_endpoint_paths_ = false;
     bool closest_point_extension_ = false;
+    bool resource_mixed_ = selected_resource_mixed_support_path();
+    std::unique_ptr<app3d::ResourceGeometryPlan3D> resource_q27_, resource_q64_;
+    std::unique_ptr<app3d::ResourceBvpOperators3D> resource_value_, resource_normal_;
     std::unique_ptr<geometry3d::NurbsSurfaceClosestPointIndex3D>
         closest_point_index_;
     geometry3d::NurbsSurfaceClosestPointOptions3D closest_point_options_;
@@ -9027,6 +9250,48 @@ manufactured_dirichlet_data_callback_3d(
     };
 }
 
+// Analytic third derivatives of the same harmonic manufactured solution.
+// third[k](i,j) = d_i d_j d_k u in world coordinates. No sampled-data fit.
+app3d::ResourceKnownAmbientCallback3D manufactured_resource_data_callback_3d(
+    const app3d::RigidTransform3D& transform)
+{
+    return [transform](const Eigen::Vector3d& point) {
+        app3d::KnownAmbientThird3D data;
+        data.value = app3d::transformed_manufactured_harmonic_value_3d(transform, point);
+        data.gradient = app3d::transformed_manufactured_harmonic_gradient_3d(transform, point);
+        data.hessian = app3d::transformed_manufactured_harmonic_hessian_3d(transform, point);
+        const Eigen::Vector3d source = transform.inverse_point(point);
+        const auto cosine_derivative = [](double x, int order) {
+            switch (order % 4) {
+            case 0: return std::cos(x);
+            case 1: return -std::sin(x);
+            case 2: return -std::cos(x);
+            default: return std::sin(x);
+            }
+        };
+        std::array<Eigen::Matrix3d, 3> source_third;
+        for (int k = 0; k < 3; ++k)
+            for (int i = 0; i < 3; ++i)
+                for (int j = 0; j < 3; ++j) {
+                    std::array<int, 3> count{};
+                    ++count[i]; ++count[j]; ++count[k];
+                    source_third[k](i, j) = std::exp(0.35 * source.x())
+                        * std::pow(0.35, count[0]) * std::pow(0.21, count[1])
+                        * std::pow(0.28, count[2])
+                        * cosine_derivative(0.21 * source.y(), count[1])
+                        * cosine_derivative(0.28 * source.z(), count[2]);
+                }
+        const auto& rotation = transform.rotation();
+        for (int c = 0; c < 3; ++c) {
+            data.third[c].setZero();
+            for (int k = 0; k < 3; ++k)
+                data.third[c] += rotation(c, k)
+                    * (rotation * source_third[k] * rotation.transpose());
+        }
+        return data;
+    };
+}
+
 [[maybe_unused]] app3d::KnownDirichletJetCallback3D
 manufactured_dirichlet_jet_callback_3d(
     const app3d::RigidTransform3D& transform)
@@ -10503,17 +10768,28 @@ ReadinessResult run_readiness_case(GeometryKind kind,
         throw std::runtime_error(
             "harmonic-jet constant probe produced NaN/Inf");
     }
+    if (selected_resource_mixed_support_path()
+        && std::max({result.harmonic_constant_exterior_trace_linf,
+                     result.harmonic_constant_interior_trace_linf,
+                     h * result.harmonic_constant_exterior_normal_linf,
+                     h * result.harmonic_constant_interior_normal_linf,
+                     result.harmonic_constant_bulk_linf}) > 5.0e-10) {
+        throw std::runtime_error("resource constant-jump identity failed");
+    }
     result.density_iteration_mode =
         density_iteration_mode_name(density_mode);
     const auto write_preprocessing_result = [&]() {
-        if (!selected_preprocess_only() && !selected_closest_point_support_path())
+        if (!selected_preprocess_only() && !selected_closest_point_support_path()
+            && !selected_resource_mixed_support_path())
             return;
         std::filesystem::create_directories(output_dir);
         std::ofstream json = open_output_file(output_dir /
             (geometry.name + "_N" + std::to_string(N) + "_preprocess.json"));
         const auto& d = harmonic_pipeline.closest_point_diagnostics();
         const char* completed_scope =
-            density_mode == DensityIterationMode3D::ReducedCoefficients
+            selected_resource_mixed_support_path()
+            ? "grid_domain,resource_plan,constant_probe,density_transfer_binding,spread_restrict_matrices"
+            : density_mode == DensityIterationMode3D::ReducedCoefficients
             ? "grid_domain,trace_templates,constant_probe,density_transfer_binding"
             : "grid_domain,trace_templates,constant_probe";
         const double elapsed = std::chrono::duration<double>(
@@ -10685,6 +10961,20 @@ ReadinessResult run_readiness_case(GeometryKind kind,
                 harmonic_pipeline.bind_direct_coefficient_normal_density(
                     density);
             }
+        }
+        if (selected_resource_mixed_support_path()) {
+            Eigen::VectorXd normal_data(harmonic_pipeline.surface_size());
+            for (int q = 0; q < normal_data.size(); ++q) {
+                const auto& dof = harmonic_pipeline.surface().dofs[static_cast<std::size_t>(q)];
+                normal_data[q] = app3d::transformed_manufactured_harmonic_gradient_3d(
+                    transform, dof.point).dot(dof.normal);
+            }
+            const double neumann_mean = surface_weighted_mean(harmonic_pipeline.surface(), normal_data);
+            harmonic_pipeline.prepare_resource_operators(
+                manufactured_resource_data_callback_3d(transform), neumann_mean,
+                output_dir / (geometry.name + "_N" + std::to_string(N) + "_resource"),
+                solve_selection != SolveSelection3D::DirichletNormalOnly,
+                solve_selection != SolveSelection3D::NeumannOnly);
         }
         write_preprocessing_result();
         if (selected_preprocess_only())
@@ -13025,7 +13315,14 @@ void print_usage(const char* executable)
         << "  Restrict-probe default levels: 32, 64.\n"
         << "  Compiled target defaults: " << compiled_defaults << ".\n"
         << "  KFBIM_3D_SUPPORT_PATH selects legacy (default), native_certified,\n"
-        << "  or closest_point. Closest-point extension requires Q27/Q64;\n"
+        << "  closest_point, or near_surface_anchor_mixed. The mixed route uses\n"
+        << "  analytic P3 spread and P2-corrected shared-side Q27/Q64 3+3 traces;\n"
+        << "  it is a separate, non-certified extension policy. Select its engine\n"
+        << "  with KFBIM_3D_RESOURCE_ENGINE=reference|reuse (default reuse).\n"
+        << "  KFBIM_3D_RESOURCE_CHECK_AB=1 compares both engines' matrices.\n"
+        << "  KFBIM_3D_RESOURCE_DUMP=1 writes sparse matrix diagnostics.\n"
+        << "  The mixed route requires topology-affine analytic coefficient data.\n"
+        << "  Closest-point extension requires Q27/Q64;\n"
         << "  smooth local anchors are cached per grid node, with counted legacy\n"
         << "  handling for ineligible projections. Outputs use closest_point/.\n"
         << "  KFBIM_3D_PREPROCESS_ONLY=1 stops after grid, trace, constant-probe\n"
@@ -13171,7 +13468,12 @@ int main(int argc, char** argv)
             && selected_support_path_mode() != SupportPathMode3D::Legacy) {
             throw std::invalid_argument(
                 "--restrict-probe is a legacy joint-tricubic diagnostic; "
-                "native_certified and closest_point require the Q27/Q64 production routes");
+                "other support policies require the Q27/Q64 coefficient routes");
+        }
+        if (rigid_study && selected_resource_mixed_support_path()) {
+            throw std::invalid_argument(
+                "resource mixed does not use the legacy --rigid-study entry; "
+                "select a geometry and set KFBIM_3D_RIGID_CASE instead");
         }
         if (argc >= 3) {
             levels.clear();
@@ -13244,6 +13546,21 @@ int main(int argc, char** argv)
         const DirichletFeatureCouplingMode3D
             dirichlet_feature_coupling_mode =
                 selected_dirichlet_feature_coupling_mode();
+        if (selected_resource_mixed_support_path()) {
+            const bool neumann_analytic = neumann_edge_jump_jet_mode
+                    == NeumannEdgeJumpJetMode3D::TopologyAffineLocalSvd
+                || neumann_edge_jump_jet_mode
+                    == NeumannEdgeJumpJetMode3D::TopologyAmbientGradientLocalSvd;
+            if (density_iteration_mode != DensityIterationMode3D::ReducedCoefficients
+                || (solve_selection != SolveSelection3D::DirichletNormalOnly && !neumann_analytic)
+                || (solve_selection != SolveSelection3D::NeumannOnly
+                    && dirichlet_jump_space_mode != DirichletJumpSpaceMode3D::AnalyticJ0AffineJ1)
+                || selected_neumann_native_gauss_trace_sampling()) {
+                throw std::invalid_argument(
+                    "resource mixed requires panel-center topology-affine analytic coefficient data; "
+                    "sampled-density and native-Gauss overrides are not implemented");
+            }
+        }
         if (solve_selection == SolveSelection3D::Both
             && trace_restrict_uses_shared_quadratic(
                    neumann_trace_restrict_mode)

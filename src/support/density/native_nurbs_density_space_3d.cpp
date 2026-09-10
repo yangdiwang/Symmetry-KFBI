@@ -1,4 +1,5 @@
 #include "src/support/density/native_nurbs_density_space_3d.hpp"
+#include "src/geometry/nurbs_basis_derivatives.hpp"
 
 #include "src/geometry/nurbs_basis.hpp"
 
@@ -603,9 +604,11 @@ struct NativeNurbsDensitySpace3D::Impl {
             values = spline.evaluate_nonzero_first_derivatives(parameter);
         else if (derivative == 2)
             values = spline.evaluate_nonzero_second_derivatives(parameter);
+        else if (derivative == 3)
+            values = geometry::nonzero_basis_third_derivatives(spline, parameter);
         else
             throw std::invalid_argument(
-                "Only density derivatives of order zero, one and two are supported");
+                "Only density derivatives through third order are supported");
     }
 
     Eigen::RowVectorXd c0_row(int patch,
@@ -615,9 +618,9 @@ struct NativeNurbsDensitySpace3D::Impl {
                               int derivative_v) const
     {
         if (derivative_u < 0 || derivative_v < 0
-            || derivative_u + derivative_v > 2) {
+            || derivative_u + derivative_v > 3) {
             throw std::invalid_argument(
-                "Density parameter derivatives must have total order at most two");
+                "Density parameter derivatives must have total order at most three");
         }
         if (patch < 0 || patch >= static_cast<int>(surface.patches.size()))
             throw std::out_of_range("Density basis patch is out of range");
@@ -648,9 +651,9 @@ struct NativeNurbsDensitySpace3D::Impl {
         int derivative_v = 0) const
     {
         if (derivative_u < 0 || derivative_v < 0
-            || derivative_u + derivative_v > 2) {
+            || derivative_u + derivative_v > 3) {
             throw std::invalid_argument(
-                "Density parameter derivatives must have total order at most two");
+                "Density parameter derivatives must have total order at most three");
         }
         if (patch < 0 || patch >= static_cast<int>(surface.patches.size()))
             throw std::out_of_range("Density stencil patch is out of range");
@@ -743,6 +746,48 @@ struct NativeNurbsDensitySpace3D::Impl {
                         ++stencil.count;
                     }
                     stencil.weights[static_cast<std::size_t>(entry)] += weight;
+                }
+            }
+        }
+        return result;
+    }
+
+    std::array<NativeDensityC0Stencil3D, 10> c0_parameter_cubic_jet_stencils(
+        int patch, double u, double v) const
+    {
+        if (patch < 0 || patch >= static_cast<int>(surface.patches.size()))
+            throw std::out_of_range("Density stencil patch is out of range");
+        const auto iu = spline.active_basis_indices(u);
+        const auto iv = spline.active_basis_indices(v);
+        const std::array<std::vector<double>, 4> bu{{
+            spline.evaluate_nonzero(u), spline.evaluate_nonzero_first_derivatives(u),
+            spline.evaluate_nonzero_second_derivatives(u),
+            geometry::nonzero_basis_third_derivatives(spline, u)}};
+        const std::array<std::vector<double>, 4> bv{{
+            spline.evaluate_nonzero(v), spline.evaluate_nonzero_first_derivatives(v),
+            spline.evaluate_nonzero_second_derivatives(v),
+            geometry::nonzero_basis_third_derivatives(spline, v)}};
+        constexpr std::array<int, 10> du{{0,1,0,2,1,0,3,2,1,0}};
+        constexpr std::array<int, 10> dv{{0,0,1,0,1,2,0,1,2,3}};
+        std::array<NativeDensityC0Stencil3D, 10> result{};
+        const int n = options.coefficients_per_direction;
+        for (std::size_t a = 0; a < iu.size(); ++a) {
+            for (std::size_t b = 0; b < iv.size(); ++b) {
+                const int index = local_to_c0_map[static_cast<std::size_t>(
+                    patch * n * n + iu[a] * n + iv[b])];
+                for (std::size_t row = 0; row < result.size(); ++row) {
+                    const double weight = bu[du[row]][a] * bv[dv[row]][b];
+                    if (weight == 0.0) continue;
+                    auto& stencil = result[row];
+                    int slot = 0;
+                    while (slot < stencil.count && stencil.indices[slot] != index) ++slot;
+                    if (slot == stencil.count) {
+                        if (slot >= static_cast<int>(stencil.indices.size()))
+                            throw std::runtime_error("Native cubic density stencil exceeded 16 entries");
+                        stencil.indices[slot] = index;
+                        ++stencil.count;
+                    }
+                    stencil.weights[slot] += weight;
                 }
             }
         }
@@ -1419,6 +1464,13 @@ NativeNurbsDensitySpace3D::c0_parameter_jet_stencils(
     int patch, double u, double v) const
 {
     return impl_->c0_parameter_jet_stencils(patch, u, v);
+}
+
+std::array<NativeDensityC0Stencil3D, 10>
+NativeNurbsDensitySpace3D::c0_parameter_cubic_jet_stencils(
+    int patch, double u, double v) const
+{
+    return impl_->c0_parameter_cubic_jet_stencils(patch, u, v);
 }
 
 Eigen::RowVectorXd

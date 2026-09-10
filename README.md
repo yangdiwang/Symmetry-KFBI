@@ -1,5 +1,28 @@
 # Symmetry-KFBI
 
+## 3D Trace93 外迹点优先入口（2026-09-09）
+
+最新 Python 93 算法包的 C++ 对照入口是 `kfbi_trace93_study_3d`，统一算例、
+包内参考记录及运行脚本在 [tests/cases/trace_first_3d](tests/cases/trace_first_3d/README.md)。
+该入口使用精确双三次 NURBS 几何、独立 analysis 参数密度、Polar-Star Neumann
+约束和 Dirichlet 仿射分解；P3 Spread / P2 Restrict 复用外迹中心，
+Neumann 为 Q27-cover3，Dirichlet 为 Q64-cover4。
+
+新增对齐对象是 L 柱（14 片）、U 柱（22 片）和半径 0.54 的实心圆柱（14 片），
+不是旧空心圆柱。旧 torus 的 `kfbi_trace_first_study_3d` 及其他历史入口保留，
+没有将其结果混入新包基准。算法差异、仍保留的认证求交及 Dirichlet 固定约束缺陷见
+[算法对齐说明](docs/Trace93_Algorithm_Alignment_20260909.md)；实际完成的验证范围见
+[数值验证报告](docs/Trace93_Numerical_Report_20260909.md)。
+
+```powershell
+cmake --build build-3d --target kfbi_trace93_study_3d --parallel 2
+./tests/cases/trace_first_3d/run_trace93.ps1 -Geometries l,u,cylinder -Levels 32,64 -SkipBuild
+```
+
+完整 native support-path 认证仍可能耗时很长；脚本每个几何/网格进程默认限时
+20 分钟，可通过 `-TimeoutMinutes` 调整。结果保存在统一算例目录下的独立
+`results/` 子目录；包内档案、单测通过和本地完整 PDE 求解分别记录，不互相替代。
+
 ## 2D NURBS same-parameter route
 
 The L-shape exterior-trace app now uses the NURBS Same-Parameter Cauchy Jet
@@ -9,7 +32,7 @@ NURBS parameter at every crossing. The formulation, tests, convergence table,
 and rigid-transform comparison are documented in
 [`docs/nsp_cj_2d.md`](docs/nsp_cj_2d.md).
 
-## 3D native-NURBS route
+## 历史 3D native-NURBS route
 
 The 3D app constructs the torus, hollow cylinder, and L prism from native
 NURBS patches. Interface DOFs are uniform native-parameter cell midpoints;

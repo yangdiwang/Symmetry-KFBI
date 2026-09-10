@@ -1,4 +1,5 @@
 #include "nurbs_cartesian_domain_3d.hpp"
+#include "nurbs_grid_line_cache_3d.hpp"
 
 #include "nurbs_bezier_extraction_3d.hpp"
 
@@ -1237,6 +1238,13 @@ struct NurbsCartesianDomain3D::Impl {
             return result;
         };
 
+        struct CachedGridLine {
+            bool reusable = false;
+            std::vector<NurbsSurfaceCrossing3D> roots;
+        };
+        // Store only roots, not N heavy edge records per line. This cache is
+        // geometry-only and lives for this preprocessing pass.
+        std::unordered_map<std::uint64_t, CachedGridLine> whole_lines;
         std::size_t incidence_cursor = 0;
         for (const std::uint64_t key : candidate_keys) {
             std::vector<std::size_t> candidate_ids;
@@ -1281,10 +1289,69 @@ struct NurbsCartesianDomain3D::Impl {
                 axis, ijk[0], ijk[1], ijk[2], start, end};
             const PreprocessClock3D::time_point intersection_begin =
                 PreprocessClock3D::now();
-            NurbsCartesianEdgeIntersections3D edge_result =
-                use_mapped_candidates
-                ? intersector.intersect_cartesian_edge(query, candidate_ids)
-                : intersector.intersect_cartesian_edge(query);
+            NurbsCartesianEdgeIntersections3D edge_result;
+            bool used_whole_line = false;
+            if (options.use_whole_grid_lines) {
+                auto line_ijk = ijk;
+                line_ijk[axis] = 0;
+                const int line_start = grid.index(line_ijk[0], line_ijk[1], line_ijk[2]);
+                const std::uint64_t line_key =
+                    (static_cast<std::uint64_t>(axis) << 62)
+                    | static_cast<std::uint64_t>(line_start);
+                auto inserted = whole_lines.try_emplace(line_key);
+                auto& line = inserted.first->second;
+                if (inserted.second) {
+                    ++diagnostics.whole_line_query_count;
+                    const auto line_begin = PreprocessClock3D::now();
+                    auto line_end_ijk = line_ijk;
+                    line_end_ijk[axis] = cells[axis];
+                    const NurbsCartesianEdgeQuery3D line_query{
+                        axis, line_ijk[0], line_ijk[1], line_ijk[2],
+                        as_vector(grid.coord(line_start)),
+                        as_vector(grid.coord(line_end_ijk[0], line_end_ijk[1], line_end_ijk[2]))};
+                    try {
+                        auto full = intersector.intersect_cartesian_edge(line_query);
+                        accumulate_intersection_diagnostics(diagnostics.intersections, full.diagnostics);
+                        line.reusable = certified_grid_line_can_partition_3d(grid, axis, full, tolerance);
+                        if (line.reusable) {
+                            // Preserve the stricter short-edge reliability
+                            // policy in downstream event/owner metadata too.
+                            // The gate proved every measured normal exceeds
+                            // this conservative bound before roots are reused.
+                            const double short_edge_tau = std::max(
+                                32.0 * std::sqrt(std::numeric_limits<double>::epsilon()),
+                                std::sqrt(8.0 * tolerance / spacing[axis]));
+                            for (auto& root : full.crossings) {
+                                root.reliable_transversality_tolerance = std::max(
+                                    root.reliable_transversality_tolerance, short_edge_tau);
+                                for (auto& owner : root.owners)
+                                    owner.reliable_transversality_tolerance = std::max(
+                                        owner.reliable_transversality_tolerance, short_edge_tau);
+                            }
+                            line.roots = std::move(full.crossings);
+                        }
+                    } catch (const std::runtime_error&) {
+                        // Unresolved long paths are not silently accepted. Run
+                        // the unchanged per-edge certified/retry path below.
+                        line.reusable = false;
+                    }
+                    diagnostics.whole_line_intersection_seconds += elapsed_seconds(
+                        line_begin, PreprocessClock3D::now());
+                    if (line.reusable) ++diagnostics.whole_line_accepted_count;
+                    else ++diagnostics.whole_line_fallback_count;
+                }
+                if (line.reusable) {
+                    edge_result = extract_grid_line_edge_3d(query, line.roots);
+                    ++diagnostics.whole_line_reused_edge_count;
+                    used_whole_line = true;
+                }
+            }
+            if (!used_whole_line) {
+                ++diagnostics.direct_edge_query_count;
+                edge_result = use_mapped_candidates
+                    ? intersector.intersect_cartesian_edge(query, candidate_ids)
+                    : intersector.intersect_cartesian_edge(query);
+            }
             diagnostics.edge_intersection_seconds += elapsed_seconds(
                 intersection_begin, PreprocessClock3D::now());
             PreprocessClock3D::time_point materialization_begin =
