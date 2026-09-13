@@ -266,6 +266,8 @@ Eigen::Vector3d exact_gradient(const Eigen::Vector3d& p)
 
 struct ShapeModel3D {
     CapAtlasDensityOptions3D options;
+    kfbim::geometry3d::AnalyticCapGeometry3D geometry{
+        options.geometry_options()};
 
     Eigen::Vector3d inverse_point(const Eigen::Vector3d& p) const
     {
@@ -285,70 +287,21 @@ struct ShapeModel3D {
         return options.rigid_rotation * exact_gradient(inverse_point(p));
     }
 
-    double flower_radius(const Eigen::Vector3d& d) const
-    {
-        const double x = d.x();
-        const double y = d.y();
-        const double z = d.z();
-        const double h4 = x * x * x * x - 6.0 * x * x * y * y
-                          + y * y * y * y;
-        return 1.0 + options.flower_epsilon * h4
-               + options.flower_eta * (3.0 * z * z - 1.0);
-    }
-
-    Eigen::Vector3d flower_radius_gradient(const Eigen::Vector3d& d) const
-    {
-        const double x = d.x();
-        const double y = d.y();
-        const double z = d.z();
-        return {options.flower_epsilon
-                    * (4.0 * x * x * x - 12.0 * x * y * y),
-                options.flower_epsilon
-                    * (-12.0 * x * x * y + 4.0 * y * y * y),
-                6.0 * options.flower_eta * z};
-    }
-
     double implicit(const Eigen::Vector3d& p) const
     {
-        const Eigen::Vector3d local = inverse_point(p);
-        if (options.shape == CapShape3D::Ellipsoid) {
-            return local.cwiseQuotient(options.ellipsoid_axes).squaredNorm()
-                   - 1.0;
-        }
-        const double r = local.norm();
-        if (r <= 1.0e-14)
-            return -1.0;
-        return r - flower_radius(local / r);
+        return geometry.level_set(p);
     }
 
     Eigen::Vector3d gradient(const Eigen::Vector3d& p) const
     {
-        const Eigen::Vector3d local = inverse_point(p);
-        Eigen::Vector3d local_gradient;
-        if (options.shape == CapShape3D::Ellipsoid) {
-            local_gradient = 2.0
-                             * local.cwiseQuotient(
-                                 options.ellipsoid_axes.cwiseProduct(
-                                     options.ellipsoid_axes));
-        } else {
-            const double r = local.norm();
-            if (r <= 1.0e-14)
-                local_gradient = Eigen::Vector3d::UnitX();
-            else {
-                const Eigen::Vector3d d = local / r;
-                const Eigen::Vector3d gd = flower_radius_gradient(d);
-                const Eigen::Vector3d tangential = gd - gd.dot(d) * d;
-                local_gradient = d - tangential / r;
-            }
-        }
-        return options.rigid_rotation * local_gradient;
+        return geometry.level_set_gradient(p);
     }
 
-    bool inside(const Eigen::Vector3d& p) const { return implicit(p) < 0.0; }
+    bool inside(const Eigen::Vector3d& p) const { return geometry.inside(p); }
 
     Eigen::Vector3d normal(const Eigen::Vector3d& p) const
     {
-        return gradient(p).normalized();
+        return geometry.outward_normal(p);
     }
 
     TangentGraphHessian3D graph_hessian(

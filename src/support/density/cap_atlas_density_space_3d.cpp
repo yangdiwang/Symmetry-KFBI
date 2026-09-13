@@ -16,9 +16,6 @@
 namespace kfbim::app3d {
 namespace {
 
-constexpr double pi = 3.141592653589793238462643383279502884;
-constexpr double rigid_transform_tolerance = 1.0e-12;
-
 struct UnionFind {
     explicit UnionFind(int count)
         : parent(static_cast<std::size_t>(count)),
@@ -244,54 +241,12 @@ private:
     std::vector<double> knots_;
 };
 
-struct ReferenceEvaluation {
-    Eigen::Vector3d point = Eigen::Vector3d::Zero();
-    Eigen::Vector3d du = Eigen::Vector3d::Zero();
-    Eigen::Vector3d dv = Eigen::Vector3d::Zero();
-};
-
-Eigen::Vector2d square_side_point(CapSide3D side,
-                                  double v,
-                                  double half_width)
-{
-    const double s = 2.0 * v - 1.0;
-    switch (side) {
-    case CapSide3D::North:
-        return {half_width * s, half_width};
-    case CapSide3D::East:
-        return {half_width, -half_width * s};
-    case CapSide3D::South:
-        return {-half_width * s, -half_width};
-    case CapSide3D::West:
-        return {-half_width, half_width * s};
-    case CapSide3D::None:
-        break;
-    }
-    throw std::invalid_argument("A square side is required");
-}
-
-Eigen::Vector2d square_side_derivative(CapSide3D side, double half_width)
-{
-    switch (side) {
-    case CapSide3D::North:
-        return {2.0 * half_width, 0.0};
-    case CapSide3D::East:
-        return {0.0, -2.0 * half_width};
-    case CapSide3D::South:
-        return {-2.0 * half_width, 0.0};
-    case CapSide3D::West:
-        return {0.0, 2.0 * half_width};
-    case CapSide3D::None:
-        break;
-    }
-    throw std::invalid_argument("A square side is required");
-}
-
 } // namespace
 
 struct CapAtlasDensitySpace3D::Impl {
     explicit Impl(CapAtlasDensityOptions3D supplied)
         : options(std::move(supplied)),
+          geometry_model(options.geometry_options()),
           spline(options.coefficients_per_direction)
     {
         validate_options();
@@ -319,73 +274,9 @@ struct CapAtlasDensitySpace3D::Impl {
             || !(options.polar_radius < 1.0))
             throw std::invalid_argument(
                 "polar_radius must enclose the square corners and be less than one");
-        if ((options.ellipsoid_axes.array() <= 0.0).any()
-            || !options.ellipsoid_axes.allFinite())
-            throw std::invalid_argument("Ellipsoid axes must be finite and positive");
-        if (!std::isfinite(options.flower_epsilon)
-            || !std::isfinite(options.flower_eta)
-            || 1.0 - std::abs(options.flower_epsilon)
-                       - 2.0 * std::abs(options.flower_eta)
-                   <= 0.0)
-            throw std::invalid_argument(
-                "Flower parameters do not guarantee a positive radial graph");
-        if (!options.rigid_rotation.allFinite()
-            || !options.rigid_center.allFinite()
-            || !options.rigid_translation.allFinite()) {
-            throw std::invalid_argument(
-                "Rigid rotation, center, and translation must be finite");
-        }
-        const Eigen::Matrix3d orthogonality_error =
-            options.rigid_rotation.transpose() * options.rigid_rotation
-            - Eigen::Matrix3d::Identity();
-        if (orthogonality_error.cwiseAbs().maxCoeff()
-            > rigid_transform_tolerance) {
-            throw std::invalid_argument("Rigid rotation must be orthogonal");
-        }
-        if (std::abs(options.rigid_rotation.determinant() - 1.0)
-            > rigid_transform_tolerance) {
-            throw std::invalid_argument(
-                "Rigid rotation must have determinant one");
-        }
         if (!(options.rank_tolerance > 0.0)
             || !(options.rank_tolerance < 1.0))
             throw std::invalid_argument("rank_tolerance must lie in (0,1)");
-    }
-
-    bool has_nontrivial_rigid_map() const
-    {
-        // Keep the historical default path free of even identity matrix
-        // products so its floating-point results remain bit-for-bit stable.
-        return !options.rigid_rotation.isIdentity(0.0)
-            || !options.rigid_translation.isZero(0.0);
-    }
-
-    Eigen::Vector3d forward_rigid_point(
-        const Eigen::Vector3d& reference) const
-    {
-        if (!has_nontrivial_rigid_map())
-            return reference;
-        return options.rigid_center
-             + options.rigid_rotation * (reference - options.rigid_center)
-             + options.rigid_translation;
-    }
-
-    Eigen::Vector3d inverse_rigid_point(const Eigen::Vector3d& world) const
-    {
-        if (!has_nontrivial_rigid_map())
-            return world;
-        return options.rigid_center
-             + options.rigid_rotation.transpose()
-                   * (world - options.rigid_center
-                      - options.rigid_translation);
-    }
-
-    Eigen::Vector3d forward_rigid_vector(
-        const Eigen::Vector3d& reference) const
-    {
-        if (!has_nontrivial_rigid_map())
-            return reference;
-        return options.rigid_rotation * reference;
     }
 
     void build_patches()
@@ -428,207 +319,9 @@ struct CapAtlasDensitySpace3D::Impl {
                    -1);
     }
 
-    ReferenceEvaluation reference_geometry(int patch_index,
-                                           double u,
-                                           double v) const
-    {
-        if (patch_index < 0 || patch_index >= static_cast<int>(patches.size()))
-            throw std::out_of_range("Patch index is out of range");
-        if (!std::isfinite(u) || !std::isfinite(v) || u < -1.0e-12
-            || u > 1.0 + 1.0e-12 || v < -1.0e-12 || v > 1.0 + 1.0e-12)
-            throw std::out_of_range("Patch coordinates lie outside [0,1]^2");
-        u = std::clamp(u, 0.0, 1.0);
-        v = std::clamp(v, 0.0, 1.0);
-
-        const CapPatchDescriptor3D& patch =
-            patches[static_cast<std::size_t>(patch_index)];
-        ReferenceEvaluation result;
-        if (patch.kind == CapPatchKind3D::PolarCentral) {
-            const double x = options.square_half_width * (2.0 * u - 1.0);
-            const double y = options.square_half_width * (2.0 * v - 1.0);
-            const double z_abs = std::sqrt(std::max(0.0, 1.0 - x * x - y * y));
-            if (!(z_abs > 0.0))
-                throw std::runtime_error("Degenerate central cap Jacobian");
-            const double sign = static_cast<double>(patch.hemisphere);
-            const double xu = 2.0 * options.square_half_width;
-            const double yv = 2.0 * options.square_half_width;
-            result.point = {x, y, sign * z_abs};
-            result.du = {xu, 0.0, -sign * x * xu / z_abs};
-            result.dv = {0.0, yv, -sign * y * yv / z_abs};
-            return result;
-        }
-
-        const Eigen::Vector2d q0 =
-            square_side_point(patch.side, v, options.square_half_width);
-        const Eigen::Vector2d dq0 =
-            square_side_derivative(patch.side, options.square_half_width);
-        const double r0 = q0.norm();
-        const Eigen::Vector2d direction = q0 / r0;
-        const Eigen::Vector2d direction_v =
-            dq0 / r0 - q0 * (q0.dot(dq0) / (r0 * r0 * r0));
-
-        if (patch.kind == CapPatchKind3D::PolarRing) {
-            const Eigen::Vector2d q1 = options.polar_radius * direction;
-            const Eigen::Vector2d q = (1.0 - u) * q0 + u * q1;
-            const Eigen::Vector2d qu = q1 - q0;
-            const Eigen::Vector2d qv =
-                (1.0 - u) * dq0 + u * options.polar_radius * direction_v;
-            const double z_abs =
-                std::sqrt(std::max(0.0, 1.0 - q.squaredNorm()));
-            if (!(z_abs > 0.0))
-                throw std::runtime_error("Degenerate polar ring Jacobian");
-            const double sign = static_cast<double>(patch.hemisphere);
-            result.point = {q.x(), q.y(), sign * z_abs};
-            result.du =
-                {qu.x(), qu.y(), -sign * q.dot(qu) / z_abs};
-            result.dv =
-                {qv.x(), qv.y(), -sign * q.dot(qv) / z_abs};
-            return result;
-        }
-
-        const double theta_c = std::asin(options.polar_radius);
-        const double theta_span = pi - 2.0 * theta_c;
-        const double theta = theta_c + u * theta_span;
-        const double st = std::sin(theta);
-        const double ct = std::cos(theta);
-        result.point = {st * direction.x(), st * direction.y(), ct};
-        result.du = {theta_span * ct * direction.x(),
-                     theta_span * ct * direction.y(),
-                     -theta_span * st};
-        result.dv = {st * direction_v.x(), st * direction_v.y(), 0.0};
-        return result;
-    }
-
-    double flower_radius(const Eigen::Vector3d& direction) const
-    {
-        const double x = direction.x();
-        const double y = direction.y();
-        const double z = direction.z();
-        const double h4 = x * x * x * x - 6.0 * x * x * y * y
-                          + y * y * y * y;
-        return 1.0 + options.flower_epsilon * h4
-               + options.flower_eta * (3.0 * z * z - 1.0);
-    }
-
-    Eigen::Vector3d flower_radius_gradient(
-        const Eigen::Vector3d& direction) const
-    {
-        const double x = direction.x();
-        const double y = direction.y();
-        const double z = direction.z();
-        return {options.flower_epsilon
-                    * (4.0 * x * x * x - 12.0 * x * y * y),
-                options.flower_epsilon
-                    * (-12.0 * x * x * y + 4.0 * y * y * y),
-                6.0 * options.flower_eta * z};
-    }
-
-    double level_set(const Eigen::Vector3d& physical) const
-    {
-        if (!physical.allFinite())
-            throw std::invalid_argument("Level-set point must be finite");
-        const Eigen::Vector3d reference = inverse_rigid_point(physical);
-        if (options.shape == CapShape3D::Ellipsoid)
-            return reference.cwiseQuotient(options.ellipsoid_axes)
-                       .squaredNorm()
-                   - 1.0;
-        const double radius = reference.norm();
-        if (!(radius > 1.0e-14))
-            return -1.0;
-        const Eigen::Vector3d direction = reference / radius;
-        return radius - flower_radius(direction);
-    }
-
-    Eigen::Vector3d level_set_gradient(const Eigen::Vector3d& physical) const
-    {
-        if (!physical.allFinite())
-            throw std::invalid_argument("Level-set point must be finite");
-        const Eigen::Vector3d reference = inverse_rigid_point(physical);
-        Eigen::Vector3d reference_gradient;
-        if (options.shape == CapShape3D::Ellipsoid) {
-            reference_gradient =
-                2.0
-                * reference.cwiseQuotient(
-                    options.ellipsoid_axes.cwiseProduct(
-                        options.ellipsoid_axes));
-        } else {
-            const double radius = reference.norm();
-            if (!(radius > 1.0e-14)) {
-                reference_gradient = Eigen::Vector3d::UnitX();
-            } else {
-                const Eigen::Vector3d direction = reference / radius;
-                const Eigen::Vector3d grad_r =
-                    flower_radius_gradient(direction);
-                const Eigen::Vector3d tangential =
-                    grad_r - grad_r.dot(direction) * direction;
-                reference_gradient = direction - tangential / radius;
-            }
-        }
-        return forward_rigid_vector(reference_gradient);
-    }
-
-    Eigen::Vector3d surface_point_from_direction(
-        const Eigen::Vector3d& supplied_direction) const
-    {
-        const double norm = supplied_direction.norm();
-        if (!(norm > 1.0e-14) || !std::isfinite(norm)
-            || !supplied_direction.allFinite())
-            throw std::invalid_argument(
-                "A nonzero finite reference direction is required");
-        const Eigen::Vector3d direction = supplied_direction / norm;
-        Eigen::Vector3d reference;
-        if (options.shape == CapShape3D::Ellipsoid)
-            reference = options.ellipsoid_axes.cwiseProduct(direction);
-        else
-            reference = flower_radius(direction) * direction;
-        return forward_rigid_point(reference);
-    }
-
     CapSurfaceEvaluation3D geometry(int patch_index, double u, double v) const
     {
-        const ReferenceEvaluation ref = reference_geometry(patch_index, u, v);
-        CapSurfaceEvaluation3D result;
-        if (options.shape == CapShape3D::Ellipsoid) {
-            result.point = options.ellipsoid_axes.cwiseProduct(ref.point);
-            result.tangents.col(0) =
-                options.ellipsoid_axes.cwiseProduct(ref.du);
-            result.tangents.col(1) =
-                options.ellipsoid_axes.cwiseProduct(ref.dv);
-            Eigen::Vector3d gradient =
-                2.0 * result.point.cwiseQuotient(
-                          options.ellipsoid_axes.cwiseProduct(
-                              options.ellipsoid_axes));
-            result.normal = gradient.normalized();
-        } else {
-            const double radius = flower_radius(ref.point);
-            const Eigen::Vector3d grad_r = flower_radius_gradient(ref.point);
-            result.point = radius * ref.point;
-            result.tangents.col(0) =
-                radius * ref.du + grad_r.dot(ref.du) * ref.point;
-            result.tangents.col(1) =
-                radius * ref.dv + grad_r.dot(ref.dv) * ref.point;
-            const Eigen::Vector3d tangential_gradient =
-                grad_r - grad_r.dot(ref.point) * ref.point;
-            result.normal =
-                (ref.point - tangential_gradient / radius).normalized();
-        }
-        result.area_element =
-            result.tangents.col(0).cross(result.tangents.col(1)).norm();
-        if (!(result.area_element > 0.0) || !std::isfinite(result.area_element)
-            || !result.point.allFinite() || !result.normal.allFinite())
-            throw std::runtime_error("Invalid cap-atlas surface geometry");
-        if (has_nontrivial_rigid_map()) {
-            result.point = forward_rigid_point(result.point);
-            result.tangents.col(0) =
-                forward_rigid_vector(result.tangents.col(0));
-            result.tangents.col(1) =
-                forward_rigid_vector(result.tangents.col(1));
-            result.normal = forward_rigid_vector(result.normal);
-            // A proper orthogonal map preserves the already-computed area
-            // element exactly at the mathematical level.  Do not recompute
-            // it from rotated tangents and introduce avoidable roundoff.
-        }
-        return result;
+        return geometry_model.evaluate(patch_index, u, v);
     }
 
     void build_seams()
@@ -1063,87 +756,7 @@ struct CapAtlasDensitySpace3D::Impl {
 
     CapPatchLocation3D locate(const Eigen::Vector3d& physical) const
     {
-        CapPatchLocation3D result;
-        if (!physical.allFinite())
-            return result;
-        const Eigen::Vector3d reference = inverse_rigid_point(physical);
-        Eigen::Vector3d direction =
-            options.shape == CapShape3D::Ellipsoid
-                ? reference.cwiseQuotient(options.ellipsoid_axes)
-                : reference;
-        const double norm = direction.norm();
-        if (!(norm > 1.0e-14))
-            return result;
-        direction /= norm;
-
-        const double x = direction.x();
-        const double y = direction.y();
-        const double theta = std::acos(std::clamp(direction.z(), -1.0, 1.0));
-        const double theta_c = std::asin(options.polar_radius);
-        const double rho = std::hypot(x, y);
-        const double maximum = std::max(std::abs(x), std::abs(y));
-
-        CapSide3D side;
-        double side_parameter = 0.0;
-        if (std::abs(y) >= std::abs(x)) {
-            if (y >= 0.0) {
-                side = CapSide3D::North;
-                side_parameter = 0.5 * (x / std::max(y, 1.0e-15) + 1.0);
-            } else {
-                side = CapSide3D::South;
-                side_parameter = 0.5 * (1.0 - x / std::max(-y, 1.0e-15));
-            }
-        } else {
-            if (x >= 0.0) {
-                side = CapSide3D::East;
-                side_parameter = 0.5 * (1.0 - y / std::max(x, 1.0e-15));
-            } else {
-                side = CapSide3D::West;
-                side_parameter = 0.5 * (y / std::max(-x, 1.0e-15) + 1.0);
-            }
-        }
-        side_parameter = std::clamp(side_parameter, 0.0, 1.0);
-
-        const bool north = theta < theta_c - 1.0e-11;
-        const bool south = theta > pi - theta_c + 1.0e-11;
-        auto find_patch = [&](CapPatchKind3D kind,
-                              CapSide3D wanted_side,
-                              int hemisphere) {
-            for (const CapPatchDescriptor3D& patch : patches)
-                if (patch.kind == kind && patch.side == wanted_side
-                    && patch.hemisphere == hemisphere)
-                    return patch.index;
-            return -1;
-        };
-
-        if (north || south) {
-            const int hemisphere = north ? +1 : -1;
-            if (maximum <= options.square_half_width + 1.0e-11) {
-                result.patch = find_patch(CapPatchKind3D::PolarCentral,
-                                          CapSide3D::None,
-                                          hemisphere);
-                result.u = 0.5 * (x / options.square_half_width + 1.0);
-                result.v = 0.5 * (y / options.square_half_width + 1.0);
-            } else {
-                result.patch = find_patch(
-                    CapPatchKind3D::PolarRing, side, hemisphere);
-                const Eigen::Vector2d q0 = square_side_point(
-                    side, side_parameter, options.square_half_width);
-                result.u = (rho - q0.norm())
-                           / (options.polar_radius - q0.norm());
-                result.v = side_parameter;
-            }
-        } else {
-            result.patch =
-                find_patch(CapPatchKind3D::MeridianBelt, side, 0);
-            result.u =
-                (theta - theta_c) / (pi - 2.0 * theta_c);
-            result.v = side_parameter;
-        }
-        result.u = std::clamp(result.u, 0.0, 1.0);
-        result.v = std::clamp(result.v, 0.0, 1.0);
-        result.valid = result.patch >= 0;
-        return result;
+        return geometry_model.locate(physical);
     }
 
     Eigen::Vector3d edge_tangent(int patch,
@@ -1157,6 +770,7 @@ struct CapAtlasDensitySpace3D::Impl {
     }
 
     CapAtlasDensityOptions3D options;
+    geometry3d::AnalyticCapGeometry3D geometry_model;
     CubicOpenUniformBasis spline;
     std::vector<CapPatchDescriptor3D> patches;
     std::vector<CapSeamDescriptor3D> seams;
@@ -1255,34 +869,30 @@ CapSurfaceEvaluation3D CapAtlasDensitySpace3D::geometry(int patch,
 
 double CapAtlasDensitySpace3D::level_set(const Eigen::Vector3d& point) const
 {
-    return impl_->level_set(point);
+    return impl_->geometry_model.level_set(point);
 }
 
 Eigen::Vector3d CapAtlasDensitySpace3D::level_set_gradient(
     const Eigen::Vector3d& point) const
 {
-    return impl_->level_set_gradient(point);
+    return impl_->geometry_model.level_set_gradient(point);
 }
 
 Eigen::Vector3d CapAtlasDensitySpace3D::outward_normal(
     const Eigen::Vector3d& point) const
 {
-    const Eigen::Vector3d gradient = impl_->level_set_gradient(point);
-    const double norm = gradient.norm();
-    if (!(norm > 0.0) || !std::isfinite(norm))
-        throw std::runtime_error("Level-set gradient has no normal direction");
-    return gradient / norm;
+    return impl_->geometry_model.outward_normal(point);
 }
 
 bool CapAtlasDensitySpace3D::inside(const Eigen::Vector3d& point) const
 {
-    return impl_->level_set(point) < 0.0;
+    return impl_->geometry_model.inside(point);
 }
 
 Eigen::Vector3d CapAtlasDensitySpace3D::surface_point_from_direction(
     const Eigen::Vector3d& direction) const
 {
-    return impl_->surface_point_from_direction(direction);
+    return impl_->geometry_model.surface_point_from_direction(direction);
 }
 
 CapPatchLocation3D CapAtlasDensitySpace3D::locate(

@@ -8,13 +8,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 get_filename_component(KFBI_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 find_package(Eigen3 3.4 REQUIRED NO_MODULE)
+include("${KFBI_ROOT}/src/geometry/models3d/sources.cmake")
 add_library(industrial_nurbs_geometry STATIC
     "${KFBI_ROOT}/src/geometry/nurbs_surface_model_3d.cpp"
-    "${KFBI_ROOT}/src/geometry/industrial_nurbs_models_3d.cpp"
-    "${KFBI_ROOT}/src/geometry/industrial_nurbs_sleeve_3d.cpp"
-    "${KFBI_ROOT}/src/geometry/industrial_nurbs_bracket_3d.cpp"
-    "${KFBI_ROOT}/src/geometry/industrial_nurbs_flange_3d.cpp"
-    "${KFBI_ROOT}/src/geometry/industrial_nurbs_impeller_3d.cpp")
+    ${KFBIM_INDUSTRIAL_MODEL_SOURCES_3D})
 target_include_directories(industrial_nurbs_geometry PUBLIC "${KFBI_ROOT}")
 target_link_libraries(industrial_nurbs_geometry PUBLIC Eigen3::Eigen)
 if(MSVC)

@@ -9,6 +9,16 @@ if(KFBIM_BUILD_3D)
     add_executable(kfbi_trace93_study_3d
         ${PROJECT_SOURCE_DIR}/apps/laplace/3d/trace93_study_3d.cpp)
     target_link_libraries(kfbi_trace93_study_3d PRIVATE kfbim_3d_app_geometry kfbim_core)
+    execute_process(COMMAND git rev-parse HEAD WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+        OUTPUT_VARIABLE KFBIM_TRACE93_BUILD_REVISION OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(KFBIM_TRACE93_BUILD_REVISION)
+        target_compile_definitions(kfbi_trace93_study_3d PRIVATE
+            KFBIM_BUILD_REVISION="${KFBIM_TRACE93_BUILD_REVISION}")
+    endif()
+    if(KFBIM_BUILD_EXPERIMENTAL_3D)
+        target_link_libraries(kfbi_trace93_study_3d PRIVATE kfbim_3d_shared_correction)
+        target_compile_definitions(kfbi_trace93_study_3d PRIVATE KFBIM_HAS_SHARED_FIELD_3D=1)
+    endif()
     target_include_directories(kfbi_trace93_study_3d PRIVATE ${PROJECT_SOURCE_DIR})
     target_compile_features(kfbi_trace93_study_3d PRIVATE cxx_std_17)
     set_target_properties(kfbi_trace93_study_3d PROPERTIES

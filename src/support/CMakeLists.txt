@@ -7,6 +7,10 @@ add_library(kfbim_2d_benchmark_geometry STATIC
 
 if(KFBIM_BUILD_3D)
     add_library(kfbim_3d_app_geometry STATIC
+        ${PROJECT_SOURCE_DIR}/src/support/trace/kfbi_correction_backend_3d.cpp
+        ${PROJECT_SOURCE_DIR}/src/support/trace/affine_trace_coordinates_3d.cpp
+        ${PROJECT_SOURCE_DIR}/src/support/trace/jump_identity_closure_3d.cpp
+        ${PROJECT_SOURCE_DIR}/src/support/solver/affine_kfbi_solve_3d.cpp
         ${PROJECT_SOURCE_DIR}/src/support/geometry/trace93_case_3d.cpp
         ${PROJECT_SOURCE_DIR}/src/support/density/trace93_density_layout_3d.cpp
         ${PROJECT_SOURCE_DIR}/src/support/trace/trace93_resource_3d.cpp
@@ -32,7 +36,6 @@ if(KFBIM_BUILD_3D)
         ${PROJECT_SOURCE_DIR}/src/support/density/native_density_resolution_3d.cpp
         ${PROJECT_SOURCE_DIR}/src/support/density/native_nurbs_density_space_3d.cpp
         ${PROJECT_SOURCE_DIR}/src/support/geometry/native_nurbs_surface_3d.cpp
-        ${PROJECT_SOURCE_DIR}/src/support/geometry/native_nurbs_surface_transform_3d.cpp
         ${PROJECT_SOURCE_DIR}/src/support/trace/native_endpoint_path_adapter_3d.cpp
         ${PROJECT_SOURCE_DIR}/src/support/trace/reduced_trace_projection_3d.cpp
         ${PROJECT_SOURCE_DIR}/src/support/diagnostics/dirichlet_rigid_transform_study_3d.cpp
@@ -49,6 +52,17 @@ endif()
 if(KFBIM_BUILD_3D)
     if(KFBIM_BUILD_EXPERIMENTAL_3D)
         find_package(Threads REQUIRED)
+
+        # Internal experimental backend; the common solver never depends on it.
+        add_library(kfbim_3d_shared_correction STATIC
+            ${PROJECT_SOURCE_DIR}/src/support/correction/shared_field_geometry_3d.cpp
+            ${PROJECT_SOURCE_DIR}/src/support/correction/shared_field_space_3d.cpp
+            ${PROJECT_SOURCE_DIR}/src/support/correction/shared_field_extension_3d.cpp
+            ${PROJECT_SOURCE_DIR}/src/support/correction/shared_field_backend_3d.cpp
+            ${PROJECT_SOURCE_DIR}/src/support/trace/shared_field_transfer_3d.cpp)
+        target_link_libraries(kfbim_3d_shared_correction PUBLIC kfbim_3d_app_geometry)
+        target_include_directories(kfbim_3d_shared_correction PRIVATE ${PROJECT_SOURCE_DIR})
+        target_compile_features(kfbim_3d_shared_correction PUBLIC cxx_std_17)
 
         add_library(kfbim_3d_experimental_algorithms STATIC
             ${PROJECT_SOURCE_DIR}/src/support/trace/harmonic_trace_correction_3d.cpp

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "src/geometry/models3d/analytic/cap_surface_geometry_3d.hpp"
+
 #include <Eigen/Core>
 
 #include <array>
@@ -12,10 +14,7 @@ namespace kfbim::app3d {
 // The analysis atlas is built on a sphere and is then mapped either to an
 // ellipsoid or to a smooth radial flower.  In both cases the implicit normal
 // is outward and the parameter domains of all patches are [0,1]^2.
-enum class CapShape3D {
-    Ellipsoid,
-    Flower
-};
+using CapShape3D = geometry3d::AnalyticCapShape3D;
 
 enum class CapPatchKind3D {
     PolarCentral,
@@ -76,6 +75,21 @@ struct CapAtlasDensityOptions3D {
     // first to remove redundant mortar rows, then to select eliminated C0
     // coefficients.
     double rank_tolerance = 1.0e-10;
+
+    geometry3d::AnalyticCapGeometryOptions3D geometry_options() const
+    {
+        geometry3d::AnalyticCapGeometryOptions3D result;
+        result.shape = shape;
+        result.square_half_width = square_half_width;
+        result.polar_radius = polar_radius;
+        result.ellipsoid_axes = ellipsoid_axes;
+        result.flower_epsilon = flower_epsilon;
+        result.flower_eta = flower_eta;
+        result.rigid_rotation = rigid_rotation;
+        result.rigid_center = rigid_center;
+        result.rigid_translation = rigid_translation;
+        return result;
+    }
 };
 
 struct CapPatchDescriptor3D {
@@ -97,20 +111,9 @@ struct CapSeamDescriptor3D {
     std::string label;
 };
 
-struct CapSurfaceEvaluation3D {
-    Eigen::Vector3d point = Eigen::Vector3d::Zero();
-    Eigen::Matrix<double, 3, 2> tangents =
-        Eigen::Matrix<double, 3, 2>::Zero();
-    Eigen::Vector3d normal = Eigen::Vector3d::Zero();
-    double area_element = 0.0;
-};
-
-struct CapPatchLocation3D {
-    int patch = -1;
-    double u = 0.0;
-    double v = 0.0;
-    bool valid = false;
-};
+using CapSurfaceEvaluation3D =
+    geometry3d::AnalyticCapSurfaceEvaluation3D;
+using CapPatchLocation3D = geometry3d::AnalyticCapPatchLocation3D;
 
 // A cubic tensor-product value row has at most 4 x 4 active functions.  The
 // entries refer to merged C0 coefficients and can therefore be cached by

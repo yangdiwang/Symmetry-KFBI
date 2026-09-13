@@ -1,0 +1,103 @@
+{
+  "fixture": "fixtures/u_dirichlet_rotate_N32",
+  "geometry": "u",
+  "N": 32,
+  "bvp": "dirichlet",
+  "transform": "rotate",
+  "R": [
+    [
+      0.9564681423308483,
+      -0.269479093310137,
+      -0.11202549252256189
+    ],
+    [
+      0.2208180698891506,
+      0.919245348528552,
+      -0.32592540437813544
+    ],
+    [
+      0.1908089953765448,
+      0.2870000130267722,
+      0.9387347441136001
+    ]
+  ],
+  "translation": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "geometry_dimensions": {
+    "a": 0.55,
+    "inner": 0.22,
+    "notch": -0.1,
+    "z0": -0.5,
+    "z1": 0.5
+  },
+  "density_factor": 8.0,
+  "ratio": 4.0,
+  "width": 4.0,
+  "ridge": 1e-12,
+  "value_weight": 1.0,
+  "normal_weight": 1.0,
+  "pde_weight": 1.0,
+  "restrict_mode": "staged",
+  "exterior_targets": [
+    "raw",
+    "input_jump_half"
+  ],
+  "seed": 51209,
+  "raw_dofs": 550,
+  "reduced_dofs": 190,
+  "field_dofs": 1243,
+  "surface_samples": 3968,
+  "volume_samples": 12096,
+  "trace_count": 1408,
+  "constraint_direction_linf": 7.771561172376096e-16,
+  "optimality_linf": 1.059144806297983e-18,
+  "actual_fitted_P2": {
+    "field_coefficient_linf": 1.6964207816272392e-13,
+    "raw_value_linf": 5.88418203051333e-15,
+    "raw_normal_linf": 2.4868995751603507e-14
+  },
+  "extension": {
+    "ncoef": 1243,
+    "ncells": 448,
+    "ratio": 4.0,
+    "width": 4.0,
+    "ridge": 1e-12,
+    "pde_weight": 1.0,
+    "trace_weight": 1.0,
+    "normal_weight": 1.0,
+    "surface_samples": 3968,
+    "volume_samples": 12096,
+    "matrix_shape": [
+      20032,
+      1243
+    ],
+    "matrix_nnz": 1232896,
+    "gram_nnz": 249145,
+    "lu_nnz": 767624,
+    "prepare_s": 0.3779056999774184,
+    "lu_reused": false,
+    "lu_mode": "symmetric_no_threshold_pivot",
+    "gram_sha256": "50942d4892321f6bf1acae218ad0cdf4f355a64d71940dfcaa07af12cc9b0333",
+    "off_surface_exact_samples_used": 0,
+    "geometry_frame": "body-reference",
+    "jump_convention": "inside-minus-outside"
+  },
+  "transfer": {
+    "operator_setup_s": 0.08381489999010228,
+    "shared_grid_query_nodes": 6746,
+    "negative_sample_queries": 4224,
+    "spread_crossings": 2640,
+    "trace_count": 1408,
+    "wrong_side_nodes": 54582,
+    "q_stencil": 64,
+    "max_weight_l2": 1.1905933537275506,
+    "restrict_mode": "staged",
+    "shared_coverage_failures": 0,
+    "first_hit_calls": 0,
+    "face_owner_calls": 0,
+    "single_face_fallbacks": 0
+  }
+}

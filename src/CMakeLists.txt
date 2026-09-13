@@ -38,7 +38,9 @@ target_include_directories(kfbim_core PUBLIC
 target_link_libraries(kfbim_core PUBLIC Eigen3::Eigen zfft)
 
 if(KFBIM_BUILD_3D)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/geometry/models3d/sources.cmake)
     target_sources(kfbim_core PRIVATE
+        ${KFBIM_GEOMETRY_MODEL_SOURCES_3D}
         grid/cartesian_grid_3d.cpp
         grid/mac_grid_3d.cpp
         interface/interface_3d.cpp
@@ -59,11 +61,6 @@ if(KFBIM_BUILD_3D)
         geometry/rational_bezier_element_3d.cpp
         geometry/rational_bezier_subdivision_3d.cpp
         geometry/nurbs_surface_model_3d.cpp
-        geometry/industrial_nurbs_models_3d.cpp
-        geometry/industrial_nurbs_sleeve_3d.cpp
-        geometry/industrial_nurbs_bracket_3d.cpp
-        geometry/industrial_nurbs_flange_3d.cpp
-        geometry/industrial_nurbs_impeller_3d.cpp
         local_cauchy/edge_patch_laplacian_3d.cpp
         local_cauchy/edge_singular_bspline_fit_3d.cpp
         local_cauchy/edge_singular_fit_3d.cpp

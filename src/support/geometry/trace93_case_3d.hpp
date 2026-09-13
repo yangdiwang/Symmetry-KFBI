@@ -1,25 +1,9 @@
 #pragma once
 
 #include "src/support/geometry/trace_first_case_3d.hpp"
+#include "src/geometry/models3d/bicubic_nurbs_models_3d.hpp"
 
 namespace kfbim::app3d {
-
-enum class Trace93PatchKind3D { Affine, CylinderSide, CylinderCapRing };
-
-struct Trace93PatchMetadata3D {
-    Trace93PatchKind3D kind = Trace93PatchKind3D::Affine;
-    bool planar = true;
-    // Canonical native physical sheet: minimum patch ID in its G1 component.
-    int sheet = -1;
-    double Lu = 0.0;
-    double Lv = 0.0;
-    double density_length = 0.0;
-    Eigen::Vector3d local_origin = Eigen::Vector3d::Zero();
-    Eigen::Vector3d du = Eigen::Vector3d::Zero();
-    Eigen::Vector3d dv = Eigen::Vector3d::Zero();
-    int quarter = -1;
-    bool top = true;
-};
 
 struct Trace93GeometryJet3D {
     // d[i][j] = world-coordinate partial_u^i partial_v^j X.
@@ -31,7 +15,7 @@ struct Trace93GeometryJet3D {
 // In particular a rational circle parameter is not a linear angle parameter.
 struct Trace93Case3D : TraceFirstCase3D {
     std::string geometry_name;
-    std::vector<Trace93PatchMetadata3D> analysis_patches;
+    std::vector<SurfaceAnalysisChart3D> analysis_patches;
     bool native_parameters_match_analysis = true;
 
     Trace93GeometryJet3D analysis_at(

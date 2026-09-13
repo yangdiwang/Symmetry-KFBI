@@ -79,7 +79,7 @@ struct Trace93PolynomialCatalog3D::Impl {
         else c.known_value=known_cubic_dirichlet_jet_3d(known,c.physical.graph,c.physical.frame);
         const auto& metadata=problem.analysis_patches.at(a.patch_id);
         if(!metadata.planar){
-            if(metadata.kind!=Trace93PatchKind3D::CylinderSide)
+            if(metadata.kind!=SurfaceAnalysisChartKind3D::CylinderSide)
                 throw std::invalid_argument("93 correction chart is neither planar nor an angular cylinder side");
             // The constructor performs a purely analytic jet composition.
             // Its patch argument is ONLY stored, never evaluated here. DO NOT

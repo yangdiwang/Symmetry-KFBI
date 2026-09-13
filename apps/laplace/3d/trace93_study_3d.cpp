@@ -4,10 +4,14 @@
 #include "src/geometry/nurbs_cartesian_domain_3d.hpp"
 #include "src/geometry/grid_pair_3d.hpp"
 #include "src/bulk_solvers/laplace_zfft_bulk_solver_3d.hpp"
-#include "src/gmres/gmres.hpp"
+#include "src/support/solver/affine_kfbi_solve_3d.hpp"
+#ifdef KFBIM_HAS_SHARED_FIELD_3D
+#include "src/support/correction/shared_field_backend_3d.hpp"
+#endif
 
 #include <Eigen/Cholesky>
 #include <Eigen/Eigenvalues>
+#include <Eigen/SVD>
 #include <algorithm>
 #include <cmath>
 #include <chrono>
@@ -17,6 +21,7 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 
 namespace {
@@ -24,10 +29,33 @@ using namespace kfbim;
 using namespace kfbim::app3d;
 using Clock=std::chrono::steady_clock;
 double seconds(Clock::time_point t) {return std::chrono::duration<double>(Clock::now()-t).count();}
+void write_vector(const std::filesystem::path& path,const Eigen::VectorXd& v) {
+    std::ofstream out(path);out<<v.size()<<" 1\n"<<std::setprecision(17);
+    for(int i=0;i<v.size();++i) out<<v[i]<<'\n';
+    if(!out) throw std::runtime_error("vector output failed: "+path.string());
+}
+void write_matrix(const std::filesystem::path& path,const Eigen::MatrixXd& m) {
+    std::ofstream out(path);out<<m.rows()<<' '<<m.cols()<<'\n'<<std::setprecision(17);
+    for(int i=0;i<m.rows();++i) {for(int j=0;j<m.cols();++j) out<<m(i,j)<<' ';out<<'\n';}
+    if(!out) throw std::runtime_error("matrix output failed: "+path.string());
+}
+Eigen::VectorXd read_vector(const std::filesystem::path& path,int expected) {
+    std::ifstream in(path);int rows=0,cols=0;in>>rows>>cols;
+    if(!in||rows!=expected||cols!=1) throw std::runtime_error("replay vector shape mismatch: "+path.string());
+    Eigen::VectorXd v(rows);for(int i=0;i<rows;++i) in>>v[i];
+    if(!in||!v.allFinite()) throw std::runtime_error("replay vector read failed: "+path.string());
+    return v;
+}
+double relative_difference(const Eigen::VectorXd& a,const Eigen::VectorXd& b) {
+    return (a-b).lpNorm<Eigen::Infinity>()/std::max({1.,a.lpNorm<Eigen::Infinity>(),b.lpNorm<Eigen::Infinity>()});
+}
 struct Options {
     int N=32, max_iterations=0;
     std::string geometry="cylinder", bvp="both", transform="rotate", policy="trace", events="python93";
     bool grid_lines=true, compare_cache=false, dump=false, geometry_only=false;
+    bool spectrum=false,dump_grid=false,verify_replay=false,explicit_policy=false,explicit_events=false,explicit_field=false;
+    std::string backend="direct_cauchy",target,field_restrict="staged";
+    double field_ratio=4.,field_width=4.,field_ridge=1e-12,value_weight=1.,normal_weight=1.,pde_weight=1.;
     std::filesystem::path output;
 };
 Options parse(int argc,char** argv) {
@@ -37,6 +65,9 @@ Options parse(int argc,char** argv) {
         if(key=="--geometry-only") {o.geometry_only=true;continue;}
         if(key=="--compare-cache") {o.compare_cache=true;continue;}
         if(key=="--dump-matrices") {o.dump=true;continue;}
+        if(key=="--operator-spectrum") {o.spectrum=true;continue;}
+        if(key=="--dump-grid") {o.dump_grid=true;continue;}
+        if(key=="--verify-replay") {o.verify_replay=true;continue;}
         if(i+1>=argc) throw std::invalid_argument("missing option value: "+key);
         const std::string v=argv[++i];
         if(key=="--N") o.N=std::stoi(v);
@@ -44,8 +75,17 @@ Options parse(int argc,char** argv) {
         else if(key=="--bvp") o.bvp=v;
         else if(key=="--transform") o.transform=v;
         else if(key=="--geometry") o.geometry=v;
-        else if(key=="--policy") o.policy=v;
-        else if(key=="--event-mode") o.events=v;
+        else if(key=="--policy") {o.policy=v;o.explicit_policy=true;}
+        else if(key=="--event-mode") {o.events=v;o.explicit_events=true;}
+        else if(key=="--correction-backend") o.backend=v;
+        else if(key=="--exterior-target") o.target=v;
+        else if(key=="--shared-field-restrict") {o.field_restrict=v;o.explicit_field=true;}
+        else if(key=="--shared-field-ratio") {o.field_ratio=std::stod(v);o.explicit_field=true;}
+        else if(key=="--shared-field-width") {o.field_width=std::stod(v);o.explicit_field=true;}
+        else if(key=="--shared-field-ridge") {o.field_ridge=std::stod(v);o.explicit_field=true;}
+        else if(key=="--shared-field-value-weight") {o.value_weight=std::stod(v);o.explicit_field=true;}
+        else if(key=="--shared-field-normal-weight") {o.normal_weight=std::stod(v);o.explicit_field=true;}
+        else if(key=="--shared-field-pde-weight") {o.pde_weight=std::stod(v);o.explicit_field=true;}
         else if(key=="--grid-lines") {if(v!="on"&&v!="off") throw std::invalid_argument("grid-lines on/off");o.grid_lines=v=="on";}
         else if(key=="--output") o.output=v;
         else throw std::invalid_argument("unknown option: "+key);
@@ -56,6 +96,21 @@ Options parse(int argc,char** argv) {
     if(o.N!=32&&o.N!=64&&o.N!=128) throw std::invalid_argument("N must be 32/64/128");
     if(o.events!="all"&&o.events!="python93") throw std::invalid_argument("invalid event mode");
     if(o.max_iterations<0||o.max_iterations>5000) throw std::invalid_argument("invalid GMRES limit");
+    if(o.backend!="direct_cauchy"&&o.backend!="shared_field") throw std::invalid_argument("correction-backend must be direct_cauchy/shared_field");
+    const bool shared=o.backend=="shared_field";
+    if(o.target.empty()) o.target=shared?"input_jump_half":"raw";
+    if(o.target!="raw"&&o.target!="input_jump_half") throw std::invalid_argument("exterior-target must be raw/input_jump_half");
+    if(o.field_restrict!="staged"&&o.field_restrict!="direct") throw std::invalid_argument("shared-field-restrict must be staged/direct");
+    for(double value:{o.field_ratio,o.field_width,o.field_ridge,o.value_weight,o.normal_weight,o.pde_weight})
+        if(!std::isfinite(value)||value<=0.) throw std::invalid_argument("shared field ratios and weights must be positive and finite");
+    if(shared) {
+        if(o.geometry!="u") throw std::invalid_argument("shared_field currently supports only --geometry u");
+        if(o.explicit_policy||o.explicit_events||o.compare_cache) throw std::invalid_argument("shared_field conflicts with legacy policy/event/cache options");
+#ifndef KFBIM_HAS_SHARED_FIELD_3D
+        throw std::invalid_argument("shared_field was not compiled; enable KFBIM_BUILD_EXPERIMENTAL_3D");
+#endif
+    } else if(o.target!="raw"||o.explicit_field) throw std::invalid_argument("direct_cauchy supports raw target and no shared-field options");
+    if(o.spectrum&&o.N!=32) throw std::invalid_argument("full operator spectrum is limited to N32");
     return o;
 }
 TraceFirstCenterPolicy3D policy(const std::string& s) {
@@ -63,17 +118,9 @@ TraceFirstCenterPolicy3D policy(const std::string& s) {
     if(s=="event") return TraceFirstCenterPolicy3D::EventCentered;
     throw std::invalid_argument("policy must be trace or event");
 }
-class ApplyOperator : public IKFBIOperator {
-public:
-    int size=0;
-    std::function<void(const Eigen::VectorXd&,Eigen::VectorXd&)> fn;
-    int problem_size() const override {return size;}
-    void apply(const Eigen::VectorXd& x,Eigen::VectorXd& y) const override {fn(x,y);}
-};
-
 bool solve_case(const Options& options,const Trace93Case3D& problem,
     const CartesianGrid3D& grid,const GridPair3D& pair,
-    const LaplaceCorrectionSupport3D& support,bool neumann,double shared_seconds)
+    const LaplaceCorrectionSupport3D* support,bool neumann,double shared_seconds)
 {
     const auto start=Clock::now();
     const std::string name=neumann?"neumann":"dirichlet";
@@ -104,8 +151,13 @@ bool solve_case(const Options& options,const Trace93Case3D& problem,
     std::size_t validated_requests=0,restrict_fallbacks=0,path_queries=0,path_hits=0,multi_paths=0,discarded_spread=0;
     double maximum_event_radius=0,maximum_target_radius=0;
     bool paths_certified=false;
+    std::unique_ptr<ICorrectionBackend3D> backend;
+    double spread_seconds=0.,restrict_seconds=0.;
+    if(options.backend=="direct_cauchy") {
+    if(!support) throw std::runtime_error("legacy correction support missing");
+    const auto& legacy_support=*support;
     {
-        auto plan=build_trace_first_geometry_plan_3d(grid,pair,problem.surface,support,anchors,cover,
+        auto plan=build_trace_first_geometry_plan_3d(grid,pair,problem.surface,legacy_support,anchors,cover,
             RestrictResourceMode3D::ReuseBySheetNode,policy(options.policy),events,{1.75,3.25,1e-13});
         current_requests=plan.current_trace_requests;nearest_requests=plan.nearest_trace_requests;
         far_requests=plan.far_trace_requests;spread_fallbacks=plan.spread_event_fallbacks;
@@ -116,107 +168,83 @@ bool solve_case(const Options& options,const Trace93Case3D& problem,
         maximum_event_radius=plan.maximum_trace_event_distance_h;maximum_target_radius=plan.maximum_trace_target_distance_h;
         plan_seconds=plan.resource.planning_seconds;
         std::cout<<name<<" geometry plan ready in "<<plan_seconds<<" s; assembling fixed P3/P2 operators"<<std::endl;
-        op=build_trace93_bvp_operators_3d(plan,grid,pair,support,problem,layout,neumann,0.0,&ts);
+        op=build_trace93_bvp_operators_3d(plan,grid,pair,legacy_support,problem,layout,neumann,0.0,&ts);
         if(options.compare_cache) {
             const auto ab_start=Clock::now();
-            const auto reference_plan=build_trace_first_geometry_plan_3d(grid,pair,problem.surface,support,anchors,cover,
+            const auto reference_plan=build_trace_first_geometry_plan_3d(grid,pair,problem.surface,legacy_support,anchors,cover,
                 RestrictResourceMode3D::ReferencePerVisit,policy(options.policy),events,{1.75,3.25,1e-13});
-            const auto reference=build_trace93_bvp_operators_3d(reference_plan,grid,pair,support,problem,layout,neumann);
+            const auto reference=build_trace93_bvp_operators_3d(reference_plan,grid,pair,legacy_support,problem,layout,neumann);
             ab_error=resource_operator_max_difference_3d(op,reference);ab_seconds=seconds(ab_start);
             if(ab_error>5e-10) throw std::runtime_error("cached/reference operator mismatch");
         }
     } // Geometry plans, centres, and row caches are not retained through GMRES.
     if(options.dump) dump_resource_operators_3d(op,(output/"matrices").string());
-    const auto projection_start=Clock::now();
     const auto& B=op.trace_basis;
     if(B.rows()!=layout.trace_basis.rows() || B.cols()!=layout.trace_basis.cols())
         throw std::runtime_error("trace basis shape mismatch");
     const Eigen::SparseMatrix<double> basis_difference=B-layout.trace_basis;
     if(basis_difference.norm()>1e-10) throw std::runtime_error("operator and analysis trace bases disagree");
-    const Eigen::MatrixXd Ber=layout.edge_basis*layout.Z;
-    const Eigen::MatrixXd Bvr=layout.vertex_basis*layout.Z;
-    auto weighted_B=B;
-    for(int row=0;row<weighted_B.outerSize();++row)
-        for(ResourceRestrictSparseMatrix3D::InnerIterator it(weighted_B,row);it;++it)
-            it.valueRef()*=layout.weights[it.row()];
-    Eigen::SparseMatrix<double> mass=B.transpose()*weighted_B;
-    Eigen::MatrixXd M=layout.Z.transpose()*(mass*layout.Z);
-    if(layout.edge_weights.size()) M+=Ber.transpose()*layout.edge_weights.asDiagonal()*Ber;
-    if(layout.vertex_weights.size()) M+=Bvr.transpose()*layout.vertex_weights.asDiagonal()*Bvr;
-    M=(0.5*(M+M.transpose())).eval();
-    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eig(M,Eigen::EigenvaluesOnly);
-    if(eig.info()!=Eigen::Success) throw std::runtime_error("projector eigenvalue diagnostic failed");
-    double gram_regularization=0;
-    if(eig.eigenvalues()[0]<=0) {
-        gram_regularization=std::max(eig.eigenvalues().maxCoeff(),1.0)*1e-13-eig.eigenvalues()[0];
-        M.diagonal().array()+=gram_regularization;
+    spread_seconds=op.statistics.spread_seconds;restrict_seconds=op.statistics.restrict_seconds;
+    backend=std::make_unique<ResourceCorrectionBackend3D>(std::move(op),trace93_density_layout_id_3d(layout),trace93_trace_layout_id_3d(layout));
+    } else {
+#ifdef KFBIM_HAS_SHARED_FIELD_3D
+        SharedFieldBackendOptions3D field_options;
+        field_options.ratio=options.field_ratio;field_options.width=options.field_width;
+        field_options.fit.ridge=options.field_ridge;field_options.fit.value_weight=options.value_weight;
+        field_options.fit.normal_weight=options.normal_weight;field_options.fit.pde_weight=options.pde_weight;
+        field_options.restrict_mode=options.field_restrict=="staged"?SharedFieldRestrictMode3D::Staged:SharedFieldRestrictMode3D::Direct;
+        Eigen::VectorXi labels(grid.num_dofs());for(int i=0;i<labels.size();++i) labels[i]=pair.domain_label(i)>0?1:0;
+        std::cout<<name<<" building shared C2 field and fixed Cauchy fit"<<std::endl;
+        backend=make_trace93_shared_field_backend_3d(problem,layout,grid,labels,field_options);
+#else
+        throw std::runtime_error("shared field unavailable in this build");
+#endif
     }
-    Eigen::LLT<Eigen::MatrixXd> chol(M);
-    if(chol.info()!=Eigen::Success) throw std::runtime_error("trace Gram matrix not positive definite: refine trace sampling");
-    const Eigen::VectorXd pivots=chol.matrixL().toDenseMatrix().diagonal();
-    const double pivot_ratio=pivots.minCoeff()/pivots.maxCoeff();
-    if(!std::isfinite(pivot_ratio)||pivot_ratio<1e-10)
-        throw std::runtime_error("trace space is insufficiently observable");
-    const auto project=[&](const Eigen::VectorXd& t)->Eigen::VectorXd {
-        Eigen::VectorXd r=layout.Z.transpose()*(B.transpose()*(layout.weights.array()*t.array()).matrix());
-        if(layout.edge_weights.size())
-            r+=Ber.transpose()*(layout.edge_weights.array()*(layout.edge_trace*t).array()).matrix();
-        if(layout.vertex_weights.size())
-            r+=Bvr.transpose()*(layout.vertex_weights.array()*(layout.vertex_trace*t).array()).matrix();
-        return chol.solve(r);
-    };
-    const double projection_seconds=seconds(projection_start);
-    const auto& Rg=neumann?op.restrict.Rg_value:op.restrict.Rg_normal;
-    const auto& Rc=neumann?op.restrict.exterior.Rc_value:op.restrict.exterior.Rc_normal;
-    const auto& br=neumann?op.restrict.exterior.known_value:op.restrict.exterior.known_normal;
+    Trace93AffineTraceCoordinates3D coordinates(layout);
+    const auto project=[&](const Eigen::VectorXd& t){return coordinates.project(t);};
+    const auto& B=layout.trace_basis;
+    const double gram_regularization=coordinates.gram_regularization(),pivot_ratio=coordinates.pivot_ratio();
+    const double projection_seconds=coordinates.setup_seconds();
+    const auto target=options.target=="raw"?ExteriorTarget3D::RawTrace:ExteriorTarget3D::InputJumpHalf;
     LaplaceFftBulkSolverZfft3D poisson(grid,ZfftBcType::Dirichlet,0.0,2);
-    double poisson_seconds=0,matvec_seconds=0;
-    int poisson_calls=0;
-    const auto field=[&](const Eigen::VectorXd& c,bool affine)->Eigen::VectorXd {
-        Eigen::VectorXd rhs=op.S*c,U;
-        if(affine) rhs+=op.known_spread;
-        const auto t=Clock::now();poisson.solve(-rhs,U);poisson_seconds+=seconds(t);++poisson_calls;
-        return U;
-    };
     double constant_bulk_error=0,constant_trace_error=0;
+    AffineKfbiTimings3D probe_timings;
     if(neumann) {
-        const Eigen::VectorXd one=Eigen::VectorXd::Ones(layout.Z.rows());
-        const Eigen::VectorXd probe=field(one,false);
-        constant_trace_error=(Rg*probe+Rc*one).cwiseAbs().maxCoeff();
+        const auto probe=evaluate_affine_kfbi_3d(*backend,poisson,Eigen::VectorXd::Ones(layout.Z.rows()),ApplyPart3D::Homogeneous,target);
+        probe_timings=probe.timings;
+        constant_trace_error=probe.raw_trace.value.cwiseAbs().maxCoeff();
         for(int i=0;i<grid.num_dofs();++i)
-            constant_bulk_error=std::max(constant_bulk_error,std::abs(probe[i]-(pair.domain_label(i)>0?1.0:0.0)));
+            constant_bulk_error=std::max(constant_bulk_error,std::abs(probe.grid_solution[i]-(pair.domain_label(i)>0?1.0:0.0)));
         if(std::max(constant_bulk_error,constant_trace_error)>1e-8)
             throw std::runtime_error("constant-jump identity failed before GMRES");
     }
-    const auto affine_start=Clock::now();
-    const Eigen::VectorXd U0=field(layout.particular,true);
-    const Eigen::VectorXd rhs=-project((Rg*U0+Rc*layout.particular+br).eval());
-    ApplyOperator A;A.size=int(layout.Z.cols());
-    A.fn=[&](const Eigen::VectorXd& y,Eigen::VectorXd& result) {
-        const auto t=Clock::now();const Eigen::VectorXd c=layout.Z*y;
-        const Eigen::VectorXd U=field(c,false);
-        result=project((Rg*U+Rc*c).eval());matvec_seconds+=seconds(t);
-    };
     const bool planar_dirichlet=!neumann&&problem.geometry_name!="cylinder";
-    const int restart=std::min(planar_dirichlet?100:120,A.size);
+    const int restart=std::min(planar_dirichlet?100:120,coordinates.reduced_size());
     const int max_iterations=options.max_iterations?options.max_iterations:restart*(planar_dirichlet?8:12);
-    GMRES gmres(max_iterations,2e-10,restart);
-    Eigen::VectorXd y=Eigen::VectorXd::Zero(A.size);
-    const double affine_rhs_seconds=seconds(affine_start);
-    const auto gmres_start=Clock::now();
-    const int iterations=gmres.solve(A,rhs,y);
-    const double gmres_seconds=seconds(gmres_start);
-    const Eigen::VectorXd c=layout.particular+layout.Z*y;
-    const Eigen::VectorXd U=field(c,true);
-    const Eigen::VectorXd tv=op.restrict.Rg_value*U+op.restrict.exterior.Rc_value*c+op.restrict.exterior.known_value;
-    const Eigen::VectorXd tn=op.restrict.Rg_normal*U+op.restrict.exterior.Rc_normal*c+op.restrict.exterior.known_normal;
-    const Eigen::VectorXd trace=neumann?tv:tn;
-    const Eigen::VectorXd residual=project(trace);
-    const double projected_relative=residual.norm()/std::max(rhs.norm(),1e-300);
-    const Eigen::VectorXd representable=B*(layout.Z*residual);
+    AffineKfbiSolveOptions3D solve_options;solve_options.neumann=neumann;solve_options.target=target;
+    solve_options.restart=restart;solve_options.max_iterations=max_iterations;solve_options.relative_tolerance=2e-10;
+    const auto solved=solve_affine_kfbi_3d(*backend,coordinates,poisson,solve_options);
+    const auto& c=solved.raw_coefficients;const auto& y=solved.reduced_coordinates;
+    const auto& U=solved.evaluation.grid_solution;
+    const auto& tv=solved.evaluation.raw_trace.value;const auto& tn=solved.evaluation.raw_trace.normal;
+    const auto& ev=solved.evaluation.equation_trace.value;const auto& en=solved.evaluation.equation_trace.normal;
+    const auto& trace=neumann?ev:en;const auto& raw_trace=neumann?tv:tn;
+    const auto& residual=solved.projected_residual;
+    const int iterations=solved.iterations;
+    const double projected_relative=solved.projected_relative_residual;
+    const double raw_projected_relative=project(raw_trace).norm()/std::max(solved.projected_rhs.norm(),1e-300);
+    const auto leakage_for=[&](const Eigen::VectorXd& values,const Eigen::VectorXd& projected) {
+        const Eigen::VectorXd representable=B*coordinates.lift_homogeneous(projected);
+        const double total=std::sqrt((layout.weights.array()*values.array().square()).sum());
+        return std::sqrt((layout.weights.array()*(values-representable).array().square()).sum())/std::max(total,1e-300);
+    };
     const double full_norm=std::sqrt((layout.weights.array()*trace.array().square()).sum());
-    const double leakage=std::sqrt((layout.weights.array()*(trace-representable).array().square()).sum())/std::max(full_norm,1e-300);
-    double interior_linf=0,interior_sq=0,density_linf=0,density_sq=0,core_linf=0;
+    const double leakage=leakage_for(trace,residual),raw_leakage=leakage_for(raw_trace,project(raw_trace));
+    const double poisson_seconds=solved.timings.poisson_seconds+probe_timings.poisson_seconds;
+    const int poisson_calls=solved.timings.poisson_calls+probe_timings.poisson_calls;
+    const double gmres_seconds=solved.timings.gmres_seconds,matvec_seconds=solved.timings.matvec_seconds;
+    const double affine_rhs_seconds=solved.timings.affine_rhs_seconds;
+    double interior_linf=0,interior_sq=0,density_linf=0,density_sq=0,core_linf=0,near_boundary_linf=0;
     int inside_count=0,max_node=-1;
     Eigen::Vector3d max_point=Eigen::Vector3d::Zero();
     for(int i=0;i<grid.num_dofs();++i) if(pair.domain_label(i)>0) {
@@ -230,6 +258,7 @@ bool solve_case(const Options& options,const Trace93Case3D& problem,
             core=core&&problem.surface.exact_inside(x+offset)&&problem.surface.exact_inside(x-offset);
         }
         if(core) core_linf=std::max(core_linf,err);
+        else near_boundary_linf=std::max(near_boundary_linf,err);
     }
     const Eigen::VectorXd density_values=B*c;
     for(int i=0;i<density_values.size();++i) {
@@ -241,15 +270,80 @@ bool solve_case(const Options& options,const Trace93Case3D& problem,
     if(!U.allFinite()||!std::isfinite(interior_linf)||inside_count==0)
         throw std::runtime_error("invalid computed field");
     const double total_seconds=seconds(start);
+    write_vector(output/"density_coefficients.txt",c);
+    write_vector(output/"reduced_coordinates.txt",y);
+    write_vector(output/"raw_value_trace.txt",tv);
+    write_vector(output/"raw_normal_trace.txt",tn);
+    write_vector(output/"equation_value_trace.txt",ev);
+    write_vector(output/"equation_normal_trace.txt",en);
+    write_vector(output/"particular_coefficients.txt",layout.particular);
+    if(options.dump_grid) write_vector(output/"grid_solution.txt",U);
+    if(solved.final_snapshot.field_coefficients) write_vector(output/"field_coefficients.txt",*solved.final_snapshot.field_coefficients);
+    if(solved.evaluation.correction.requested_jump) {
+        const auto& requested=*solved.evaluation.correction.requested_jump;
+        const auto& fitted=*solved.evaluation.correction.fitted_jump;
+        write_vector(output/"requested_value_jump.txt",requested.value);write_vector(output/"requested_normal_jump.txt",requested.normal);
+        write_vector(output/"fitted_value_jump.txt",fitted.value);write_vector(output/"fitted_normal_jump.txt",fitted.normal);
+    }
+    double replay_error=0.,replay_seconds=0.;
+    if(options.verify_replay) {
+        const auto replay_start=Clock::now();
+        const auto saved_c=read_vector(output/"density_coefficients.txt",static_cast<int>(c.size()));
+        const auto saved_y=read_vector(output/"reduced_coordinates.txt",static_cast<int>(y.size()));
+        replay_error=relative_difference(saved_c,coordinates.particular()+coordinates.lift_homogeneous(saved_y));
+        const auto replay=evaluate_affine_kfbi_3d(*backend,poisson,saved_c,ApplyPart3D::WithPrescribedData,target);
+        replay_error=std::max({replay_error,relative_difference(replay.grid_solution,U),
+            relative_difference(replay.raw_trace.value,read_vector(output/"raw_value_trace.txt",static_cast<int>(tv.size()))),
+            relative_difference(replay.raw_trace.normal,read_vector(output/"raw_normal_trace.txt",static_cast<int>(tn.size()))),
+            relative_difference(replay.equation_trace.value,read_vector(output/"equation_value_trace.txt",static_cast<int>(ev.size()))),
+            relative_difference(replay.equation_trace.normal,read_vector(output/"equation_normal_trace.txt",static_cast<int>(en.size())))});
+        if(solved.final_snapshot.field_coefficients) {
+            const auto replay_snapshot=backend->snapshot_last_evaluation(replay.evaluation_id);
+            if(!replay_snapshot.field_coefficients) throw std::runtime_error("replay lost the shared field snapshot");
+            replay_error=std::max(replay_error,relative_difference(*replay_snapshot.field_coefficients,
+                read_vector(output/"field_coefficients.txt",static_cast<int>(solved.final_snapshot.field_coefficients->size()))));
+        }
+        if(!std::isfinite(replay_error)||replay_error>1e-10) throw std::runtime_error("saved coefficient replay failed");
+        replay_seconds=seconds(replay_start);
+    }
+    double spectrum_seconds=0.,sigma_min=0.,sigma_max=0.;
+    if(options.spectrum) {
+        const auto spectrum_start=Clock::now();
+        const int nr=coordinates.reduced_size();Eigen::MatrixXd matrix(nr,nr);
+        for(int col=0;col<nr;++col) {
+            const Eigen::VectorXd direction=coordinates.lift_homogeneous(Eigen::VectorXd::Unit(nr,col));
+            const auto probe=evaluate_affine_kfbi_3d(*backend,poisson,direction,ApplyPart3D::Homogeneous,target);
+            matrix.col(col)=project(neumann?probe.equation_trace.value:probe.equation_trace.normal);
+        }
+        if(!matrix.allFinite()) throw std::runtime_error("nonfinite reduced operator");
+        Eigen::JacobiSVD<Eigen::MatrixXd> svd(matrix);
+        sigma_max=svd.singularValues()[0];sigma_min=svd.singularValues().tail(1)[0];
+        write_matrix(output/"reduced_operator.txt",matrix);write_matrix(output/"density_nullspace.txt",layout.Z);
+        write_vector(output/"operator_singular_values.txt",svd.singularValues());
+        spectrum_seconds=seconds(spectrum_start);
+    }
     std::ofstream history(output/"gmres_history.json");history<<std::setprecision(17)<<"[";
-    for(std::size_t i=0;i<gmres.residuals().size();++i) {if(i)history<<",";history<<gmres.residuals()[i];}history<<"]\n";
+    for(std::size_t i=0;i<solved.recursive_residuals.size();++i) {if(i)history<<",";history<<solved.recursive_residuals[i];}history<<"]\n";
     std::ofstream j(output/"result.json");j<<std::setprecision(17)<<"{\n";
     const auto s=[&](const char* k,const std::string& v){j<<"  \""<<k<<"\": \""<<v<<"\",\n";};
-    const auto n=[&](const char* k,double v){j<<"  \""<<k<<"\": "<<v<<",\n";};
+    const auto n=[&](const char* k,double v){if(!std::isfinite(v))throw std::runtime_error(std::string("nonfinite result: ")+k);j<<"  \""<<k<<"\": "<<v<<",\n";};
     s("case",problem.id);s("transform",options.transform);s("bvp",name);s("chart","python93_analysis");s("geometry",problem.geometry_name);
+    s("correction_backend",options.backend);s("exterior_target",options.target);
+    s("density_layout_id",backend->descriptor().density_layout_id);s("trace_layout_id",backend->descriptor().trace_layout_id);
+#ifdef KFBIM_BUILD_REVISION
+    s("local_base_commit",KFBIM_BUILD_REVISION);
+#endif
+    if(options.backend=="shared_field") {
+        s("source_package_sha256","23cfa03489e1d1004a57f39703e1f4237d83afb6da096fed7cc7033ecb884ce5");
+        s("field_linear_algebra","Eigen SimplicialLDLT AMD; two fixed refinements");
+        s("shared_field_restrict",options.field_restrict);
+        n("shared_field_ratio",options.field_ratio);n("shared_field_width",options.field_width);n("shared_field_ridge",options.field_ridge);
+        n("shared_field_value_weight",options.value_weight);n("shared_field_normal_weight",options.normal_weight);n("shared_field_pde_weight",options.pde_weight);
+        n("density_factor",8.);n("field_lift_rcond",1e-13);n("field_refinement_count",2);
+    }
     s("center_policy",options.policy);s("event_mode",options.events);s("density","python93_independent_analysis_coefficients");
     n("N",options.N);n("h",2.0/options.N);n("reference_raw_dofs",layout.reference_raw_dofs);
-    n("reduced_dofs",A.size);n("trace_points",layout.traces.size());
+    n("reduced_dofs",coordinates.reduced_size());n("trace_points",layout.traces.size());
     n("constraint_rows",layout.C.rows());n("constraint_rank",layout.rank);
     n("constraint_residual",layout.constraint_residual);n("nullspace_residual",layout.nullspace_residual);
     n("final_constraint_residual",(layout.C*c-layout.d).cwiseAbs().maxCoeff());
@@ -263,12 +357,27 @@ bool solve_case(const Options& options,const Trace93Case3D& problem,
     j<<"],\n";
     n("gram_cholesky_pivot_ratio",pivot_ratio);n("gmres_iterations",iterations);n("gmres_tolerance",2e-10);
     n("projected_relative_residual",projected_relative);n("full_exterior_value_linf",tv.cwiseAbs().maxCoeff());
+    n("raw_value_linf",tv.cwiseAbs().maxCoeff());n("raw_normal_linf",tn.cwiseAbs().maxCoeff());
+    n("raw_projected_relative_residual",raw_projected_relative);n("raw_projection_leakage",raw_leakage);
+    n("equation_value_linf",ev.cwiseAbs().maxCoeff());n("equation_normal_linf",en.cwiseAbs().maxCoeff());
+    const auto rms=[&](const Eigen::VectorXd& values){return std::sqrt((layout.weights.array()*values.array().square()).sum()/layout.weights.sum());};
+    n("raw_value_rms",rms(tv));n("raw_normal_rms",rms(tn));n("equation_value_rms",rms(ev));n("equation_normal_rms",rms(en));
+    n("half_jump_value_change_linf",(ev-tv).cwiseAbs().maxCoeff());n("half_jump_normal_change_linf",(en-tn).cwiseAbs().maxCoeff());
+    n("final_residual_certification_limit",3e-10);n("final_evaluation_id",double(solved.final_snapshot.evaluation_id));
+    j<<"  \"replay_verified\": "<<(options.verify_replay?"true":"false")<<",\n";
+    if(options.verify_replay) {n("replay_normalized_error",replay_error);n("replay_seconds",replay_seconds);}
+    for(const auto& item:solved.final_snapshot.scalar_diagnostics) n(item.first.c_str(),item.second);
+    if(options.spectrum) {
+        n("operator_sigma_min",sigma_min);n("operator_sigma_max",sigma_max);n("operator_spectrum_seconds",spectrum_seconds);
+        if(sigma_min>0.) n("operator_condition",sigma_max/sigma_min);else j<<"  \"operator_condition\": null,\n";
+    }
     n("full_exterior_normal_linf",tn.cwiseAbs().maxCoeff());n("active_trace_weighted_l2",full_norm);n("projection_leakage",leakage);
     n("interior_linf",interior_linf);n("cartesian_core_linf",core_linf);n("interior_l2",std::sqrt(interior_sq/inside_count));
+    n("near_boundary_linf",near_boundary_linf);
     n("density_linf",density_linf);n("density_l2",std::sqrt(density_sq/layout.weights.sum()));
     n("max_error_grid_id",max_node);j<<"  \"max_error_point\": ["<<max_point.x()<<","<<max_point.y()<<","<<max_point.z()<<"],\n";
     n("shared_geometry_seconds",shared_seconds);n("density_seconds",density_seconds);n("planning_seconds",plan_seconds);
-    n("spread_seconds",op.statistics.spread_seconds);n("restrict_seconds",op.statistics.restrict_seconds);
+    n("spread_seconds",spread_seconds);n("restrict_seconds",restrict_seconds);
     n("projection_setup_seconds",projection_seconds);n("gmres_seconds",gmres_seconds);n("poisson_seconds",poisson_seconds);
     n("affine_rhs_seconds",affine_rhs_seconds);
     n("poisson_calls",poisson_calls);n("matvec_seconds",matvec_seconds);n("bvp_total_seconds",total_seconds);
@@ -288,11 +397,11 @@ bool solve_case(const Options& options,const Trace93Case3D& problem,
     j<<"  \"constant_jump_checked\": "<<(neumann?"true":"false")<<",\n";
     j<<"  \"cache_comparison_checked\": "<<(options.compare_cache?"true":"false")<<",\n"
      <<"  \"support_paths_certified\": "<<(paths_certified?"true":"false")<<",\n"
-     <<"  \"gmres_converged\": "<<(gmres.converged()&&projected_relative<3e-10?"true":"false")<<"\n}\n";
+     <<"  \"gmres_converged\": "<<(solved.gmres_converged&&projected_relative<3e-10?"true":"false")<<"\n}\n";
     if(!j||!history) throw std::runtime_error("result write failed");
     std::cout<<std::setprecision(10)<<name<<" N="<<options.N<<" error="<<interior_linf<<" iter="<<iterations
              <<" residual="<<projected_relative<<" seconds="<<total_seconds<<std::endl;
-    return gmres.converged()&&projected_relative<3e-10;
+    return solved.gmres_converged&&projected_relative<3e-10;
 }
 } // namespace
 
@@ -449,23 +558,33 @@ int main(int argc,char** argv) {
             write_geometry(seconds(t),false);
             throw std::runtime_error("native grid labels disagree with exact case oracle");
         }
-        const auto support=[&] {
-            try {return build_laplace_correction_support_3d(pair,"trace93 study");}
+        std::optional<LaplaceCorrectionSupport3D> support;
+        {
+            try {
+                if(options.backend=="shared_field") {
+                    if(d.uncertified_grid_edge_count!=0)
+                        throw std::runtime_error("shared field requires certified native candidate grid edges");
+                    // Retain the existing event certification checks, without
+                    // retaining event polynomials or constructing owner paths.
+                    for(const auto& event:domain->grid_edge_event_catalog())
+                        (void)native_grid_edge_event_correction_ops_3d(grid,event);
+                } else support.emplace(build_laplace_correction_support_3d(pair,"trace93 study"));
+            }
             catch(...) {
                 const auto original=std::current_exception();
                 try {write_geometry(seconds(t),false);write_uncertified_edges();}
                 catch(const std::exception& e) {std::cerr<<"diagnostic write failed: "<<e.what()<<std::endl;}
                 std::rethrow_exception(original);
             }
-        }();
+        }
         // Same successful timing boundary as before: after support setup,
         // before diagnostic file I/O or any Neumann/Dirichlet solve.
         const double shared_seconds=seconds(t);
         write_geometry(shared_seconds,true);
         if(options.geometry_only) return 0;
         bool passed=true;
-        if(options.bvp!="dirichlet") passed=solve_case(options,problem,grid,pair,support,true,shared_seconds)&&passed;
-        if(options.bvp!="neumann") passed=solve_case(options,problem,grid,pair,support,false,shared_seconds)&&passed;
+        if(options.bvp!="dirichlet") passed=solve_case(options,problem,grid,pair,support?&*support:nullptr,true,shared_seconds)&&passed;
+        if(options.bvp!="neumann") passed=solve_case(options,problem,grid,pair,support?&*support:nullptr,false,shared_seconds)&&passed;
         return passed?0:2;
     } catch(const std::exception& e) {std::cerr<<"trace93 study: "<<e.what()<<std::endl;return 1;}
 }

@@ -1,5 +1,23 @@
 # Symmetry-KFBI
 
+## 三维几何模型模块
+
+三维实体构造统一位于 [`src/geometry/models3d`](src/geometry/models3d/README.md)，
+Native、bicubic NURBS 和工业 NURBS 模型按几何体独立维护，椭球/花形解析几何由应用与密度模块共用。Native 模型使用 NURBS 自身参数，包括双线性柱体平面片以及精确有理圆环和空心圆柱；`bicubic_nurbs` 模型另带 `SurfaceAnalysisChart3D`，其中圆柱使用角度 chart。
+模型构造与网格装配、制造解及求解分离；已有研究入口通过适配调用几何工厂。
+模型清单、调用示例及新增几何流程见模块说明；本次迁移的检查范围和结果见
+[验证报告](docs/Geometry_Model_Module_Validation.md)。
+
+## 共享修正场实验后端（2026-09-12）
+
+`kfbi_trace93_study_3d` 新增 `--correction-backend shared_field`，使用同一个 C² 体样条
+修正场完成 Spread 和 Restrict，并单独保留原始外迹与半跳跃方程目标。
+当前范围是 U 柱的 Laplace Dirichlet/Neumann；开启
+`KFBIM_BUILD_EXPERIMENTAL_3D=ON` 后可用，原默认 `direct_cauchy` 保留。
+模块框架、配置和运行命令见 [实现说明](docs/Shared_Field_KFBI_Implementation.md)，
+实测范围见 [验证报告](docs/Shared_Field_KFBI_Validation.md)，固定来源及复现实验见
+[共享场测试目录](tests/cases/shared_field_3d/README.md)。
+
 ## 3D Trace93 外迹点优先入口（2026-09-09）
 
 最新 Python 93 算法包的 C++ 对照入口是 `kfbi_trace93_study_3d`，统一算例、

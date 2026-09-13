@@ -317,7 +317,7 @@ DirectCoefficientCubicCauchyPlan3D build_direct_coefficient_cubic_cauchy_plan_3d
     result.diagnostics.tangent_plane_residual=std::max(std::abs(frame.normal.dot(geometry.lower.x_u)),
         std::abs(frame.normal.dot(geometry.lower.x_v)));
     for(int row=0;row<10;++row) {
-        const Eigen::Matrix<double,1,10> weights=map.row(row);result.value_rows[row]=combine(rows,weights);
+        const Eigen::Matrix<double,1,10> weights=map.row(row);result.value_rows[row]=combine<10>(rows,weights);
         if(row<6) result.normal_rows[row]=result.value_rows[row];
     }
     return result;
@@ -354,9 +354,9 @@ Eigen::Matrix<double,1,10> DirectCoefficientCubicCauchyPlan3D::value_weights(con
 Eigen::Matrix<double,1,6> DirectCoefficientCubicCauchyPlan3D::normal_weights(const Eigen::Vector3d& d,int degree) const
 { return monomials(d,frame,degree)*closure.normal_map; }
 NativeDensityC0Stencil3D DirectCoefficientCubicCauchyPlan3D::compose_value_row(const Eigen::Vector3d& d,int degree) const
-{ return combine(value_rows,value_weights(d,degree)); }
+{ return combine<10>(value_rows,value_weights(d,degree)); }
 NativeDensityC0Stencil3D DirectCoefficientCubicCauchyPlan3D::compose_normal_row(const Eigen::Vector3d& d,int degree) const
-{ return combine(normal_rows,normal_weights(d,degree)); }
+{ return combine<6>(normal_rows,normal_weights(d,degree)); }
 
 CubicValueJet3D known_cubic_dirichlet_jet_3d(const KnownAmbientThird3D& data,
     const TangentGraphThirdJet3D& f,const LocalOrthonormalFrame3D& frame)

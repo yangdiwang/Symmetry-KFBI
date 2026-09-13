@@ -12,6 +12,7 @@
 #include "src/geometry/nurbs_curve_3d.hpp"
 #include "src/geometry/nurbs_patch_triangulator_3d.hpp"
 #include "src/geometry/nurbs_surface_3d.hpp"
+#include "src/geometry/models3d/catalog_3d.hpp"
 #include "src/geometry/nurbs_utils.hpp"
 #include "src/geometry/p2_curve_2d.hpp"
 #include "src/geometry/p2_projection_2d.hpp"

@@ -9,11 +9,19 @@
 
 ## 目录职责
 
+三维算例实体统一在 `src/geometry/models3d/` 构造，按 `native`、`bicubic_nurbs`、
+`industrial`、`analytic` 分类并按实体拆文件。`native` 使用 NURBS 自身参数，包含双线性
+柱体平面片和精确有理圆环/空心圆柱；`bicubic_nurbs` 为 box、实心圆柱、L/U 柱提供独立
+`SurfaceAnalysisChart3D`，圆柱的分析参数是角度 chart。工厂不依赖网格尺度、密度布局或
+制造解；旧 support 几何头兼容转发。
+按 h 三角化及 GridPair 属于离散装配，继续位于模型模块之外。
+新增实体的步骤见 [三维模型模块](../../src/geometry/models3d/README.md)。
+
 | 目录 | 内容与边界 |
 | --- | --- |
 | `include/kfbim/` | 面向使用者的公开头文件。 |
 | `src/` | `kfbim_core` 的实现与随核心安装的内部头文件。 |
-| `src/support/` | 算例、测试和基准共享的仓库内部支撑代码，按 `cauchy`、`density`、`diagnostics`、`geometry`、`topology`、`trace` 分类。这里的 targets 不安装，也不属于公开 API。 |
+| `src/support/` | 算例、测试和基准共享的仓库内部支撑代码，按 `cauchy`、`correction`、`density`、`diagnostics`、`geometry`、`solver`、`topology`、`trace` 分类。这里的 targets 不安装，也不属于公开 API。 |
 | `apps/laplace/2d/`、`apps/laplace/3d/` | Laplace 方程的二维、三维算例和求解入口。构建后的程序仍位于 `build/apps/`；多配置生成器在其下增加 `Release/`、`Debug/` 等配置目录。 |
 | `apps/transmission/` | 传输问题及中心扰动入口。 |
 | `apps/shape_optimization/` | 形状优化入口。 |
@@ -30,6 +38,13 @@ targets 或头文件；若某项能力需要成为公开 API，应先迁入 `inc
 实现，并明确安装和兼容性约束。
 
 ## 构建开关
+
+Trace93 的两个修正后端共用 `support/solver/affine_kfbi_solve_3d`。
+公共后端接口、旧 Resource 适配器、lift/project 和半跳跃闭合归
+`kfbim_3d_app_geometry`；共享场 geometry/space/extension/backend 和
+`shared_field_transfer_3d` 归 `kfbim_3d_shared_correction`，仅在实验开关 ON 时构建。
+依赖方向是实验库到公共库，公共求解流程不依赖共享场实现。
+详细数据流和生命周期见 [共享场实现](../Shared_Field_KFBI_Implementation.md)。
 
 | CMake 选项 | 首次配置默认值 | 作用 |
 | --- | --- | --- |

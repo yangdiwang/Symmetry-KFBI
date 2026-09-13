@@ -1,4 +1,4 @@
-#include "industrial_nurbs_models_3d.hpp"
+#include "src/geometry/models3d/industrial/models_3d.hpp"
 
 #include <array>
 #include <cmath>

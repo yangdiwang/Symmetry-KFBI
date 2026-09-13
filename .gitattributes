@@ -1,3 +1,8 @@
 * text=auto eol=lf
 *.bat text eol=crlf
 *.cmd text eol=crlf
+
+# These numerical references are pinned by byte-level SHA256 in provenance.json.
+tests/cases/shared_field_3d/fixtures/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+tests/cases/shared_field_3d/cases.json -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+tests/cases/shared_field_3d/package_reference_summary.json -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
